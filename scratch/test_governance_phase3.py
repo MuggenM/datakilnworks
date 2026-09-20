@@ -96,6 +96,7 @@ def setup():
     con = app_module.get_duckrun_conn().con
     Env.con = con
     con.execute("CREATE SCHEMA IF NOT EXISTS warehouse.hr")
+    con.execute("CREATE SCHEMA IF NOT EXISTS warehouse.dbo")
     con.execute("""CREATE OR REPLACE TABLE warehouse.hr.employees (
         id INTEGER, first_name VARCHAR, email VARCHAR, ssn VARCHAR, salary DECIMAL(10,2), dob DATE, dept VARCHAR)""")
     con.execute("""INSERT INTO warehouse.hr.employees VALUES
@@ -208,6 +209,25 @@ def test_composition():
     check("EXPLAIN ANALYZE is rewritten and does not leak", rows_ok(rows) and not leaks(rows), (rows, res.blocked))
 
 
+def test_context_independence():
+    print("\n2b. Rewritten SQL does not depend on the executing session's default catalog")
+    rows, res = run("SELECT email, ssn FROM employees")
+    check("an unqualified name is pinned to its resolved table", rows_ok(rows) and "warehouse.hr.employees" in res.sql.replace('"', ""), (rows, res.blocked, res.sql))
+    for home in (None, "warehouse.dbo", "warehouse.hr", "memory.main"):
+        cur = Env.con.cursor()
+        try:
+            if home:
+                cur.execute(f"USE {home}")
+            got = cur.execute(res.sql).fetchall()
+            check(f"the same rewritten SQL is masked when executed from {home or 'a fresh cursor'}", not leaks(got) and got[0][0] == "a***@example.com", got)
+        finally:
+            cur.close()
+    rows, res = run("SELECT * FROM employees", home=None)
+    check("from a session where the name cannot be resolved, a tagged name is refused instead of guessed", res.blocked and rows is None, (rows, res.sql))
+    rows, res = run("SELECT count(*) FROM information_schema.tables")
+    check("information_schema is left alone", rows_ok(rows) and res.blocked is None, (rows, res.blocked))
+
+
 def test_no_oracles():
     print("\n3. No filter / ordering oracles")
     for label, sql in {
@@ -292,7 +312,8 @@ def test_gating():
     check("mask macros were not damaged by the attempts", run("SELECT memory.main.gov_mask_email('ada@example.com')", SYSTEM)[0] == [("a***@example.com",)])
 
     rows, res = run("SELECT * FROM warehouse.hr.plain ORDER BY id")
-    check("tables without tagged columns are unaffected", rows == [(1, "hello"), (2, "world")] and res.changed is False, (rows, res.blocked))
+    check("tables without tagged columns return the same rows (and are pinned to their resolved name)",
+          rows == [(1, "hello"), (2, "world")] and not res.masked and "warehouse.hr.plain" in res.sql, (rows, res.blocked, res.sql))
     check("CREATE TABLE / INSERT VALUES on unrelated tables still work",
           run("CREATE TABLE warehouse.hr.scratch (x INT)")[1].blocked is None and run("INSERT INTO warehouse.hr.scratch VALUES (1)")[1].blocked is None)
     run("DROP TABLE IF EXISTS warehouse.hr.scratch")
@@ -463,6 +484,7 @@ def main():
         delta_dir = setup()
         test_basic_shapes()
         test_composition()
+        test_context_independence()
         test_no_oracles()
         test_paths(delta_dir)
         test_gating()

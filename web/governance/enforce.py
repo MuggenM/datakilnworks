@@ -191,8 +191,9 @@ class _Ctx:
     """Per-call state: metadata lookups (cached), current catalog/schema (tracks USE), accumulated results."""
 
     def __init__(self, con, principal: Principal, subject: bool, sandbox: bool, default_catalog: Optional[str],
-                 default_schema: Optional[str]):
+                 default_schema: Optional[str], trusted: bool = False):
         self.con = con
+        self.trusted = trusted          # server-built SQL (previews, exports): masking applies, file sandbox/allowlists do not
         self.principal = principal
         self.subject = subject          # at least one masking policy applies -> allowlists + masking
         self.sandbox = sandbox          # non-admin: file sandbox applies
@@ -255,8 +256,8 @@ def _candidates(tbl: exp.Table, ctx: _Ctx) -> List[Tuple[str, str, str]]:
     if cat and db:
         return [(cat, db, name)]
     if db:
-        return [(ctx.catalog, db, name), (db, "main", name), (db, ctx.schema, name)]
-    return [(ctx.catalog, ctx.schema, name), (ctx.catalog, "main", name)]
+        return [(ctx.catalog, db, name), (db, "main", name), (db, ctx.schema, name), (db, "dbo", name)]
+    return [(ctx.catalog, ctx.schema, name), (ctx.catalog, "main", name), (ctx.catalog, "dbo", name)]
 
 
 def _resolve_identifier(tbl: exp.Table, ctx: _Ctx) -> Optional[Tuple[str, str, str]]:
@@ -325,16 +326,25 @@ def _rewrite_table_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack: Tuple[Tuple
     if not isinstance(tbl.this, exp.Identifier):
         return _rewrite_function_ref(tbl, ctx, depth, stack)
 
+    if tags.norm(tbl.db) in ("information_schema", "pg_catalog") and not tbl.catalog:
+        return set()                                        # engine metadata views: names and types, never row values
     ident = _resolve_identifier(tbl, ctx)
     if ident is None and _looks_like_path(tbl):
         # sqlglot cannot tell FROM 'x.parquet' from FROM "x.parquet": a real object of that name wins, else it is a file scan
         return _rewrite_function_ref(tbl, ctx, depth, stack)
     if ident is None:
-        # Might be a table we failed to resolve. Refuse if its bare name belongs to any masked table.
-        if ctx.subject and _name_is_sensitive(tags.norm(tbl.name), ctx):
-            raise _Block(f"Could not resolve table '{tbl.sql()}' safely, and its name matches a table with masked columns.")
+        # A name we cannot resolve might still resolve for the engine (its default catalog/schema can differ from ours).
+        # Refuse when it could be tagged data: a tagged table's name, or any broad (catalog/schema) tag exists.
+        if ctx.subject and not ctx.trusted and (_name_is_sensitive(tags.norm(tbl.name), ctx) or _broad_tags_exist()):
+            raise _Block(f"Could not resolve table '{tbl.sql()}' while masking policies apply; qualify it as catalog.schema.table.")
         return set()
     ctx.tables.add(_label(ident))
+    if ctx.subject:
+        # Execute exactly what was analysed: pin the reference to its resolved identity so the engine's own default
+        # catalog/schema (which differs between the studio cursor, workers and Ray actors) cannot pick another table.
+        tbl.set("catalog", exp.to_identifier(ident[0]))
+        tbl.set("db", exp.to_identifier(ident[1]))
+        ctx.changed = True
 
     inner_masked: Set[Tuple[str, str, str]] = set()
     alias_node = tbl.args.get("alias")
@@ -395,6 +405,11 @@ def _with_alias(subquery: exp.Subquery, alias_node: Optional[exp.Expression]) ->
     return subquery
 
 
+def _broad_tags_exist() -> bool:
+    idx = tags.get_index()
+    return bool(idx["catalogs"] or idx["schemas"])
+
+
 def _name_is_sensitive(name: str, ctx: _Ctx) -> bool:
     """True when some table with masked columns for this principal has this bare name."""
     idx = tags.get_index()
@@ -431,7 +446,7 @@ def _rewrite_function_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack) -> Set[T
     literal_name = _looks_like_path(tbl)
     fn_name = _function_name(tbl) if literal_name is None else "read_parquet" if literal_name.lower().endswith(".parquet") else "read_csv"
     if literal_name is None and not isinstance(tbl.this, exp.Identifier) and fn_name not in FILE_SCAN_FUNCS:
-        if ctx.subject and fn_name not in ALLOWED_TABLE_FUNCS:
+        if ctx.subject and not ctx.trusted and fn_name not in ALLOWED_TABLE_FUNCS:
             raise _Block(f"The table function '{fn_name}' is not available while masking policies apply to you.")
         return set()
 
@@ -442,7 +457,7 @@ def _rewrite_function_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack) -> Set[T
         arg = _first_arg(tbl.this)
         paths = _literal_paths(arg) if arg is not None else None
     if paths is None:
-        if ctx.sandbox or ctx.subject:
+        if (ctx.sandbox or ctx.subject) and not ctx.trusted:
             raise _Block(f"'{fn_name}' needs a literal file path; computed paths are not allowed for your role.")
         return set()
 
@@ -451,13 +466,13 @@ def _rewrite_function_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack) -> Set[T
         info = resolve_path(path, ctx.home_catalog)
         if info.kind == "metadata" and (ctx.sandbox or ctx.subject):
             raise _Block("Access to platform metadata files is not allowed.")
-        if info.kind in ("outside", "remote-unknown", "warehouse-other") and (ctx.sandbox or ctx.subject):
+        if info.kind in ("outside", "remote-unknown", "warehouse-other") and (ctx.sandbox or ctx.subject) and not ctx.trusted:
             raise _Block(f"Reading '{path}' is not allowed: only warehouse tables, volumes and exports can be scanned.")
         if info.kind == "table" and info.identity:
             idents.add(info.identity)
     if not idents:
         return set()
-    if len(idents) > 1 and ctx.subject:
+    if len(idents) > 1 and ctx.subject and not ctx.trusted:
         raise _Block("A single scan cannot mix files of several tables while masking policies apply.")
 
     ident = next(iter(idents))
@@ -533,7 +548,7 @@ _READ_ONLY_ROOTS = (exp.Update, exp.Delete, exp.Merge, exp.Copy, exp.Summarize, 
 
 def _gate_sandbox(stmt: exp.Expression, ctx: _Ctx) -> None:
     """Rules for every non-admin principal, with or without masking policies."""
-    if not ctx.sandbox:
+    if not ctx.sandbox or ctx.trusted:
         return
     if isinstance(stmt, (exp.Create, exp.Drop)) and (stmt.args.get("kind") or "").upper() in ("MACRO", "FUNCTION"):
         target = stmt.this.sql(dialect="duckdb").lower() if stmt.this is not None else ""
@@ -557,7 +572,7 @@ _COMMAND_RISKY = re.compile(r"\b(query|query_table|read_text|read_blob|glob|read
 def _gate_statement(stmt: exp.Expression, ctx: _Ctx) -> None:
     """Default-deny statement allowlist for principals subject to masking."""
     _gate_sandbox(stmt, ctx)
-    if not ctx.subject:
+    if not ctx.subject or ctx.trusted:
         return
     kind = (stmt.args.get("kind") or "").upper() if isinstance(stmt, (exp.Create, exp.Drop, exp.Alter)) else ""
     if isinstance(stmt, exp.Command):
@@ -644,7 +659,7 @@ def _rewrite_statement(stmt: exp.Expression, ctx: _Ctx) -> exp.Expression:
         _apply_use(stmt, ctx)
         return stmt
     bad = _forbidden_function(stmt)
-    if bad and (ctx.subject or ctx.sandbox):
+    if bad and (ctx.subject or ctx.sandbox) and not ctx.trusted:
         raise _Block(bad)
     _gate_statement(stmt, ctx)
 
@@ -709,7 +724,7 @@ def _subject_to_policies(principal: Principal) -> bool:
 
 
 def rewrite_for_principal(sql: str, principal: Principal, con, *, default_catalog: Optional[str] = None,
-                          default_schema: Optional[str] = None) -> RewriteResult:
+                          default_schema: Optional[str] = None, trusted: bool = False) -> RewriteResult:
     """
     Returns the SQL to execute for `principal`, or a `blocked` reason. `con` is a DuckDB connection/cursor used only for
     metadata lookups (current catalog/schema, columns, view definitions).
@@ -725,7 +740,7 @@ def rewrite_for_principal(sql: str, principal: Principal, con, *, default_catalo
     if not (sandbox or subject or audit_exempt):
         return result
 
-    if (sandbox or subject) and ".metadata" in sql.lower():
+    if (sandbox or subject) and ".metadata" in sql.lower() and not trusted:
         result.blocked = "Access to platform metadata files is not allowed."
         return result
 
@@ -740,7 +755,7 @@ def rewrite_for_principal(sql: str, principal: Principal, con, *, default_catalo
     except Exception as exc:
         return _on_parse_failure(sql, body, principal, subject, sandbox, result, exc)
 
-    ctx = _Ctx(con, principal, subject, sandbox, default_catalog, default_schema)
+    ctx = _Ctx(con, principal, subject, sandbox, default_catalog, default_schema, trusted)
     try:
         rewritten = [_rewrite_statement(s, ctx) for s in statements]
     except _Block as blocked:
@@ -817,12 +832,13 @@ def record_outcome(result: RewriteResult, principal: Principal, *, client: str =
 
 
 def govern(sql: str, principal: Principal, con, *, default_catalog: Optional[str] = None,
-           default_schema: Optional[str] = None, client: str = "sql") -> RewriteResult:
+           default_schema: Optional[str] = None, client: str = "sql", trusted: bool = False) -> RewriteResult:
     """
     The call every egress path makes: rewrite + audit + mode handling.
     In `audit` mode nothing is changed or blocked; what would have happened is recorded and the original SQL returned.
     """
-    result = rewrite_for_principal(sql, principal, con, default_catalog=default_catalog, default_schema=default_schema)
+    result = rewrite_for_principal(sql, principal, con, default_catalog=default_catalog, default_schema=default_schema,
+                                   trusted=trusted)
     record_outcome(result, principal, client=client)
     if enforcement_mode() == "audit":
         result.sql, result.blocked, result.changed = sql, None, False
@@ -835,7 +851,7 @@ def masked_relation(catalog: str, schema_name: str, table_name: str, principal: 
     `catalog.schema.table` when nothing is masked, else the masked subquery text. Raises GovernanceBlocked on refusal.
     """
     ident_sql = ".".join(_quote(p) for p in (catalog, schema_name, table_name))
-    res = govern(f"SELECT * FROM {ident_sql}", principal, con, client="table-reference")
+    res = govern(f"SELECT * FROM {ident_sql}", principal, con, client="table-reference", trusted=True)
     if res.blocked:
         raise GovernanceBlocked(res.blocked)
     if not res.changed:
