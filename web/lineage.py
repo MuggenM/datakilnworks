@@ -246,6 +246,23 @@ def upsert_node(
         """, (node_id, name, node_type, inferred_layer, catalog, schema_name, meta_json, now_iso, now_iso))
 
 
+def delete_node(node_id: str):
+    """Removes a node and every edge touching it."""
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM lineage_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+        conn.execute("DELETE FROM lineage_nodes WHERE id = ?", (node_id,))
+
+
+def delete_nodes_by_type(node_type: str) -> int:
+    """Removes all nodes of a type (and their edges); returns how many nodes were deleted."""
+    with get_db_connection() as conn:
+        ids = [r[0] for r in conn.execute("SELECT id FROM lineage_nodes WHERE node_type = ?", (node_type,)).fetchall()]
+        for node_id in ids:
+            conn.execute("DELETE FROM lineage_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+        conn.execute("DELETE FROM lineage_nodes WHERE node_type = ?", (node_type,))
+    return len(ids)
+
+
 def upsert_edge(
     source_id: str,
     target_id: str,

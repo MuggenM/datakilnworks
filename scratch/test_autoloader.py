@@ -328,6 +328,54 @@ def test_cron_schedule():
     check("legacy table migrated with cron_schedule column", "cron_schedule" in cols, cols)
 
 
+def test_lineage():
+    print("\n12. Lineage graph")
+    from web import lineage
+    lineage.init_lineage_db()
+
+    def rows(sql, *args):
+        with lineage.get_db_connection() as conn:
+            return conn.execute(sql, args).fetchall()
+
+    # Leftovers from earlier versions are purged
+    lineage.upsert_node("volume_file:old/f.csv", "f.csv", "VOLUME_FILE", layer="RAW")
+    lineage.upsert_node("pipeline:old", "old", "AUTOLOADER", layer="INGESTION")
+    autoloader.purge_legacy_lineage_nodes()
+    check("legacy VOLUME_FILE / AUTOLOADER nodes purged",
+          not rows("SELECT 1 FROM lineage_nodes WHERE node_type IN ('VOLUME_FILE','AUTOLOADER')"))
+
+    pipe, vol_dir = make_pipeline("lin_vol", "bronze_lin")
+    vol_id = "volume:/Volumes/warehouse/raw/lin_vol"
+    node = rows("SELECT node_type, layer FROM lineage_nodes WHERE id = ?", vol_id)
+    check("volume node exists right after pipeline creation (before any file)",
+          len(node) == 1 and tuple(node[0]) == ("VOLUME", "RAW_FILE"), node)
+    edge = rows("SELECT edge_type, job_id FROM lineage_edges WHERE source_id = ?", vol_id)
+    check("VOLUME --AUTOLOADED_TO--> TABLE edge carries the pipeline id",
+          len(edge) == 1 and tuple(edge[0]) == ("AUTOLOADED_TO", pipe["id"]), edge)
+
+    for i in range(5):
+        drop_csv(vol_dir, f"l{i}.csv", 2, mtime=time.time() - 10 + i)
+    autoloader.run_pipeline_cycle(pipe["id"])
+    check("5 ingested files add no per-file nodes",
+          not rows("SELECT 1 FROM lineage_nodes WHERE node_type = 'VOLUME_FILE'")
+          and len(rows("SELECT 1 FROM lineage_nodes WHERE id = ?", vol_id)) == 1)
+    meta = rows("SELECT metadata FROM lineage_nodes WHERE id = ?", vol_id)[0][0]
+    check("volume node records the latest file", '"last_file"' in meta and ".csv" in meta, meta)
+
+    pipe_b, _ = make_pipeline("lin_vol_b", "bronze_lin_b")
+    autoloader.update_pipeline(pipe_b["id"], {"source_volume_path": "/Volumes/warehouse/raw/lin_vol"})
+    check("a second pipeline on the same volume reuses the node",
+          len(rows("SELECT 1 FROM lineage_edges WHERE source_id = ?", vol_id)) == 2)
+
+    autoloader.delete_pipeline(pipe["id"])
+    check("deleting one pipeline keeps the volume node for the other",
+          len(rows("SELECT 1 FROM lineage_edges WHERE source_id = ?", vol_id)) == 1
+          and len(rows("SELECT 1 FROM lineage_nodes WHERE id = ?", vol_id)) == 1)
+    autoloader.delete_pipeline(pipe_b["id"])
+    check("deleting the last pipeline removes the volume node",
+          not rows("SELECT 1 FROM lineage_nodes WHERE id = ?", vol_id))
+
+
 def main():
     autoloader.init_autoloader_db()
     try:
@@ -341,6 +389,7 @@ def main():
         test_merge_mode()
         test_merge_key_safety()
         test_cron_schedule()
+        test_lineage()
     finally:
         shutil.rmtree(TMP_WAREHOUSE, ignore_errors=True)
     print()

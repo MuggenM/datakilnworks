@@ -201,7 +201,9 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     conn.close()
 
     logger.info(f"Created Auto-Loader pipeline '{name}' ({pipeline_id}): {source_vol} -> {target_cat}.{target_sch}.{target_tbl}")
-    return get_pipeline(pipeline_id)
+    created = get_pipeline(pipeline_id)
+    sync_pipeline_lineage(created)
+    return created
 
 
 def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -243,11 +245,16 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     conn.commit()
     conn.close()
 
-    return get_pipeline(pipeline_id)
+    updated = get_pipeline(pipeline_id)
+    sync_pipeline_lineage(updated)
+    return updated
 
 
 def delete_pipeline(pipeline_id: str) -> bool:
     """Deletes an Auto-Loader pipeline and its execution history."""
+    pipe = get_pipeline(pipeline_id)
+    if pipe:
+        _remove_pipeline_lineage(pipe)
     conn = get_db()
     conn.execute("DELETE FROM autoloader_file_history WHERE pipeline_id = ?", (pipeline_id,))
     cur = conn.execute("DELETE FROM autoloader_pipelines WHERE id = ?", (pipeline_id,))
@@ -460,6 +467,67 @@ def _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_has
     }
 
 
+def _remove_pipeline_lineage(pipeline: Dict[str, Any]):
+    """Drops the pipeline's lineage edge, and the volume node when no other pipeline still reads it."""
+    try:
+        from web.lineage import delete_node, get_db_connection, make_table_id
+        vol_id = _volume_lineage_id(pipeline["source_volume_path"])
+        table_id = make_table_id(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
+        with get_db_connection() as conn:
+            conn.execute("DELETE FROM lineage_edges WHERE source_id = ? AND target_id = ? AND edge_type = 'AUTOLOADED_TO'",
+                         (vol_id, table_id))
+            remaining = conn.execute("SELECT COUNT(*) FROM lineage_edges WHERE source_id = ?", (vol_id,)).fetchone()[0]
+        if remaining == 0:
+            delete_node(vol_id)
+    except Exception as lin_err:
+        logger.debug(f"Lineage cleanup notice: {lin_err}")
+
+
+def _volume_lineage_id(source_volume_path: str) -> str:
+    """Lineage node id for the volume behind a pipeline (`volume:/Volumes/cat/schema/vol`)."""
+    parts = [p for p in (source_volume_path or "").strip().replace("\\", "/").split("/") if p]
+    if parts and parts[0].lower() == "volumes":
+        parts = parts[1:]
+    return "volume:/Volumes/" + "/".join(parts[:3]).lower()
+
+
+def sync_pipeline_lineage(pipeline: Dict[str, Any], last_file: Optional[str] = None):
+    """
+    Records `VOLUME --AUTOLOADED_TO--> TABLE` in the lineage graph. The pipeline id rides on the edge
+    (job_id), so a volume feeding several tables (or several volumes feeding one table) stays unambiguous.
+    Best effort: lineage must never break ingestion.
+    """
+    try:
+        from web.lineage import upsert_node, upsert_edge, make_table_id
+        vol_id = _volume_lineage_id(pipeline["source_volume_path"])
+        vol_path = vol_id[len("volume:"):]
+        vol_parts = vol_path.split("/")  # ['', 'Volumes', catalog, schema, volume]
+        vol_catalog = vol_parts[2] if len(vol_parts) > 2 else "warehouse"
+        vol_schema = vol_parts[3] if len(vol_parts) > 3 else "dbo"
+        vol_name = vol_parts[-1] or vol_path
+        table_id = make_table_id(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
+
+        # layer RAW_FILE + type VOLUME puts the node in the "Raw Files / Ingestion" column of the lineage graph
+        upsert_node(vol_id, vol_name, "VOLUME", layer="RAW_FILE", catalog=vol_catalog, schema_name=vol_schema,
+                    metadata={"posix_path": vol_path, "pipeline_id": pipeline["id"], "last_file": last_file})
+        upsert_node(table_id, pipeline["target_table"], "TABLE",
+                    catalog=pipeline["target_catalog"], schema_name=pipeline["target_schema"])
+        upsert_edge(vol_id, table_id, edge_type="AUTOLOADED_TO", job_id=pipeline["id"])
+    except Exception as lin_err:
+        logger.debug(f"Lineage graph update notice: {lin_err}")
+
+
+def purge_legacy_lineage_nodes():
+    """Removes the per-file VOLUME_FILE and per-pipeline AUTOLOADER nodes written by earlier versions."""
+    try:
+        from web.lineage import delete_nodes_by_type
+        removed = sum(delete_nodes_by_type(t) for t in ("VOLUME_FILE", "AUTOLOADER"))
+        if removed:
+            logger.info(f"Auto-Loader: removed {removed} legacy lineage nodes")
+    except Exception as err:
+        logger.debug(f"Legacy lineage purge skipped: {err}")
+
+
 def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_dir: str) -> Dict[str, Any]:
     """
     Ingests a single file into the pipeline's target Delta Lake table.
@@ -565,22 +633,8 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
         db.commit()
         db.close()
 
-        # Step 4: Lineage DAG Sync
-        try:
-            from web.lineage import upsert_node, upsert_edge, make_table_id
-            v_name = os.path.basename(pipeline["source_volume_path"])
-            file_node_id = f"volume_file:{v_name}/{rel_path}"
-            pipe_node_id = f"pipeline:{pipeline['id']}"
-            table_node_id = make_table_id(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
-
-            upsert_node(file_node_id, os.path.basename(rel_path), "VOLUME_FILE", layer="RAW")
-            upsert_node(pipe_node_id, pipeline["name"], "AUTOLOADER", layer="INGESTION")
-            upsert_node(table_node_id, pipeline["target_table"], "TABLE", catalog=pipeline["target_catalog"], schema_name=pipeline["target_schema"])
-
-            upsert_edge(file_node_id, pipe_node_id, edge_type="CONSUMED_BY")
-            upsert_edge(pipe_node_id, table_node_id, edge_type="AUTOLOADS_TO")
-        except Exception as lin_err:
-            logger.debug(f"Lineage graph update notice: {lin_err}")
+        # Step 4: Lineage DAG Sync (one VOLUME -> TABLE edge per pipeline, not one node per file)
+        sync_pipeline_lineage(pipeline, last_file=rel_path)
 
         logger.info(f"AutoLoader [{pipeline['name']}]: Ingested '{rel_path}' ({row_count} rows, {elapsed_ms}ms) -> {pipeline['target_catalog']}.{pipeline['target_schema']}.{pipeline['target_table']}")
 
@@ -714,6 +768,7 @@ async def autoloader_daemon_loop():
     Runs asynchronously alongside the main FastAPI web server.
     """
     logger.info("Volume Auto-Loader Background Daemon started.")
+    await asyncio.to_thread(purge_legacy_lineage_nodes)
     last_run_map: Dict[str, float] = {}
 
     while True:

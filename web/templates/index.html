@@ -2362,8 +2362,8 @@
                             <div class="p-3 bg-dbx-panel border border-dbx-border rounded-lg shadow-sm hover:border-slate-600 transition flex items-center justify-between group">
                               <div class="flex items-center space-x-2.5 min-w-0">
                                 <div class="h-7 w-7 rounded flex items-center justify-center shrink-0"
-                                     :class="n.node_type === 'FILE' ? 'bg-slate-800 text-slate-300' : (n.layer === 'BRONZE' ? 'bg-amber-950/80 text-amber-400' : 'bg-sky-950/80 text-sky-400')">
-                                  <i :class="n.node_type === 'FILE' ? 'ph ph-file' : (n.node_type === 'JOB' ? 'ph ph-git-merge' : 'ph ph-database')" class="text-sm"></i>
+                                     :class="n.node_type === 'FILE' || n.node_type === 'VOLUME' ? 'bg-slate-800 text-slate-300' : (n.layer === 'BRONZE' ? 'bg-amber-950/80 text-amber-400' : 'bg-sky-950/80 text-sky-400')">
+                                  <i :class="n.node_type === 'FILE' ? 'ph ph-file' : (n.node_type === 'VOLUME' ? 'ph ph-folder-open' : (n.node_type === 'JOB' ? 'ph ph-git-merge' : 'ph ph-database'))" class="text-sm"></i>
                                 </div>
                                 <div class="min-w-0">
                                   <div class="text-xs font-semibold text-slate-200 truncate font-mono" x-text="n.name"></div>
@@ -8652,20 +8652,20 @@
                   <i class="ph ph-tray-arrow-down text-slate-500 dark:text-slate-400"></i>
                   <span>1. Sources & Files</span>
                 </span>
-                <span class="text-[10px] px-1.5 py-0.2 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-400 font-mono font-semibold" x-text="filteredGlobalLineageNodes('RAW_FILE', 'FILE').length"></span>
+                <span class="text-[10px] px-1.5 py-0.2 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-400 font-mono font-semibold" x-text="filteredGlobalLineageNodes('RAW_FILE', 'FILE,VOLUME').length"></span>
               </div>
               <div class="flex-1 overflow-y-auto p-3 space-y-2.5">
-                <template x-for="n in filteredGlobalLineageNodes('RAW_FILE', 'FILE')" :key="n.id">
+                <template x-for="n in filteredGlobalLineageNodes('RAW_FILE', 'FILE,VOLUME')" :key="n.id">
                   <div @click="selectLineageNode(n)"
                        :data-node-id="n.id"
                        :class="selectedLineageNode?.id === n.id ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/30' : 'border-slate-200 hover:border-slate-400 dark:border-dbx-border dark:hover:border-slate-600 bg-white dark:bg-dbx-panel/80'"
                        class="p-3 border rounded-lg cursor-pointer transition shadow-xs space-y-1 group">
                     <div class="flex items-center space-x-2">
-                      <i class="ph ph-file-text text-slate-500 dark:text-slate-400 text-sm shrink-0"></i>
+                      <i :class="n.node_type === 'VOLUME' ? 'ph ph-folder-open text-emerald-600 dark:text-emerald-400' : 'ph ph-file-text text-slate-500 dark:text-slate-400'" class="text-sm shrink-0"></i>
                       <span class="text-xs font-mono font-bold text-slate-800 dark:text-slate-200 truncate" x-text="n.name"></span>
                     </div>
                     <div class="flex items-center justify-between text-[10px] text-slate-500">
-                      <span class="uppercase font-semibold">FILE / INGESTION</span>
+                      <span class="uppercase font-semibold" x-text="n.node_type === 'VOLUME' ? 'VOLUME / AUTO-LOADER' : 'FILE / INGESTION'"></span>
                       <span class="text-emerald-600 dark:text-emerald-400 font-mono font-semibold" x-text="getNodeConnectionsCount(n.id) + ' edges'"></span>
                     </div>
                   </div>
@@ -26387,6 +26387,10 @@
             this.currentView = 'jobs';
           } else if (node.node_type === 'FILE') {
             this.currentView = 'workspace';
+          } else if (node.node_type === 'VOLUME') {
+            this.currentView = 'autoloader';
+            this.autoloaderTab = 'volumes';
+            this.initAutoLoader();
           } else if (node.node_type === 'MODEL') {
             this.currentView = 'experiments';
             const rid = node.metadata?.run_id;
