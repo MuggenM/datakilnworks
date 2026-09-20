@@ -208,11 +208,11 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Per-User Execution History** | ⚠️ Job run history | ⚠️ Query history | ✅ **dbt Run History partitioned by user** | 🏆 **Data Kiln Works** |
 | **Orchestration & Scheduling** | ✅ Databricks Workflows | ✅ Tasks & Streams | ✅ **APScheduler + Native Cron Scheduling** | 🏆 **Databricks / Snowflake** |
 | **Continuous Streaming Ingestion** | ✅ Structured Streaming | ✅ Snowpipe / Streaming | ⚠️ Micro-batch / File Ingestion | 🏆 **Databricks / Snowflake** |
-| **Continuous File Ingestion (Auto-Loader / Snowpipe)** | ✅ Auto Loader (`cloudFiles`, event notifications) | ✅ Snowpipe (auto-ingest via cloud event notifications) | ✅ **Volume Auto-Loader**: polling daemon (5s minimum) over `/Volumes/...` folders into Delta tables, with exactly-once file checkpoints and per-file audit log | 🏆 **Databricks / Snowflake** (event-driven, cloud-scale). Data Kiln is polling-based and single-node |
+| **Continuous File Ingestion (Auto-Loader / Snowpipe)** | ✅ Auto Loader (`cloudFiles`, event notifications) | ✅ Snowpipe (auto-ingest via cloud event notifications) | ✅ **Volume Auto-Loader**: polling daemon (5s minimum) or cron schedule over `/Volumes/...` folders into Delta tables, with exactly-once file checkpoints and per-file audit log | 🏆 **Databricks / Snowflake** (event-driven, cloud-scale). Data Kiln is polling-based and single-node |
 | **Schema Drift Handling on Load** | ✅ `addNewColumns` / `rescue` / `failOnNewColumns` | ⚠️ `MATCH_BY_COLUMN_NAME` + Schema Evolution (`ENABLE_SCHEMA_EVOLUTION`) | ✅ **`addNewColumns`, `failOnNewColumns`, `rescue` (JSON `_rescued_data`)** | ✅ Tie with Databricks |
 | **Load Modes** | ⚠️ Append (merge via `foreachBatch`) | ⚠️ Append (`COPY INTO`); merge via Streams + Tasks | ✅ **Append, Merge (upsert on keys), Overwrite** | 🏆 **Data Kiln Works** |
 | **Bad-File Handling** | ✅ `badRecordsPath` | ✅ `ON_ERROR = SKIP_FILE` / `COPY_HISTORY` | ✅ **Auto-quarantine to `_quarantine/` + FAILED/QUARANTINED history; pipeline keeps going** | ✅ Tie |
-| **Load History / Audit** | ✅ Auto Loader checkpoints & events | ✅ `COPY_HISTORY` / `PIPE_USAGE_HISTORY` | ✅ **Per-file rows, latency & error log; lineage `VOLUME_FILE → AUTOLOADER → TABLE`** | ✅ Tie |
+| **Load History / Audit** | ✅ Auto Loader checkpoints & events | ✅ `COPY_HISTORY` / `PIPE_USAGE_HISTORY` | ✅ **Per-file rows, latency & error log; lineage `VOLUME → TABLE`** | ✅ Tie |
 
 **Domain Verdict:** **DataKilnWorks Studio** is unique in providing a **first-class native GUI and API for dbt Core**, running transformations directly within the studio without requiring a separate dbt Cloud subscription.
 

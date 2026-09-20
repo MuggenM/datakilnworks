@@ -7235,6 +7235,7 @@ async def delete_autoloader_pipeline_endpoint(pipeline_id: str, request: Request
 
 
 @app.post("/api/autoloader/pipelines/{pipeline_id}/run")
+@app.post("/api/autoloader/pipelines/{pipeline_id}/run-now")
 async def run_autoloader_pipeline_now(pipeline_id: str):
     from web.autoloader import run_pipeline_cycle
     try:
