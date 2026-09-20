@@ -91,7 +91,21 @@ def get_worker_conn():
             register_duckdb_ai_functions(_worker_conn.con)
         except Exception as e:
             logger.warning(f"Failed registering DuckDB AI UDFs on worker {NODE_ID}: {e}")
+        try:
+            from web.governance.macros import install_governance_macros
+            install_governance_macros(_worker_conn.con)
+        except Exception as e:
+            logger.error(f"Failed installing governance masks on worker {NODE_ID} (masked queries will fail closed): {e}")
     return _worker_conn
+
+def _governance_masks_ready() -> bool:
+    """Reported in status so the studio can tell whether this node can run masked queries."""
+    try:
+        from web.governance.macros import macros_installed
+        return macros_installed(get_worker_conn().con)
+    except Exception:
+        return False
+
 
 def clean_json_val(v: Any) -> Any:
     if v is None:
@@ -200,7 +214,8 @@ def get_compute_status():
         "memory_rss_mb": rss_mb,
         "memory_percent": mem_pct,
         "last_query_at": metrics["last_query_at"],
-        "last_query_preview": metrics["last_query_preview"]
+        "last_query_preview": metrics["last_query_preview"],
+        "governance_masks_installed": _governance_masks_ready()
     }
 
 @app.post("/api/compute/execute")

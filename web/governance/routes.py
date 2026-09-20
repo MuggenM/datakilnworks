@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from web.auth import resolve_principal
-from web.governance import catalog_meta, classify, store, tags
+from web.auth import resolve_principal, get_user_by_username
+from web.governance import catalog_meta, classify, macros, masks, policies, store, tags
 from web.permissions import can_user_access_catalog, can_user_manage_catalog
 
 logger = logging.getLogger("localspark.governance")
@@ -91,6 +91,42 @@ class BulkAssignment(BaseModel):
 
 class BulkApply(BaseModel):
     assignments: List[BulkAssignment]
+
+
+class PolicyIn(BaseModel):
+    name: str
+    description: str = ""
+    tag_key: str
+    tag_value: Optional[str] = None
+    mask_type: str
+    mask_expr: Optional[str] = None
+    applies_to_types: Optional[List[str]] = None
+    except_roles: List[str] = Field(default_factory=lambda: ["admin"])
+    except_users: List[str] = Field(default_factory=list)
+    priority: int = 100
+    enabled: bool = True
+
+
+class PolicyPatch(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    tag_key: Optional[str] = None
+    tag_value: Optional[str] = None
+    mask_type: Optional[str] = None
+    mask_expr: Optional[str] = None
+    applies_to_types: Optional[List[str]] = None
+    except_roles: Optional[List[str]] = None
+    except_users: Optional[List[str]] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class ValidateIn(BaseModel):
+    mask_type: str
+    mask_expr: Optional[str] = None
+    applies_to_types: Optional[List[str]] = None
+    data_type: str = "VARCHAR"
+    value: Optional[str] = None
 
 
 # ----------------------------------------------------------------------------
@@ -244,3 +280,99 @@ async def audit_log(since: Optional[str] = None, actor: Optional[str] = None, ac
                     limit: int = 200, user: Dict[str, Any] = Depends(principal)):
     _require_admin(user)
     return {"events": store.list_audit(since=since, actor=actor, action=action, limit=limit)}
+
+
+# ----------------------------------------------------------------------------
+# Masking policies
+# ----------------------------------------------------------------------------
+
+@router.get("/masking-policies")
+async def list_masking_policies(user: Dict[str, Any] = Depends(principal)):
+    return {"policies": policies.list_policies()}
+
+
+@router.post("/masking-policies")
+async def create_masking_policy(body: PolicyIn, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    try:
+        return policies.create_policy(body.model_dump(), actor=_actor(user))
+    except ValueError as exc:
+        raise _translate(exc)
+
+
+@router.put("/masking-policies/{policy_id}")
+async def update_masking_policy(policy_id: str, body: PolicyPatch, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    try:
+        return policies.update_policy(policy_id, body.model_dump(exclude_unset=True), actor=_actor(user))
+    except ValueError as exc:
+        raise _translate(exc)
+
+
+@router.delete("/masking-policies/{policy_id}")
+async def delete_masking_policy(policy_id: str, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    try:
+        policies.delete_policy(policy_id, actor=_actor(user))
+    except ValueError as exc:
+        raise _translate(exc)
+    return {"deleted": policy_id}
+
+
+@router.post("/masking-policies/validate")
+async def validate_masking_policy(body: ValidateIn, user: Dict[str, Any] = Depends(principal)):
+    """Dry run for the policy editor: per-type behaviour, custom-expression verdict and a sample masked value."""
+    _require_admin(user)
+    if body.mask_type not in masks.MASK_TYPES:
+        raise HTTPException(status_code=400, detail=f"mask_type must be one of: {', '.join(masks.MASK_TYPES)}.")
+    out: Dict[str, Any] = {"behaviour": masks.behaviour_table(body.mask_type)}
+    if body.mask_type == "custom":
+        out["custom"] = masks.validate_custom_expression(body.mask_expr or "", body.applies_to_types)
+    if body.value is not None and (body.mask_type != "custom" or out["custom"]["ok"]):
+        try:
+            out["sample"] = masks.run_mask(body.mask_type, body.data_type, body.value, body.mask_expr)
+        except ValueError as exc:
+            raise _translate(exc)
+    return out
+
+
+@router.get("/effective/{catalog}/{schema_name}/{table_name}")
+async def effective_governance(catalog: str, schema_name: str, table_name: str, as_user: Optional[str] = None,
+                               user: Dict[str, Any] = Depends(principal)):
+    """Per column: effective tags, the winning masking policy and whether it masks the caller (or `as_user`, admin only)."""
+    _require_read(user, catalog)
+    subject = user
+    if as_user:
+        _require_admin(user)
+        subject = get_user_by_username(as_user)
+        if not subject:
+            raise HTTPException(status_code=404, detail=f"User '{as_user}' does not exist.")
+    who = policies.Principal.from_user(subject)
+    columns = catalog_meta.list_columns(_con(), catalog, schema_name, table_name)
+    if not columns:
+        raise HTTPException(status_code=404, detail=f"Table '{catalog}.{schema_name}.{table_name}' does not exist.")
+    eff = tags.effective_tags(catalog, schema_name, table_name, [c["column"] for c in columns])
+    out = []
+    for c in columns:
+        spec = policies.resolve_column_policy(c["column"], c["type"], eff[c["column"]], who)
+        out.append({"column": c["column"], "type": c["type"], "family": masks.type_family(c["type"]), "tags": eff[c["column"]],
+                    "masked": spec is not None,
+                    "policy": ({"id": spec.policy_id, "name": spec.policy_name, "mask_type": spec.mask_type,
+                                "tied_with": spec.conflicts} if spec else None)})
+    return {"object": tags.object_label(tags.norm(catalog), tags.norm(schema_name), tags.norm(table_name)),
+            "as_user": subject.get("username"), "role": subject.get("role"), "columns": out,
+            "masked_columns": [c["column"] for c in out if c["masked"]]}
+
+
+@router.get("/status")
+async def governance_status(user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    con = _con()
+    return {
+        "version": store.get_version(),
+        "tag_definitions": len(tags.list_definitions()),
+        "tag_assignments": len(tags.list_assignments(limit=5000)),
+        "policies_total": len(policies.list_policies()),
+        "policies_enabled": len(policies.enabled_policies()),
+        "masks_installed": macros.macros_installed(con),
+    }

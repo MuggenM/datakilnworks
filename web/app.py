@@ -195,6 +195,11 @@ def get_duckrun_conn():
             register_duckdb_ai_functions(_duckrun_conn.con)
         except Exception as e:
             logger.warning(f"Failed registering DuckDB AI UDFs: {e}")
+        try:
+            from web.governance.macros import install_governance_macros
+            install_governance_macros(_duckrun_conn.con)
+        except Exception as e:
+            logger.error(f"Failed installing governance masks (masking policies will fail closed): {e}")
     else:
         sync_catalogs_with_duckrun(_duckrun_conn)
     return _duckrun_conn
