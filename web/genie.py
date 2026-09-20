@@ -174,6 +174,23 @@ def get_available_providers() -> Dict[str, Any]:
         "models": ["builtin-heuristic"]
     })
 
+    # Check if a custom default provider has been configured in platform settings
+    try:
+        from web.llm_settings import load_llm_config
+        cfg = load_llm_config()
+        configured_default = cfg.get("default_provider")
+        if configured_default and configured_default != "auto":
+            for p in providers:
+                if p["id"] == configured_default:
+                    default_provider = configured_default
+                    if p.get("loaded_models"):
+                        default_model = p["loaded_models"][0]
+                    elif p.get("models"):
+                        default_model = p["models"][0]
+                    break
+    except Exception:
+        pass
+
     return {
         "providers": providers,
         "default_provider": default_provider,
@@ -187,13 +204,18 @@ def get_available_providers() -> Dict[str, Any]:
 
 # ==================== CHAT STORAGE ====================
 
-def load_chats() -> List[Dict[str, Any]]:
+def load_chats(user: Optional[str] = None, is_admin: bool = True) -> List[Dict[str, Any]]:
     if not os.path.exists(CHATS_FILE):
         return []
     try:
         with open(CHATS_FILE, "r") as f:
             data = json.load(f)
-            return data.get("chats", [])
+            all_chats = data.get("chats", [])
+            if not is_admin:
+                return [c for c in all_chats if c.get("user", "admin") == user]
+            elif user and user != "all":
+                return [c for c in all_chats if c.get("user", "admin") == user]
+            return all_chats
     except Exception as e:
         logger.error(f"Failed to load genie chats: {e}")
         return []
@@ -205,18 +227,21 @@ def save_chats(chats: List[Dict[str, Any]]):
     except Exception as e:
         logger.error(f"Failed to save genie chats: {e}")
 
-def get_chat(chat_id: str) -> Optional[Dict[str, Any]]:
-    chats = load_chats()
+def get_chat(chat_id: str, user: Optional[str] = None, is_admin: bool = True) -> Optional[Dict[str, Any]]:
+    chats = load_chats(user=None, is_admin=True)
     for c in chats:
         if c["id"] == chat_id:
+            if not is_admin and user and c.get("user", "admin") != user:
+                return None
             return c
     return None
 
-def create_chat(title: str = "New Exploration") -> Dict[str, Any]:
-    chats = load_chats()
+def create_chat(title: str = "New Exploration", user: str = "admin") -> Dict[str, Any]:
+    chats = load_chats(user=None, is_admin=True)
     new_chat = {
         "id": f"genie_{uuid.uuid4().hex[:8]}",
         "title": title,
+        "user": user or "admin",
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "messages": []
@@ -225,10 +250,13 @@ def create_chat(title: str = "New Exploration") -> Dict[str, Any]:
     save_chats(chats)
     return new_chat
 
-def delete_chat(chat_id: str) -> bool:
-    chats = load_chats()
+def delete_chat(chat_id: str, user: Optional[str] = None, is_admin: bool = True) -> bool:
+    chats = load_chats(user=None, is_admin=True)
     orig_len = len(chats)
-    chats = [c for c in chats if c["id"] != chat_id]
+    if is_admin or not user:
+        chats = [c for c in chats if c["id"] != chat_id]
+    else:
+        chats = [c for c in chats if not (c["id"] == chat_id and c.get("user", "admin") == user)]
     if len(chats) != orig_len:
         save_chats(chats)
         return True
@@ -448,6 +476,37 @@ def call_gemini(model: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
     text = data["candidates"][0]["content"]["parts"][0]["text"]
     return extract_json_from_text(text)
 
+def call_anthropic(model: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise ValueError("ANTHROPIC_API_KEY environment variable not set")
+    model_name = model or "claude-3-5-sonnet-20241022"
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    sys_msgs = [m["content"] for m in messages if m.get("role") == "system"]
+    conv_msgs = [
+        {"role": "user" if m.get("role") == "user" else "assistant", "content": m.get("content", "")}
+        for m in messages if m.get("role") in ("user", "assistant")
+    ]
+    payload = {
+        "model": model_name,
+        "messages": conv_msgs,
+        "max_tokens": 1024,
+        "temperature": 0.1
+    }
+    if sys_msgs:
+        payload["system"] = "\n\n".join(sys_msgs)
+    res = requests.post(url, json=payload, headers=headers, timeout=30)
+    if res.status_code != 200:
+        raise RuntimeError(f"Anthropic error {res.status_code}: {res.text}")
+    data = res.json()
+    text = "".join([block.get("text", "") for block in data.get("content", [])])
+    return extract_json_from_text(text)
+
 def call_heuristic_fallback(user_prompt: str, schema_info: Dict[str, Any]) -> Dict[str, Any]:
     """
     High-accuracy rule-based natural language SQL generator.
@@ -621,7 +680,9 @@ def ask_genie(
     chat_id: str,
     user_prompt: str,
     provider: Optional[str] = None,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    user: str = "admin",
+    is_admin: bool = True
 ) -> Dict[str, Any]:
     """
     Main conversational pipeline:
@@ -631,9 +692,9 @@ def ask_genie(
     4. Executes generated SQL query.
     5. Appends user & assistant messages to chat session and returns response.
     """
-    chat = get_chat(chat_id)
+    chat = get_chat(chat_id, user=user, is_admin=is_admin)
     if not chat:
-        chat = create_chat(title=user_prompt[:35] + ("..." if len(user_prompt) > 35 else ""))
+        chat = create_chat(title=user_prompt[:35] + ("..." if len(user_prompt) > 35 else ""), user=user)
 
     # Extract schema context
     schema_info = extract_schema_context()
@@ -717,6 +778,15 @@ def ask_genie(
             generated_plan = call_heuristic_fallback(user_prompt, schema_info)
             chosen_provider = "heuristic (fallback)"
 
+    elif chosen_provider == "anthropic":
+        try:
+            generated_plan = call_anthropic(chosen_model, llm_messages)
+        except Exception as e:
+            logger.warning(f"Anthropic call failed ({e}); falling back to heuristic engine.")
+            generation_error = str(e)
+            generated_plan = call_heuristic_fallback(user_prompt, schema_info)
+            chosen_provider = "heuristic (fallback)"
+
     else:
         generated_plan = call_heuristic_fallback(user_prompt, schema_info)
 
@@ -732,7 +802,7 @@ def ask_genie(
     exec_result = execute_genie_sql(sql_query)
 
     # If first query fails and we were using an LLM, attempt 1 quick self-correction
-    if not exec_result["success"] and chosen_provider in ["ollama", "lmstudio", "openai", "gemini"]:
+    if not exec_result["success"] and chosen_provider in ["ollama", "lmstudio", "openai", "gemini", "anthropic"]:
         try:
             fix_messages = list(llm_messages)
             fix_messages.append({"role": "assistant", "content": json.dumps({"sql": sql_query})})
@@ -746,8 +816,10 @@ def ask_genie(
                 fixed_plan = call_lmstudio(config["lmstudio_host"], chosen_model, fix_messages)
             elif chosen_provider == "openai":
                 fixed_plan = call_openai(chosen_model, fix_messages)
-            else:
+            elif chosen_provider == "gemini":
                 fixed_plan = call_gemini(chosen_model, fix_messages)
+            else:
+                fixed_plan = call_anthropic(chosen_model, fix_messages)
 
             if fixed_plan.get("sql"):
                 sql_query = fixed_plan["sql"]
@@ -797,7 +869,7 @@ def ask_genie(
     if chat["title"] == "New Exploration" or chat["title"].startswith("New "):
         chat["title"] = user_prompt[:40] + ("..." if len(user_prompt) > 40 else "")
 
-    chats = load_chats()
+    chats = load_chats(user=None, is_admin=True)
     for i, c in enumerate(chats):
         if c["id"] == chat["id"]:
             chats[i] = chat

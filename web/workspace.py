@@ -29,20 +29,57 @@ def get_safe_path(rel_path: str) -> str:
     return target
 
 
-def init_workspace_directories():
-    """Ensures standard Databricks directory hierarchy (Users/martin, Shared) exists."""
+def init_user_workspace(username: str):
+    """Ensures personal workspace directory Users/<username> exists with a starter notebook."""
+    if not username:
+        return
+    clean_user = username.strip().lower()
     os.makedirs(NOTEBOOKS_DIR, exist_ok=True)
     users_dir = os.path.join(NOTEBOOKS_DIR, "Users")
-    martin_dir = os.path.join(users_dir, "martin")
+    user_dir = os.path.join(users_dir, clean_user)
+    os.makedirs(user_dir, exist_ok=True)
+
+    sample_nb = os.path.join(user_dir, f"{clean_user}_scratchpad.ipynb")
+    if not os.path.exists(sample_nb):
+        create_blank_notebook(sample_nb, title=f"{clean_user.title()}'s Lakehouse Workspace")
+
+
+def can_access_workspace_path(rel_path: str, current_user: Optional[Dict[str, Any]], write: bool = False) -> bool:
+    """
+    Enforces Databricks workspace access control:
+    - Users have full access to Users/<their_username> and Shared/
+    - Admin has full access to all paths
+    - Regular users cannot read or modify other users' private directories (Users/<other_user>)
+    """
+    if not current_user:
+        return True
+    role = current_user.get("role", "user")
+    if role == "admin":
+        return True
+    username = (current_user.get("username") or "").strip().lower()
+    norm = (rel_path or "").strip().lstrip("/\\").replace("\\", "/")
+    
+    if norm.startswith("Users/") or norm == "Users":
+        parts = norm.split("/")
+        if len(parts) > 1:
+            target_user = parts[1].strip().lower()
+            if target_user != username:
+                return False
+    return True
+
+
+def init_workspace_directories():
+    """Ensures standard Databricks directory hierarchy (Users/<users>, Shared) exists."""
+    os.makedirs(NOTEBOOKS_DIR, exist_ok=True)
+    users_dir = os.path.join(NOTEBOOKS_DIR, "Users")
     shared_dir = os.path.join(NOTEBOOKS_DIR, "Shared")
 
-    os.makedirs(martin_dir, exist_ok=True)
+    os.makedirs(users_dir, exist_ok=True)
     os.makedirs(shared_dir, exist_ok=True)
 
-    # Seed sample starter notebook in Users/martin if empty
-    sample_user_nb = os.path.join(martin_dir, "lakehouse_scratchpad.ipynb")
-    if not os.path.exists(sample_user_nb):
-        create_blank_notebook(sample_user_nb, title="My Lakehouse Scratchpad")
+    # Seed default user workspaces
+    for u in ["admin", "lead_engineer", "analyst_bob", "martin"]:
+        init_user_workspace(u)
 
     # Seed sample shared python script in Shared if empty
     sample_shared = os.path.join(shared_dir, "common_transforms.py")
@@ -162,11 +199,18 @@ def get_file_type(name: str, is_dir: bool) -> str:
     return "file"
 
 
-def get_workspace_tree(base_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_workspace_tree(base_dir: Optional[str] = None, current_user: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Recursively scans the workspace directory returning a nested hierarchical tree.
+    Filters private Users/<other_user> folders for non-admin users.
     """
     init_workspace_directories()
+    current_username = (current_user.get("username") or "").strip().lower() if current_user else ""
+    is_admin = (current_user.get("role") == "admin") if current_user else True
+
+    if current_username:
+        init_user_workspace(current_username)
+
     root = base_dir or NOTEBOOKS_DIR
     if not os.path.exists(root):
         return []
@@ -191,6 +235,13 @@ def get_workspace_tree(base_dir: Optional[str] = None) -> List[Dict[str, Any]]:
             rel_path = os.path.join(rel_prefix, item).replace("\\", "/")
             is_dir = os.path.isdir(full_path)
 
+            # Access control filtering for Users directory
+            if not is_admin and current_username:
+                if rel_prefix == "Users" and is_dir:
+                    # In Users/, non-admin users can ONLY see their own directory
+                    if item.strip().lower() != current_username:
+                        continue
+
             try:
                 stat = os.stat(full_path)
                 mtime = stat.st_mtime
@@ -211,6 +262,7 @@ def get_workspace_tree(base_dir: Optional[str] = None) -> List[Dict[str, Any]]:
                 "size_bytes": size,
                 "modified_at": mtime,
                 "modified_iso": mtime_iso,
+                "is_user_home": rel_path.lower() == f"users/{current_username}" if current_username else False
             }
 
             if is_dir:

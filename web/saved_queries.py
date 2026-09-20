@@ -140,6 +140,61 @@ def get_default_saved_queries() -> List[Dict[str, Any]]:
             "updated_at": now_str,
             "last_run_at": None,
             "run_count": 0
+        },
+        {
+            "id": "sq_ai_employee_turnover_scoring",
+            "name": "AI Inference: Employee Attrition Risk Scoring",
+            "description": "Databricks ai_predict / ai_score model inference predicting employee turnover probabilities and retention recommendations.",
+            "query_text": (
+                "SELECT \n"
+                "    name,\n"
+                "    department,\n"
+                "    salary,\n"
+                "    ai_score('employee_turnover_predictor', json_object('salary', salary, 'tenure_years', 2.5, 'satisfaction_score', 0.45, 'overtime_hours', 12.0)) AS turnover_risk,\n"
+                "    ai_classify('employee_turnover_predictor', json_object('salary', salary, 'tenure_years', 2.5, 'satisfaction_score', 0.45, 'overtime_hours', 12.0)) AS risk_tier,\n"
+                "    ai_explain('employee_turnover_predictor', json_object('salary', salary, 'tenure_years', 2.5, 'satisfaction_score', 0.45, 'overtime_hours', 12.0)) AS recommendation\n"
+                "FROM warehouse.dbo.silver_employees\n"
+                "ORDER BY turnover_risk DESC\n"
+                "LIMIT 20;"
+            ),
+            "warehouse_id": "wh_starter",
+            "catalog": "warehouse",
+            "schema_name": "dbo",
+            "tags": ["AI/ML", "Inference", "MLflow"],
+            "created_at": now_str,
+            "updated_at": now_str,
+            "last_run_at": None,
+            "run_count": 0
+        },
+        {
+            "id": "sq_ai_predictive_maintenance_forecasting",
+            "name": "AI Inference: Industrial Equipment Failure Risk",
+            "description": "Predictive maintenance model inference estimating failure likelihood, alert tier, and remaining hours to failure.",
+            "query_text": (
+                "WITH telemetry_samples AS (\n"
+                "    SELECT 101 AS machine_id, 'Hydraulic Pump A' AS machine_name, 5.4 AS vib, 89.0 AS temp, 138.0 AS psi, 7400 AS op_hours\n"
+                "    UNION ALL\n"
+                "    SELECT 102 AS machine_id, 'Wind Turbine B' AS machine_name, 2.1 AS vib, 68.0 AS temp, 98.0 AS psi, 1200 AS op_hours\n"
+                "    UNION ALL\n"
+                "    SELECT 103 AS machine_id, 'Centrifugal Compressor C' AS machine_name, 6.2 AS vib, 96.0 AS temp, 155.0 AS psi, 11200 AS op_hours\n"
+                ")\n"
+                "SELECT \n"
+                "    machine_id,\n"
+                "    machine_name,\n"
+                "    ai_score('equipment_failure_forecaster', json_object('vibration_rms', vib, 'temperature_c', temp, 'pressure_psi', psi, 'operating_hours', op_hours)) AS failure_risk,\n"
+                "    ai_classify('equipment_failure_forecaster', json_object('vibration_rms', vib, 'temperature_c', temp, 'pressure_psi', psi, 'operating_hours', op_hours)) AS alert_level,\n"
+                "    ai_predict('equipment_failure_forecaster', json_object('vibration_rms', vib, 'temperature_c', temp, 'pressure_psi', psi, 'operating_hours', op_hours)) ->> '$.hours_to_failure' AS est_hours_remaining\n"
+                "FROM telemetry_samples\n"
+                "ORDER BY failure_risk DESC;"
+            ),
+            "warehouse_id": "wh_starter",
+            "catalog": "warehouse",
+            "schema_name": "dbo",
+            "tags": ["AI/ML", "IoT", "Predictive Maintenance"],
+            "created_at": now_str,
+            "updated_at": now_str,
+            "last_run_at": None,
+            "run_count": 0
         }
     ]
 
@@ -155,11 +210,23 @@ def load_saved_queries() -> List[Dict[str, Any]]:
     try:
         with open(SAVED_QUERIES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+            loaded = []
             if isinstance(data, dict):
-                return data.get("queries", [])
+                loaded = data.get("queries", [])
             elif isinstance(data, list):
-                return data
-            return []
+                loaded = data
+            
+            # Ensure new AI default queries are present
+            existing_ids = {q.get("id") for q in loaded if isinstance(q, dict)}
+            defaults = get_default_saved_queries()
+            updated = False
+            for d in defaults:
+                if d["id"] not in existing_ids and d["id"].startswith("sq_ai_"):
+                    loaded.append(d)
+                    updated = True
+            if updated:
+                save_saved_queries(loaded)
+            return loaded
     except Exception as e:
         logger.error(f"Failed to load saved_queries.json: {e}")
         return get_default_saved_queries()
@@ -187,10 +254,25 @@ def save_saved_queries(queries: List[Dict[str, Any]]) -> None:
         raise e
 
 
-def get_saved_queries(q: Optional[str] = None, tag: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Returns saved queries filtered by search keyword or tag."""
+def get_saved_queries(
+    q: Optional[str] = None,
+    tag: Optional[str] = None,
+    user_id: Optional[str] = None,
+    is_admin: bool = True
+) -> List[Dict[str, Any]]:
+    """Returns saved queries filtered by search keyword, tag, and user ownership."""
     queries = load_saved_queries()
     filtered = queries
+
+    if not is_admin and user_id:
+        default_ids = {d["id"] for d in get_default_saved_queries()}
+        filtered = [
+            query for query in filtered
+            if query.get("id") in default_ids
+            or query.get("owner") == user_id
+            or query.get("created_by") == user_id
+            or query.get("is_starter")
+        ]
 
     if tag and tag.lower() != "all":
         tag_lower = tag.lower().strip()
@@ -235,6 +317,8 @@ def create_saved_query(data: Dict[str, Any]) -> Dict[str, Any]:
     else:
         tags = []
 
+    owner = data.get("owner") or data.get("user") or "admin"
+
     new_query = {
         "id": qid,
         "name": (data.get("name") or "Untitled Query").strip(),
@@ -244,6 +328,8 @@ def create_saved_query(data: Dict[str, Any]) -> Dict[str, Any]:
         "catalog": data.get("catalog") or "warehouse",
         "schema_name": data.get("schema_name") or "dbo",
         "tags": tags,
+        "owner": owner,
+        "created_by": owner,
         "created_at": now_str,
         "updated_at": now_str,
         "last_run_at": None,

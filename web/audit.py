@@ -132,11 +132,16 @@ def get_query_history(
     status: Optional[str] = None,
     client: Optional[str] = None,
     search: Optional[str] = None,
-    min_duration_ms: Optional[float] = None
+    min_duration_ms: Optional[float] = None,
+    user: Optional[str] = None
 ) -> Dict[str, Any]:
     init_history_db()
     where_clauses = ["1=1"]
     params: List[Any] = []
+
+    if user and user.upper() != "ALL":
+        where_clauses.append("user = ?")
+        params.append(user)
 
     if status and status.upper() != "ALL":
         where_clauses.append("status = ?")
@@ -161,7 +166,7 @@ def get_query_history(
         count_cursor = conn.execute(f"SELECT COUNT(*) FROM query_history WHERE {where_sql}", params)
         total_count = count_cursor.fetchone()[0]
 
-        metrics_cursor = conn.execute("""
+        metrics_cursor = conn.execute(f"""
             SELECT
                 COUNT(*) as total_queries,
                 SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) as success_count,
@@ -169,7 +174,8 @@ def get_query_history(
                 AVG(duration_ms) as avg_duration_ms,
                 SUM(rows_produced) as total_rows_produced
             FROM query_history
-        """)
+            WHERE {where_sql}
+        """, params)
         m_row = metrics_cursor.fetchone()
         tot = m_row["total_queries"] or 0
         succ = m_row["success_count"] or 0

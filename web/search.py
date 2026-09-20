@@ -601,6 +601,149 @@ def search_experiments(query: str) -> List[Dict[str, Any]]:
     return sorted(results, key=lambda x: x["score"], reverse=True)
 
 
+DOCS_TOPICS = [
+    {
+        "id": "doc_arch",
+        "title": "Architecture & Engine Overview",
+        "subtitle": "Zero-JVM, in-process DuckDB, Ray distributed compute, Delta Lake transaction log",
+        "badge": "DOCS",
+        "badge_color": "amber",
+        "icon": "ph-cpu",
+        "url": "/docs/#overview-architecture",
+        "keywords": ["architecture", "overview", "engine", "duckdb", "ray", "delta lake", "jvm", "parquet", "vectorized", "zero jvm"]
+    },
+    {
+        "id": "doc_tutorial",
+        "title": "Hands-on Tutorial: Bronze, Silver & Gold Medallion",
+        "subtitle": "End-to-end lakehouse pipeline from raw ingestion to Delta KPI tables",
+        "badge": "TUTORIAL",
+        "badge_color": "emerald",
+        "icon": "ph-graduation-cap",
+        "url": "/docs/#hands-on-tutorial",
+        "keywords": ["tutorial", "hands on", "guide", "walkthrough", "step by step", "bronze", "silver", "gold", "medallion", "etl"]
+    },
+    {
+        "id": "doc_sql_bi",
+        "title": "SQL Editor & BI Warehouses",
+        "subtitle": "ACID transactional queries, time travel snapshots, and Lakeview dashboards",
+        "badge": "DOCS",
+        "badge_color": "blue",
+        "icon": "ph-terminal-window",
+        "url": "/docs/#sql-bi",
+        "keywords": ["sql", "editor", "warehouse", "queries", "bi", "dashboards", "time travel", "duckdb sql", "analytics"]
+    },
+    {
+        "id": "doc_de",
+        "title": "Data Engineering & Pipeline Workflows",
+        "subtitle": "dbt Core orchestration, multi-task cron DAGs, and lineage tracing",
+        "badge": "DOCS",
+        "badge_color": "teal",
+        "icon": "ph-git-merge",
+        "url": "/docs/#data-engineering",
+        "keywords": ["data engineering", "pipeline", "jobs", "workflows", "dbt", "cron", "orchestration", "lineage", "dag"]
+    },
+    {
+        "id": "doc_ml",
+        "title": "Machine Learning & AI Spaces",
+        "subtitle": "MLflow tracking parity, Unity Catalog model registry, Prompt Playground, Genie Space",
+        "badge": "DOCS",
+        "badge_color": "purple",
+        "icon": "ph-flask",
+        "url": "/docs/#machine-learning",
+        "keywords": ["machine learning", "mlflow", "ai", "genie", "playground", "experiments", "models", "registry", "llm", "prompt"]
+    },
+    {
+        "id": "doc_docker",
+        "title": "Docker Local Installation & Setup",
+        "subtitle": "Step-by-step instructions to run DataKilnWorks locally with Docker Compose",
+        "badge": "INSTALL",
+        "badge_color": "sky",
+        "icon": "ph-cube",
+        "url": "/docs/#docker-local-install",
+        "keywords": ["docker", "install", "installation", "setup", "compose", "container", "local", "ports", "environment"]
+    },
+    {
+        "id": "doc_k8s",
+        "title": "Kubernetes & Production Deployment",
+        "subtitle": "StatefulSets, persistent volume claims, Helm charts, and ingress routing",
+        "badge": "DEPLOY",
+        "badge_color": "indigo",
+        "icon": "ph-cloud",
+        "url": "/docs/#k8s-install",
+        "keywords": ["kubernetes", "k8s", "helm", "production", "deploy", "deployment", "statefulset", "pvc", "cloud"]
+    },
+    {
+        "id": "doc_api",
+        "title": "REST API Reference & SDK",
+        "subtitle": "FastAPI endpoints, token auth, SQL query execution, and compute workers",
+        "badge": "API",
+        "badge_color": "slate",
+        "icon": "ph-code",
+        "url": "/docs/#api-reference",
+        "keywords": ["api", "rest", "endpoints", "sdk", "swagger", "openapi", "auth", "token", "curl"]
+    },
+    {
+        "id": "doc_troubleshoot",
+        "title": "Troubleshooting & FAQ",
+        "subtitle": "Memory limits, Delta log concurrency, worker connectivity, and common questions",
+        "badge": "FAQ",
+        "badge_color": "rose",
+        "icon": "ph-question",
+        "url": "/docs/#troubleshooting",
+        "keywords": ["troubleshooting", "faq", "error", "debug", "memory", "concurrency", "lock", "help", "manual"]
+    }
+]
+
+def search_documentation(query: str) -> List[Dict[str, Any]]:
+    if not query:
+        # If empty query, return top guide topics
+        return [
+            {
+                "id": doc["id"],
+                "category": "docs",
+                "title": doc["title"],
+                "subtitle": doc["subtitle"],
+                "badge": doc["badge"],
+                "badge_color": doc["badge_color"],
+                "icon": doc["icon"],
+                "score": 50.0,
+                "meta": {
+                    "url": doc["url"],
+                    "action_type": "open_doc",
+                    "title": doc["title"]
+                }
+            }
+            for doc in DOCS_TOPICS[:4]
+        ]
+    clean_q = query.lower().strip()
+    results = []
+    for doc in DOCS_TOPICS:
+        best_score = score_text_match(clean_q, doc["title"])
+        sub_score = score_text_match(clean_q, doc["subtitle"])
+        best_score = max(best_score, sub_score * 0.8)
+        for kw in doc.get("keywords", []):
+            kw_score = score_text_match(clean_q, kw)
+            if kw_score > best_score:
+                best_score = kw_score
+        if best_score > 40:
+            results.append({
+                "id": doc["id"],
+                "category": "docs",
+                "title": doc["title"],
+                "subtitle": doc["subtitle"],
+                "badge": doc["badge"],
+                "badge_color": doc["badge_color"],
+                "icon": doc["icon"],
+                "score": best_score + 10,
+                "meta": {
+                    "url": doc["url"],
+                    "action_type": "open_doc",
+                    "title": doc["title"]
+                }
+            })
+    return sorted(results, key=lambda x: x["score"], reverse=True)
+
+
 def universal_search(query: str = "", category: str = "ALL", limit: int = 25) -> Dict[str, Any]:
     """
     Executes a high-speed unified fuzzy search across all lakehouse assets.
@@ -622,7 +765,8 @@ def universal_search(query: str = "", category: str = "ALL", limit: int = 25) ->
         "dashboards": 0,
         "jobs": 0,
         "warehouses": 0,
-        "experiments": 0
+        "experiments": 0,
+        "docs": 0
     }
 
     # 1. Search Tables & Catalogs
@@ -675,6 +819,12 @@ def universal_search(query: str = "", category: str = "ALL", limit: int = 25) ->
         exp_results = search_experiments(clean_q)
         counts["experiments"] = len(exp_results)
         all_results.extend(exp_results)
+
+    # 9. Search Documentation & Manual
+    if cat_upper in ("ALL", "DOCS", "HELP", "MANUAL"):
+        doc_results = search_documentation(clean_q)
+        counts["docs"] = len(doc_results)
+        all_results.extend(doc_results)
 
     # Sort all results by score descending
     all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)

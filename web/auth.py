@@ -77,6 +77,8 @@ def init_auth_db():
             );
             """)
 
+            now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
             # Seed default users if users table is empty
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) FROM users")
@@ -84,7 +86,6 @@ def init_auth_db():
 
             if count == 0:
                 logger.info("Seeding default multi-user accounts in auth.db...")
-                now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
                 seed_users = [
                     (
@@ -114,6 +115,15 @@ def init_auth_db():
                         1,
                         now_str
                     ),
+                    (
+                        "u_admin_martin",
+                        "martin",
+                        hash_password("adminpassword123"),
+                        "Martin (Admin)",
+                        "admin",
+                        1,
+                        now_str
+                    )
                 ]
 
                 cur.executemany("""
@@ -121,8 +131,17 @@ def init_auth_db():
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, seed_users)
 
-                # Seed initial default settings
-                conn.execute("""
+            # Ensure martin exists if db was already created
+            cur.execute("SELECT COUNT(*) FROM users WHERE username = 'martin'")
+            if cur.fetchone()[0] == 0:
+                now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute("""
+                    INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at)
+                    VALUES ('u_admin_martin', 'martin', ?, 'Martin (Admin)', 'admin', 1, ?)
+                """, (hash_password("adminpassword123"), now_str))
+
+            # Seed initial default settings
+            conn.execute("""
                 INSERT OR IGNORE INTO app_settings (key, value_json, updated_by, updated_at)
                 VALUES 
                     ('workspace_name', '"Localspark Lakehouse Studio"', 'admin', ?),
@@ -130,8 +149,7 @@ def init_auth_db():
                     ('default_warehouse', '"wh_starter"', 'admin', ?),
                     ('session_timeout_minutes', '1440', 'admin', ?)
                 """, (now_str, now_str, now_str, now_str))
-
-                logger.info("Successfully initialized and seeded auth.db")
+            logger.info("Successfully initialized and seeded auth.db")
     finally:
         conn.close()
 

@@ -73,8 +73,11 @@ def get_worker_conn():
         except Exception as e:
             logger.warning(f"Failed setting compute limits: {e}")
         sync_catalogs_with_duckrun(_worker_conn)
-    else:
-        sync_catalogs_with_duckrun(_worker_conn)
+        try:
+            from web.ai_sql import register_duckdb_ai_functions
+            register_duckdb_ai_functions(_worker_conn.con)
+        except Exception as e:
+            logger.warning(f"Failed registering DuckDB AI UDFs on worker {NODE_ID}: {e}")
     return _worker_conn
 
 def clean_json_val(v: Any) -> Any:
@@ -117,11 +120,14 @@ def serialize_row(row_dict: Any) -> Any:
         return clean_json_val(row_dict)
     return {str(k): clean_json_val(v) for k, v in row_dict.items()}
 
+ACTIVE_WORKER_QUERIES: Dict[str, Dict[str, Any]] = {}
+
 class ComputeExecuteRequest(BaseModel):
     query: str
     warehouse_id: Optional[str] = None
     catalog: Optional[str] = None
     limit: Optional[int] = None
+    execution_id: Optional[str] = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -190,26 +196,57 @@ def execute_query(req: ComputeExecuteRequest):
     if not query:
         raise HTTPException(status_code=400, detail="Empty query string")
 
+    exec_id = req.execution_id
     metrics["queries_active"] += 1
     start_time = time.perf_counter()
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    cur = None
     try:
         conn = get_worker_conn()
+
+        is_delta_special = (
+            any(k in query.lower() for k in ["describe detail", "describe history", "restore table", "vacuum"])
+            or any(query.strip().lower().startswith(p) for p in ["insert ", "update ", "delete ", "merge "])
+        )
+
+        if not is_delta_special:
+            cur = conn.con.cursor()
+            if exec_id:
+                ACTIVE_WORKER_QUERIES[exec_id] = {"cursor": cur, "cancelled": False}
+        else:
+            if exec_id:
+                ACTIVE_WORKER_QUERIES[exec_id] = {"cursor": conn.con, "cancelled": False}
+
+        if exec_id and ACTIVE_WORKER_QUERIES.get(exec_id, {}).get("cancelled"):
+            return {
+                "success": False,
+                "cancelled": True,
+                "error": "Query execution cancelled by user.",
+                "executed_by": NODE_ID,
+                "node_name": NODE_NAME,
+                "warehouse_id": ASSIGNED_WAREHOUSE_ID,
+                "elapsed_ms": 0,
+                "is_mutation": False
+            }
 
         # Switch catalog context if specified
         if req.catalog and req.catalog != "warehouse":
             try:
-                conn.sql(f'USE "{req.catalog}";')
+                (cur if cur else conn).sql(f'USE "{req.catalog}";')
             except Exception:
                 pass
         else:
             try:
-                conn.sql("USE warehouse;")
+                (cur if cur else conn).sql("USE warehouse;")
             except Exception:
                 pass
 
-        res = conn.sql(query)
+        if not is_delta_special:
+            res = cur.sql(query)
+        else:
+            res = conn.sql(query)
+
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         # Update metrics
@@ -253,6 +290,23 @@ def execute_query(req: ComputeExecuteRequest):
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
         metrics["queries_failed"] += 1
+        is_interrupted = (
+            (exec_id and ACTIVE_WORKER_QUERIES.get(exec_id, {}).get("cancelled", False))
+            or "interrupted" in str(e).lower()
+            or "interruptexception" in type(e).__name__.lower()
+        )
+        if is_interrupted:
+            logger.info(f"Query {exec_id} on {NODE_ID} was cancelled.")
+            return {
+                "success": False,
+                "cancelled": True,
+                "error": "Query execution was cancelled by user.",
+                "executed_by": NODE_ID,
+                "node_name": NODE_NAME,
+                "warehouse_id": ASSIGNED_WAREHOUSE_ID,
+                "elapsed_ms": elapsed_ms,
+                "is_mutation": False
+            }
         logger.error(f"Query execution failed on {NODE_ID}: {e}")
         return {
             "success": False,
@@ -264,7 +318,32 @@ def execute_query(req: ComputeExecuteRequest):
             "is_mutation": False
         }
     finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if exec_id:
+            ACTIVE_WORKER_QUERIES.pop(exec_id, None)
         metrics["queries_active"] = max(0, metrics["queries_active"] - 1)
+
+
+@app.post("/api/compute/cancel/{execution_id}")
+def cancel_worker_query(execution_id: str):
+    info = ACTIVE_WORKER_QUERIES.get(execution_id)
+    if not info:
+        return {"success": False, "message": "Query not found or already completed."}
+    info["cancelled"] = True
+    cur = info.get("cursor")
+    if cur is not None:
+        try:
+            cur.interrupt()
+            logger.info(f"Interrupted query {execution_id} on worker {NODE_ID}")
+            return {"success": True, "message": "Interrupt signal sent to worker cursor."}
+        except Exception as e:
+            logger.warning(f"Error interrupting query {execution_id}: {e}")
+            return {"success": False, "error": str(e)}
+    return {"success": True, "message": "Marked cancelled"}
 
 @app.post("/api/compute/refresh")
 def refresh_catalogs():

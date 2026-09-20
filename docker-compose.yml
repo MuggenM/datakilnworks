@@ -14,6 +14,7 @@ services:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse
       - ./dbt_project:/workspace/dbt_project
+      - ./docs:/workspace/docs
     deploy:
       resources:
         limits:
@@ -40,6 +41,7 @@ services:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
       - ./dbt_project:/workspace/dbt_project
+      - ./docs:/workspace/docs
     deploy:
       resources:
         limits:
