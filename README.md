@@ -460,6 +460,18 @@ spec:
 * **Generic REST Webhooks**:
   - Webhook payloads for PagerDuty, Discord, or automated orchestration pipelines.
 
+### 27. 📂 Unity Catalog Volumes & Volume Auto-Loader (Snowpipe / Databricks Auto Loader equivalent)
+* **Volumes** (`/Volumes/<catalog>/<schema>/<volume>/`): create, browse, upload, preview and delete files; paths are traversal-guarded and stored under `warehouse/volumes/`.
+* **Auto-Loader pipelines**: a background daemon polls a volume folder (`*.csv`, `*.tsv`, `*.json`, `*.jsonl`, `*.parquet`, minimum 5s interval) and loads new files into a Delta table.
+  - **Exactly-once**: each file is fingerprinted (size + mtime + first 64KB) in a SQLite checkpoint (`.metadata/autoloader.db`) and committed as one Delta transaction.
+  - **Streaming reads**: files stream through DuckDB into delta-rs in `AUTOLOADER_BATCH_ROWS` (default 100,000) batches, so memory does not scale with file size.
+  - **Load modes**: `append`, `merge` (upsert on `merge_keys`) and `overwrite`.
+  - **Schema evolution policies**: `addNewColumns`, `failOnNewColumns` and `rescue` (unknown columns go to a JSON `_rescued_data` column).
+  - **Quarantine**: unreadable or corrupt files move to `_quarantine/` while the pipeline continues; Delta write and schema-policy failures are logged as `FAILED` and retried on the next cycle.
+  - **Observability**: per-file history (rows, latency, error), KPI cards in the UI, and lineage `VOLUME_FILE → AUTOLOADER → TABLE`.
+* **API**: `/api/volumes/...` and `/api/autoloader/pipelines/...` (create, update, delete, `run`, `reset`, `history`, `stats`).
+* **Verification**: `python scratch/test_autoloader.py` (uses a throwaway warehouse).
+
 ---
 
 ## 🧪 Interactive Notebook Verification (Port 8890)
