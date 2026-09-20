@@ -54,8 +54,9 @@ services:
     image: localspark-lakehouse-notebook
     container_name: local-compute-node-01
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8001"]
-    ports:
-      - "8001:8001"
+    # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
+    expose:
+      - "8001"
     environment:
       - WORKER_NODE_ID=compute-node-01
       - WORKER_NODE_NAME=Compute Worker 01 (Starter Node)
@@ -79,8 +80,9 @@ services:
     image: localspark-lakehouse-notebook
     container_name: local-compute-node-02
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8002"]
-    ports:
-      - "8002:8002"
+    # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
+    expose:
+      - "8002"
     environment:
       - WORKER_NODE_ID=compute-node-02
       - WORKER_NODE_NAME=Compute Worker 02 (Analytics Pro)
@@ -104,8 +106,9 @@ services:
     image: localspark-lakehouse-notebook
     container_name: local-compute-node-03
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8003"]
-    ports:
-      - "8003:8003"
+    # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
+    expose:
+      - "8003"
     environment:
       - WORKER_NODE_ID=compute-node-03
       - WORKER_NODE_NAME=Compute Worker 03 (ETL Batch)

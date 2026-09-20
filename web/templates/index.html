@@ -985,7 +985,7 @@
         <i class="ph ph-arrows-clockwise text-sm" :class="{ 'animate-spin': isRefreshing }"></i>
       </button>
 
-      <a :href="jupyterUrl" target="_blank" class="flex items-center space-x-1 hover:text-white transition px-2 py-1 rounded bg-dbx-panel border border-dbx-border">
+      <a x-show="notebooksAllowed" :href="jupyterUrl" target="_blank" class="flex items-center space-x-1 hover:text-white transition px-2 py-1 rounded bg-dbx-panel border border-dbx-border">
         <i class="ph ph-notebook text-sm text-amber-400"></i>
         <span>JupyterLab</span>
         <i class="ph ph-arrow-square-out text-[10px]"></i>
@@ -3878,7 +3878,7 @@
                 <i class="ph ph-sidebar-simple text-xs"></i>
                 <span>Browser & Preview</span>
               </button>
-              <button @click="workspaceViewMode = 'fullscreen'" :class="workspaceViewMode === 'fullscreen' ? 'bg-dbx-hover text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-200'" class="px-2 py-0.5 rounded flex items-center space-x-1 transition">
+              <button x-show="notebooksAllowed" @click="workspaceViewMode = 'fullscreen'" :class="workspaceViewMode === 'fullscreen' ? 'bg-dbx-hover text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-200'" class="px-2 py-0.5 rounded flex items-center space-x-1 transition">
                 <i class="ph ph-browsers text-xs"></i>
                 <span>Full JupyterLab</span>
               </button>
@@ -3958,7 +3958,7 @@
                       </button>
                     </template>
                     <template x-if="node.type === 'notebook'">
-                      <button @click.stop="openInJupyterLab(node.rel_path, true)" title="Open in JupyterLab (New Tab)" class="p-1 text-slate-400 hover:text-dbx-orange rounded hover:bg-slate-700">
+                      <button x-show="notebooksAllowed" @click.stop="openInJupyterLab(node.rel_path, true)" title="Open in JupyterLab (New Tab)" class="p-1 text-slate-400 hover:text-dbx-orange rounded hover:bg-slate-700">
                         <i class="ph ph-arrow-square-out text-xs"></i>
                       </button>
                     </template>
@@ -4034,7 +4034,7 @@
                   <div class="flex items-center space-x-2 shrink-0">
                     <!-- Notebook / Python action: Open in JupyterLab -->
                     <template x-if="selectedWorkspaceItem.type === 'notebook' || selectedWorkspaceItem.type === 'python'">
-                      <a :href="jupyterDeepUrl" target="_blank" class="px-2.5 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition" :title="selectedWorkspaceItem.type === 'notebook' ? 'Open selected notebook in JupyterLab (New Tab)' : 'Open file in JupyterLab (New Tab)'">
+                      <a x-show="notebooksAllowed" :href="jupyterDeepUrl" target="_blank" class="px-2.5 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition" :title="selectedWorkspaceItem.type === 'notebook' ? 'Open selected notebook in JupyterLab (New Tab)' : 'Open file in JupyterLab (New Tab)'">
                         <span>Open in JupyterLab</span>
                         <i class="ph ph-arrow-square-out text-xs"></i>
                       </a>
@@ -4303,7 +4303,7 @@
                           </div>
                           <div class="flex items-center space-x-2">
                             <template x-if="selectedWorkspaceItem.type === 'python'">
-                              <a :href="jupyterDeepUrl" target="_blank" class="text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-dbx-border hover:bg-slate-50 dark:hover:bg-slate-700 transition text-[11px] shadow-xs" title="Open and edit in JupyterLab">
+                              <a x-show="notebooksAllowed" :href="jupyterDeepUrl" target="_blank" class="text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-dbx-border hover:bg-slate-50 dark:hover:bg-slate-700 transition text-[11px] shadow-xs" title="Open and edit in JupyterLab">
                                 <i class="ph ph-arrow-square-out text-xs"></i>
                                 <span>Edit in JupyterLab</span>
                               </a>
@@ -4405,7 +4405,7 @@
               <i class="ph ph-arrow-square-out text-xs"></i>
             </a>
           </div>
-          <iframe :src="jupyterDeepUrl" class="w-full h-full border-0" allow="clipboard-read; clipboard-write"></iframe>
+          <iframe :src="notebooksAllowed ? jupyterDeepUrl : 'about:blank'" class="w-full h-full border-0" allow="clipboard-read; clipboard-write"></iframe>
         </div>
       </div>
 
@@ -7962,7 +7962,7 @@
                 <div class="px-2.5 py-1 rounded bg-white dark:bg-dbx-sidebar border border-amber-300 dark:border-amber-800 flex items-center space-x-2 text-[11px] shrink-0 shadow-xs">
                   <span class="font-bold text-slate-800 dark:text-slate-200" x-text="ass.name"></span>
                   <span :class="ass.value === '1' ? 'text-emerald-600 font-bold' : (ass.value === '-1' ? 'text-red-600 font-bold' : 'text-amber-600 font-bold')" x-text="'= ' + ass.value"></span>
-                  <span class="text-slate-400 italic text-[10px]" x-show="ass.rationale" x-text="'(\"' + ass.rationale + '\")'"></span>
+                  <span class="text-slate-400 italic text-[10px]" x-show="ass.rationale" x-text="'(&quot;' + ass.rationale + '&quot;)'"></span>
                   <span class="text-[9px] text-slate-400 font-mono" x-text="ass.source_type"></span>
                 </div>
               </template>
@@ -16028,6 +16028,8 @@
         jupyterPort: '{{ jupyter_port }}',
         jupyterToken: '{{ jupyter_token }}',
         jupyterUrl: 'http://' + window.location.hostname + ':{{ jupyter_port }}/lab?token={{ jupyter_token }}',
+        // Role gating (GOVERNANCE_RESTRICT_NOTEBOOKS): false until /api/notebooks/access allows this user
+        notebooksAllowed: {{ 'false' if notebooks_restricted else 'true' }},
         status: {},
         catalogs: [],
         selectedTable: null,
@@ -17165,7 +17167,24 @@
           await this.onUserChanged();
         },
 
+        async refreshNotebookAccess() {
+          try {
+            const res = await fetch('/api/notebooks/access');
+            if (!res.ok) { this.notebooksAllowed = false; this.jupyterToken = ''; return; }
+            const a = await res.json();
+            this.notebooksAllowed = !!a.allowed;
+            this.jupyterToken = a.token || '';
+            if (a.port) { this.jupyterPort = a.port; }
+            this.jupyterUrl = a.allowed
+              ? 'http://' + window.location.hostname + ':' + this.jupyterPort + '/lab?token=' + this.jupyterToken
+              : '';
+          } catch (e) {
+            console.warn('Notebook access check failed:', e);
+          }
+        },
+
         async onUserChanged() {
+          await this.refreshNotebookAccess();
           const username = this.currentUser?.username || 'admin';
           console.log(`[MultiUser] Scoping studio state to user: ${username}`);
 
@@ -18346,6 +18365,7 @@
 
         async initApp() {
           await this.checkAuth();
+          await this.refreshNotebookAccess();
           this.applyTheme(this.isDarkMode);
           this.$watch('currentView', (val) => {
             if (val) localStorage.setItem('dbx_current_view', val);

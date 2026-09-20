@@ -474,6 +474,20 @@ spec:
 
 ---
 
+## 🔐 Security Settings & Governance Trust Boundary
+
+| Setting | Default | Effect |
+| :--- | :--- | :--- |
+| `GOVERNANCE_REQUIRE_AUTH` | `false` | `false` keeps the single-user local mode (requests **without credentials** run as the local admin). `true` makes them the least-privilege `anonymous` user and ignores the credential-less `X-User` header. Invalid or expired credentials are **never** admin in either mode. |
+| `GOVERNANCE_RESTRICT_NOTEBOOKS` | `false` | Only hand the JupyterLab URL/token to roles in `GOVERNANCE_NOTEBOOK_ROLES` (default `admin,power_user`). |
+| `JWT_SECRET_KEY` | per-install random | Session signing key. If unset, a random key is created in `warehouse/.metadata/jwt_secret` (existing sessions are signed out once after upgrading). |
+| `COMPUTE_TOKEN` | per-install random | Shared secret (`X-Compute-Token`) the studio sends to compute workers, which reject requests without it. Stored in `warehouse/.metadata/compute_token` when unset. |
+| `JUPYTER_TOKEN` | `datakilnworks` | **Change this for any shared install.** |
+
+**What column masking will and will not cover.** Studio queries (SQL editor, dashboards, previews, exports, alerts, Genie) are governed. **JupyterLab notebooks and anything that can read `warehouse/` directly are outside that boundary**, because kernels talk to the warehouse without a user identity. Restrict notebooks by role, use a non-default `JUPYTER_TOKEN`, and do not publish the Jupyter port to untrusted networks. Compute workers (`compute-node-01..03`) are no longer published on the host; they are reachable only on the compose network and require the compute token.
+
+---
+
 ## 🧪 Interactive Notebook Verification (Port 8890)
 
 Open [`notebooks/sample_lakehouse_pipeline.ipynb`](notebooks/sample_lakehouse_pipeline.ipynb) in JupyterLab:

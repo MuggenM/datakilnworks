@@ -47,6 +47,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+
+@app.middleware("http")
+async def require_compute_token(request, call_next):
+    """Every route except the health probe needs the studio's shared secret (see web/compute_auth.py)."""
+    from fastapi.responses import JSONResponse
+    from web.compute_auth import COMPUTE_TOKEN_HEADER, PUBLIC_PATHS, token_is_valid
+    if request.method != "OPTIONS" and request.url.path not in PUBLIC_PATHS:
+        if not token_is_valid(request.headers.get(COMPUTE_TOKEN_HEADER, "")):
+            return JSONResponse(status_code=401, content={"detail": "Compute token required."})
+    return await call_next(request)
+
+
 # Execution telemetry
 metrics = {
     "queries_total": 0,

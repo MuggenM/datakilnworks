@@ -16,13 +16,18 @@ from datetime import timedelta
 import jwt
 from fastapi import Request, HTTPException, Depends, status
 
+from web.secrets_store import load_or_create_secret
+
 logger = logging.getLogger("localspark.auth")
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
 AUTH_DB_FILE = os.path.join(METADATA_DIR, "auth.db")
 
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "localspark-super-secret-jwt-key-2026-secure")
+
+
+# The previous hard-coded default key lived in the public repository, so anyone could forge an admin token.
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY") or load_or_create_secret("jwt_secret")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
@@ -406,9 +411,9 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
             if user and user.get("is_active", 1) == 1:
                 return user
 
-    # Fallback to X-User header if supplied
+    # Fallback to X-User header if supplied. It carries no credential, so it is disabled once auth is required.
     x_user = request.headers.get("X-User")
-    if x_user:
+    if x_user and not governance_require_auth():
         user = get_user_by_username(x_user)
         if user and user.get("is_active", 1) == 1:
             return user
@@ -430,6 +435,43 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         detail="Authentication required. Please log in.",
         headers={"WWW-Authenticate": "Bearer"}
     )
+
+
+def governance_require_auth() -> bool:
+    """When true, requests without credentials are anonymous (least privilege) instead of the local admin."""
+    return os.getenv("GOVERNANCE_REQUIRE_AUTH", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+LOCAL_ADMIN = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+ANONYMOUS = {"role": "user", "username": "anonymous", "id": "anonymous"}
+
+
+def _presented_credentials(request: Request) -> bool:
+    """True when the request tried to authenticate (cookie, bearer token or X-User), valid or not."""
+    if request.cookies.get(COOKIE_NAME):
+        return True
+    header = request.headers.get("Authorization") or ""
+    if header.startswith("Bearer ") and header[7:].strip():
+        return True
+    return bool(request.headers.get("X-User")) and not governance_require_auth()
+
+
+async def resolve_principal(request: Request) -> Dict[str, Any]:
+    """
+    Single source of truth for "who is calling" in endpoints that tolerate anonymous access.
+
+    - Valid credentials -> that user.
+    - Credentials presented but invalid/expired/unknown/inactive -> 401. NEVER admin.
+    - No credentials at all -> the local single-user admin (the documented no-login mode), or the
+      least-privilege `anonymous` user when GOVERNANCE_REQUIRE_AUTH is set.
+    - Unexpected errors propagate (500) instead of silently granting admin.
+    """
+    try:
+        return dict(await get_current_user(request))
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED or _presented_credentials(request):
+            raise
+        return dict(ANONYMOUS if governance_require_auth() else LOCAL_ADMIN)
 
 
 def require_role(allowed_roles: List[str]):

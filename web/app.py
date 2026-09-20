@@ -23,11 +23,12 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from web.auth import (
-    get_current_user, require_role, create_access_token, verify_password,
+    get_current_user, resolve_principal, require_role, create_access_token, verify_password,
     get_user_by_username, list_users, create_user, update_user, reset_user_password,
     delete_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db
 )
 from web import auth_frameworks, llm_settings
+from web.compute_auth import compute_headers
 from web import onelake
 from web.permissions import (
     can_user_access_catalog, can_user_manage_catalog, can_user_delete_catalog,
@@ -77,8 +78,22 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Data Kiln Works Studio", version="2.4.0", docs_url="/api/docs", redoc_url="/api/redoc")
 
+def _log_security_posture():
+    """Warns about configurations that undermine the governance trust boundary."""
+    from web.notebook_access import restrict_notebooks, DEFAULT_TOKEN
+    from web.auth import governance_require_auth
+    if not governance_require_auth():
+        logger.warning("Governance: GOVERNANCE_REQUIRE_AUTH is off; requests without credentials run as the local admin.")
+    if JUPYTER_TOKEN == DEFAULT_TOKEN:
+        logger.warning("Governance: JupyterLab uses the default public token. Notebooks bypass column masking; "
+                       "set JUPYTER_TOKEN and GOVERNANCE_RESTRICT_NOTEBOOKS for multi-user installs.")
+    elif not restrict_notebooks():
+        logger.info("Governance: notebooks are open to all roles (GOVERNANCE_RESTRICT_NOTEBOOKS=false).")
+
+
 @app.on_event("startup")
 async def startup_event():
+    _log_security_posture()
     asyncio.create_task(cron_scheduler_loop())
     init_auth_db()
     from web.alerts import alerts_scheduler_loop, init_alerts_db
@@ -265,12 +280,17 @@ def scan_delta_tables() -> List[Dict[str, Any]]:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    from web.notebook_access import restrict_notebooks
+    restricted = restrict_notebooks()
     resp = templates.TemplateResponse(
         request=request,
         name="index.html",
         context={
             "jupyter_port": JUPYTER_PORT,
-            "jupyter_token": JUPYTER_TOKEN,
+            # When notebooks are role-gated the token is never embedded in the (unauthenticated) page;
+            # the UI fetches it from /api/notebooks/access after sign-in.
+            "jupyter_token": "" if restricted else JUPYTER_TOKEN,
+            "notebooks_restricted": restricted,
             "warehouse_dir": WAREHOUSE_DIR
         }
     )
@@ -279,8 +299,21 @@ async def index(request: Request):
     resp.headers["Expires"] = "0"
     return resp
 
+@app.get("/api/notebooks/access")
+async def get_notebook_access(request: Request):
+    """Tells the UI whether the caller may open JupyterLab, and hands the token only to allowed roles."""
+    from web.notebook_access import access_payload
+    current_user = await resolve_principal(request)
+    return access_payload(current_user, JUPYTER_PORT, JUPYTER_TOKEN)
+
+
 @app.get("/api/status")
-async def get_status():
+async def get_status(request: Request):
+    from web.notebook_access import notebooks_allowed
+    try:
+        allowed = notebooks_allowed(await resolve_principal(request))
+    except HTTPException:
+        allowed = False
     conn = get_duckrun_conn()
     tables = scan_delta_tables()
     return {
@@ -290,7 +323,7 @@ async def get_status():
         "warehouse_dir": WAREHOUSE_DIR,
         "table_count": len(tables),
         "status": "RUNNING",
-        "jupyter_url": f"http://localhost:{JUPYTER_PORT}/lab?token={JUPYTER_TOKEN}"
+        "jupyter_url": f"http://localhost:{JUPYTER_PORT}/lab?token={JUPYTER_TOKEN}" if allowed else None
     }
 
 # ==============================================================================
@@ -626,10 +659,7 @@ async def test_oidc_endpoint(
 
 @app.get("/api/catalogs")
 async def get_catalogs(request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     conn = get_duckrun_conn()
     sync_catalogs_with_duckrun(conn)
@@ -647,10 +677,7 @@ async def create_catalog_endpoint(
     payload: Dict[str, Any],
     request: Request
 ):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(
@@ -679,10 +706,7 @@ async def create_catalog_endpoint(
 
 @app.delete("/api/catalogs/{cat_id}")
 async def delete_catalog_endpoint(cat_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if cat_id == "warehouse":
         raise HTTPException(
@@ -720,10 +744,7 @@ async def delete_catalog_endpoint(cat_id: str, request: Request):
 
 @app.get("/api/catalogs/{cat_id}/permissions")
 async def get_catalog_permissions_endpoint(cat_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if not can_user_manage_catalog(current_user, cat_id):
         raise HTTPException(
@@ -739,10 +760,7 @@ async def grant_catalog_permission_endpoint(
     payload: CatalogPermissionRequest,
     request: Request
 ):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     target = payload.user_id or payload.username
     if not target:
@@ -762,10 +780,7 @@ async def revoke_catalog_permission_endpoint(
     target_user_id: str,
     request: Request
 ):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     ok = revoke_catalog_permission(
         catalog_id=cat_id,
@@ -798,10 +813,7 @@ class OneLakeMountRequest(BaseModel):
 @app.post("/api/catalogs/onelake/mount")
 async def mount_onelake_catalog_endpoint(payload: OneLakeMountRequest, request: Request):
     """Mount OneLake lakehouse as read-only external catalog."""
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Only admins can mount external catalogs
     if current_user.get("role") != "admin":
@@ -983,10 +995,7 @@ async def query_onelake_table_endpoint(catalog_id: str, payload: OneLakeQueryReq
 @app.delete("/api/catalogs/onelake/{catalog_id}")
 async def unmount_onelake_catalog_endpoint(catalog_id: str, request: Request):
     """Unmount OneLake catalog."""
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Only admins can unmount external catalogs
     if current_user.get("role") != "admin":
@@ -1257,10 +1266,7 @@ async def drop_table_api(schema_name: str, table_name: str, catalog: Optional[st
 async def get_table_details(schema_name: str, table_name: str, catalog: Optional[str] = None, request: Request = None):
     cat_id = catalog or "warehouse"
     if request:
-        try:
-            current_user = await get_current_user(request)
-        except Exception:
-            current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+        current_user = await resolve_principal(request)
         if not can_user_access_catalog(current_user, cat_id, action="READ"):
             raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
     # Check if catalog is an external storage mount
@@ -1516,10 +1522,7 @@ async def get_table_details(schema_name: str, table_name: str, catalog: Optional
 async def preview_table(schema_name: str, table_name: str, limit: int = 50, version: Optional[int] = None, catalog: Optional[str] = None, request: Request = None):
     cat_id = catalog or "warehouse"
     if request:
-        try:
-            current_user = await get_current_user(request)
-        except Exception:
-            current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+        current_user = await resolve_principal(request)
         if not can_user_access_catalog(current_user, cat_id, action="READ"):
             raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
     conn = get_duckrun_conn()
@@ -1662,10 +1665,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
     if not query:
         return {"success": False, "error": "Empty query"}
 
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Enforce zero-trust catalog permissions
     try:
@@ -1719,7 +1719,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                     for ep in endpoints_to_try:
                         try:
                             active_entry["endpoint"] = ep
-                            with httpx.Client(timeout=45.0) as client:
+                            with httpx.Client(timeout=45.0, headers=compute_headers()) as client:
                                 resp = client.post(
                                     f"{ep}/api/compute/execute",
                                     json={
@@ -1977,10 +1977,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
 @app.post("/api/sql/cancel/{execution_id}")
 async def cancel_query(execution_id: str, request: Request):
     """Cancels an ongoing SQL query execution via DuckDB cursor interrupt."""
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     active = ACTIVE_QUERIES.get(execution_id)
     if not active:
@@ -2009,7 +2006,7 @@ async def cancel_query(execution_id: str, request: Request):
     if endpoint:
         try:
             import httpx
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, headers=compute_headers()) as client:
                 resp = client.post(f"{endpoint}/api/compute/cancel/{execution_id}")
                 if resp.status_code == 200 and resp.json().get("success"):
                     interrupted = True
@@ -2136,10 +2133,7 @@ async def profile_sql(payload: QueryRequest, request: Request):
     if not query:
         return {"success": False, "error": "Empty query"}
 
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Enforce zero-trust catalog permissions
     try:
@@ -2738,10 +2732,7 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
     if not os.path.exists(temp_path):
         raise HTTPException(status_code=404, detail="Uploaded file session expired or not found. Please upload again.")
 
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     target_catalog = payload.catalog or "warehouse"
     if not can_user_access_catalog(current_user, target_catalog, action="WRITE"):
@@ -6571,10 +6562,7 @@ async def list_mounts_endpoint():
 
 @app.post("/api/mounts")
 async def create_or_update_mount_endpoint(payload: Dict[str, Any], request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(
@@ -6610,10 +6598,7 @@ async def create_or_update_mount_endpoint(payload: Dict[str, Any], request: Requ
 
 @app.post("/api/mounts/{mount_id}/duplicate")
 async def duplicate_mount_endpoint(mount_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(
@@ -6643,10 +6628,7 @@ async def duplicate_mount_endpoint(mount_id: str, request: Request):
 
 @app.delete("/api/mounts/{mount_id}")
 async def delete_mount_endpoint(mount_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if mount_id.startswith("onelake_"):
         cat_id = mount_id.replace("onelake_", "")
@@ -7021,10 +7003,7 @@ async def get_volumes_endpoint(catalog: Optional[str] = None, schema: Optional[s
 @app.post("/api/volumes")
 async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
     from web.volumes import create_volume
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
     
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can create volumes.")
@@ -7056,10 +7035,7 @@ async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
 @app.delete("/api/volumes/{catalog}/{schema}/{volume_name}")
 async def delete_volume_endpoint(catalog: str, schema: str, volume_name: str, request: Request):
     from web.volumes import delete_volume
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete volumes.")
@@ -7115,10 +7091,7 @@ async def delete_volume_file_endpoint(
     request: Request
 ):
     from web.volumes import delete_file_from_volume
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete files from volumes.")
@@ -7170,10 +7143,7 @@ async def get_autoloader_pipelines():
 @app.post("/api/autoloader/pipelines")
 async def create_autoloader_pipeline_endpoint(payload: Dict[str, Any], request: Request):
     from web.autoloader import create_pipeline
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can create Auto-Loader pipelines.")
@@ -7200,10 +7170,7 @@ async def get_autoloader_pipeline_endpoint(pipeline_id: str):
 @app.put("/api/autoloader/pipelines/{pipeline_id}")
 async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[str, Any], request: Request):
     from web.autoloader import update_pipeline
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can modify Auto-Loader pipelines.")
@@ -7220,10 +7187,7 @@ async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[st
 @app.delete("/api/autoloader/pipelines/{pipeline_id}")
 async def delete_autoloader_pipeline_endpoint(pipeline_id: str, request: Request):
     from web.autoloader import delete_pipeline
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete Auto-Loader pipelines.")
@@ -7251,10 +7215,7 @@ async def run_autoloader_pipeline_now(pipeline_id: str):
 @app.post("/api/autoloader/pipelines/{pipeline_id}/reset")
 async def reset_autoloader_pipeline_checkpoints(pipeline_id: str, request: Request):
     from web.autoloader import reset_pipeline_checkpoints
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can reset checkpoints.")

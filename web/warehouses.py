@@ -246,6 +246,7 @@ def get_compute_nodes_status() -> List[Dict[str, Any]]:
     """Polls real-time telemetry from all clustered Docker compute worker nodes."""
     results = []
     import httpx
+    from web.compute_auth import compute_headers
     for node in KNOWN_WORKER_NODES:
         endpoints_to_try = [node["endpoint"], node.get("host_endpoint", "")]
         node_res = {
@@ -274,7 +275,7 @@ def get_compute_nodes_status() -> List[Dict[str, Any]]:
                 continue
             try:
                 t0 = time.perf_counter()
-                with httpx.Client(timeout=1.0) as client:
+                with httpx.Client(timeout=1.0, headers=compute_headers()) as client:
                     resp = client.get(f"{ep}/api/compute/status")
                 latency = round((time.perf_counter() - t0) * 1000, 1)
                 if resp.status_code == 200:
