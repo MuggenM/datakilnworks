@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("localspark.governance")
@@ -121,14 +122,30 @@ def init_governance_db() -> None:
         conn.close()
 
 
+_tls = threading.local()
+
+
+def _reader() -> sqlite3.Connection:
+    """A per-thread, per-path read connection: opening SQLite (plus PRAGMAs) on every version check cost ~0.4 ms."""
+    conn = getattr(_tls, "conn", None)
+    if conn is None or getattr(_tls, "path", None) != GOV_DB_PATH:
+        os.makedirs(METADATA_DIR, exist_ok=True)
+        conn = sqlite3.connect(GOV_DB_PATH, timeout=15.0)
+        conn.row_factory = sqlite3.Row
+        _tls.conn, _tls.path = conn, GOV_DB_PATH
+    return conn
+
+
 def get_version() -> int:
     """Cheap point read used to validate in-process caches."""
-    conn = get_db()
     try:
-        row = conn.execute("SELECT value FROM governance_meta WHERE key = 'version'").fetchone()
-        return int(row["value"]) if row else 0
-    finally:
-        conn.close()
+        row = _reader().execute("SELECT value FROM governance_meta WHERE key = 'version'").fetchone()
+    except sqlite3.OperationalError:
+        # database not initialised yet (or replaced): initialise and retry once
+        _tls.conn = None
+        init_governance_db()
+        row = _reader().execute("SELECT value FROM governance_meta WHERE key = 'version'").fetchone()
+    return int(row["value"]) if row else 0
 
 
 def bump_version(conn: sqlite3.Connection) -> None:

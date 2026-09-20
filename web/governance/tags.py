@@ -297,6 +297,12 @@ def effective_tags(catalog: str, schema_name: str, table_name: str, columns: Lis
     return out
 
 
+def has_any_tags() -> bool:
+    """False on installs that do not use tags: masking is impossible and metadata lookups can be skipped entirely."""
+    idx = get_index()
+    return bool(idx["catalogs"] or idx["schemas"] or idx["tables"] or idx["columns"])
+
+
 def table_has_any_tags(catalog: str, schema_name: str, table_name: str) -> bool:
     """True when any level at or above the table (or any of its columns) carries a tag."""
     catalog, schema_name, table_name = norm(catalog), norm(schema_name), norm(table_name)
