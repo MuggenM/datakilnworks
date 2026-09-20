@@ -1809,7 +1809,7 @@
                     <div class="text-purple-600 dark:text-purple-400 truncate font-medium">
                       <span x-text="p.file_pattern"></span>
                       <span class="text-slate-400"> • </span>
-                      <span x-text="p.poll_interval_seconds + 's interval'"></span>
+                      <span x-text="p.cron_schedule ? ('cron ' + p.cron_schedule + ' UTC') : (p.poll_interval_seconds + 's interval')"></span>
                     </div>
                   </div>
                 </div>
@@ -10651,8 +10651,20 @@
               <option value="10">Standard (10 seconds)</option>
               <option value="30">30 seconds</option>
               <option value="60">1 minute</option>
+              <option value="cron">Scheduled (Cron, UTC)</option>
             </select>
           </div>
+        </div>
+
+        <div x-show="newPipelineForm.poll_interval_seconds === 'cron'" class="space-y-1.5">
+          <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Cron Expression (UTC)</label>
+          <input type="text" x-model="newPipelineForm.cron_schedule" placeholder="*/15 * * * *" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="preset in [['Every 5 min','*/5 * * * *'],['Hourly','0 * * * *'],['Daily 02:00','0 2 * * *'],['Weekdays 06:00','0 6 * * 1-5']]" :key="preset[1]">
+              <button type="button" @click="newPipelineForm.cron_schedule = preset[1]" class="px-2 py-0.5 text-[10px] rounded border border-slate-300 dark:border-dbx-border text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-dbx-hover" x-text="preset[0]"></button>
+            </template>
+          </div>
+          <p class="text-[10px] text-slate-500">The pipeline scans its volume only when a cron tick has elapsed. Missed ticks run once on catch-up.</p>
         </div>
 
         <div class="p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg space-y-3">
@@ -15787,6 +15799,7 @@
           merge_keys: '',
           schema_evolution: 'addNewColumns',
           poll_interval_seconds: 10,
+          cron_schedule: '',
           enabled: true
         },
         pipelineHistoryModalOpen: false,
@@ -23866,7 +23879,9 @@
             const res = await fetch('/api/autoloader/pipelines', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(this.newPipelineForm)
+              body: JSON.stringify(this.newPipelineForm.poll_interval_seconds === 'cron'
+                ? { ...this.newPipelineForm, poll_interval_seconds: 10 }
+                : { ...this.newPipelineForm, cron_schedule: '' })
             });
             const data = await res.json();
             if (res.ok) {

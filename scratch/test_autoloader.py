@@ -280,6 +280,54 @@ def test_merge_key_safety():
     check("keys with spaces are quoted correctly", rows == {1: "x", 2: "z"}, rows)
 
 
+def test_cron_schedule():
+    print("\n11. Cron scheduling")
+    from datetime import datetime
+    import sqlite3
+    check("cron normalized", autoloader.normalize_cron("  */15   * * * * ") == "*/15 * * * *")
+    check("empty cron -> None", autoloader.normalize_cron("  ") is None)
+    for bad in ("not a cron", "* * * *", "61 * * * *"):
+        try:
+            autoloader.normalize_cron(bad)
+            check(f"rejects '{bad}'", False)
+        except ValueError:
+            check(f"rejects '{bad}'", True)
+
+    last = "2026-09-20 10:00:00"
+    check("not due before next tick", not autoloader.cron_is_due("*/15 * * * *", last, datetime(2026, 9, 20, 10, 14, 59)))
+    check("due at next tick", autoloader.cron_is_due("*/15 * * * *", last, datetime(2026, 9, 20, 10, 15, 0)))
+    check("missed ticks catch up once", autoloader.cron_is_due("0 * * * *", last, datetime(2026, 9, 20, 15, 0, 0)))
+
+    pipe, _ = make_pipeline("cron_vol", "bronze_cron", cron_schedule="0 2 * * *")
+    check("cron stored on the pipeline", pipe["cron_schedule"] == "0 2 * * *")
+    upd = autoloader.update_pipeline(pipe["id"], {"name": "renamed"})
+    check("update without cron keeps it", upd["cron_schedule"] == "0 2 * * *")
+    upd = autoloader.update_pipeline(pipe["id"], {"cron_schedule": ""})
+    check("empty cron switches back to interval polling", upd["cron_schedule"] is None)
+    try:
+        autoloader.update_pipeline(pipe["id"], {"cron_schedule": "nope"})
+        check("update rejects invalid cron", False)
+    except ValueError:
+        check("update rejects invalid cron", True)
+
+    # Databases created before cron support get the column added in place
+    legacy_path = os.path.join(TMP_WAREHOUSE, "legacy_autoloader.db")
+    legacy = sqlite3.connect(legacy_path)
+    legacy.execute("CREATE TABLE autoloader_pipelines (id TEXT PRIMARY KEY, name TEXT)")
+    legacy.commit()
+    legacy.close()
+    real_path = autoloader.DB_PATH
+    autoloader.DB_PATH = legacy_path
+    try:
+        autoloader.init_autoloader_db()
+        conn = sqlite3.connect(legacy_path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(autoloader_pipelines)")}
+        conn.close()
+    finally:
+        autoloader.DB_PATH = real_path
+    check("legacy table migrated with cron_schedule column", "cron_schedule" in cols, cols)
+
+
 def main():
     autoloader.init_autoloader_db()
     try:
@@ -292,6 +340,7 @@ def main():
         test_streaming_large_file()
         test_merge_mode()
         test_merge_key_safety()
+        test_cron_schedule()
     finally:
         shutil.rmtree(TMP_WAREHOUSE, ignore_errors=True)
     print()

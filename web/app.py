@@ -7208,7 +7208,10 @@ async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[st
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can modify Auto-Loader pipelines.")
 
-    pipe = update_pipeline(pipeline_id, payload)
+    try:
+        pipe = update_pipeline(pipeline_id, payload)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     if not pipe:
         raise HTTPException(status_code=404, detail="Pipeline not found")
     return pipe

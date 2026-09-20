@@ -13,6 +13,10 @@ from typing import Dict, Any, List, Optional
 
 import duckdb
 import pyarrow as pa
+try:
+    from croniter import croniter
+except ImportError:  # requirements.txt ships croniter; guard like web/workflow.py
+    croniter = None
 from deltalake import DeltaTable, write_deltalake
 
 from web.volumes import resolve_volume_posix_path, get_volume_physical_path
@@ -76,6 +80,11 @@ def init_autoloader_db():
     );
     """)
 
+    # Additive migrations for databases created by earlier versions
+    existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(autoloader_pipelines)").fetchall()}
+    if "cron_schedule" not in existing_cols:
+        cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN cron_schedule TEXT")
+
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_file_history_pipeline ON autoloader_file_history(pipeline_id);
     """)
@@ -118,6 +127,26 @@ def get_pipeline(pipeline_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def normalize_cron(expr: Optional[str]) -> Optional[str]:
+    """Validates a 5-field cron expression (evaluated in UTC); returns None for empty input."""
+    expr = " ".join((expr or "").split())
+    if not expr:
+        return None
+    if croniter is None:
+        raise ValueError("Cron schedules require the 'croniter' package.")
+    if len(expr.split(" ")) != 5 or not croniter.is_valid(expr):
+        raise ValueError(f"Invalid cron expression '{expr}'. Use 5 fields, e.g. '*/15 * * * *'.")
+    return expr
+
+
+def cron_is_due(expr: str, last_run_iso: Optional[str], now: datetime) -> bool:
+    """True when a cron tick has elapsed since the last run (UTC). A never-run pipeline is due immediately."""
+    if not last_run_iso:
+        return True
+    last_run = datetime.strptime(last_run_iso, "%Y-%m-%d %H:%M:%S")
+    return croniter(expr, last_run).get_next(datetime) <= now
+
+
 INGEST_MODES = ("append", "merge", "overwrite")
 
 
@@ -146,6 +175,7 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     enabled = 1 if data.get("enabled", True) else 0
 
     _validate_pipeline_mode(ingest_mode, merge_keys)
+    cron_schedule = normalize_cron(data.get("cron_schedule"))
     if not source_vol:
         raise ValueError("Source volume path is required (e.g. /Volumes/warehouse/raw/iot_stream).")
     if not target_tbl:
@@ -159,13 +189,13 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
             id, name, description, source_volume_path, file_pattern,
             target_catalog, target_schema, target_table, ingest_mode,
             merge_keys, schema_evolution, poll_interval_seconds, enabled,
-            status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0)
+            status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested, cron_schedule
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?)
     """, (
         pipeline_id, name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        created_by, now_iso
+        created_by, now_iso, cron_schedule
     ))
     conn.commit()
     conn.close()
@@ -194,19 +224,21 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     enabled = 1 if data.get("enabled", pipe["enabled"]) else 0
     ingest_mode = (ingest_mode or "append").strip().lower()
     _validate_pipeline_mode(ingest_mode, merge_keys)
+    cron_schedule = normalize_cron(data["cron_schedule"]) if "cron_schedule" in data else pipe.get("cron_schedule")
 
     conn = get_db()
     conn.execute("""
         UPDATE autoloader_pipelines SET
             name = ?, description = ?, source_volume_path = ?, file_pattern = ?,
             target_catalog = ?, target_schema = ?, target_table = ?, ingest_mode = ?,
-            merge_keys = ?, schema_evolution = ?, poll_interval_seconds = ?, enabled = ?
+            merge_keys = ?, schema_evolution = ?, poll_interval_seconds = ?, enabled = ?,
+            cron_schedule = ?
         WHERE id = ?
     """, (
         name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        pipeline_id
+        cron_schedule, pipeline_id
     ))
     conn.commit()
     conn.close()
@@ -694,10 +726,19 @@ async def autoloader_daemon_loop():
                 if not p.get("enabled", 1):
                     continue
 
-                interval = max(5, int(p.get("poll_interval_seconds", 10)))
-                last_time = last_run_map.get(p_id, 0.0)
+                cron_expr = p.get("cron_schedule")
+                if cron_expr:
+                    # Scheduled pipelines run when a cron tick (UTC) has elapsed since the last run in the DB.
+                    try:
+                        due = cron_is_due(cron_expr, p.get("last_run_at") or p.get("created_at"), datetime.utcnow())
+                    except Exception as cron_err:
+                        logger.error(f"Auto-Loader pipeline {p_id}: bad cron '{cron_expr}': {cron_err}")
+                        continue
+                else:
+                    interval = max(5, int(p.get("poll_interval_seconds", 10)))
+                    due = (now - last_run_map.get(p_id, 0.0)) >= interval
 
-                if (now - last_time) >= interval:
+                if due:
                     last_run_map[p_id] = now
                     # Run cycle in background thread to avoid blocking asyncio event loop
                     await asyncio.to_thread(run_pipeline_cycle, p_id)
