@@ -153,6 +153,47 @@ def test_quarantine():
     check("quarantined file is not rescanned", res2.get("files_quarantined") == 0 and res2.get("files_ingested") == 0, res2)
 
 
+def test_fail_on_new_columns():
+    print("\n6. failOnNewColumns policy")
+    pipe, vol_dir = make_pipeline("fail_vol", "bronze_fail", schema_evolution="failOnNewColumns")
+    now = time.time()
+    drop_csv(vol_dir, "ok1.csv", 4, mtime=now - 20)
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    check("matching-schema file ingested", res.get("files_ingested") == 1, res)
+    drop_csv(vol_dir, "drift.csv", 3, extra_cols=True, mtime=now - 10)
+    drop_csv(vol_dir, "ok2.csv", 2, mtime=now)
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    check("drifted file is not ingested", res.get("files_ingested") == 1, res)
+    tbl = DeltaTable(delta_path("bronze_fail")).to_pyarrow_table()
+    check("target schema unchanged and 6 rows", set(tbl.column_names) == {"device_id", "temperature"} and tbl.num_rows == 6)
+    failed = [h for h in autoloader.get_pipeline_history(pipe["id"]) if h["status"] == "FAILED"]
+    check("drifted file flagged FAILED with a schema-mismatch reason",
+          len(failed) == 1 and "Schema mismatch" in (failed[0]["error_message"] or ""), failed)
+    check("UI alias 'fail' accepted", autoloader.normalize_schema_evolution("fail") == "failOnNewColumns")
+    try:
+        autoloader.normalize_schema_evolution("bogus")
+        check("unknown policy rejected", False)
+    except ValueError:
+        check("unknown policy rejected", True)
+
+
+def test_rescue():
+    print("\n7. rescue policy")
+    pipe, vol_dir = make_pipeline("rescue_vol", "bronze_rescue", schema_evolution="rescue")
+    now = time.time()
+    drop_csv(vol_dir, "r1.csv", 3, mtime=now - 10)
+    autoloader.run_pipeline_cycle(pipe["id"])
+    drop_csv(vol_dir, "r2.csv", 2, extra_cols=True, mtime=now)
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    check("file with unknown columns ingested", res.get("files_ingested") == 1, res)
+    tbl = DeltaTable(delta_path("bronze_rescue")).to_pyarrow_table()
+    check("schema not widened", set(tbl.column_names) == {"device_id", "temperature", "_rescued_data"}, tbl.column_names)
+    check("5 rows total", tbl.num_rows == 5)
+    rescued = [r for r in tbl.column("_rescued_data").to_pylist() if r]
+    check("unknown columns captured as JSON for 2 rows", len(rescued) == 2 and '"site": "plant_a"' in rescued[0], rescued)
+    check("clean rows have NULL _rescued_data", tbl.column("_rescued_data").null_count == 3)
+
+
 def main():
     autoloader.init_autoloader_db()
     try:
@@ -160,6 +201,8 @@ def main():
         test_ingest_and_idempotency()
         test_schema_evolution()
         test_quarantine()
+        test_fail_on_new_columns()
+        test_rescue()
     finally:
         shutil.rmtree(TMP_WAREHOUSE, ignore_errors=True)
     print()

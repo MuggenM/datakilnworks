@@ -131,7 +131,7 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     target_tbl = (data.get("target_table") or "").strip().lower()
     ingest_mode = (data.get("ingest_mode") or "append").strip().lower()
     merge_keys = (data.get("merge_keys") or "").strip()
-    schema_evol = (data.get("schema_evolution") or "addNewColumns").strip()
+    schema_evol = normalize_schema_evolution(data.get("schema_evolution"))
     poll_sec = max(5, int(data.get("poll_interval_seconds", 10)))
     enabled = 1 if data.get("enabled", True) else 0
 
@@ -178,7 +178,7 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     target_tbl = data.get("target_table", pipe["target_table"])
     ingest_mode = data.get("ingest_mode", pipe["ingest_mode"])
     merge_keys = data.get("merge_keys", pipe["merge_keys"])
-    schema_evol = data.get("schema_evolution", pipe["schema_evolution"])
+    schema_evol = normalize_schema_evolution(data.get("schema_evolution", pipe["schema_evolution"]))
     poll_sec = max(5, int(data.get("poll_interval_seconds", pipe["poll_interval_seconds"])))
     enabled = 1 if data.get("enabled", pipe["enabled"]) else 0
 
@@ -284,6 +284,67 @@ def _resolve_target_delta_path(catalog: str, schema: str, table_name: str) -> st
         return os.path.join(cat_dir, sch_clean, tbl_clean)
 
 
+SCHEMA_EVOLUTION_MODES = {
+    "addnewcolumns": "addNewColumns",
+    "failonnewcolumns": "failOnNewColumns",
+    "fail": "failOnNewColumns",
+    "rescue": "rescue",
+}
+RESCUED_COLUMN = "_rescued_data"
+
+
+def normalize_schema_evolution(value: Optional[str]) -> str:
+    """Maps user/UI input to a canonical schema-evolution policy name."""
+    key = (value or "addNewColumns").strip().lower()
+    if key not in SCHEMA_EVOLUTION_MODES:
+        raise ValueError(
+            f"Unknown schema evolution policy '{value}'. Use addNewColumns, failOnNewColumns or rescue."
+        )
+    return SCHEMA_EVOLUTION_MODES[key]
+
+
+def _apply_schema_policy(arrow_table: pa.Table, target_path: str, policy: str) -> pa.Table:
+    """
+    Enforces the schema-evolution policy against an existing target table.
+    - addNewColumns: unchanged (Delta schema_mode='merge' adds the columns on write).
+    - failOnNewColumns: raises if the file has columns unknown to the target.
+    - rescue: folds unknown columns into a JSON `_rescued_data` string column.
+    """
+    if policy == "rescue":
+        known = None
+        if os.path.exists(os.path.join(target_path, "_delta_log")):
+            known = {f.name.lower() for f in DeltaTable(target_path).schema().fields}
+            known.discard(RESCUED_COLUMN)
+        if known is None:
+            rescued = [None] * arrow_table.num_rows
+        else:
+            extra = [c for c in arrow_table.column_names if c.lower() not in known]
+            if extra:
+                extra_rows = arrow_table.select(extra).to_pylist()
+                rescued = [json.dumps(r, default=str) for r in extra_rows]
+                arrow_table = arrow_table.drop_columns(extra)
+            else:
+                rescued = [None] * arrow_table.num_rows
+        return arrow_table.append_column(RESCUED_COLUMN, pa.array(rescued, type=pa.string()))
+
+    if policy == "failOnNewColumns" and os.path.exists(os.path.join(target_path, "_delta_log")):
+        known = {f.name.lower() for f in DeltaTable(target_path).schema().fields}
+        extra = [c for c in arrow_table.column_names if c.lower() not in known]
+        if extra:
+            raise ValueError(
+                f"Schema mismatch: unknown column(s) {extra} (policy failOnNewColumns). "
+                "Change the pipeline's schema evolution policy or update the target table."
+            )
+    return arrow_table
+
+
+def _ensure_column_exists(target_path: str, arrow_table: pa.Table, column: str):
+    """Adds `column` to the Delta schema through an empty schema-merging append (needed before MERGE)."""
+    existing = {f.name for f in DeltaTable(target_path).schema().fields}
+    if column not in existing:
+        write_deltalake(target_path, arrow_table.slice(0, 0), mode="append", schema_mode="merge")
+
+
 def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_dir: str) -> Dict[str, Any]:
     """
     Ingests a single file into the pipeline's target Delta Lake table.
@@ -362,32 +423,39 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
     try:
         table_exists = os.path.exists(target_path) and os.path.exists(os.path.join(target_path, "_delta_log"))
         ingest_mode = pipeline.get("ingest_mode", "append").lower()
-        schema_evol = pipeline.get("schema_evolution", "addNewColumns")
+        schema_evol = normalize_schema_evolution(pipeline.get("schema_evolution"))
 
         if not table_exists or ingest_mode == "overwrite":
-            write_deltalake(target_path, arrow_table, mode="overwrite")
-        elif ingest_mode == "append":
-            schema_mode = "merge" if schema_evol == "addNewColumns" else "error"
-            write_deltalake(target_path, arrow_table, mode="append", schema_mode=schema_mode)
-        elif ingest_mode == "merge":
-            # Primary-Key Upsert
-            dt = DeltaTable(target_path)
-            raw_keys = pipeline.get("merge_keys") or ""
-            keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-            if not keys:
-                # Fallback to append if no merge keys defined
+            if schema_evol == "rescue":
+                # Fresh schema: nothing to rescue yet, but keep the column so later files can use it.
+                arrow_table = _apply_schema_policy(arrow_table, "", schema_evol)
+            write_deltalake(target_path, arrow_table, mode="overwrite", schema_mode="overwrite" if table_exists else None)
+        else:
+            arrow_table = _apply_schema_policy(arrow_table, target_path, schema_evol)
+            if ingest_mode == "append":
                 write_deltalake(target_path, arrow_table, mode="append", schema_mode="merge")
-            else:
-                predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
-                (dt.merge(
-                    source=arrow_table,
-                    predicate=predicate,
-                    source_alias="source",
-                    target_alias="target"
-                )
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute())
+            elif ingest_mode == "merge":
+                # Primary-Key Upsert
+                dt = DeltaTable(target_path)
+                raw_keys = pipeline.get("merge_keys") or ""
+                keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+                if not keys:
+                    # Fallback to append if no merge keys defined
+                    write_deltalake(target_path, arrow_table, mode="append", schema_mode="merge")
+                else:
+                    if schema_evol == "rescue":
+                        _ensure_column_exists(target_path, arrow_table, RESCUED_COLUMN)
+                        dt = DeltaTable(target_path)
+                    predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
+                    (dt.merge(
+                        source=arrow_table,
+                        predicate=predicate,
+                        source_alias="source",
+                        target_alias="target"
+                    )
+                    .when_matched_update_all()
+                    .when_not_matched_insert_all()
+                    .execute())
 
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
