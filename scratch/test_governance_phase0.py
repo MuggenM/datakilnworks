@@ -111,6 +111,11 @@ def test_auth_never_fails_open():
                 offenders.append(name)
     check("no endpoint keeps the 'except -> admin' fallback", not offenders, offenders)
 
+    text = open(os.path.join(BASE_DIR, "web", "app.py")).read()
+    swallowing = re.findall(r'await get_current_user\(request\)[^\n]*\n(?:[^\n]*\n){0,4}?\s*except Exception:\s*\n\s*(?:pass|user(?:_id)? = )', text)
+    check("no endpoint swallows an auth failure (defaults to admin, None or a client-supplied user)", not swallowing, swallowing[:2])
+    check("identity defaults of 'admin' are gone", not re.search(r'username = "admin"\n\s*is_admin = True\n\s*try:', text))
+
 
 def test_require_auth_mode():
     print("\n2. GOVERNANCE_REQUIRE_AUTH")

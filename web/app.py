@@ -4597,14 +4597,9 @@ class SavedQueryUpdateRequest(BaseModel):
 @app.get("/api/queries")
 async def list_saved_queries(request: Request, q: Optional[str] = None, tag: Optional[str] = None):
     from web.saved_queries import get_saved_queries
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     try:
         queries = get_saved_queries(q=q, tag=tag, user_id=username, is_admin=is_admin)
         return {"queries": queries}
@@ -4615,12 +4610,8 @@ async def list_saved_queries(request: Request, q: Optional[str] = None, tag: Opt
 @app.post("/api/queries")
 async def create_new_saved_query(payload: SavedQueryCreateRequest, request: Request):
     from web.saved_queries import create_saved_query
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     try:
         d = payload.dict()
         d["owner"] = username
@@ -4679,11 +4670,7 @@ async def list_query_history(
     user: Optional[str] = None
 ):
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
 
     target_user = user
     if current_user and current_user.get("role") == "user":
@@ -4823,14 +4810,9 @@ class DbtRunRequest(BaseModel):
 @app.get("/api/dbt/status")
 async def get_dbt_status_endpoint(request: Request):
     from web.dbt_service import get_dbt_status
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return get_dbt_status(user=username, is_admin=is_admin)
 
 @app.get("/api/dbt/models")
@@ -4849,12 +4831,8 @@ async def get_dbt_model_endpoint(model_name: str):
 @app.post("/api/dbt/run")
 async def run_dbt_endpoint(payload: DbtRunRequest, request: Request):
     from web.dbt_service import run_dbt_cli
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     res = run_dbt_cli(
         action=payload.action,
         select=payload.select,
@@ -4867,27 +4845,17 @@ async def run_dbt_endpoint(payload: DbtRunRequest, request: Request):
 @app.get("/api/dbt/runs")
 async def list_dbt_runs_endpoint(request: Request):
     from web.dbt_service import _load_runs_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return {"runs": _load_runs_history(user=username, is_admin=is_admin)}
 
 @app.get("/api/dbt/runs/{run_id}")
 async def get_dbt_run_endpoint(run_id: str, request: Request):
     from web.dbt_service import _load_runs_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     runs = _load_runs_history(user=username, is_admin=is_admin)
     matched = next((r for r in runs if r["run_id"] == run_id), None)
     if not matched:
@@ -5098,14 +5066,9 @@ async def genie_config_endpoint():
 
 @app.get("/api/genie/chats")
 async def list_genie_chats_endpoint(request: Request):
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     scope_user = None if is_admin else username
     chats = load_chats(user=scope_user, is_admin=is_admin)
     return {"chats": chats}
@@ -5113,25 +5076,16 @@ async def list_genie_chats_endpoint(request: Request):
 @app.post("/api/genie/chats")
 async def create_genie_chat_endpoint(request: Request, payload: Optional[CreateChatPayload] = None):
     title = payload.title if payload and payload.title else "New Exploration"
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     new_chat = create_chat(title=title, user=username)
     return new_chat
 
 @app.get("/api/genie/chats/{chat_id}")
 async def get_genie_chat_endpoint(chat_id: str, request: Request):
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     chat = get_chat(chat_id, user=username, is_admin=is_admin)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -5139,14 +5093,9 @@ async def get_genie_chat_endpoint(chat_id: str, request: Request):
 
 @app.delete("/api/genie/chats/{chat_id}")
 async def delete_genie_chat_endpoint(chat_id: str, request: Request):
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     ok = delete_chat(chat_id, user=username, is_admin=is_admin)
     if not ok:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -5156,14 +5105,9 @@ async def delete_genie_chat_endpoint(chat_id: str, request: Request):
 async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload, request: Request):
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     try:
         res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin)
         return res
@@ -5175,14 +5119,9 @@ async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload, req
 async def quick_ask_genie_endpoint(payload: GenieAskPayload, request: Request):
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     chat_id = payload.chat_id
     if not chat_id:
         new_chat = create_chat(title=payload.prompt[:35] + ("..." if len(payload.prompt) > 35 else ""), user=username)
@@ -5221,11 +5160,7 @@ async def search_endpoint(
 async def get_workspace_tree_endpoint(request: Request):
     from web.workspace import get_workspace_tree
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     try:
         user_home = f"Users/{current_user['username']}" if current_user else "Users/admin"
         return {
@@ -5241,11 +5176,7 @@ async def get_workspace_tree_endpoint(request: Request):
 async def get_workspace_file_endpoint(path: str, request: Request):
     from web.workspace import get_file_details, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     if not can_access_workspace_path(path, current_user):
         raise HTTPException(status_code=403, detail="Access denied: Cannot access another user's private workspace.")
     try:
@@ -5266,11 +5197,7 @@ class WorkspaceCreatePayload(BaseModel):
 async def create_workspace_item_endpoint(payload: WorkspaceCreatePayload, request: Request):
     from web.workspace import create_workspace_item, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     # If target_dir is empty, default to user's home folder
     target_dir = payload.target_dir or (f"Users/{current_user['username']}" if current_user else "")
     if not can_access_workspace_path(target_dir, current_user, write=True):
@@ -5294,11 +5221,7 @@ class WorkspaceRenamePayload(BaseModel):
 async def rename_workspace_item_endpoint(payload: WorkspaceRenamePayload, request: Request):
     from web.workspace import rename_workspace_item, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     if not can_access_workspace_path(payload.old_rel_path, current_user, write=True):
         raise HTTPException(status_code=403, detail="Access denied: Cannot rename another user's private workspace items.")
     try:
@@ -5311,11 +5234,7 @@ async def rename_workspace_item_endpoint(payload: WorkspaceRenamePayload, reques
 async def delete_workspace_item_endpoint(path: str, request: Request):
     from web.workspace import delete_workspace_item, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     if not can_access_workspace_path(path, current_user, write=True):
         raise HTTPException(status_code=403, detail="Access denied: Cannot delete another user's private workspace items.")
     try:
@@ -5449,12 +5368,8 @@ class RecentRecordPayload(BaseModel):
 @app.post("/api/recents")
 async def record_recent_endpoint(payload: RecentRecordPayload, request: Request):
     from web.recents import record_recent
-    user = "admin"
-    try:
-        current_user = await get_current_user(request)
-        user = current_user.get("username", "admin")
-    except Exception:
-        user = request.headers.get("X-User") or payload.user or "admin"
+    current_user = await resolve_principal(request)
+    user = current_user.get("username", "admin")
     try:
         return record_recent(
             item_type=payload.item_type,
@@ -5477,12 +5392,8 @@ async def get_recents_endpoint(
     user: Optional[str] = None
 ):
     from web.recents import get_recents
-    user_id = user
-    try:
-        current_user = await get_current_user(request)
-        user_id = current_user.get("username", "admin")
-    except Exception:
-        user_id = request.headers.get("X-User") or user or "admin"
+    current_user = await resolve_principal(request)
+    user_id = current_user.get("username", "admin")
     try:
         return get_recents(user_id=user_id, item_type=type, search=search, limit=limit)
     except Exception as e:
@@ -5497,12 +5408,8 @@ class RecentPinPayload(BaseModel):
 @app.post("/api/recents/pin")
 async def toggle_pin_recent_endpoint(payload: RecentPinPayload, request: Request):
     from web.recents import toggle_pin_recent
-    user = "admin"
-    try:
-        current_user = await get_current_user(request)
-        user = current_user.get("username", "admin")
-    except Exception:
-        user = request.headers.get("X-User") or payload.user or "admin"
+    current_user = await resolve_principal(request)
+    user = current_user.get("username", "admin")
     try:
         return toggle_pin_recent(item_type=payload.item_type, item_id=payload.item_id, user_id=user)
     except Exception as e:
@@ -5517,12 +5424,8 @@ async def delete_recent_endpoint(
     user: Optional[str] = None
 ):
     from web.recents import delete_recent
-    user_id = user
-    try:
-        current_user = await get_current_user(request)
-        user_id = current_user.get("username", "admin")
-    except Exception:
-        user_id = request.headers.get("X-User") or user or "admin"
+    current_user = await resolve_principal(request)
+    user_id = current_user.get("username", "admin")
     try:
         success = delete_recent(item_type=item_type, item_id=item_id, user_id=user_id)
         return {"success": success, "item_type": item_type, "item_id": item_id}
@@ -5538,12 +5441,8 @@ async def clear_recents_endpoint(
     user: Optional[str] = None
 ):
     from web.recents import clear_recents
-    user_id = user
-    try:
-        current_user = await get_current_user(request)
-        user_id = current_user.get("username", "admin")
-    except Exception:
-        user_id = request.headers.get("X-User") or user or "admin"
+    current_user = await resolve_principal(request)
+    user_id = current_user.get("username", "admin")
     try:
         count = clear_recents(user_id=user_id, item_type=type, include_pinned=include_pinned)
         return {"success": True, "deleted_count": count}
@@ -5737,11 +5636,7 @@ async def mlflow_create_experiment_api(request: Request):
     from web.experiments import mlflow_create_experiment
     from web.auth import get_current_user
     body = await request.json()
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else (request.headers.get("X-User") or "admin")
     try:
         res = mlflow_create_experiment(body.get("name", ""), body.get("artifact_location"), user_id=user_id)
@@ -5753,11 +5648,7 @@ async def mlflow_create_experiment_api(request: Request):
 async def mlflow_list_experiments_api(request: Request, view_type: str = "ACTIVE_ONLY"):
     from web.experiments import mlflow_list_experiments
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else None
     is_admin = (current_user.get("role") == "admin") if current_user else True
     return {"experiments": mlflow_list_experiments(view_type=view_type, user_id=user_id, is_admin=is_admin)}
@@ -5767,11 +5658,7 @@ async def mlflow_list_experiments_api(request: Request, view_type: str = "ACTIVE
 async def mlflow_search_experiments_api(request: Request, view_type: str = "ACTIVE_ONLY"):
     from web.experiments import mlflow_list_experiments
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else None
     is_admin = (current_user.get("role") == "admin") if current_user else True
     return {"experiments": mlflow_list_experiments(view_type=view_type, user_id=user_id, is_admin=is_admin)}
@@ -5844,11 +5731,7 @@ async def mlflow_create_run_api(request: Request):
     from web.experiments import mlflow_create_run
     from web.auth import get_current_user
     body = await request.json()
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else (request.headers.get("X-User") or "admin")
     try:
         run_data = mlflow_create_run(
@@ -6278,12 +6161,8 @@ async def api_playground_run(req: PlaygroundSingleRunRequest, request: Request):
         "top_p": req.top_p,
         "max_tokens": req.max_tokens
     }
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     return await run_and_record_single(
         config=config,
         rendered_prompt=req.prompt,
@@ -6297,12 +6176,8 @@ async def api_playground_run(req: PlaygroundSingleRunRequest, request: Request):
 async def api_playground_compare(req: PlaygroundCompareRunRequest, request: Request):
     from web.playground import run_comparison_prompts
     raw = req.raw_prompt if req.raw_prompt is not None else req.prompt
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     return await run_comparison_prompts(
         config_a=req.config_a,
         config_b=req.config_b,
@@ -6316,38 +6191,24 @@ async def api_playground_compare(req: PlaygroundCompareRunRequest, request: Requ
 @app.get("/api/playground/templates")
 async def api_playground_get_templates(request: Request, category: Optional[str] = None):
     from web.playground import get_templates
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return get_templates(category=category, user_id=username, is_admin=is_admin)
 
 @app.post("/api/playground/templates")
 async def api_playground_save_template(req: PlaygroundTemplateRequest, request: Request):
     from web.playground import save_template
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     return save_template(req.dict(), user_id=username)
 
 @app.delete("/api/playground/templates/{template_id}")
 async def api_playground_delete_template(template_id: str, request: Request):
     from web.playground import delete_template
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     ok = delete_template(template_id, user_id=username, is_admin=is_admin)
     if not ok:
         raise HTTPException(status_code=400, detail="Cannot delete template (might be built-in, not found, or not owned by you)")
@@ -6356,41 +6217,26 @@ async def api_playground_delete_template(template_id: str, request: Request):
 @app.get("/api/playground/history")
 async def api_playground_get_history(request: Request, limit: int = 50):
     from web.playground import get_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return get_history(limit=limit, user_id=username, is_admin=is_admin)
 
 @app.delete("/api/playground/history/{hist_id}")
 async def api_playground_delete_history(hist_id: str, request: Request):
     from web.playground import delete_history_item
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     ok = delete_history_item(hist_id, user_id=username, is_admin=is_admin)
     return {"status": "SUCCESS" if ok else "NOT_FOUND"}
 
 @app.delete("/api/playground/history")
 async def api_playground_clear_history(request: Request):
     from web.playground import clear_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     clear_history(user_id=username, is_admin=is_admin)
     return {"status": "SUCCESS"}
 
@@ -6486,13 +6332,10 @@ async def get_global_lineage_endpoint(
 ):
     from web.lineage import get_global_lineage
     allowed_catalogs = None
-    try:
-        current_user = await get_current_user(request)
-        if current_user.get("role") == "user":
-            perms = current_user.get("catalog_permissions") or []
-            allowed_catalogs = [p["catalog_id"] for p in perms] + ["warehouse", "dbt_analytics"]
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    if current_user.get("role") == "user":
+        perms = current_user.get("catalog_permissions") or []
+        allowed_catalogs = [p["catalog_id"] for p in perms] + ["warehouse", "dbt_analytics"]
     try:
         return get_global_lineage(layer=layer, schema=schema, search=search, allowed_catalogs=allowed_catalogs)
     except Exception as e:
