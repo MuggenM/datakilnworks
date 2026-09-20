@@ -94,6 +94,8 @@ def _log_security_posture():
 @app.on_event("startup")
 async def startup_event():
     _log_security_posture()
+    from web.governance.store import init_governance_db
+    init_governance_db()
     asyncio.create_task(cron_scheduler_loop())
     init_auth_db()
     from web.alerts import alerts_scheduler_loop, init_alerts_db
@@ -128,6 +130,9 @@ async def shutdown_event():
     """Cleanup on shutdown."""
     from web.scheduled_exports import shutdown_scheduler
     shutdown_scheduler()
+
+from web.governance import routes as governance_routes
+app.include_router(governance_routes.router)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -193,6 +198,10 @@ def get_duckrun_conn():
     else:
         sync_catalogs_with_duckrun(_duckrun_conn)
     return _duckrun_conn
+
+
+# Governance runs its metadata lookups (existence checks, column listings) on an isolated cursor.
+governance_routes.set_connection_provider(lambda: get_duckrun_conn().con.cursor())
 
 def clean_json_value(v: Any) -> Any:
     """Sanitizes individual values for RFC 7159/8259 compliant JSON serialization, replacing NaNs/Infs/NAs with None."""
