@@ -194,6 +194,49 @@ def test_rescue():
     check("clean rows have NULL _rescued_data", tbl.column("_rescued_data").null_count == 3)
 
 
+def test_streaming_large_file():
+    print("\n8. Streaming ingestion")
+    autoloader.BATCH_ROWS = 1000
+    pipe, vol_dir = make_pipeline("stream_vol", "bronze_stream")
+    now = time.time()
+    drop_csv(vol_dir, "big.csv", 10_500, mtime=now - 10)
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    check("large file ingested", res.get("rows_ingested") == 10_500, res)
+    dt = DeltaTable(delta_path("bronze_stream"))
+    check("all rows landed in one atomic Delta commit", dt.to_pyarrow_table().num_rows == 10_500 and dt.version() == 0,
+          f"version={dt.version()}")
+
+    # Bad value far past the CSV sniffing sample: fails mid-stream, must leave the table untouched.
+    path = drop_csv(vol_dir, "midbad.csv", 30_000, mtime=now)
+    with open(path, "a") as f:
+        f.write("dev_bad,not_a_number\n")
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    check("mid-stream corrupt file quarantined", res.get("files_quarantined") == 1, res)
+    check("no partial rows committed", DeltaTable(delta_path("bronze_stream")).to_pyarrow_table().num_rows == 10_500)
+    check("bad file moved to _quarantine/", not os.path.exists(path))
+
+    weird = drop_csv(vol_dir, "o'brien.csv", 2, mtime=now + 1)
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    check("file names containing quotes are ingested", res.get("files_ingested") == 1, res)
+    autoloader.BATCH_ROWS = int(os.getenv("AUTOLOADER_BATCH_ROWS", "100000"))
+
+
+def test_merge_mode():
+    print("\n9. Merge (upsert) mode")
+    pipe, vol_dir = make_pipeline("merge_vol", "bronze_merge", ingest_mode="merge", merge_keys="device_id")
+    now = time.time()
+    with open(os.path.join(vol_dir, "m1.csv"), "w") as f:
+        f.write("device_id,temperature\na,1\nb,2\n")
+    os.utime(os.path.join(vol_dir, "m1.csv"), (now - 10, now - 10))
+    autoloader.run_pipeline_cycle(pipe["id"])
+    with open(os.path.join(vol_dir, "m2.csv"), "w") as f:
+        f.write("device_id,temperature\nb,20\nc,3\n")
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    check("upsert file ingested", res.get("files_ingested") == 1, res)
+    rows = {r["device_id"]: r["temperature"] for r in DeltaTable(delta_path("bronze_merge")).to_pyarrow_table().to_pylist()}
+    check("existing key updated and new key inserted", rows == {"a": 1, "b": 20, "c": 3}, rows)
+
+
 def main():
     autoloader.init_autoloader_db()
     try:
@@ -203,6 +246,8 @@ def main():
         test_quarantine()
         test_fail_on_new_columns()
         test_rescue()
+        test_streaming_large_file()
+        test_merge_mode()
     finally:
         shutil.rmtree(TMP_WAREHOUSE, ignore_errors=True)
     print()

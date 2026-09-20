@@ -291,6 +291,7 @@ SCHEMA_EVOLUTION_MODES = {
     "rescue": "rescue",
 }
 RESCUED_COLUMN = "_rescued_data"
+BATCH_ROWS = int(os.getenv("AUTOLOADER_BATCH_ROWS", "100000"))
 
 
 def normalize_schema_evolution(value: Optional[str]) -> str:
@@ -303,46 +304,92 @@ def normalize_schema_evolution(value: Optional[str]) -> str:
     return SCHEMA_EVOLUTION_MODES[key]
 
 
-def _apply_schema_policy(arrow_table: pa.Table, target_path: str, policy: str) -> pa.Table:
+def _plan_schema_policy(columns: List[str], target_path: str, policy: str) -> List[str]:
     """
-    Enforces the schema-evolution policy against an existing target table.
-    - addNewColumns: unchanged (Delta schema_mode='merge' adds the columns on write).
+    Enforces the schema-evolution policy for a file's columns against an existing target table.
+    - addNewColumns: nothing to do (Delta schema_mode='merge' adds the columns on write).
     - failOnNewColumns: raises if the file has columns unknown to the target.
-    - rescue: folds unknown columns into a JSON `_rescued_data` string column.
+    - rescue: returns the unknown columns, which the caller folds into `_rescued_data`.
     """
-    if policy == "rescue":
-        known = None
-        if os.path.exists(os.path.join(target_path, "_delta_log")):
-            known = {f.name.lower() for f in DeltaTable(target_path).schema().fields}
-            known.discard(RESCUED_COLUMN)
-        if known is None:
-            rescued = [None] * arrow_table.num_rows
-        else:
-            extra = [c for c in arrow_table.column_names if c.lower() not in known]
-            if extra:
-                extra_rows = arrow_table.select(extra).to_pylist()
-                rescued = [json.dumps(r, default=str) for r in extra_rows]
-                arrow_table = arrow_table.drop_columns(extra)
-            else:
-                rescued = [None] * arrow_table.num_rows
-        return arrow_table.append_column(RESCUED_COLUMN, pa.array(rescued, type=pa.string()))
-
-    if policy == "failOnNewColumns" and os.path.exists(os.path.join(target_path, "_delta_log")):
-        known = {f.name.lower() for f in DeltaTable(target_path).schema().fields}
-        extra = [c for c in arrow_table.column_names if c.lower() not in known]
-        if extra:
-            raise ValueError(
-                f"Schema mismatch: unknown column(s) {extra} (policy failOnNewColumns). "
-                "Change the pipeline's schema evolution policy or update the target table."
-            )
-    return arrow_table
+    if policy == "addNewColumns" or not target_path or not os.path.exists(os.path.join(target_path, "_delta_log")):
+        return []
+    known = {f.name.lower() for f in DeltaTable(target_path).schema().fields}
+    known.discard(RESCUED_COLUMN)
+    extra = [c for c in columns if c.lower() not in known]
+    if extra and policy == "failOnNewColumns":
+        raise ValueError(
+            f"Schema mismatch: unknown column(s) {extra} (policy failOnNewColumns). "
+            "Change the pipeline's schema evolution policy or update the target table."
+        )
+    return extra if policy == "rescue" else []
 
 
-def _ensure_column_exists(target_path: str, arrow_table: pa.Table, column: str):
+def _rescue_schema(schema: pa.Schema, extra: List[str]) -> pa.Schema:
+    """Output schema of a rescue-policy stream: known columns plus a JSON string `_rescued_data`."""
+    fields = [f for f in schema if f.name not in extra]
+    return pa.schema(fields + [pa.field(RESCUED_COLUMN, pa.string())])
+
+
+def _rescue_batch(batch: pa.RecordBatch, extra: List[str]) -> List[pa.RecordBatch]:
+    """Moves `extra` columns of a batch into a JSON `_rescued_data` column (NULL when nothing was rescued)."""
+    table = pa.Table.from_batches([batch])
+    if extra:
+        rescued = [json.dumps(r, default=str) for r in table.select(extra).to_pylist()]
+        table = table.drop_columns(extra)
+    else:
+        rescued = [None] * table.num_rows
+    return table.append_column(RESCUED_COLUMN, pa.array(rescued, type=pa.string())).to_batches()
+
+
+def _ensure_column_exists(target_path: str, schema: pa.Schema, column: str):
     """Adds `column` to the Delta schema through an empty schema-merging append (needed before MERGE)."""
     existing = {f.name for f in DeltaTable(target_path).schema().fields}
     if column not in existing:
-        write_deltalake(target_path, arrow_table.slice(0, 0), mode="append", schema_mode="merge")
+        write_deltalake(target_path, schema.empty_table(), mode="append", schema_mode="merge")
+
+
+def _open_source_reader(duck_conn, file_path: str, ext_lower: str) -> pa.RecordBatchReader:
+    """Opens a streaming Arrow reader over a source file; nothing is materialized in memory."""
+    safe_path = file_path.replace("'", "''")
+    if ext_lower in ("csv", "tsv", "txt"):
+        query = f"SELECT * FROM read_csv_auto('{safe_path}')"
+    elif ext_lower == "parquet":
+        query = f"SELECT * FROM read_parquet('{safe_path}')"
+    elif ext_lower in ("json", "jsonl", "ndjson"):
+        query = f"SELECT * FROM read_json_auto('{safe_path}')"
+    else:
+        raise ValueError(f"Unsupported file format '.{ext_lower}' for Auto-Loader.")
+    return duck_conn.sql(query).fetch_arrow_reader(batch_size=BATCH_ROWS)
+
+
+def _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash, file_size,
+                     elapsed_ms, now_iso, err) -> Dict[str, Any]:
+    """Moves a malformed file into `_quarantine/`, records it in the checkpoint DB and returns the result."""
+    quarantine_dir = os.path.join(base_source_dir, "_quarantine")
+    os.makedirs(quarantine_dir, exist_ok=True)
+    quarantine_file_dest = os.path.join(quarantine_dir, f"{os.path.basename(file_path)}.{int(time.time())}.bad")
+    try:
+        shutil.move(file_path, quarantine_file_dest)
+        logger.warning(f"Quarantined corrupt file '{file_path}' -> '{quarantine_file_dest}': {err}")
+    except Exception as q_err:
+        logger.error(f"Failed to move file to quarantine: {q_err}")
+
+    db = get_db()
+    db.execute("""
+        INSERT OR REPLACE INTO autoloader_file_history (
+            pipeline_id, file_path, file_hash, file_size_bytes,
+            status, rows_ingested, execution_ms, error_message, ingested_at
+        ) VALUES (?, ?, ?, ?, 'QUARANTINED', 0, ?, ?, ?)
+    """, (pipeline_id, rel_path, file_hash, file_size, elapsed_ms, str(err), now_iso))
+    db.commit()
+    db.close()
+    return {
+        "status": "QUARANTINED",
+        "file_path": rel_path,
+        "rows": 0,
+        "error": str(err),
+        "execution_ms": elapsed_ms
+    }
 
 
 def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_dir: str) -> Dict[str, Any]:
@@ -369,94 +416,69 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
 
     now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Step 1: Read source file using DuckDB into PyArrow Table
+    # Step 1+2: Stream the source file through DuckDB into a single Delta commit.
+    # Batches flow lazily reader -> generator -> delta-rs, so memory stays bounded by BATCH_ROWS.
+    # The commit happens only after the whole stream is consumed, so a bad row midway aborts atomically.
     duck_conn = duckdb.connect(":memory:")
+    read_state = {"opened": False, "error": None, "rows": 0}
     try:
-        if ext_lower in ("csv", "tsv", "txt"):
-            query = f"SELECT * FROM read_csv_auto('{file_path}')"
-        elif ext_lower == "parquet":
-            query = f"SELECT * FROM read_parquet('{file_path}')"
-        elif ext_lower in ("json", "jsonl", "ndjson"):
-            query = f"SELECT * FROM read_json_auto('{file_path}')"
-        else:
-            raise ValueError(f"Unsupported file format '.{ext_lower}' for Auto-Loader.")
+        reader = _open_source_reader(duck_conn, file_path, ext_lower)
+        read_state["opened"] = True
 
-        arrow_reader = duck_conn.sql(query).arrow()
-        arrow_table = arrow_reader.read_all()
-        row_count = arrow_table.num_rows
-
-    except Exception as read_err:
-        duck_conn.close()
-        # Quarantine malformed file
-        quarantine_dir = os.path.join(base_source_dir, "_quarantine")
-        os.makedirs(quarantine_dir, exist_ok=True)
-        quarantine_file_dest = os.path.join(quarantine_dir, f"{os.path.basename(file_path)}.{int(time.time())}.bad")
-        try:
-            shutil.move(file_path, quarantine_file_dest)
-            logger.warning(f"Quarantined corrupt file '{file_path}' -> '{quarantine_file_dest}': {read_err}")
-        except Exception as q_err:
-            logger.error(f"Failed to move file to quarantine: {q_err}")
-
-        # Record in history
-        elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        db = get_db()
-        db.execute("""
-            INSERT OR REPLACE INTO autoloader_file_history (
-                pipeline_id, file_path, file_hash, file_size_bytes,
-                status, rows_ingested, execution_ms, error_message, ingested_at
-            ) VALUES (?, ?, ?, ?, 'QUARANTINED', 0, ?, ?, ?)
-        """, (pipeline_id, rel_path, file_hash, file_size, elapsed_ms, str(read_err), now_iso))
-        db.commit()
-        db.close()
-
-        return {
-            "status": "QUARANTINED",
-            "file_path": rel_path,
-            "rows": 0,
-            "error": str(read_err),
-            "execution_ms": elapsed_ms
-        }
-    finally:
-        duck_conn.close()
-
-    # Step 2: Write into Delta Lake with Schema Evolution & Ingest Mode
-    try:
         table_exists = os.path.exists(target_path) and os.path.exists(os.path.join(target_path, "_delta_log"))
         ingest_mode = pipeline.get("ingest_mode", "append").lower()
         schema_evol = normalize_schema_evolution(pipeline.get("schema_evolution"))
 
-        if not table_exists or ingest_mode == "overwrite":
-            if schema_evol == "rescue":
-                # Fresh schema: nothing to rescue yet, but keep the column so later files can use it.
-                arrow_table = _apply_schema_policy(arrow_table, "", schema_evol)
-            write_deltalake(target_path, arrow_table, mode="overwrite", schema_mode="overwrite" if table_exists else None)
-        else:
-            arrow_table = _apply_schema_policy(arrow_table, target_path, schema_evol)
-            if ingest_mode == "append":
-                write_deltalake(target_path, arrow_table, mode="append", schema_mode="merge")
-            elif ingest_mode == "merge":
-                # Primary-Key Upsert
-                dt = DeltaTable(target_path)
-                raw_keys = pipeline.get("merge_keys") or ""
-                keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-                if not keys:
-                    # Fallback to append if no merge keys defined
-                    write_deltalake(target_path, arrow_table, mode="append", schema_mode="merge")
-                else:
-                    if schema_evol == "rescue":
-                        _ensure_column_exists(target_path, arrow_table, RESCUED_COLUMN)
-                        dt = DeltaTable(target_path)
-                    predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
-                    (dt.merge(
-                        source=arrow_table,
-                        predicate=predicate,
-                        source_alias="source",
-                        target_alias="target"
-                    )
-                    .when_matched_update_all()
-                    .when_not_matched_insert_all()
-                    .execute())
+        out_schema = reader.schema
+        extra_cols: List[str] = []
+        if schema_evol == "rescue":
+            # A fresh (or overwritten) table has nothing to rescue against, but keeps the column for later files.
+            replacing = not table_exists or ingest_mode == "overwrite"
+            extra_cols = _plan_schema_policy(reader.schema.names, "" if replacing else target_path, schema_evol)
+            out_schema = _rescue_schema(reader.schema, extra_cols)
+        elif not (not table_exists or ingest_mode == "overwrite"):
+            _plan_schema_policy(reader.schema.names, target_path, schema_evol)
 
+        def _batches():
+            try:
+                for batch in reader:
+                    read_state["rows"] += batch.num_rows
+                    if schema_evol == "rescue":
+                        yield from _rescue_batch(batch, extra_cols)
+                    else:
+                        yield batch
+            except Exception as stream_err:
+                read_state["error"] = stream_err
+                raise
+
+        source = pa.RecordBatchReader.from_batches(out_schema, _batches())
+
+        if not table_exists or ingest_mode == "overwrite":
+            write_deltalake(target_path, source, mode="overwrite", schema_mode="overwrite" if table_exists else None)
+        elif ingest_mode == "append":
+            write_deltalake(target_path, source, mode="append", schema_mode="merge")
+        elif ingest_mode == "merge":
+            # Primary-Key Upsert
+            raw_keys = pipeline.get("merge_keys") or ""
+            keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+            if not keys:
+                # Fallback to append if no merge keys defined
+                write_deltalake(target_path, source, mode="append", schema_mode="merge")
+            else:
+                if schema_evol == "rescue":
+                    _ensure_column_exists(target_path, out_schema, RESCUED_COLUMN)
+                predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
+                (DeltaTable(target_path).merge(
+                    source=source,
+                    predicate=predicate,
+                    source_alias="source",
+                    target_alias="target"
+                )
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute())
+
+        row_count = read_state["rows"]
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         # Step 3: Record Successful Checkpoint
@@ -508,6 +530,10 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
 
     except Exception as write_err:
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        if not read_state["opened"] or read_state["error"] is not None:
+            # The source itself is unreadable/corrupt (not a Delta problem): quarantine it and keep going.
+            return _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash,
+                                    file_size, elapsed_ms, now_iso, read_state["error"] or write_err)
         db = get_db()
         db.execute("""
             INSERT OR REPLACE INTO autoloader_file_history (
@@ -527,6 +553,8 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
             "error": str(write_err),
             "execution_ms": elapsed_ms
         }
+    finally:
+        duck_conn.close()
 
 
 def run_pipeline_cycle(pipeline_id: str) -> Dict[str, Any]:
