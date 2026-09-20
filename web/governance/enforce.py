@@ -198,8 +198,9 @@ class _Ctx:
         self.subject = subject          # at least one masking policy applies -> allowlists + masking
         self.sandbox = sandbox          # non-admin: file sandbox applies
         cur = con.execute("SELECT current_database(), current_schema()").fetchone()
-        self.home_catalog = tags.norm(cur[0])
-        self.catalog = tags.norm(default_catalog) if default_catalog else self.home_catalog
+        self.session_catalog = tags.norm(cur[0])
+        self.home_catalog = self._warehouse_catalog() or self.session_catalog
+        self.catalog = tags.norm(default_catalog) if default_catalog else self.session_catalog
         self.schema = tags.norm(default_schema) if default_schema else tags.norm(cur[1])
         self._cols: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
         self._views: Optional[Dict[Tuple[str, str, str], str]] = None
@@ -209,6 +210,20 @@ class _Ctx:
         self.changed = False
         self.uses_file_scan = False
         self.use_texts: Dict[int, str] = {}     # USE statements are re-emitted verbatim (sqlglot mangles `USE catalog.schema`)
+
+    def _warehouse_catalog(self) -> Optional[str]:
+        """
+        The catalog that WAREHOUSE_DIR is attached as. Path scans of `<warehouse>/<schema>/<table>` belong to it no matter
+        which catalog the executing session happens to be in (cursors start in memory.main, workers in warehouse).
+        """
+        name = tags.norm(os.path.basename(os.path.normpath(os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")))).replace("-", "_")
+        for candidate in (name, "warehouse"):
+            try:
+                if catalog_meta.catalog_exists(self.con, candidate):
+                    return candidate
+            except Exception:
+                pass
+        return None
 
     def prefetch(self, candidates: List[Tuple[str, str, str]]) -> None:
         """

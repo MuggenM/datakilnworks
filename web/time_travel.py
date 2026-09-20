@@ -94,9 +94,24 @@ def sanitize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return res
 
 
-def get_version_preview(target_path: str, version: int, limit: int = 50) -> Dict[str, Any]:
+def _masked(arrow_tbl, user, catalog: str, schema_name: str, table_name: str):
+    """Masks an Arrow table for `user` (None = least privilege, never raw). Row counts stay real; displayed values are masked."""
+    from web.governance import gateway
+    return gateway.mask_arrow(arrow_tbl, catalog, schema_name, table_name, user)
+
+
+def _masked_df(df, user, catalog: str, schema_name: str, table_name: str):
+    import pyarrow as pa
+    if df is None or df.empty:
+        return df
+    return _masked(pa.Table.from_pandas(df, preserve_index=False), user, catalog, schema_name, table_name).to_pandas()
+
+
+def get_version_preview(target_path: str, version: int, limit: int = 50, *, user=None, catalog: str = "warehouse",
+                        schema_name: str = "", table_name: str = "") -> Dict[str, Any]:
     """
-    Loads a specific historical version of a Delta table and returns columns and sample rows.
+    Loads a specific historical version of a Delta table and returns columns and sample rows,
+    masked for `user` (governance): historical versions carry the same tagged columns as the live table.
     """
     dt = get_delta_table(target_path, version=version)
     schema_fields = dt.schema().fields
@@ -114,7 +129,7 @@ def get_version_preview(target_path: str, version: int, limit: int = 50) -> Dict
     total_rows = arrow_tbl.num_rows
 
     # Read slice for preview
-    slice_tbl = arrow_tbl.slice(0, limit)
+    slice_tbl = _masked(arrow_tbl.slice(0, limit), user, catalog, schema_name, table_name)
     df = slice_tbl.to_pandas()
     sample_rows = [sanitize_row(r) for r in df.to_dict(orient="records")]
 
@@ -130,7 +145,12 @@ def compare_table_versions(
     target_path: str,
     v1: int,
     v2: int,
-    sample_limit: int = 50
+    sample_limit: int = 50,
+    *,
+    user=None,
+    catalog: str = "warehouse",
+    schema_name: str = "",
+    table_name: str = ""
 ) -> Dict[str, Any]:
     """
     Computes a deep visual difference between version v1 (earlier/reference) and v2 (later/target).
@@ -189,7 +209,7 @@ def compare_table_versions(
             added_query = f"SELECT {col_list_sql} FROM t2 EXCEPT SELECT {col_list_sql} FROM t1"
             added_cnt_res = conn.sql(f"SELECT COUNT(*) FROM ({added_query})").fetchone()
             added_count = int(added_cnt_res[0]) if added_cnt_res else 0
-            added_df = conn.sql(f"{added_query} LIMIT {sample_limit}").df()
+            added_df = _masked_df(conn.sql(f"{added_query} LIMIT {sample_limit}").df(), user, catalog, schema_name, table_name)
             added_rows = [sanitize_row(r) for r in added_df.to_dict(orient="records")]
         except Exception as e:
             logger.warning(f"Failed to calculate added rows: {e}")
@@ -199,7 +219,7 @@ def compare_table_versions(
             deleted_query = f"SELECT {col_list_sql} FROM t1 EXCEPT SELECT {col_list_sql} FROM t2"
             deleted_cnt_res = conn.sql(f"SELECT COUNT(*) FROM ({deleted_query})").fetchone()
             deleted_count = int(deleted_cnt_res[0]) if deleted_cnt_res else 0
-            deleted_df = conn.sql(f"{deleted_query} LIMIT {sample_limit}").df()
+            deleted_df = _masked_df(conn.sql(f"{deleted_query} LIMIT {sample_limit}").df(), user, catalog, schema_name, table_name)
             deleted_rows = [sanitize_row(r) for r in deleted_df.to_dict(orient="records")]
         except Exception as e:
             logger.warning(f"Failed to calculate deleted rows: {e}")

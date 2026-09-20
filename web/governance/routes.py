@@ -12,26 +12,23 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from web.auth import resolve_principal, get_user_by_username
-from web.governance import catalog_meta, classify, macros, masks, policies, store, tags
+from web.governance import catalog_meta, classify, gateway, macros, masks, policies, store, tags
 from web.permissions import can_user_access_catalog, can_user_manage_catalog
 
 logger = logging.getLogger("localspark.governance")
 
 router = APIRouter(prefix="/api/governance", tags=["governance"])
 
-_connection_provider = None
-
-
 def set_connection_provider(provider) -> None:
-    """app.py injects a callable returning a DuckDB connection (avoids importing app from here)."""
-    global _connection_provider
-    _connection_provider = provider
+    """app.py injects a callable returning a DuckDB cursor (avoids importing app from here)."""
+    gateway.set_connection_provider(provider)
 
 
 def _con():
-    if _connection_provider is None:
+    try:
+        return gateway._cursor()
+    except RuntimeError:
         raise HTTPException(status_code=503, detail="Governance is not connected to the query engine.")
-    return _connection_provider()
 
 
 async def principal(request: Request) -> Dict[str, Any]:

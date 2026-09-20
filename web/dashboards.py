@@ -363,7 +363,7 @@ def resolve_query_parameters(query: str, params: Optional[Dict[str, Any]] = None
 
     return resolved
 
-def get_dashboard_filter_options(conn, dashboard_id: str) -> Dict[str, Any]:
+def get_dashboard_filter_options(conn, dashboard_id: str, principal=None) -> Dict[str, Any]:
     """
     Returns available filter configurations and dynamic dropdown options
     queried from the active Lakehouse tables.
@@ -382,7 +382,11 @@ def get_dashboard_filter_options(conn, dashboard_id: str) -> Dict[str, Any]:
         dimension = f.get("dimension")
         if table and dimension:
             try:
-                res = conn.sql(f"SELECT DISTINCT {dimension} FROM {table} WHERE {dimension} IS NOT NULL ORDER BY 1 LIMIT 50").df()
+                from web.governance import gateway
+                option_sql = gateway.governed_sql_or_raise(
+                    f"SELECT DISTINCT {dimension} FROM {table} WHERE {dimension} IS NOT NULL ORDER BY 1 LIMIT 50",
+                    principal, client="dashboard-filter")
+                res = conn.sql(option_sql).df()
                 vals = ["ALL"] + [str(v) for v in res[dimension].tolist() if v is not None]
                 options[key] = vals
             except Exception as e:
@@ -409,9 +413,9 @@ def json_serializable_row(row: Dict[str, Any]) -> Dict[str, Any]:
             new_row[k] = v
     return new_row
 
-def get_cache_key(query: str, params: Optional[Dict[str, Any]] = None) -> str:
-    """Generate a unique cache key from query and parameters."""
-    cache_str = query + json.dumps(params or {}, sort_keys=True)
+def get_cache_key(query: str, params: Optional[Dict[str, Any]] = None, mask_fingerprint: str = "") -> str:
+    """Generate a unique cache key from query, parameters and the masks the result was computed under."""
+    cache_str = query + json.dumps(params or {}, sort_keys=True) + "|masks:" + mask_fingerprint
     return hashlib.md5(cache_str.encode()).hexdigest()
 
 def get_cached_result(cache_key: str) -> Optional[Dict[str, Any]]:
@@ -544,18 +548,27 @@ def list_dashboard_shares(dashboard_id: Optional[str] = None) -> List[Dict[str, 
 
     return sorted(shares, key=lambda x: x["created_at"], reverse=True)
 
-def execute_widget_query(conn, query: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    # Check cache first
-    cache_key = get_cache_key(query, params)
+def execute_widget_query(conn, query: str, params: Optional[Dict[str, Any]] = None, principal=None) -> Dict[str, Any]:
+    """
+    Runs a widget query for `principal` (a user dict or Principal). A missing principal means least privilege, never
+    admin. The result cache is keyed by the set of masks the query ran under, so a result computed for an exempt
+    viewer is never served to a masked one (and vice versa).
+    """
+    from web.governance import gateway
+    resolved_query = resolve_query_parameters(query, params)
+    gov = gateway.govern_sql(resolved_query, principal, client="dashboard")
+    if gov.blocked:
+        return {"success": False, "query_id": None, "query_executed": resolved_query, "columns": [], "rows": [], "row_count": 0,
+                "elapsed_ms": 0, "error": gov.blocked, "governance_blocked": True, "from_cache": False, "masked_columns": []}
+    cache_key = get_cache_key(query, params, gateway.fingerprint(gov))
     cached = get_cached_result(cache_key)
     if cached:
         cached['from_cache'] = True
         return cached
 
     start = time.perf_counter()
-    resolved_query = resolve_query_parameters(query, params)
     try:
-        res = conn.sql(resolved_query)
+        res = conn.sql(gov.sql)
         df = res.df()
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
         columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
@@ -571,7 +584,8 @@ def execute_widget_query(conn, query: str, params: Optional[Dict[str, Any]] = No
             "row_count": len(rows),
             "elapsed_ms": elapsed_ms,
             "error": None,
-            "from_cache": False
+            "from_cache": False,
+            "masked_columns": gateway.masked_columns_payload(gov)
         }
 
         # Cache the result

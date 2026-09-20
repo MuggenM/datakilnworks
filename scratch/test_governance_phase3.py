@@ -263,6 +263,9 @@ def test_paths(delta_dir):
     check("the registered Delta view is masked", rows_ok(rows) and rows[0][1] == "a***@example.com" and rows[0][2] == "*******6789", (rows, res.blocked))
     check("...exactly once (its own tags and its delta_scan path resolve to the same table)",
           res.sql.count("gov_mask_email") == 1 and res.sql.count("gov_mask_partial") == 1, res.sql)
+    rows, res = run(f"SELECT * FROM delta_scan('{delta_dir}')", home=None)
+    check("path scans are attributed to the warehouse catalog even from a session that starts in memory.main",
+          rows_ok(rows) and not leaks(rows) and res.changed, (rows, res.blocked, res.sql[:160]))
     check("computed path is refused", run("SELECT * FROM read_parquet('/tmp/' || 'x.parquet')")[1].blocked)
     check("read_text on a masked table's files is refused", run(f"SELECT * FROM read_text('{delta_dir}/_delta_log/00000000000000000000.json')")[1].blocked)
     check("query() is refused", run("SELECT * FROM query('SELECT * FROM warehouse.hr.employees')")[1].blocked)

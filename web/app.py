@@ -29,6 +29,8 @@ from web.auth import (
 )
 from web import auth_frameworks, llm_settings
 from web.compute_auth import compute_headers
+from web.governance import gateway as gov_gateway
+from web.governance.enforce import GovernanceBlocked
 from web import onelake
 from web.permissions import (
     can_user_access_catalog, can_user_manage_catalog, can_user_delete_catalog,
@@ -207,6 +209,14 @@ def get_duckrun_conn():
 
 # Governance runs its metadata lookups (existence checks, column listings) on an isolated cursor.
 governance_routes.set_connection_provider(lambda: get_duckrun_conn().con.cursor())
+
+
+def _gov_or_403(sql: str, user, *, catalog: Optional[str] = None, client: str = "sql", trusted: bool = False) -> str:
+    """Runs `sql` through the governance gateway for `user`; returns the SQL to execute or raises HTTP 403."""
+    try:
+        return gov_gateway.governed_sql_or_raise(sql, user, catalog=catalog, client=client, trusted=trusted)
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 def clean_json_value(v: Any) -> Any:
     """Sanitizes individual values for RFC 7159/8259 compliant JSON serialization, replacing NaNs/Infs/NAs with None."""
@@ -975,8 +985,15 @@ class OneLakeQueryRequest(BaseModel):
     filters: Optional[List] = None
 
 @app.post("/api/catalogs/onelake/{catalog_id}/query")
-async def query_onelake_table_endpoint(catalog_id: str, payload: OneLakeQueryRequest):
+async def query_onelake_table_endpoint(catalog_id: str, payload: OneLakeQueryRequest, request: Request):
     """Query OneLake table."""
+    onelake_user = await resolve_principal(request)
+    if not can_user_access_catalog(onelake_user, catalog_id, action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot query catalog '{catalog_id}'.")
+    try:
+        gov_gateway.deny_if_subject(onelake_user, "Direct OneLake queries")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     catalog = onelake.get_onelake_catalog(catalog_id)
 
     if not catalog:
@@ -1221,8 +1238,13 @@ async def scale_warehouse_endpoint(wh_id: str, payload: Dict[str, Any]):
     return res
 
 @app.post("/api/compute/warehouses/{wh_id}/distributed-query")
-async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any]):
+async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any], request: Request):
     """Executes a distributed Map-Reduce query across Delta Lake Parquet partitions using Ray tasks."""
+    scan_user = await resolve_principal(request)
+    try:
+        gov_gateway.deny_if_subject(scan_user, "Distributed Delta scans")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     table_path = payload.get("table_path")
     select_clause = payload.get("select", "*")
     where_clause = payload.get("where", "")
@@ -1232,6 +1254,10 @@ async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any]):
 
     if not os.path.isabs(table_path):
         table_path = os.path.join(WAREHOUSE_DIR, table_path)
+    if scan_user.get("role") != "admin":
+        from web.governance.enforce import resolve_path
+        if resolve_path(table_path, "warehouse").kind != "table":
+            raise HTTPException(status_code=403, detail="Only warehouse tables can be scanned.")
 
     res = ray_manager.execute_distributed_delta_scan(
         warehouse_id=wh_id,
@@ -1279,10 +1305,9 @@ async def drop_table_api(schema_name: str, table_name: str, catalog: Optional[st
 @app.get("/api/table/{schema_name}/{table_name}")
 async def get_table_details(schema_name: str, table_name: str, catalog: Optional[str] = None, request: Request = None):
     cat_id = catalog or "warehouse"
-    if request:
-        current_user = await resolve_principal(request)
-        if not can_user_access_catalog(current_user, cat_id, action="READ"):
-            raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
+    current_user = await resolve_principal(request)
+    if not can_user_access_catalog(current_user, cat_id, action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
     # Check if catalog is an external storage mount
     from web.mounts import load_mounts
     mounts = {m["catalog_name"]: m for m in load_mounts() if m.get("enabled", True)}
@@ -1575,7 +1600,8 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
             else:
                 query_target = f"{catalog}.{schema_name}.{table_name}"
 
-            df = conn.sql(f"SELECT * FROM {query_target} LIMIT {int(limit)}").df()
+            preview_sql = _gov_or_403(f"SELECT * FROM {query_target} LIMIT {int(limit)}", current_user, catalog=catalog, client="preview")
+            df = conn.sql(preview_sql).df()
             df_clean = df.replace({np.nan: None, np.inf: None, -np.inf: None})
             rows = [
                 {col: clean_json_value(val) for col, val in row.items()}
@@ -1651,7 +1677,7 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
         else:
             query = f"SELECT * FROM delta_scan('{target_path}') LIMIT {limit}"
 
-        res = conn.sql(query)
+        res = conn.sql(_gov_or_403(query, current_user, catalog=catalog, client="preview"))
         df = res.df()
         columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
         rows = [json_serializable_row(row) for row in df.to_dict(orient="records")]
@@ -1660,6 +1686,8 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
             "rows": rows,
             "row_count": len(rows)
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1695,6 +1723,19 @@ async def execute_sql(payload: QueryRequest, request: Request):
     conn = get_duckrun_conn()
     wh = apply_warehouse_compute(conn, payload.warehouse_id)
     start_time = time.perf_counter()
+
+    # Column masking / statement gating. `query` stays the user's text (history, lineage); `run_sql` is what executes,
+    # and it is what every dispatch path below (worker, Ray, local) receives.
+    fallback_note = "Studio (local DuckDB)"        # executed_by label when no worker/Ray pool ran the query
+    gov = await asyncio.to_thread(gov_gateway.govern_sql, query, current_user, catalog=payload.catalog, client="sql_editor")
+    if gov.blocked:
+        qid = log_query(query_text=query, duration_ms=0, rows_produced=0, status="FAILED", error_message=gov.blocked,
+                        client="SQL_EDITOR", warehouse_id=wh["id"] if wh else "wh_starter", catalog=payload.catalog or "warehouse",
+                        user=current_user.get("username", "admin"))
+        return {"success": False, "query_id": qid, "error": gov.blocked, "governance_blocked": True, "elapsed_ms": 0,
+                "warehouse_id": wh["id"] if wh else "wh_starter"}
+    run_sql = gov.sql
+    masked_info = gov_gateway.masked_columns_payload(gov)
 
     execution_id = payload.execution_id or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
     active_entry = {
@@ -1737,7 +1778,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                                 resp = client.post(
                                     f"{ep}/api/compute/execute",
                                     json={
-                                        "query": query,
+                                        "query": run_sql,
                                         "warehouse_id": wh["id"],
                                         "catalog": payload.catalog or "warehouse",
                                         "execution_id": execution_id
@@ -1753,7 +1794,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
             # 2. Attempt Ray Actor Pool Dispatch (if Ray is active or warehouse has ray_workers configured)
             if wh and RAY_INSTALLED and (wh.get("id") in ray_manager.actor_pools or wh.get("ray_workers", 0) > 0):
                 try:
-                    ray_res = ray_manager.execute_query(wh["id"], query)
+                    ray_res = ray_manager.execute_query(wh["id"], run_sql)
                     if ray_res and ray_res.get("success"):
                         return ("remote", {
                             "success": True,
@@ -1769,14 +1810,14 @@ async def execute_sql(payload: QueryRequest, request: Request):
 
             # 3. Local In-Process DuckDB Execution (with dedicated cursor isolation & interrupt support)
             is_delta_special = (
-                any(k in query.lower() for k in ["describe detail", "describe history", "restore table", "vacuum"])
-                or any(query.strip().lower().startswith(p) for p in ["insert ", "update ", "delete ", "merge "])
+                any(k in run_sql.lower() for k in ["describe detail", "describe history", "restore table", "vacuum"])
+                or any(run_sql.strip().lower().startswith(p) for p in ["insert ", "update ", "delete ", "merge "])
             )
             if not is_delta_special:
                 cur = conn.con.cursor()
                 active_entry["cursor"] = cur
                 try:
-                    res = cur.sql(query)
+                    res = cur.sql(run_sql)
                     if res is not None and hasattr(res, "df"):
                         df = res.df()
                         columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
@@ -1797,7 +1838,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                         pass
             else:
                 active_entry["cursor"] = conn.con
-                res = conn.sql(query)
+                res = conn.sql(run_sql)
                 if res is not None and hasattr(res, "df"):
                     df = res.df()
                     columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
@@ -1840,6 +1881,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 res_data["execution_id"] = execution_id
                 return res_data
             elif res_data.get("success"):
+                res_data["masked_columns"] = masked_info
                 qid = log_query(
                     query_text=query,
                     duration_ms=elapsed_ms,
@@ -1850,7 +1892,8 @@ async def execute_sql(payload: QueryRequest, request: Request):
                     warehouse_id=wh["id"] if wh else "wh_starter",
                     catalog=payload.catalog or "warehouse",
                     user=current_user.get("username", "admin"),
-                    executed_by=node_id
+                    executed_by=node_id,
+                    masked_columns=len(masked_info)
                 )
                 res_data["query_id"] = qid
                 res_data["execution_id"] = execution_id
@@ -1885,10 +1928,12 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 warehouse_id=wh["id"] if wh else "wh_starter",
                 catalog=payload.catalog or "warehouse",
                 user=current_user.get("username", "admin"),
-                executed_by=fallback_note
+                executed_by=fallback_note,
+                masked_columns=len(masked_info)
             )
             return {
                 "success": True,
+                "masked_columns": masked_info,
                 "query_id": qid,
                 "execution_id": execution_id,
                 "is_mutation": False,
@@ -2106,11 +2151,17 @@ async def export_sql_parquet_endpoint(payload: Dict[str, Any], request: Request)
     # Strategy 2: If query is provided, execute COPY via active DuckDB session
     if query:
         import tempfile
+        export_user = await resolve_principal(request)
+        try:
+            enforce_sql_permissions(query, export_user, action="READ")
+        except HTTPException as e_perm:
+            raise HTTPException(status_code=403, detail=e_perm.detail)
+        governed_query = await asyncio.to_thread(_gov_or_403, query.rstrip("; \t\n"), export_user, client="export")
         try:
             def do_export_query():
                 conn = get_duckrun_conn()
                 raw_conn = getattr(conn, "con", conn)
-                clean_q = query.rstrip("; \t\n")
+                clean_q = governed_query
                 with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
                     tmp_path = tmp.name
                 try:
@@ -2164,8 +2215,12 @@ async def profile_sql(payload: QueryRequest, request: Request):
     wh = apply_warehouse_compute(conn, payload.warehouse_id)
     start_time = time.perf_counter()
 
+    gov = await asyncio.to_thread(gov_gateway.govern_sql, query, current_user, catalog=payload.catalog, client="profile")
+    if gov.blocked:
+        return {"success": False, "error": gov.blocked, "governance_blocked": True, "elapsed_ms": 0, "profile": None}
+
     try:
-        res = execute_profiled_query(conn, query)
+        res = execute_profiled_query(conn, gov.sql)
         elapsed_ms = res["elapsed_ms"]
         profile_obj = res.get("profile")
         profile_json_str = json.dumps(profile_obj) if profile_obj else None
@@ -2742,6 +2797,10 @@ class IngestCommitRequest(BaseModel):
 
 @app.post("/api/ingest/create")
 async def ingest_create(payload: IngestCommitRequest, request: Request):
+    # file_id comes back from the client: it must be exactly the id /api/ingest/preview handed out, or the wizard
+    # becomes an arbitrary file reader (e.g. ingesting a tagged table's parquet files into an untagged table).
+    if not re.fullmatch(r"upload_[0-9a-f]{12}\.[A-Za-z0-9]{1,8}", payload.file_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid upload id.")
     temp_path = os.path.join(UPLOADS_DIR, payload.file_id)
     if not os.path.exists(temp_path):
         raise HTTPException(status_code=404, detail="Uploaded file session expired or not found. Please upload again.")
@@ -3063,7 +3122,7 @@ async def list_dashboards():
     }
 
 @app.get("/api/dashboards/{dashboard_id}")
-async def get_dashboard(dashboard_id: str, params: Optional[str] = None):
+async def get_dashboard(dashboard_id: str, request: Request, params: Optional[str] = None):
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -3079,12 +3138,13 @@ async def get_dashboard(dashboard_id: str, params: Optional[str] = None):
         except Exception:
             pass
 
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
-    filter_data = get_dashboard_filter_options(conn, target["id"])
+    filter_data = get_dashboard_filter_options(conn, target["id"], principal=current_user)
     hydrated_widgets = []
     for w in target.get("widgets", []):
         w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], parsed_params)
+        exec_res = execute_widget_query(conn, w["query"], parsed_params, principal=current_user)
         w_copy["result"] = exec_res
         hydrated_widgets.append(w_copy)
 
@@ -3102,17 +3162,18 @@ class DashboardQueryParams(BaseModel):
     parameters: Optional[Dict[str, Any]] = {}
 
 @app.post("/api/dashboards/{dashboard_id}/query")
-async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams):
+async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams, request: Request):
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Dashboard not found")
 
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     hydrated_widgets = []
     for w in target.get("widgets", []):
         w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], payload.parameters or {})
+        exec_res = execute_widget_query(conn, w["query"], payload.parameters or {}, principal=current_user)
         w_copy["result"] = exec_res
         hydrated_widgets.append(w_copy)
 
@@ -3122,9 +3183,10 @@ async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams):
     }
 
 @app.get("/api/dashboards/{dashboard_id}/filters")
-async def get_dashboard_filters(dashboard_id: str):
+async def get_dashboard_filters(dashboard_id: str, request: Request):
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
-    return get_dashboard_filter_options(conn, dashboard_id)
+    return get_dashboard_filter_options(conn, dashboard_id, principal=current_user)
 
 class CreateDashboardRequest(BaseModel):
     name: str
@@ -3182,7 +3244,7 @@ class WidgetPayload(BaseModel):
     history_query_id: Optional[str] = None
 
 @app.post("/api/dashboards/{dashboard_id}/widgets")
-async def add_widget(dashboard_id: str, payload: WidgetPayload):
+async def add_widget(dashboard_id: str, payload: WidgetPayload, request: Request):
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -3210,9 +3272,10 @@ async def add_widget(dashboard_id: str, payload: WidgetPayload):
     target["widgets"].append(new_widget)
     save_dashboards_store(dashboards)
 
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     new_widget_copy = dict(new_widget)
-    new_widget_copy["result"] = execute_widget_query(conn, new_widget["query"])
+    new_widget_copy["result"] = execute_widget_query(conn, new_widget["query"], principal=current_user)
     return new_widget_copy
 
 @app.delete("/api/dashboards/{dashboard_id}/widgets/{widget_id}")
@@ -3227,7 +3290,7 @@ async def delete_widget(dashboard_id: str, widget_id: str):
     return {"success": True, "deleted_widget_id": widget_id}
 
 @app.get("/api/dashboards/{dashboard_id}/widgets/{widget_id}/export")
-async def export_widget(dashboard_id: str, widget_id: str, format: str = "csv", params: Optional[str] = None):
+async def export_widget(dashboard_id: str, widget_id: str, request: Request, format: str = "csv", params: Optional[str] = None):
     """
     Export widget data in CSV or Parquet format.
     Params:
@@ -3255,9 +3318,10 @@ async def export_widget(dashboard_id: str, widget_id: str, format: str = "csv", 
             filter_params = {}
 
     # Execute the query
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     query = target_widget.get("query", "")
-    result = execute_widget_query(conn, query, filter_params)
+    result = execute_widget_query(conn, query, filter_params, principal=current_user)
 
     if not result.get("success"):
         raise HTTPException(status_code=500, detail=f"Query failed: {result.get('error')}")
@@ -4568,9 +4632,10 @@ class PreviewWidgetRequest(BaseModel):
     query: str
 
 @app.post("/api/dashboards/preview-widget")
-async def preview_widget(payload: PreviewWidgetRequest):
+async def preview_widget(payload: PreviewWidgetRequest, request: Request):
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
-    exec_res = execute_widget_query(conn, payload.query.strip())
+    exec_res = execute_widget_query(conn, payload.query.strip(), principal=current_user)
     return exec_res
 
 
@@ -4697,7 +4762,8 @@ async def get_single_query_history(query_id: str):
     return record
 
 @app.get("/api/history/{query_id}/profile")
-async def get_history_query_profile(query_id: str):
+async def get_history_query_profile(query_id: str, request: Request):
+    profile_user = await resolve_principal(request)
     record = get_query_by_id(query_id)
     if not record:
         raise HTTPException(status_code=404, detail="Query audit record not found")
@@ -4711,7 +4777,10 @@ async def get_history_query_profile(query_id: str):
 
     # If not previously profiled, execute profiled query on-demand
     conn = get_duckrun_conn()
-    res = execute_profiled_query(conn, record["query_text"])
+    governed = await asyncio.to_thread(gov_gateway.govern_sql, record["query_text"], profile_user, client="history-profile")
+    if governed.blocked:
+        return {"success": False, "error": governed.blocked}
+    res = execute_profiled_query(conn, governed.sql)
     if res.get("profile"):
         save_query_profile(query_id, json.dumps(res["profile"]))
         return {"success": True, "query_id": query_id, "profile": res["profile"]}
@@ -4761,7 +4830,13 @@ async def list_jobs_endpoint():
     return {"jobs": enriched}
 
 @app.post("/api/jobs")
-async def save_job_endpoint(payload: Dict[str, Any]):
+async def save_job_endpoint(payload: Dict[str, Any], request: Request):
+    user = await resolve_principal(request)
+    existing = get_job(payload.get("id")) if payload.get("id") else None
+    if existing and existing.get("created_by") and user.get("role") != "admin" and existing["created_by"] != user.get("username"):
+        raise HTTPException(status_code=403, detail="Only the job's owner or an admin can change it.")
+    # Ownership is server-side: jobs run as their owner, so the client must not be able to name one.
+    payload["created_by"] = (existing or {}).get("created_by") or user.get("username")
     saved = create_or_update_job(payload)
     return saved
 
@@ -4774,14 +4849,19 @@ async def get_job_endpoint(job_id: str):
     return {"job": job, "runs": runs}
 
 @app.delete("/api/jobs/{job_id}")
-async def delete_job_endpoint(job_id: str):
+async def delete_job_endpoint(job_id: str, request: Request):
+    user = await resolve_principal(request)
+    existing = get_job(job_id)
+    if existing and existing.get("created_by") and user.get("role") != "admin" and existing["created_by"] != user.get("username"):
+        raise HTTPException(status_code=403, detail="Only the job's owner or an admin can delete it.")
     ok = delete_job(job_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"success": True, "deleted_id": job_id}
 
 @app.post("/api/jobs/{job_id}/run")
-async def trigger_job_run_endpoint(job_id: str):
+async def trigger_job_run_endpoint(job_id: str, request: Request):
+    await resolve_principal(request)          # authentication only: the job itself runs as its owner
     try:
         res = run_pipeline(job_id, trigger="MANUAL")
         return res
@@ -4832,6 +4912,11 @@ async def get_dbt_model_endpoint(model_name: str):
 async def run_dbt_endpoint(payload: DbtRunRequest, request: Request):
     from web.dbt_service import run_dbt_cli
     current_user = await resolve_principal(request)
+    try:
+        # dbt executes model SQL as the system and materialises raw results into an ungoverned database
+        gov_gateway.deny_if_subject(current_user, "Running dbt")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     username = current_user.get("username", "admin")
     res = run_dbt_cli(
         action=payload.action,
@@ -4863,12 +4948,20 @@ async def get_dbt_run_endpoint(run_id: str, request: Request):
     return matched
 
 @app.get("/api/dbt/preview/{model_name}")
-async def preview_dbt_model_endpoint(model_name: str, limit: int = 50):
+async def preview_dbt_model_endpoint(model_name: str, request: Request, limit: int = 50):
+    try:
+        gov_gateway.deny_if_subject(await resolve_principal(request), "dbt model preview")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     from web.dbt_service import preview_dbt_model_data
     return preview_dbt_model_data(model_name, limit=limit)
 
 @app.get("/api/dbt/cte-preview/{model_name}/{cte_name}")
-async def preview_dbt_cte_endpoint(model_name: str, cte_name: str, limit: int = 50):
+async def preview_dbt_cte_endpoint(model_name: str, cte_name: str, request: Request, limit: int = 50):
+    try:
+        gov_gateway.deny_if_subject(await resolve_principal(request), "dbt CTE preview")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     from web.dbt_service import preview_cte_step
     return preview_cte_step(model_name, cte_name, limit=limit)
 
@@ -4994,7 +5087,11 @@ async def delete_dbt_source_endpoint(payload: DbtSourceDeleteRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/dbt/sources/{source_name}/{table_name}/preview")
-async def preview_dbt_source_endpoint(source_name: str, table_name: str, limit: int = 50):
+async def preview_dbt_source_endpoint(source_name: str, table_name: str, request: Request, limit: int = 50):
+    try:
+        gov_gateway.deny_if_subject(await resolve_principal(request), "dbt source preview")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     from web.dbt_service import preview_dbt_source
     return preview_dbt_source(source_name=source_name, table_name=table_name, limit=limit)
 
@@ -5109,7 +5206,7 @@ async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload, req
     username = current_user.get("username", "admin")
     is_admin = current_user.get("role") == "admin"
     try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin)
+        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
@@ -5127,7 +5224,7 @@ async def quick_ask_genie_endpoint(payload: GenieAskPayload, request: Request):
         new_chat = create_chat(title=payload.prompt[:35] + ("..." if len(payload.prompt) > 35 else ""), user=username)
         chat_id = new_chat["id"]
     try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin)
+        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
@@ -6261,15 +6358,20 @@ async def get_table_diff_endpoint(
     table_name: str,
     v1: int,
     v2: int,
+    request: Request,
     catalog: Optional[str] = "warehouse",
     limit: int = 50
 ):
     from web.time_travel import resolve_table_path, compare_table_versions
+    diff_user = await resolve_principal(request)
+    if not can_user_access_catalog(diff_user, catalog or "warehouse", action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
     try:
-        return compare_table_versions(path, v1, v2, sample_limit=limit)
+        return compare_table_versions(path, v1, v2, sample_limit=limit, user=diff_user, catalog=cat_id or catalog or "warehouse",
+                                      schema_name=schema_name, table_name=table_name)
     except Exception as e:
         logger.error(f"Error diffing table versions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -6305,15 +6407,20 @@ async def preview_table_version_endpoint(
     schema_name: str,
     table_name: str,
     version: int,
+    request: Request,
     catalog: Optional[str] = "warehouse",
     limit: int = 50
 ):
     from web.time_travel import resolve_table_path, get_version_preview
+    preview_user = await resolve_principal(request)
+    if not can_user_access_catalog(preview_user, catalog or "warehouse", action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
     try:
-        return get_version_preview(path, version, limit=limit)
+        return get_version_preview(path, version, limit=limit, user=preview_user, catalog=cat_id or catalog or "warehouse",
+                                   schema_name=schema_name, table_name=table_name)
     except Exception as e:
         logger.error(f"Error previewing version: {e}")
         raise HTTPException(status_code=400, detail=str(e))

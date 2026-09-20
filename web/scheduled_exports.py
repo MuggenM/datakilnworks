@@ -175,7 +175,11 @@ def execute_scheduled_export(schedule_id: str):
             return
 
         # Get database connection
-        conn = duckrun.get_connection()
+        conn = duckrun.connect(WAREHOUSE_DIR, read_only=True)   # duckrun has no get_connection(); exports never ran before
+        from web.governance import gateway
+        gateway.ensure_masks(conn)
+        # Exports run as the schedule's owner (role resolved now): a masked owner gets masked files.
+        owner = gateway.principal_for_username(schedule.get("created_by"))
 
         # Create export directory for this run
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -194,7 +198,7 @@ def execute_scheduled_export(schedule_id: str):
                 if not query:
                     continue
 
-                result = execute_widget_query(conn, query)
+                result = execute_widget_query(conn, query, principal=owner)
 
                 if not result or "rows" not in result:
                     continue
