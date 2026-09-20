@@ -293,7 +293,8 @@ def get_compute_nodes_status() -> List[Dict[str, Any]]:
                         "avg_duration_ms": data.get("avg_duration_ms", 0.0),
                         "duckdb_version": data.get("duckdb_version", "1.5.5"),
                         "duckrun_version": data.get("duckrun_version", "0.4.68"),
-                        "last_query_at": data.get("last_query_at")
+                        "last_query_at": data.get("last_query_at"),
+                        "governance_masks_installed": data.get("governance_masks_installed")
                     })
                     break
             except Exception:

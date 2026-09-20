@@ -80,6 +80,26 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Data Kiln Works Studio", version="2.4.0", docs_url="/api/docs", redoc_url="/api/redoc")
 
+async def _governance_reconcile_loop(interval_seconds: int = 6 * 3600):
+    """Flags tags whose table/column no longer exists (orphans) at startup and every few hours; never deletes them."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            from web.governance import tags as gov_tags
+            cur = get_duckrun_conn().con.cursor()
+            try:
+                result = await asyncio.to_thread(gov_tags.reconcile, cur, "system")
+            finally:
+                cur.close()
+            if result["orphaned"] or result["restored"]:
+                logger.info(f"Governance reconcile: {result}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e_rec:
+            logger.warning(f"Governance reconcile failed: {e_rec}")
+        await asyncio.sleep(interval_seconds)
+
+
 def _log_security_posture():
     """Warns about configurations that undermine the governance trust boundary."""
     from web.notebook_access import restrict_notebooks, DEFAULT_TOKEN
@@ -98,6 +118,7 @@ async def startup_event():
     _log_security_posture()
     from web.governance.store import init_governance_db
     init_governance_db()
+    asyncio.create_task(_governance_reconcile_loop())
     asyncio.create_task(cron_scheduler_loop())
     init_auth_db()
     from web.alerts import alerts_scheduler_loop, init_alerts_db
@@ -1268,10 +1289,13 @@ async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any], r
     return res
 
 @app.delete("/api/table/{schema_name}/{table_name}")
-async def drop_table_api(schema_name: str, table_name: str, catalog: Optional[str] = "warehouse"):
+async def drop_table_api(schema_name: str, table_name: str, request: Request, catalog: Optional[str] = "warehouse"):
     schema_clean = sanitize_identifier(schema_name)
     table_clean = sanitize_identifier(table_name)
     target_catalog = catalog or "warehouse"
+    drop_user = await resolve_principal(request)
+    if not can_user_access_catalog(drop_user, target_catalog, action="WRITE"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot modify catalog '{target_catalog}'.")
 
     conn = get_duckrun_conn()
     if target_catalog != "warehouse":
@@ -1296,6 +1320,14 @@ async def drop_table_api(schema_name: str, table_name: str, catalog: Optional[st
             logger.info(f"Purged dropped table directory: {dt_path}")
     except Exception as e:
         logger.warning(f"Error removing dropped table directory {dt_path}: {e}")
+
+    try:
+        from web.governance import tags as gov_tags
+        removed = gov_tags.drop_object(target_catalog, schema_clean, table_clean, actor=drop_user.get("username", "system"))
+        if removed:
+            logger.info(f"Removed {removed} governance tag(s) of dropped table {table_ref}")
+    except Exception as e_tags:
+        logger.warning(f"Could not clean governance tags of {table_ref}: {e_tags}")
 
     return {
         "success": True,
@@ -1855,6 +1887,13 @@ async def execute_sql(payload: QueryRequest, request: Request):
 
         res_kind, res_data = await asyncio.to_thread(_execute_sync)
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
+        # An exempt user who materialises raw tagged columns into a new table must not create an untagged raw copy.
+        if gov.exempt_reads and (res_kind in ("select", "mutation") or (res_kind == "remote" and res_data.get("success"))):
+            try:
+                await asyncio.to_thread(gov_gateway.propagate_tags, query, current_user, gov, catalog=payload.catalog)
+            except Exception as e_prop:
+                logger.warning(f"Tag propagation failed: {e_prop}")
 
         try:
             from web.lineage import record_query_lineage

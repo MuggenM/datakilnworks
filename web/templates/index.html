@@ -1651,6 +1651,9 @@
               <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Tag assignments</div><div class="text-sm font-mono font-bold text-slate-900 dark:text-white" x-text="govStatus.tag_assignments"></div></div>
               <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Mask functions</div><div class="text-sm font-mono font-bold" :class="govStatus.masks_installed ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'" x-text="govStatus.masks_installed ? 'installed' : 'MISSING'"></div></div>
             </div>
+            <template x-if="(govStatus.workers || []).some(w => w.status === 'ONLINE' && w.masks_installed === false)">
+              <div class="text-[11px] p-3 rounded-lg border border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/30 text-red-800 dark:text-red-200 flex items-center space-x-1.5"><i class="ph ph-warning-octagon"></i><span>A compute node cannot run masked SQL (mask functions are missing). Masked queries routed to it fail closed; restart the node.</span></div>
+            </template>
             <div class="text-[11px] p-3 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 space-y-1">
               <div class="font-semibold flex items-center space-x-1.5"><i class="ph ph-warning"></i><span>Trust boundary</span></div>
               <div>JupyterLab notebooks and anything that can read the warehouse files directly are <strong>outside</strong> column masking.

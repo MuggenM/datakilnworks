@@ -302,6 +302,17 @@ def _masks_for(ident: Tuple[str, str, str], ctx: _Ctx, principal: Principal) -> 
     return policies.masks_for_table(ident[0], ident[1], ident[2], cols, principal)
 
 
+def _record_exempt_reads(ident: Tuple[str, str, str], ctx: _Ctx, specs: List[MaskSpec]) -> None:
+    """
+    Columns of `ident` that a fully non-exempt principal would lose but this principal reads raw. Includes the mixed
+    case (exempt from some policies, masked by others): only the columns still masked are excluded.
+    """
+    still_masked = {s.column for s in specs}
+    for g in _would_mask_for_exempt(ident, ctx):
+        if g.column not in still_masked:
+            ctx.exempt_reads.append(MaskedColumn(_label(ident), g.column, g.policy_id, g.policy_name, g.mask_type))
+
+
 def _would_mask_for_exempt(ident: Tuple[str, str, str], ctx: _Ctx) -> List[MaskSpec]:
     """Columns a *non-exempt* principal would lose here (used to audit exempt reads such as admins)."""
     ghost = Principal(username="\u0000audit", role="user")
@@ -396,11 +407,9 @@ def _rewrite_table_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack: Tuple[Tuple
 
     # -- masks on the object itself --------------------------------------------------------------------------------
     specs = _masks_for(ident, ctx, ctx.principal) if ident not in inner_masked else []
+    if ident not in inner_masked:            # (masked inside the view body already: nothing was read raw)
+        _record_exempt_reads(ident, ctx, specs)
     if not specs:
-        ghost = _would_mask_for_exempt(ident, ctx)
-        if ghost:
-            for s in ghost:
-                ctx.exempt_reads.append(MaskedColumn(_label(ident), s.column, s.policy_id, s.policy_name, s.mask_type))
         if view_body_replaced:
             tbl.replace(_with_alias(source, alias_node))
         return inner_masked | ({ident} if view_body_replaced else set())
@@ -499,9 +508,8 @@ def _rewrite_function_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack) -> Set[T
             raise _Block(f"Cannot verify the columns of '{_label(ident)}' for masking.")
         return set()
     specs = _masks_for(ident, ctx, ctx.principal)
+    _record_exempt_reads(ident, ctx, specs)
     if not specs:
-        for s in _would_mask_for_exempt(ident, ctx):
-            ctx.exempt_reads.append(MaskedColumn(_label(ident), s.column, s.policy_id, s.policy_name, s.mask_type))
         return set()
     if fn_name not in COLUMN_SCAN_FUNCS:
         raise _Block(f"'{fn_name}' cannot read files of '{_label(ident)}': it has masked columns "

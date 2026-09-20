@@ -633,6 +633,16 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
         db.commit()
         db.close()
 
+        # Rescued columns may hold values of unknown columns (potentially personal data): flag them for review.
+        if schema_evol == "rescue":
+            try:
+                from web.governance import tags as gov_tags
+                gov_tags.set_tag(catalog=pipeline["target_catalog"], schema_name=pipeline["target_schema"],
+                                 table_name=pipeline["target_table"], column_name=RESCUED_COLUMN, tag_key="sensitivity",
+                                 tag_value="unclassified", actor="autoloader", source="propagated")
+            except Exception as gov_err:
+                logger.debug(f"Governance tag for {RESCUED_COLUMN} skipped: {gov_err}")
+
         # Step 4: Lineage DAG Sync (one VOLUME -> TABLE edge per pipeline, not one node per file)
         sync_pipeline_lineage(pipeline, last_file=rel_path)
 

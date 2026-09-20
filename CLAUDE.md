@@ -54,8 +54,9 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 - `web/governance/` holds tags (`tags.py`), masking policies and masks (`policies.py`, `masks.py`, `macros.py`), the query gateway (`enforce.py`, `gateway.py`) and the REST router (`routes.py`). State lives in `warehouse/.metadata/governance.db`.
 - **Every code path that runs SQL on behalf of a user must go through the gateway** (`gateway.govern_sql`, `governed_sql_or_raise`, `_gov_or_403` in `app.py`, `masked_relation`, or `mask_arrow` for data Python already holds). Use the *rewritten* SQL for execution and the user's own text for history. Identity comes from `resolve_principal(request)` (never fall back to admin on errors), or `gateway.principal_for_username(owner)` for background work; a missing identity is least privilege.
 - `scratch/test_governance_coverage.py` scans `web/*.py` for DuckDB execution sites; a new one must call the gateway or be added to `web/governance/ALLOWLIST.md` with a reason.
+- Statements that create tables from tagged columns are followed by `gateway.propagate_tags(...)` (SQL editor, job SQL tasks); do the same in any new path that runs user DML.
 - Caches of query results must be keyed by `gateway.fingerprint(result)` (the set of masks the result was computed under).
-- Tests: `scratch/test_governance_phase{0,1,2,3,4}.py` (run inside the studio container against a throwaway warehouse whose directory is named `warehouse`), `scratch/test_governance_coverage.py` (host), `scratch/verify_governance_ui.py` (Playwright, throwaway instance only).
+- Tests: `scratch/test_governance_phase{0..6}.py` (run inside the studio container against a throwaway warehouse whose directory is named `warehouse`), `scratch/test_governance_coverage.py` (host), `scratch/verify_governance_ui.py` (Playwright, throwaway instance only).
 
 ## Conventions
 

@@ -373,7 +373,18 @@ async def governance_status(user: Dict[str, Any] = Depends(principal)):
         "policies_enabled": len(policies.enabled_policies()),
         "masks_installed": macros.macros_installed(con),
         "posture": _posture(),
+        "workers": _workers(),
     }
+
+
+def _workers() -> List[Dict[str, Any]]:
+    """Whether each compute node can run masked SQL (the studio polls their status; nodes without masks fail closed)."""
+    try:
+        from web.warehouses import get_compute_nodes_status
+        return [{"node_id": n.get("node_id"), "status": n.get("status"), "masks_installed": n.get("governance_masks_installed")}
+                for n in get_compute_nodes_status()]
+    except Exception:
+        return []
 
 
 def _posture() -> Dict[str, Any]:

@@ -378,6 +378,8 @@ def test_exemptions_audit_modes():
     check("MASK_APPLIED lists tables, columns and policies but no values or SQL",
           "warehouse.hr.employees.email" in applied["detail"]["columns"] and "Email masking" in applied["detail"]["policies"]
           and not leaks([applied["detail"]]) and "SELECT" not in str(applied["detail"]), applied)
+    check("a masked user reading a Delta view records no exempt read (it was masked inside the view)",
+          not any(e["action"] == "EXEMPT_READ" and e["actor"] == "analyst_bob" for e in ev), [e for e in ev if e["action"] == "EXEMPT_READ"][:2])
     ex = next(e for e in ev if e["action"] == "EXEMPT_READ")
     check("EXEMPT_READ names the admin and the columns read raw", ex["actor"] == "admin" and "warehouse.hr.employees.email" in ex["detail"]["columns"], ex)
 
@@ -387,6 +389,19 @@ def test_exemptions_audit_modes():
     check("per-user exemption: lead is not nulled by the priority-1 policy but is still partial-masked by the next", rows[0][0] == "a***@example.com", rows)
     rows, _ = run("SELECT email FROM warehouse.hr.employees ORDER BY id", BOB)
     check("...while everyone else is nulled by it", rows[0][0] is None, rows)
+    by_name = {p["name"]: p for p in policies.list_policies()}
+    saved = {n: by_name[n]["except_users"] for n in ("PII partial", "Email masking")}
+    for n in saved:
+        policies.update_policy(by_name[n]["id"], {"except_users": ["lead_engineer"]})
+    cur = Env.con.cursor()
+    cur.execute("USE warehouse.hr")
+    mixed = enforce.rewrite_for_principal("SELECT email, ssn, salary FROM warehouse.hr.employees", LEAD, cur)
+    cur.close()
+    for n, users in saved.items():
+        policies.update_policy(by_name[n]["id"], {"except_users": users})
+    check("mixed case: exempt from the PII policies but masked by the salary policy",
+          {m.column for m in mixed.masked} == {"salary"} and {m.column for m in mixed.exempt_reads} == {"email", "ssn"},
+          ([m.column for m in mixed.masked], [m.column for m in mixed.exempt_reads]))
     policies.delete_policy(ep["id"])
 
     os.environ["GOVERNANCE_ENFORCEMENT"] = "audit"

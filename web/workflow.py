@@ -221,6 +221,11 @@ def execute_task(task: Dict[str, Any], conn, principal=None) -> Dict[str, Any]:
             if governed.blocked:
                 raise ValueError(f"Blocked by governance: {governed.blocked}")
             res = conn.sql(governed.sql)
+            if governed.exempt_reads:
+                try:
+                    gateway.propagate_tags(query, principal, governed, con=getattr(conn, "con", conn).cursor())
+                except Exception as e_prop:
+                    logger.warning(f"Tag propagation failed for job task: {e_prop}")
             duration_sec = round(time.perf_counter() - t0, 3)
             row_count = 0
             if res is not None and hasattr(res, "df"):

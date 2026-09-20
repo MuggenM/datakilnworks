@@ -83,6 +83,22 @@ def govern_sql(sql: str, user, *, catalog: Optional[str] = None, client: str = "
                 pass
 
 
+def propagate_tags(sql: str, user, result: RewriteResult, *, catalog: Optional[str] = None, con=None) -> List[Dict[str, str]]:
+    """After a successful CREATE TABLE AS / INSERT ... SELECT by an exempt principal: tag the new table like its sources."""
+    from web.governance import propagate
+    principal = user if isinstance(user, Principal) else principal_for(user)
+    own = con is None
+    cur = con if con is not None else _cursor()
+    try:
+        return propagate.propagate_after(sql, principal, result, cur, default_catalog=catalog or "warehouse")
+    finally:
+        if own:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+
 def governed_sql_or_raise(sql: str, user, **kw) -> str:
     result = govern_sql(sql, user, **kw)
     if result.blocked:
