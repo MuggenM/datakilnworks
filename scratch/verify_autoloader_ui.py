@@ -72,7 +72,7 @@ def main():
         page.wait_for_selector("text=Volume Auto-Loader", state="visible")
         time.sleep(1)
         baseline_errors = len(errors)
-        print(f"  (info) {baseline_errors} JS errors already occur on initial page load, before any Auto-Loader interaction")
+        check("no JS / Alpine errors on initial page load", baseline_errors == 0, errors[:3])
         check("demo pipeline card rendered", page.locator("text=IoT Sensor Telemetry Auto-Loader").first.is_visible())
         page.screenshot(path=f"{OUT_DIR}/01_autoloader_dark.png")
 

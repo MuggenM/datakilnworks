@@ -7905,7 +7905,8 @@
           </div>
 
           <!-- Right Column: Waterfall Timeline & Span Details Inspector (w-2/3) -->
-          <div class="flex-1 flex flex-col bg-slate-50 dark:bg-slate-950 overflow-hidden" x-show="selectedTrace">
+          <template x-if="selectedTrace">
+          <div class="flex-1 flex flex-col bg-slate-50 dark:bg-slate-950 overflow-hidden">
             <!-- Selected Trace Header Banner -->
             <div class="p-4 border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-sidebar/60 flex items-center justify-between shrink-0">
               <div class="flex items-center space-x-3">
@@ -8031,7 +8032,8 @@
               </div>
 
               <!-- Bottom Half: Selected Span Inspector (Inputs, Outputs, Attributes) -->
-              <div class="h-1/2 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950" x-show="selectedSpan">
+              <template x-if="selectedSpan">
+              <div class="h-1/2 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950">
                 <!-- Span Header Bar -->
                 <div class="h-10 border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-sidebar/80 px-4 flex items-center justify-between shrink-0">
                   <div class="flex items-center space-x-2 truncate">
@@ -8100,6 +8102,7 @@
                   </div>
                 </div>
               </div>
+              </template>
 
               <!-- Empty Span Details State -->
               <div class="h-1/2 flex items-center justify-center text-slate-400 p-6" x-show="!selectedSpan">
@@ -8138,6 +8141,7 @@
               </div>
             </div>
           </div>
+          </template>
 
           <!-- Empty Detail State (No Trace Selected) -->
           <div class="flex-1 flex flex-col items-center justify-center p-8 text-center" x-show="!selectedTrace">
@@ -12034,7 +12038,7 @@
             <div class="flex items-center space-x-2">
               <span x-show="selectedExpRunDetail?.tags_dict?.['delta.table_version']" class="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-100 dark:bg-purple-950/80 text-purple-800 dark:text-purple-300 border border-purple-300 dark:border-purple-800 font-bold flex items-center space-x-1">
                 <i class="ph ph-clock-counter-clockwise text-xs"></i>
-                <span x-text="'DELTA COMMIT v' + selectedExpRunDetail.tags_dict['delta.table_version']"></span>
+                <span x-text="'DELTA COMMIT v' + selectedExpRunDetail?.tags_dict?.['delta.table_version']"></span>
               </span>
               <button @click="openLineageForRun(selectedExpRunDetail)" class="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-700 text-white font-semibold text-[11px] flex items-center space-x-1.5 shadow-sm transition">
                 <i class="ph ph-graph text-xs"></i>
