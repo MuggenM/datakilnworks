@@ -118,6 +118,16 @@ def get_pipeline(pipeline_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+INGEST_MODES = ("append", "merge", "overwrite")
+
+
+def _validate_pipeline_mode(ingest_mode: str, merge_keys: str):
+    if ingest_mode not in INGEST_MODES:
+        raise ValueError(f"Unknown ingest mode '{ingest_mode}'. Use append, merge or overwrite.")
+    if ingest_mode == "merge" and not _parse_merge_keys(merge_keys):
+        raise ValueError("Merge mode requires at least one merge key (comma-separated column names).")
+
+
 def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str, Any]:
     """Creates a new Auto-Loader pipeline."""
     init_autoloader_db()
@@ -135,6 +145,7 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     poll_sec = max(5, int(data.get("poll_interval_seconds", 10)))
     enabled = 1 if data.get("enabled", True) else 0
 
+    _validate_pipeline_mode(ingest_mode, merge_keys)
     if not source_vol:
         raise ValueError("Source volume path is required (e.g. /Volumes/warehouse/raw/iot_stream).")
     if not target_tbl:
@@ -181,6 +192,8 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     schema_evol = normalize_schema_evolution(data.get("schema_evolution", pipe["schema_evolution"]))
     poll_sec = max(5, int(data.get("poll_interval_seconds", pipe["poll_interval_seconds"])))
     enabled = 1 if data.get("enabled", pipe["enabled"]) else 0
+    ingest_mode = (ingest_mode or "append").strip().lower()
+    _validate_pipeline_mode(ingest_mode, merge_keys)
 
     conn = get_db()
     conn.execute("""
@@ -341,11 +354,34 @@ def _rescue_batch(batch: pa.RecordBatch, extra: List[str]) -> List[pa.RecordBatc
     return table.append_column(RESCUED_COLUMN, pa.array(rescued, type=pa.string())).to_batches()
 
 
-def _ensure_column_exists(target_path: str, schema: pa.Schema, column: str):
-    """Adds `column` to the Delta schema through an empty schema-merging append (needed before MERGE)."""
+def _evolve_schema_for_merge(target_path: str, schema: pa.Schema):
+    """
+    Adds columns that the source has but the target lacks through an empty schema-merging append.
+    delta-rs MERGE cannot add columns itself, so this must run before it.
+    """
     existing = {f.name for f in DeltaTable(target_path).schema().fields}
-    if column not in existing:
+    if any(f.name not in existing for f in schema):
         write_deltalake(target_path, schema.empty_table(), mode="append", schema_mode="merge")
+
+
+def _build_merge_predicate(keys: List[str], source_columns: List[str]) -> str:
+    """
+    Builds the MERGE join predicate. Each key must be an actual source column (matched case-insensitively)
+    and is emitted as a quoted identifier, so pipeline config can never inject SQL.
+    """
+    by_lower = {c.lower(): c for c in source_columns}
+    clauses = []
+    for key in keys:
+        column = by_lower.get(key.lower())
+        if column is None:
+            raise ValueError(f"Merge key '{key}' is not a column of the incoming file (columns: {source_columns}).")
+        quoted = '"' + column.replace('"', '""') + '"'
+        clauses.append(f"target.{quoted} = source.{quoted}")
+    return " AND ".join(clauses)
+
+
+def _parse_merge_keys(raw: Optional[str]) -> List[str]:
+    return [k.strip() for k in (raw or "").split(",") if k.strip()]
 
 
 def _open_source_reader(duck_conn, file_path: str, ext_lower: str) -> pa.RecordBatchReader:
@@ -459,24 +495,19 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
             write_deltalake(target_path, source, mode="append", schema_mode="merge")
         elif ingest_mode == "merge":
             # Primary-Key Upsert
-            raw_keys = pipeline.get("merge_keys") or ""
-            keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-            if not keys:
-                # Fallback to append if no merge keys defined
-                write_deltalake(target_path, source, mode="append", schema_mode="merge")
-            else:
-                if schema_evol == "rescue":
-                    _ensure_column_exists(target_path, out_schema, RESCUED_COLUMN)
-                predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
-                (DeltaTable(target_path).merge(
-                    source=source,
-                    predicate=predicate,
-                    source_alias="source",
-                    target_alias="target"
-                )
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute())
+            predicate = _build_merge_predicate(_parse_merge_keys(pipeline.get("merge_keys")), out_schema.names)
+            _evolve_schema_for_merge(target_path, out_schema)
+            (DeltaTable(target_path).merge(
+                source=source,
+                predicate=predicate,
+                source_alias="source",
+                target_alias="target"
+            )
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute())
+        else:
+            raise ValueError(f"Unknown ingest mode '{ingest_mode}'.")
 
         row_count = read_state["rows"]
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)

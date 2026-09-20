@@ -237,6 +237,49 @@ def test_merge_mode():
     check("existing key updated and new key inserted", rows == {"a": 1, "b": 20, "c": 3}, rows)
 
 
+def test_merge_key_safety():
+    print("\n10. Merge key validation")
+    for bad in (dict(ingest_mode="merge"), dict(ingest_mode="merge", merge_keys="  ,"), dict(ingest_mode="upsert")):
+        try:
+            make_pipeline(f"badcfg_{abs(hash(str(bad)))}", "t_badcfg", **bad)
+            check(f"rejects config {bad}", False)
+        except ValueError:
+            check(f"rejects config {bad}", True)
+
+    pipe, vol_dir = make_pipeline("mkey_vol", "bronze_mkey", ingest_mode="merge", merge_keys="DEVICE_ID")
+    now = time.time()
+    with open(os.path.join(vol_dir, "k1.csv"), "w") as f:
+        f.write("device_id,temperature\na,1\nb,2\n")
+    os.utime(os.path.join(vol_dir, "k1.csv"), (now - 20, now - 20))
+    autoloader.run_pipeline_cycle(pipe["id"])
+    with open(os.path.join(vol_dir, "k2.csv"), "w") as f:
+        f.write("device_id,temperature,humidity\nb,20,55\nc,3,60\n")
+    os.utime(os.path.join(vol_dir, "k2.csv"), (now - 10, now - 10))
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    tbl = DeltaTable(delta_path("bronze_mkey")).to_pyarrow_table()
+    check("case-insensitive key + new column merged in one file", res.get("files_ingested") == 1 and "humidity" in tbl.column_names, res)
+    check("upsert result correct", {r["device_id"]: r["temperature"] for r in tbl.to_pylist()} == {"a": 1, "b": 20, "c": 3})
+
+    autoloader.update_pipeline(pipe["id"], {"merge_keys": "device_id = source.device_id OR 1=1 --"})
+    with open(os.path.join(vol_dir, "k3.csv"), "w") as f:
+        f.write("device_id,temperature,humidity\na,99,1\n")
+    res = autoloader.run_pipeline_cycle(pipe["id"])
+    failed = [h for h in autoloader.get_pipeline_history(pipe["id"]) if h["status"] == "FAILED"]
+    check("injection-style key rejected as a non-column", res.get("files_ingested") == 0 and len(failed) == 1, res)
+    tbl = DeltaTable(delta_path("bronze_mkey")).to_pyarrow_table()
+    check("table untouched by rejected key", {r["device_id"]: r["temperature"] for r in tbl.to_pylist()}["a"] == 1)
+
+    pipe2, vol2 = make_pipeline("mkey_space_vol", "bronze_mkey2", ingest_mode="merge", merge_keys="my id")
+    for i, body in enumerate(["my id,val\n1,x\n2,y\n", "my id,val\n2,z\n"]):
+        path = os.path.join(vol2, f"s{i}.csv")
+        with open(path, "w") as f:
+            f.write(body)
+        os.utime(path, (now - 10 + i, now - 10 + i))
+        autoloader.run_pipeline_cycle(pipe2["id"])
+    rows = {r["my id"]: r["val"] for r in DeltaTable(delta_path("bronze_mkey2")).to_pyarrow_table().to_pylist()}
+    check("keys with spaces are quoted correctly", rows == {1: "x", 2: "z"}, rows)
+
+
 def main():
     autoloader.init_autoloader_db()
     try:
@@ -248,6 +291,7 @@ def main():
         test_rescue()
         test_streaming_large_file()
         test_merge_mode()
+        test_merge_key_safety()
     finally:
         shutil.rmtree(TMP_WAREHOUSE, ignore_errors=True)
     print()
