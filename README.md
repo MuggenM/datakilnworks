@@ -472,6 +472,15 @@ spec:
 * **API**: `/api/volumes/...` and `/api/autoloader/pipelines/...` (create, update, delete, `run` / `run-now`, `reset`, `history`, `stats`).
 * **Verification**: `python scratch/test_autoloader.py` (backend, throwaway warehouse) and `AUTOLOADER_UI_URL=<throwaway studio> python3 scratch/verify_autoloader_ui.py` (Playwright; it creates pipelines, so never point it at real data).
 
+### 28. 🛡️ Data Governance: Tags & Tag-Driven Column Masking
+* **Tags** on catalogs, schemas, tables and columns (`pii=email`, `sensitivity=confidential`), stored in `warehouse/.metadata/governance.db`. Tags **inherit downward** (catalog → schema → table → column, most specific wins), so new columns from schema evolution or the Auto-Loader are covered automatically. Optional allowed-value lists, an audit trail, orphan detection when a column is dropped, and a name-based **classifier** that suggests tags without reading any data.
+* **Masking policies** point at a tag, not at objects: *"mask everything tagged `pii` for everyone except admins"* protects every current and future column carrying that tag. Mask types: `redact`, `hash` (stable keyed pseudonym, joins still work), `partial`, `email`, `null`, `generalize` and validated `custom` expressions. Masks are type-aware and always cast back to the column's type; a mask that does not fit a type yields `NULL`, so a policy can never leak because it did not apply. Exemptions by role and by user, priorities, and a per-type filter.
+* **Enforced at query time by rewriting the SQL** (`web/governance/enforce.py`): each scan of a table with masked columns becomes `(SELECT * REPLACE (mask AS col) FROM table)`, so filters, joins, aggregates and `ORDER BY` only ever see masked values (no `WHERE ssn = '…'` oracle). Views are inlined recursively, path scans (`delta_scan('…')`, `read_parquet('…')`) map back to their table, and the rewritten SQL is what workers, Ray and the local engine execute. Masked principals get a default-deny statement allowlist; anything that cannot be verified is refused, never run unmasked.
+* **Every data-egress path is governed**: SQL editor, exports, profiles, previews, version diffs (Arrow-level masking), dashboards (with a result cache keyed by the mask set), Genie (LLM prompt samples are *always* masked, whoever asks), alerts, scheduled exports and jobs (run as their owner). Features that read data outside the governed catalogs (dbt, direct OneLake queries, distributed scans) are refused for masked users. `scratch/test_governance_coverage.py` fails when a new unreviewed DuckDB execution site appears.
+* **UI**: a *Governance* view (tags, policies with a live mask tester, suggestions, *preview as user*, audit and coverage), tag chips and lock badges in the Catalog Explorer, and masked-column indicators in SQL results. Admins are exempt by default (`except_roles`), and their reads of tagged columns are audited (`EXEMPT_READ`).
+* **Rollout**: `GOVERNANCE_ENFORCEMENT=audit` computes and logs what would be masked without changing results; `enforce` (default) applies it; `off` disables the gateway.
+* **Verification**: `scratch/test_governance_phase{0..4}.py`, `scratch/test_governance_coverage.py`, and `scratch/verify_governance_ui.py` (Playwright, throwaway instance only).
+
 ---
 
 ## 🔐 Security Settings & Governance Trust Boundary
@@ -483,6 +492,10 @@ spec:
 | `JWT_SECRET_KEY` | per-install random | Session signing key. If unset, a random key is created in `warehouse/.metadata/jwt_secret` (existing sessions are signed out once after upgrading). |
 | `COMPUTE_TOKEN` | per-install random | Shared secret (`X-Compute-Token`) the studio sends to compute workers, which reject requests without it. Stored in `warehouse/.metadata/compute_token` when unset. |
 | `JUPYTER_TOKEN` | `datakilnworks` | **Change this for any shared install.** |
+| `GOVERNANCE_ENFORCEMENT` | `enforce` | `enforce` applies masking and statement gating; `audit` computes and logs what would be masked but never changes or blocks a query; `off` disables the gateway. |
+| `GOVERNANCE_ALLOWED_PATHS` | empty | Extra directories (`:`-separated) non-admins may read with file functions, besides warehouse tables, volumes, exports and `/tmp/uploads`. |
+
+**Non-admin file access.** File functions (`read_csv`, `read_parquet`, `delta_scan`, `read_text`, …) accept only literal paths inside warehouse tables, volumes and exports for non-admin roles, regardless of masking policies: reading `.metadata` (session signing key, compute token, auth database) would otherwise let anyone forge an admin session. `query()`/`query_table()` and redefining the `gov_*` mask functions are refused for non-admins.
 
 **What column masking will and will not cover.** Studio queries (SQL editor, dashboards, previews, exports, alerts, Genie) are governed. **JupyterLab notebooks and anything that can read `warehouse/` directly are outside that boundary**, because kernels talk to the warehouse without a user identity. Restrict notebooks by role, use a non-default `JUPYTER_TOKEN`, and do not publish the Jupyter port to untrusted networks. Compute workers (`compute-node-01..03`) are no longer published on the host; they are reachable only on the compose network and require the compute token.
 

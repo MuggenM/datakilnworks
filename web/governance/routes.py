@@ -372,4 +372,64 @@ async def governance_status(user: Dict[str, Any] = Depends(principal)):
         "policies_total": len(policies.list_policies()),
         "policies_enabled": len(policies.enabled_policies()),
         "masks_installed": macros.macros_installed(con),
+        "posture": _posture(),
     }
+
+
+def _posture() -> Dict[str, Any]:
+    """The governance trust boundary at a glance (what masking does and does not cover in this install)."""
+    import os
+    from web.auth import governance_require_auth
+    from web.governance.enforce import enforcement_mode
+    from web.notebook_access import DEFAULT_TOKEN, restrict_notebooks
+    return {
+        "enforcement_mode": enforcement_mode(),
+        "require_auth": governance_require_auth(),
+        "notebooks_restricted": restrict_notebooks(),
+        "default_jupyter_token": os.getenv("JUPYTER_TOKEN", DEFAULT_TOKEN) == DEFAULT_TOKEN,
+    }
+
+
+class PreviewAsIn(BaseModel):
+    sql: str
+    as_user: str
+    catalog: Optional[str] = "warehouse"
+
+
+@router.post("/preview-as")
+async def preview_as(body: PreviewAsIn, user: Dict[str, Any] = Depends(principal)):
+    """What would `as_user` actually run for this SQL? Returns the rewritten SQL and masked columns; nothing executes."""
+    _require_admin(user)
+    subject = get_user_by_username(body.as_user)
+    if not subject:
+        raise HTTPException(status_code=404, detail=f"User '{body.as_user}' does not exist.")
+    from web.governance import enforce
+    cur = _con()
+    try:
+        result = enforce.rewrite_for_principal(body.sql, policies.Principal.from_user(subject), cur,
+                                               default_catalog=body.catalog or "warehouse", default_schema="main")
+    finally:
+        cur.close()
+    return {"as_user": subject["username"], "role": subject.get("role"), "blocked": result.blocked, "changed": result.changed,
+            "rewritten_sql": result.sql if result.changed else None, "tables": result.tables,
+            "masked_columns": gateway.masked_columns_payload(result),
+            "exempt_reads": sorted({f"{m.table}.{m.column}" for m in result.exempt_reads})}
+
+
+@router.get("/coverage")
+async def coverage(user: Dict[str, Any] = Depends(principal)):
+    """Where governance stands: assignments by level, orphans, and what each enabled policy currently matches."""
+    _require_admin(user)
+    assignments = tags.list_assignments(limit=5000)
+    by_level: Dict[str, int] = {}
+    for a in assignments:
+        by_level[a["level"]] = by_level.get(a["level"], 0) + 1
+    per_policy = []
+    for pol in policies.list_policies():
+        matched = [a for a in assignments if not a["orphaned"] and a["tag_key"] == pol["tag_key"]
+                   and (pol["tag_value"] is None or a["tag_value"] == pol["tag_value"])]
+        per_policy.append({"id": pol["id"], "name": pol["name"], "enabled": pol["enabled"], "mask_type": pol["mask_type"],
+                           "matching_assignments": len(matched)})
+    return {"assignments": len(assignments), "by_level": by_level, "orphaned": sum(1 for a in assignments if a["orphaned"]),
+            "policies": per_policy,
+            "policies_without_matches": [p["name"] for p in per_policy if p["enabled"] and p["matching_assignments"] == 0]}

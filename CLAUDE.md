@@ -20,7 +20,7 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 | --- | --- | --- |
 | `lakehouse-notebook` | 8890 (Jupyter, token `datakilnworks`) | Dockerfile CMD |
 | `datakilnworks-studio` | 8891 | `uvicorn web.app:app --reload` |
-| `compute-node-01/02/03` | 8001-8003 | `uvicorn web.compute_worker:app` |
+| `compute-node-01/02/03` | 8001-8003, compose network only (not published; require `X-Compute-Token`) | `uvicorn web.compute_worker:app` |
 
 - `./web`, `./notebooks`, `./warehouse` and `./docs` are bind-mounted, and the studio uses `--reload`, so edits to `web/*.py` apply without a rebuild. Only `requirements.txt`/`Dockerfile`/`config/00_databricks_shim.py` changes need `docker compose build`. The shim is copied into the image, not mounted.
 - Swagger UI is at `/api/docs`; the built-in manual is served from `docs/index.html` at `/docs/`.
@@ -48,6 +48,14 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 **Frontend**
 - `web/templates/index.html` is a single roughly 27k-line Jinja/Alpine.js file containing every view (Chart.js for charts, Monaco for SQL). Expect large, targeted edits with grep, not whole-file reads. Note the recent fix commits for Alpine expression and scope errors, since inline expressions are brittle.
 - The MLflow shim (`mlflow_shim.py`), model serving (`serving.py`) and SQL-native inference functions (`ai_sql.py`, exposing `predict`, `ai_query` and similar as DuckDB UDFs) emulate Databricks MLflow, serving and AI functions locally. LLM backends (LM Studio and Ollama) are configured in `llm_settings.py`.
+
+## Governance (tags + column masking)
+
+- `web/governance/` holds tags (`tags.py`), masking policies and masks (`policies.py`, `masks.py`, `macros.py`), the query gateway (`enforce.py`, `gateway.py`) and the REST router (`routes.py`). State lives in `warehouse/.metadata/governance.db`.
+- **Every code path that runs SQL on behalf of a user must go through the gateway** (`gateway.govern_sql`, `governed_sql_or_raise`, `_gov_or_403` in `app.py`, `masked_relation`, or `mask_arrow` for data Python already holds). Use the *rewritten* SQL for execution and the user's own text for history. Identity comes from `resolve_principal(request)` (never fall back to admin on errors), or `gateway.principal_for_username(owner)` for background work; a missing identity is least privilege.
+- `scratch/test_governance_coverage.py` scans `web/*.py` for DuckDB execution sites; a new one must call the gateway or be added to `web/governance/ALLOWLIST.md` with a reason.
+- Caches of query results must be keyed by `gateway.fingerprint(result)` (the set of masks the result was computed under).
+- Tests: `scratch/test_governance_phase{0,1,2,3,4}.py` (run inside the studio container against a throwaway warehouse whose directory is named `warehouse`), `scratch/test_governance_coverage.py` (host), `scratch/verify_governance_ui.py` (Playwright, throwaway instance only).
 
 ## Conventions
 
