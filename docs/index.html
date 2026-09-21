@@ -129,6 +129,11 @@
           <span>Interactive Lineage DAG</span>
           <span class="sidebar-badge">22-Node</span>
         </a>
+        <a href="#tags-masking-policies" class="sidebar-nav-item">
+          <i class="ph ph-shield-check"></i>
+          <span>Tags & Masking Policies</span>
+          <span class="sidebar-badge">New</span>
+        </a>
       </div>
 
       <!-- Group: SQL & BI -->
@@ -175,6 +180,11 @@
         <a href="#dbt-core-transformations" class="sidebar-nav-item">
           <i class="ph ph-stack"></i>
           <span>Transformations (dbt Core)</span>
+        </a>
+        <a href="#autoloader-pipelines" class="sidebar-nav-item">
+          <i class="ph ph-arrows-in-line-horizontal"></i>
+          <span>Auto-Loader Pipelines</span>
+          <span class="sidebar-badge">New</span>
         </a>
         <a href="#jobs-pipelines-workflows" class="sidebar-nav-item">
           <i class="ph ph-git-merge"></i>
@@ -231,6 +241,10 @@
         <a href="#resources-deployment" class="sidebar-nav-item">
           <i class="ph ph-docker-logo"></i>
           <span>Docker Local Install</span>
+        </a>
+        <a href="#security-settings" class="sidebar-nav-item">
+          <i class="ph ph-lock-key"></i>
+          <span>Security Settings</span>
         </a>
         <a href="#kubernetes-deployment" class="sidebar-nav-item">
           <i class="ph ph-cloud"></i>
@@ -477,6 +491,16 @@
           </div>
         </div>
 
+        <div class="callout note">
+          <div class="callout-icon"><i class="ph ph-info"></i></div>
+          <div class="callout-body">
+            <div class="callout-title">Notebooks are per user and run inside the studio</div>
+            <p>
+              There is no separate JupyterLab server. Notebooks are edited and run in the embedded runner, every notebook endpoint requires a valid session, and each user reaches only <code>Users/&lt;their name&gt;</code> and <code>Shared</code> (administrators reach everything). Kernels are per user and notebook, so two users on the same shared notebook never share variables. Users a masking policy applies to can read and edit notebooks but not run them; set <code>GOVERNANCE_NOTEBOOK_EXECUTION=all</code> to lift this.
+            </p>
+          </div>
+        </div>
+
         <h3 id="scratchpad-notebooks">Scratchpad Notebooks & PySpark via SQLFrame</h3>
         <p>
           Personal scratchpads support Python, SQL, and PySpark DataFrame code. Through the built-in <strong>SQLFrame</strong> engine, you can write idiomatic PySpark code that executes directly on DuckDB without starting a JVM:
@@ -594,6 +618,7 @@ WHERE curr.salary <> prev.salary;</code></pre>
         <ul>
           <li><strong>Managed Volumes:</strong> Storage is hosted and governed directly inside the studio storage layer (<code>./warehouse/volumes/{catalog}/{schema}/{volume}/</code>).</li>
           <li><strong>External Volumes:</strong> Mapped to external storage mounts, NFS, or S3-compatible endpoints.</li>
+          <li><strong>Auto-Loader:</strong> a volume can be watched by an <a href="#autoloader-pipelines">Auto-Loader pipeline</a> that ingests new files into a Delta table.</li>
           <li><strong>Interactive Volume Explorer:</strong> Browse directories, upload files via drag-and-drop, and generate presigned download links directly within the UI.</li>
         </ul>
 
@@ -601,6 +626,40 @@ WHERE curr.salary <> prev.salary;</code></pre>
         <p>
           The <strong>Data Lineage</strong> workbench visualizes column-level and table-level lineage. The engine statically parses SQL DDL/DML, dbt schemas, and Delta log operations to construct an interactive Directed Acyclic Graph (DAG) displaying upstream sources and downstream consumers.
         </p>
+
+        <h3 id="tags-masking-policies">Tags & Tag-Driven Masking Policies</h3>
+        <p>
+          Tags classify data once; masking policies then protect every column carrying a tag, wherever it is queried. Tags can be attached to catalogs, schemas, tables and columns, are stored in SQLite (<code>warehouse/.metadata/governance.db</code>), and are inherited downwards: a tag on a schema applies to every table and column beneath it, and a more specific tag overrides the inherited one.
+        </p>
+        <ul>
+          <li><strong>Tags:</strong> a key with an optional list of allowed values (for example <code>pii</code> = <code>email</code>, <code>phone</code>, <code>name</code>). Manage them in the <strong>Governance</strong> view (admins) or from the <strong>Tags</strong> column of the catalog explorer schema tab.</li>
+          <li><strong>Masking policies:</strong> bind a tag (and optionally a value) to a mask, with exemptions by role or user. Built-in masks: <code>full</code>, <code>partial</code>, <code>email</code>, <code>null</code>, <code>hash</code> (keyed, so it cannot be reversed by a dictionary attack), <code>date_year</code>, <code>round</code> and a validated <code>custom</code> SQL expression. Each mask states what it does per column type.</li>
+          <li><strong>Enforcement at query time:</strong> a gateway rewrites the SQL of every governed execution path (SQL editor, dashboards, Genie, alerts, scheduled exports, jobs, time travel, Auto-Loader, compute nodes) with <code>SELECT * REPLACE (...)</code>, using scope analysis so that CTEs, joins, subqueries, aliases and <code>SELECT *</code> cannot bypass it. It fails closed: SQL it cannot analyse is refused, and users a policy applies to may only run allow-listed read statements.</li>
+          <li><strong>Suggestions:</strong> the classifier proposes tags for untagged columns (emails, phone numbers, names) which an admin accepts in bulk.</li>
+          <li><strong>Preview as user:</strong> shows which columns another user sees masked and the rewritten SQL, without impersonating them.</li>
+          <li><strong>Tag propagation:</strong> when an exempt user runs <code>CREATE TABLE ... AS SELECT</code> over tagged columns, the tags follow onto the new table. Columns that are computed from tagged columns are marked <code>sensitivity=unclassified</code> for review, so a copy cannot become an unprotected leak.</li>
+          <li><strong>Audit & coverage:</strong> every tag and policy change is logged, and the coverage view shows which execution paths are governed and how many sensitive columns are still untagged.</li>
+        </ul>
+
+        <div class="code-container">
+          <div class="code-header">
+            <span class="code-lang">SQL</span>
+          </div>
+          <pre><code class="language-sql">-- An analyst with a policy on pii=email sees masked values; an admin (exempt) sees raw values
+SELECT name, email FROM warehouse.hr.employees;
+-- name | email
+-- Ada  | a***@example.com</code></pre>
+        </div>
+
+        <div class="callout warning">
+          <div class="callout-icon"><i class="ph ph-warning"></i></div>
+          <div class="callout-body">
+            <div class="callout-title">Limits of masking</div>
+            <p>
+              Masking is enforced in the studio's SQL layer. Notebook kernels run arbitrary Python and cannot be masked, so users a masking policy applies to can open and edit notebooks but not run them (see <a href="#security-settings">Security Settings</a>). Row-level filtering is not implemented yet. Direct file access to the warehouse is only possible for administrators.
+            </p>
+          </div>
+        </div>
       </section>
 
       <!-- SECTION 4: SQL & BI -->
@@ -790,6 +849,20 @@ FROM staged
 WHERE trip_distance > 0 AND total_amount > 0</code></pre>
         </div>
 
+        <h3 id="autoloader-pipelines">Auto-Loader Pipelines (Volume to Delta)</h3>
+        <p>
+          Auto-Loader pipelines incrementally ingest files that land in a Volume into a Delta table, tracking which files were already loaded so each file is processed once.
+        </p>
+        <ul>
+          <li><strong>Formats:</strong> CSV, JSON, Parquet and text, with schema inference and schema evolution.</li>
+          <li><strong>Write modes:</strong> append or merge on one or more keys (key values are escaped, so odd column names are safe).</li>
+          <li><strong>Rescued data:</strong> values that do not fit the schema land in a rescued-data column instead of failing the run.</li>
+          <li><strong>Streaming-style batches:</strong> large loads are processed in batches (<code>AUTOLOADER_BATCH_ROWS</code>) with per-run history.</li>
+          <li><strong>Scheduling:</strong> run on demand or on a cron schedule.</li>
+          <li><strong>Lineage:</strong> the source Volume appears as a node in the lineage graph.</li>
+          <li><strong>Governance:</strong> ingestion runs as the pipeline owner, and tags propagate to the target table.</li>
+        </ul>
+
         <h3 id="jobs-pipelines-workflows">Jobs & Pipelines (Local Workflows DAG)</h3>
         <p>
           The <strong>Jobs & Pipelines</strong> engine orchestrates multi-task workflows without requiring external schedulers (such as Apache Airflow or Celery). Supported task types include:
@@ -939,7 +1012,8 @@ WHERE active = true;</code></pre>
           <li><strong>OAuth 2.0 / OIDC:</strong> Native integration with 8 identity providers: Okta, Azure AD, Google Workspace, GitHub, GitLab, Auth0, Keycloak, and Generic Custom OIDC with PKCE.</li>
           <li><strong>LDAP / Active Directory:</strong> In-studio LDAP connection testing, credential validation, and automatic group-to-role mapping.</li>
           <li><strong>Multi-Factor Authentication (MFA):</strong> TOTP (RFC 6238) generation, QR code registration, and 10 self-service emergency backup recovery codes.</li>
-          <li><strong>Row-Level Security (RLS):</strong> Policy manager injecting dynamic SQL filters based on user attributes or group membership, complete with an interactive policy verification tester.</li>
+          <li><strong>Column masking:</strong> tag-driven masking policies with role and user exemptions (see <a href="#tags-masking-policies">Tags & Masking Policies</a>).</li>
+          <li><strong>Row-Level Security (RLS):</strong> <em>planned, not yet implemented.</em> Column masking is the only fine-grained data policy today.</li>
         </ul>
       </section>
 
@@ -1016,6 +1090,33 @@ docker compose up -d
 # Verify container status
 docker compose ps</code></pre>
         </div>
+
+        <h3 id="security-settings">Security Settings & Trust Boundary</h3>
+        <p>
+          Masking is enforced by default. An invalid or expired session is never treated as an administrator. Requests with no credentials at all run as the local admin in single-user mode; set <code>GOVERNANCE_REQUIRE_AUTH=true</code> for any shared deployment.
+        </p>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Setting</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>GOVERNANCE_ENFORCEMENT</code></td><td><code>enforce</code> (default) applies masking and statement gating; <code>audit</code> logs what would be masked without changing queries; <code>off</code> disables the gateway.</td></tr>
+              <tr><td><code>GOVERNANCE_REQUIRE_AUTH</code></td><td>Default <code>false</code> (single-user local mode: credential-less requests run as the local admin). <code>true</code> makes them the least-privilege <code>anonymous</code> user. Set it to <code>true</code> for shared deployments.</td></tr>
+              <tr><td><code>GOVERNANCE_NOTEBOOK_EXECUTION</code></td><td>Default: only users no masking policy applies to may run notebooks. <code>all</code> lets everyone run them (masking cannot be enforced inside a kernel).</td></tr>
+              <tr><td><code>GOVERNANCE_ALLOWED_PATHS</code></td><td>Extra directories non-admins may read with file functions; everything else outside the governed catalog is blocked.</td></tr>
+              <tr><td><code>JWT_SECRET_KEY</code></td><td>Session signing key. If unset, a per-install secret is generated and stored under <code>warehouse/.metadata/</code>.</td></tr>
+              <tr><td><code>COMPUTE_TOKEN</code></td><td>Shared secret (<code>X-Compute-Token</code>) the studio sends to compute nodes; workers reject requests without it. Generated per install when unset.</td></tr>
+              <tr><td><code>AUTOLOADER_BATCH_ROWS</code></td><td>Rows per batch for Auto-Loader ingestion.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><strong>Compute nodes are not published:</strong> worker containers are only exposed on the internal Docker network and require the compute token, so users cannot bypass the studio's gateway by calling a worker directly.</li>
+          <li><strong>File sandbox:</strong> non-admin users cannot read arbitrary files (such as the warehouse's Delta files or metadata) through SQL file functions.</li>
+          <li><strong>No JupyterLab:</strong> the shared Jupyter server and its token were removed; notebooks run in the per-user embedded runner.</li>
+        </ul>
+        <p>
+          After upgrading, recreate the stack to remove the old Jupyter container: <code>docker compose up -d --remove-orphans</code>.
+        </p>
 
         <h3 id="kubernetes-deployment">Enterprise Kubernetes Deployment (k3s / k8s / KubeRay)</h3>
         <p>
@@ -1249,6 +1350,108 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
                 <td>Real-time model prediction invocation</td>
                 <td><code>{"dataframe_records": [...]}</code></td>
               </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/tags</code></td>
+                <td>Lists tag definitions</td>
+                <td>Admin</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/governance/tags</code></td>
+                <td>Creates or updates a tag definition</td>
+                <td><code>{"tag_key": "pii", "allowed_values": [...]}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge orange">PUT</span></td>
+                <td><code>/api/governance/objects/{catalog}/{schema}/{table}/columns/{column}/tags</code></td>
+                <td>Sets tags on a column (tables, schemas and catalogs have equivalent routes)</td>
+                <td><code>{"tags": {"pii": "email"}}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/objects/{catalog}/{schema}/{table}/tags</code></td>
+                <td>Direct and inherited tags for a table</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/effective/{catalog}/{schema}/{table}</code></td>
+                <td>Per-column masks that apply to the current user</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/masking-policies</code></td>
+                <td>Lists masking policies</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/governance/masking-policies</code></td>
+                <td>Creates a masking policy (PUT and DELETE on <code>/{policy_id}</code>)</td>
+                <td><code>{"tag_key": "pii", "mask_type": "email", "except_roles": ["admin"]}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/governance/preview-as</code></td>
+                <td>Shows what another user would see, with the rewritten SQL</td>
+                <td><code>{"username": "...", "sql": "..."}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/suggestions</code></td>
+                <td>Suggested tags for untagged sensitive columns</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/audit</code></td>
+                <td>Tag and policy change log</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/coverage</code></td>
+                <td>Governance coverage of execution paths and columns</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/autoloader/pipelines</code></td>
+                <td>Lists Auto-Loader pipelines (POST creates, PUT/DELETE on <code>/{id}</code>)</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/autoloader/pipelines/{id}/run</code></td>
+                <td>Runs a pipeline now</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/autoloader/pipelines/{id}/history</code></td>
+                <td>Run history</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/volumes</code></td>
+                <td>Lists volumes (files under <code>/api/volumes/{catalog}/{schema}/{volume}/files</code>)</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/notebooks/access</code></td>
+                <td>Whether the current user may run notebooks</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/workspace/notebook/cell/run</code></td>
+                <td>Runs a notebook cell in the caller's own kernel</td>
+                <td><code>{"path": "Users/me/a.ipynb", "cell_index": 1}</code></td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -1305,12 +1508,14 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
         <li class="toc-item"><a href="#delta-lake-time-travel" class="toc-link" style="padding-left: 1rem;">Delta Time Travel</a></li>
         <li class="toc-item"><a href="#unity-catalog-volumes" class="toc-link" style="padding-left: 1rem;">Volumes Explorer</a></li>
         <li class="toc-item"><a href="#interactive-data-lineage" class="toc-link" style="padding-left: 1rem;">Data Lineage DAG</a></li>
+        <li class="toc-item"><a href="#tags-masking-policies" class="toc-link" style="padding-left: 1rem;">Tags & Masking</a></li>
         <li class="toc-item"><a href="#monaco-sql-editor" class="toc-link">SQL & Lakeview BI</a></li>
         <li class="toc-item"><a href="#lakeview-dashboards" class="toc-link" style="padding-left: 1rem;">Dashboards & Exports</a></li>
         <li class="toc-item"><a href="#genie-spaces-ai" class="toc-link" style="padding-left: 1rem;">Genie Space (AI)</a></li>
         <li class="toc-item"><a href="#sql-warehouses-compute" class="toc-link" style="padding-left: 1rem;">SQL Warehouses</a></li>
         <li class="toc-item"><a href="#data-ingestion-wizard" class="toc-link">Data Engineering</a></li>
         <li class="toc-item"><a href="#dbt-core-transformations" class="toc-link" style="padding-left: 1rem;">dbt Transformations</a></li>
+        <li class="toc-item"><a href="#autoloader-pipelines" class="toc-link" style="padding-left: 1rem;">Auto-Loader</a></li>
         <li class="toc-item"><a href="#jobs-pipelines-workflows" class="toc-link" style="padding-left: 1rem;">Jobs & Workflows</a></li>
         <li class="toc-item"><a href="#mlflow-experiments" class="toc-link">Machine Learning & AI</a></li>
         <li class="toc-item"><a href="#mlflow-genai-tracing" class="toc-link" style="padding-left: 1rem;">LLM Tracing & Gantt</a></li>
@@ -1319,6 +1524,7 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
         <li class="toc-item"><a href="#sql-native-ai-inference" class="toc-link" style="padding-left: 1rem;">SQL-Native AI</a></li>
         <li class="toc-item"><a href="#ray-distributed-engine" class="toc-link">Platform & Admin</a></li>
         <li class="toc-item"><a href="#resources-deployment" class="toc-link">Resources & Deploy</a></li>
+        <li class="toc-item"><a href="#security-settings" class="toc-link" style="padding-left: 1rem;">Security Settings</a></li>
         <li class="toc-item"><a href="#docker-local-install" class="toc-link" style="padding-left: 1rem;">Docker Compose</a></li>
         <li class="toc-item"><a href="#kubernetes-deployment" class="toc-link" style="padding-left: 1rem;">Kubernetes (K8s)</a></li>
         <li class="toc-item"><a href="#hands-on-tutorial" class="toc-link" style="padding-left: 1rem;">End-to-End Tutorial</a></li>
