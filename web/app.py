@@ -384,6 +384,10 @@ class UserUpdateRequest(BaseModel):
 class PasswordResetRequest(BaseModel):
     new_password: str
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
+
 class CatalogPermissionRequest(BaseModel):
     user_id: Optional[str] = None
     username: Optional[str] = None
@@ -419,6 +423,23 @@ async def login_endpoint(payload: LoginRequest):
         samesite="lax",
         secure=False
     )
+    return resp
+
+
+@app.post("/api/auth/change-password")
+async def change_password_endpoint(payload: PasswordChangeRequest, request: Request):
+    """A signed-in user changes their own password (local accounts only; needs the current password)."""
+    from web.auth import change_own_password
+    user = await get_current_user(request)          # never resolve_principal: no credentials must not mean "local admin"
+    try:
+        change_own_password(user["id"], payload.current_password, payload.new_password)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    fresh = get_user_by_username(user["username"])
+    resp = JSONResponse(content={"success": True, "message": "Password changed. Other sessions were signed out."})
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh), max_age=86400, httponly=True, samesite="lax", secure=False)
     return resp
 
 

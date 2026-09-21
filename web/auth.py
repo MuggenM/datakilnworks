@@ -7,6 +7,7 @@ SQLite persistence for users and settings, and FastAPI authentication dependenci
 import os
 import sqlite3
 import datetime
+import time
 import hashlib
 import secrets
 import logging
@@ -60,6 +61,15 @@ def init_auth_db():
                 last_login_at TEXT
             );
             """)
+
+            # Columns added after the first release: `auth_source` ('local' = password kept in this database; anything else is
+            # an external identity provider that owns the password) and `password_changed_at` (epoch seconds; sessions issued
+            # before it are no longer accepted).
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "auth_source" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'")
+            if "password_changed_at" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN password_changed_at INTEGER")
 
             conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_permissions (
@@ -352,10 +362,38 @@ def reset_user_password(user_id: str, new_password: str) -> bool:
     try:
         pw_hash = hash_password(new_password)
         with conn:
-            res = conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (pw_hash, user_id))
+            res = conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
+                               (pw_hash, int(time.time()), user_id))
             return res.rowcount > 0
     finally:
         conn.close()
+
+
+MIN_SELF_PASSWORD_LENGTH = 6
+
+
+def change_own_password(user_id: str, current_password: str, new_password: str) -> None:
+    """
+    Lets a user change their own password. Only for accounts whose password lives in this database, and only with the
+    current password (a stolen session alone is not enough). Sessions issued before the change stop working.
+    Raises PermissionError (wrong current password / not a local account) or ValueError (unacceptable new password).
+    """
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT password_hash, auth_source, is_active FROM users WHERE id = ?", (user_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row or row["is_active"] != 1:
+        raise PermissionError("Account not found or deactivated.")
+    if (row["auth_source"] or "local") != "local":
+        raise PermissionError("This account signs in through an external identity provider; change the password there.")
+    if not verify_password(current_password, row["password_hash"]):
+        raise PermissionError("The current password is incorrect.")
+    if len(new_password) < MIN_SELF_PASSWORD_LENGTH:
+        raise ValueError(f"The new password must be at least {MIN_SELF_PASSWORD_LENGTH} characters long.")
+    if new_password == current_password:
+        raise ValueError("The new password must differ from the current one.")
+    reset_user_password(user_id, new_password)
 
 
 def delete_user(user_id: str) -> bool:
@@ -408,7 +446,8 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         payload = decode_access_token(token)
         if payload and "sub" in payload:
             user = get_user_by_id(payload["sub"])
-            if user and user.get("is_active", 1) == 1:
+            changed = user.get("password_changed_at") if user else None
+            if user and user.get("is_active", 1) == 1 and not (changed and int(payload.get("iat", 0)) < int(changed)):
                 return user
 
     # Fallback to X-User header if supplied. It carries no credential, so it is disabled once auth is required.

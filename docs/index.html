@@ -1011,6 +1011,7 @@ WHERE active = true;</code></pre>
           <li><strong>Role-Based Access Control (RBAC):</strong> Three built-in roles: <code>admin</code> (full platform governance), <code>power_user</code> (pipeline/model authoring), and <code>user</code> (query execution & reporting).</li>
           <li><strong>OAuth 2.0 / OIDC:</strong> Native integration with 8 identity providers: Okta, Azure AD, Google Workspace, GitHub, GitLab, Auth0, Keycloak, and Generic Custom OIDC with PKCE.</li>
           <li><strong>LDAP / Active Directory:</strong> In-studio LDAP connection testing, credential validation, and automatic group-to-role mapping.</li>
+          <li><strong>Change your own password:</strong> user menu &rarr; <em>Change password</em> (accounts whose password is kept in the studio's own database only). It needs the current password, and sessions signed in before the change are signed out. Administrators can still reset any password from Users &amp; IAM.</li>
           <li><strong>Multi-Factor Authentication (MFA):</strong> TOTP (RFC 6238) generation, QR code registration, and 10 self-service emergency backup recovery codes.</li>
           <li><strong>Column masking:</strong> tag-driven masking policies with role and user exemptions (see <a href="#tags-masking-policies">Tags & Masking Policies</a>).</li>
           <li><strong>Row-Level Security (RLS):</strong> <em>planned, not yet implemented.</em> Column masking is the only fine-grained data policy today.</li>
