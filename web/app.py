@@ -102,15 +102,13 @@ async def _governance_reconcile_loop(interval_seconds: int = 6 * 3600):
 
 def _log_security_posture():
     """Warns about configurations that undermine the governance trust boundary."""
-    from web.notebook_access import restrict_notebooks, DEFAULT_TOKEN
     from web.auth import governance_require_auth
+    from web.notebook_access import execution_mode
     if not governance_require_auth():
         logger.warning("Governance: GOVERNANCE_REQUIRE_AUTH is off; requests without credentials run as the local admin.")
-    if JUPYTER_TOKEN == DEFAULT_TOKEN:
-        logger.warning("Governance: JupyterLab uses the default public token. Notebooks bypass column masking; "
-                       "set JUPYTER_TOKEN and GOVERNANCE_RESTRICT_NOTEBOOKS for multi-user installs.")
-    elif not restrict_notebooks():
-        logger.info("Governance: notebooks are open to all roles (GOVERNANCE_RESTRICT_NOTEBOOKS=false).")
+    if execution_mode() == "all":
+        logger.warning("Governance: GOVERNANCE_NOTEBOOK_EXECUTION=all; notebook code can read warehouse files directly, "
+                       "so column masking does not apply to it.")
 
 
 @app.on_event("startup")
@@ -194,8 +192,6 @@ async def tutorial_redirect():
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 NOTEBOOKS_DIR = os.getenv("NOTEBOOKS_DIR", "/workspace/notebooks")
-JUPYTER_PORT = os.getenv("JUPYTER_PORT", "8890")
-JUPYTER_TOKEN = os.getenv("JUPYTER_TOKEN", "databricks")
 
 os.makedirs(WAREHOUSE_DIR, exist_ok=True)
 os.makedirs(NOTEBOOKS_DIR, exist_ok=True)
@@ -325,40 +321,19 @@ def scan_delta_tables() -> List[Dict[str, Any]]:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    from web.notebook_access import restrict_notebooks
-    restricted = restrict_notebooks()
     resp = templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={
-            "jupyter_port": JUPYTER_PORT,
-            # When notebooks are role-gated the token is never embedded in the (unauthenticated) page;
-            # the UI fetches it from /api/notebooks/access after sign-in.
-            "jupyter_token": "" if restricted else JUPYTER_TOKEN,
-            "notebooks_restricted": restricted,
-            "warehouse_dir": WAREHOUSE_DIR
-        }
+        context={"warehouse_dir": WAREHOUSE_DIR}
     )
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
 
-@app.get("/api/notebooks/access")
-async def get_notebook_access(request: Request):
-    """Tells the UI whether the caller may open JupyterLab, and hands the token only to allowed roles."""
-    from web.notebook_access import access_payload
-    current_user = await resolve_principal(request)
-    return access_payload(current_user, JUPYTER_PORT, JUPYTER_TOKEN)
-
 
 @app.get("/api/status")
-async def get_status(request: Request):
-    from web.notebook_access import notebooks_allowed
-    try:
-        allowed = notebooks_allowed(await resolve_principal(request))
-    except HTTPException:
-        allowed = False
+async def get_status():
     conn = get_duckrun_conn()
     tables = scan_delta_tables()
     return {
@@ -367,8 +342,7 @@ async def get_status(request: Request):
         "duckrun_version": getattr(duckrun, "__version__", "0.4.68"),
         "warehouse_dir": WAREHOUSE_DIR,
         "table_count": len(tables),
-        "status": "RUNNING",
-        "jupyter_url": f"http://localhost:{JUPYTER_PORT}/lab?token={JUPYTER_TOKEN}" if allowed else None
+        "status": "RUNNING"
     }
 
 # ==============================================================================
@@ -2356,7 +2330,8 @@ async def get_copilot_providers_api():
 
 
 @app.get("/api/workspace/files")
-async def get_workspace_files():
+async def get_workspace_files(request: Request):
+    await resolve_principal(request)
     files = []
     if os.path.exists(NOTEBOOKS_DIR):
         for name in sorted(os.listdir(NOTEBOOKS_DIR)):
@@ -2366,8 +2341,7 @@ async def get_workspace_files():
                     "name": name,
                     "size_bytes": os.path.getsize(full),
                     "modified": datetime.datetime.fromtimestamp(os.path.getmtime(full)).strftime("%Y-%m-%d %H:%M"),
-                    "is_notebook": name.endswith(".ipynb"),
-                    "url": f"http://localhost:{JUPYTER_PORT}/lab/tree/notebooks/{name}?token={JUPYTER_TOKEN}"
+                    "is_notebook": name.endswith(".ipynb")
                 })
     return {"files": files}
 
@@ -5397,16 +5371,32 @@ async def upload_workspace_file_endpoint(file: UploadFile = File(...), target_di
 
 # ==================== NOTEBOOK EXECUTION APIS (NATIVE RUNNER) ====================
 
+async def _notebook_user(request: Request, path: str, *, write: bool = False, execute: bool = False) -> Dict[str, Any]:
+    """
+    Every notebook endpoint: authenticated, restricted to the caller's own Users/<name> folder and Shared (admins see all),
+    and code execution limited to principals that masking policies do not apply to (see web/notebook_access.py).
+    """
+    from web.notebook_access import execution_allowed, execution_denied_message
+    from web.workspace import can_access_workspace_path
+    user = await resolve_principal(request)
+    if not can_access_workspace_path(path, user, write=write or execute):
+        raise HTTPException(status_code=403, detail="Access denied: you cannot access this notebook.")
+    if execute and not execution_allowed(user):
+        raise HTTPException(status_code=403, detail=execution_denied_message())
+    return user
+
+
 class NotebookCellRunPayload(BaseModel):
     path: str
     cell_index: int
     source: Optional[str] = None
 
 @app.post("/api/workspace/notebook/cell/run")
-async def run_notebook_cell_endpoint(payload: NotebookCellRunPayload):
+async def run_notebook_cell_endpoint(payload: NotebookCellRunPayload, request: Request):
     from web.notebook_runner import execute_single_cell
+    user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return execute_single_cell(payload.path, payload.cell_index, payload.source)
+        return await asyncio.to_thread(execute_single_cell, payload.path, payload.cell_index, payload.source, user.get("username", "anonymous"))
     except Exception as e:
         logger.error(f"Error executing notebook cell: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5415,10 +5405,11 @@ class NotebookRunAllPayload(BaseModel):
     path: str
 
 @app.post("/api/workspace/notebook/run_all")
-async def run_all_notebook_cells_endpoint(payload: NotebookRunAllPayload):
+async def run_all_notebook_cells_endpoint(payload: NotebookRunAllPayload, request: Request):
     from web.notebook_runner import execute_all_cells
+    user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return execute_all_cells(payload.path)
+        return await asyncio.to_thread(execute_all_cells, payload.path, user.get("username", "anonymous"))
     except Exception as e:
         logger.error(f"Error running all notebook cells: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5427,19 +5418,21 @@ class NotebookKernelPayload(BaseModel):
     path: str
 
 @app.post("/api/workspace/notebook/kernel/restart")
-async def restart_notebook_kernel_endpoint(payload: NotebookKernelPayload):
+async def restart_notebook_kernel_endpoint(payload: NotebookKernelPayload, request: Request):
     from web.notebook_runner import restart_notebook_kernel
+    user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return restart_notebook_kernel(payload.path)
+        return await asyncio.to_thread(restart_notebook_kernel, payload.path, user.get("username", "anonymous"))
     except Exception as e:
         logger.error(f"Error restarting notebook kernel: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/workspace/notebook/kernel/status")
-async def get_notebook_kernel_status_endpoint(path: str):
+async def get_notebook_kernel_status_endpoint(path: str, request: Request):
     from web.notebook_runner import get_kernel_status
+    user = await _notebook_user(request, path)
     try:
-        return get_kernel_status(path)
+        return get_kernel_status(path, user.get("username", "anonymous"))
     except Exception as e:
         logger.error(f"Error checking notebook kernel status: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5450,8 +5443,9 @@ class NotebookCellSavePayload(BaseModel):
     source: str
 
 @app.post("/api/workspace/notebook/cell/save")
-async def save_notebook_cell_endpoint(payload: NotebookCellSavePayload):
+async def save_notebook_cell_endpoint(payload: NotebookCellSavePayload, request: Request):
     from web.notebook_runner import save_cell_source
+    await _notebook_user(request, payload.path, write=True)
     try:
         return save_cell_source(payload.path, payload.cell_index, payload.source)
     except Exception as e:
@@ -5464,8 +5458,9 @@ class NotebookCellAddPayload(BaseModel):
     type: str = "code"
 
 @app.post("/api/workspace/notebook/cell/add")
-async def add_notebook_cell_endpoint(payload: NotebookCellAddPayload):
+async def add_notebook_cell_endpoint(payload: NotebookCellAddPayload, request: Request):
     from web.notebook_runner import add_new_cell
+    await _notebook_user(request, payload.path, write=True)
     try:
         return add_new_cell(payload.path, payload.after_index, payload.type)
     except Exception as e:
@@ -5473,8 +5468,9 @@ async def add_notebook_cell_endpoint(payload: NotebookCellAddPayload):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.delete("/api/workspace/notebook/cell")
-async def delete_notebook_cell_endpoint(path: str, cell_index: int):
+async def delete_notebook_cell_endpoint(path: str, cell_index: int, request: Request):
     from web.notebook_runner import delete_cell
+    await _notebook_user(request, path, write=True)
     try:
         return delete_cell(path, cell_index)
     except Exception as e:
@@ -5482,13 +5478,22 @@ async def delete_notebook_cell_endpoint(path: str, cell_index: int):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/workspace/notebook/clear_outputs")
-async def clear_notebook_outputs_endpoint(payload: NotebookKernelPayload):
+async def clear_notebook_outputs_endpoint(payload: NotebookKernelPayload, request: Request):
     from web.notebook_runner import clear_notebook_outputs
+    await _notebook_user(request, payload.path, write=True)
     try:
         return clear_notebook_outputs(payload.path)
     except Exception as e:
         logger.error(f"Error clearing notebook outputs: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/notebooks/access")
+async def get_notebook_access(request: Request):
+    """Whether the caller may run notebook code (masked users can open and edit notebooks, not run them)."""
+    from web.notebook_access import execution_allowed, execution_mode
+    user = await resolve_principal(request)
+    return {"execution_allowed": execution_allowed(user), "mode": execution_mode()}
 
 
 # ==================== RECENTS APIS (MULTI-USER TRACKING) ====================

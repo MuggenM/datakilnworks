@@ -15,7 +15,7 @@ TMP_ROOT = tempfile.mkdtemp(prefix="governance_p5_")
 TMP_WAREHOUSE = os.path.join(TMP_ROOT, "warehouse")
 os.makedirs(TMP_WAREHOUSE)
 os.environ["WAREHOUSE_DIR"] = TMP_WAREHOUSE
-for var in ("GOVERNANCE_REQUIRE_AUTH", "GOVERNANCE_RESTRICT_NOTEBOOKS", "JWT_SECRET_KEY", "COMPUTE_TOKEN", "GOVERNANCE_ENFORCEMENT", "JUPYTER_TOKEN"):
+for var in ("GOVERNANCE_REQUIRE_AUTH", "GOVERNANCE_NOTEBOOK_EXECUTION", "JWT_SECRET_KEY", "COMPUTE_TOKEN", "GOVERNANCE_ENFORCEMENT"):
     os.environ.pop(var, None)
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -58,14 +58,14 @@ def main():
         r = client.get("/api/governance/status", cookies=admin).json()
         posture = r["posture"]
         check("posture reports enforcement mode, auth and notebook settings", posture["enforcement_mode"] == "enforce"
-              and posture["require_auth"] is False and posture["notebooks_restricted"] is False, posture)
+              and posture["require_auth"] is False and posture["notebook_execution"] == "exempt", posture)
         os.environ["GOVERNANCE_ENFORCEMENT"] = "audit"
-        os.environ["GOVERNANCE_RESTRICT_NOTEBOOKS"] = "true"
+        os.environ["GOVERNANCE_NOTEBOOK_EXECUTION"] = "all"
         try:
             p2 = client.get("/api/governance/status", cookies=admin).json()["posture"]
-            check("posture follows the environment", p2["enforcement_mode"] == "audit" and p2["notebooks_restricted"] is True, p2)
+            check("posture follows the environment", p2["enforcement_mode"] == "audit" and p2["notebook_execution"] == "all", p2)
         finally:
-            os.environ.pop("GOVERNANCE_ENFORCEMENT"), os.environ.pop("GOVERNANCE_RESTRICT_NOTEBOOKS")
+            os.environ.pop("GOVERNANCE_ENFORCEMENT"), os.environ.pop("GOVERNANCE_NOTEBOOK_EXECUTION")
 
         print("\n2. Preview as user")
         tags.set_tag(catalog="warehouse", schema_name="hr", table_name="employees", column_name="email", tag_key="pii", tag_value="email")

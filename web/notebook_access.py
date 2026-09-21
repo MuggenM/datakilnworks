@@ -1,38 +1,35 @@
 """
-Role gating for JupyterLab (governance trust boundary).
+Who may execute notebook code in the Studio (governance trust boundary).
 
-Notebook kernels talk to the warehouse directly, so they cannot honour per-user column masking. Optionally
-restricting who receives the Jupyter URL/token keeps masked roles from reaching an unmasked path through the Studio.
-This gates what the Studio *hands out*; the Jupyter port itself must still be protected with a non-default
-JUPYTER_TOKEN and network controls (see README, "Governance trust boundary").
+Notebook kernels are ordinary Python processes: they can read the warehouse files directly, so column masking cannot be
+enforced inside them. Until kernels are sandboxed, code execution is limited to principals that no masking policy applies
+to; masked users can still open and edit notebooks, but not run them.
+
+GOVERNANCE_NOTEBOOK_EXECUTION
+  exempt (default)  only principals not subject to a masking policy may run cells / notebooks
+  all               everyone who can open a notebook may run it (masking is then not enforced for notebook code)
 """
 
 import os
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional
 
-DEFAULT_TOKEN = "datakilnworks"
-
-
-def restrict_notebooks() -> bool:
-    return os.getenv("GOVERNANCE_RESTRICT_NOTEBOOKS", "false").strip().lower() in ("1", "true", "yes", "on")
+MODES = ("exempt", "all")
 
 
-def notebook_roles() -> Set[str]:
-    raw = os.getenv("GOVERNANCE_NOTEBOOK_ROLES", "admin,power_user")
-    return {r.strip() for r in raw.split(",") if r.strip()}
+def execution_mode() -> str:
+    mode = os.getenv("GOVERNANCE_NOTEBOOK_EXECUTION", "exempt").strip().lower()
+    return mode if mode in MODES else "exempt"
 
 
-def notebooks_allowed(user: Dict[str, Any]) -> bool:
-    return (not restrict_notebooks()) or (user or {}).get("role") in notebook_roles()
+def execution_allowed(user: Optional[Dict[str, Any]]) -> bool:
+    """False only when masking policies apply to this user and execution is limited to exempt principals."""
+    if execution_mode() == "all":
+        return True
+    from web.governance import gateway
+    return not gateway.is_subject(user)
 
 
-def access_payload(user: Dict[str, Any], jupyter_port: Any, jupyter_token: str) -> Dict[str, Any]:
-    """What the UI needs to show or hide Jupyter entry points; the token only travels to allowed roles."""
-    allowed = notebooks_allowed(user)
-    return {
-        "restricted": restrict_notebooks(),
-        "allowed": allowed,
-        "port": jupyter_port if allowed else None,
-        "token": jupyter_token if allowed else "",
-        "default_token_in_use": jupyter_token == DEFAULT_TOKEN,
-    }
+def execution_denied_message() -> str:
+    return ("Running notebooks is not available while masking policies apply to you: notebook code can read the "
+            "warehouse files directly, which masking cannot cover. You can still open and edit notebooks; use the SQL "
+            "editor to query masked data.")

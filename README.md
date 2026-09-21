@@ -21,7 +21,7 @@ Includes **Data Kiln Works**—a powerful data lakehouse web workbench with **Da
 │  - Jobs & Pipelines / Local Workflows (DAG engine, Delta compaction & Papermill) │
 │  - Unity Catalog Explorer (3-Level Namespace: catalog.schema.table, ACID log)    │
 │  - Monaco SQL Editor (Live compute warehouse selector, cross-catalog joins)      │
-│  - Workspace (Embedded JupyterLab integration on Port 8890)                      │
+│  - Workspace (In-Studio notebook runner, per-user folders, per-user kernels)     │
 │  - Compute Monitor (DuckDB engine stats & active cluster pools)                  │
 └────────────────────────┬─────────────────────────────────────────────────────────┘
                          │ REST APIs (FastAPI)
@@ -63,7 +63,6 @@ docker compose up -d
 | Interface | URL | Credentials / Notes |
 | :--- | :--- | :--- |
 | **Data Kiln Works** | [http://localhost:8891](http://localhost:8891) | **No password required.** Includes Data Ingestion wizard, Unity Catalog tree, Monaco SQL Workbench, Time Travel, and Compute stats. |
-| **JupyterLab** | [http://localhost:8890](http://localhost:8890) | Token: `datakilnworks` (pre-injected globals: `spark`, `dbutils`, `display()`, `%sql`) |
 
 ---
 
@@ -192,7 +191,7 @@ docker compose up -d
   - **Saved Queries**: Top-priority library queries with direct execution in the SQL Editor.
   - **Tables & Catalogs**: Search across all lakehouse catalogs with direct navigation to table inspection.
   - **Columns & Data Types**: Instant fuzzy search across table schemas (e.g. `price`, `salary`, `market_cap_b`) with direct routing to the Schema tab.
-  - **Notebooks**: Recursive discovery in `./notebooks/*.ipynb` with deep-linking into JupyterLab.
+  - **Notebooks**: Recursive discovery in `./notebooks/*.ipynb` opened in the in-Studio notebook runner.
   - **Lakeview Dashboards**: Match by dashboard names and widget titles.
   - **Jobs & Pipelines**: Match workflow DAGs and individual task names.
   - **Query History**: Search historical SQL executions from SQLite WAL logs with 1-click loading into the Monaco SQL Editor.
@@ -201,7 +200,7 @@ docker compose up -d
 * **Keyboard Navigation**: Full arrow key navigation (<kbd>↑</kbd> / <kbd>↓</kbd>), <kbd>Enter</kbd> to open, <kbd>Shift+Enter</kbd> to query table in editor, <kbd>Tab</kbd> to cycle categories, and <kbd>Esc</kbd> to close.
 
 ### 11. 📁 Workspace Browser & Native In-Studio Notebook Runner
-* **Native In-Studio Notebook Execution (Zero JupyterLab Overhead)**:
+* **Native In-Studio Notebook Execution (no separate Jupyter server)**:
   - **Direct In-Browser Cell Execution**: Execute any code cell directly inside the Data Kiln Works right-pane with the **▶ Run** button or <kbd>Shift+Enter</kbd> / <kbd>Ctrl+Enter</kbd>.
   - **Persistent Stateful Kernel Sessions**: Built-in `IPython` / `ipykernel` runner maintains live in-memory state across cell executions (variables, DataFrames, and imports persist from cell to cell).
   - **Pre-Loaded Databricks Globals**: Native access to `spark` (SQLFrame session), `conn` (duckrun Delta session), `dbutils`, `display()` (rich DataTables & HTML previews), and `%sql` / `%%sql` magics.
@@ -217,7 +216,7 @@ docker compose up -d
     - Expandable and collapsible directory tree with persistent open/closed state.
     - Live file filter search box to quickly locate notebooks and scripts across nested directories.
     - Type-specific icons: Jupyter Notebooks (`.ipynb`, purple), Python scripts (`.py`, blue), SQL scripts (`.sql`, green), and Folders (amber).
-    - Quick actions per item: New Notebook inside folder, Open in JupyterLab tab, Rename, and Delete.
+    - Quick actions per item: New Notebook inside folder, Rename, and Delete.
   - **Right Pane (In-Studio Workbench)**:
     - Dedicated interactive notebook environment, text/script viewer with one-click "Query in Monaco SQL Editor", and folder overview cards.
 * **Workspace Management Operations**:
@@ -225,8 +224,8 @@ docker compose up -d
   - `+ New Folder`: Creates nested subdirectories on the local filesystem.
   - `Upload`: Upload notebooks or scripts from your desktop directly into any workspace folder.
   - In-place renaming and deletion with confirmation safeguards and path traversal protection.
-* **Seamless JupyterLab Deep-Linking (Optional)**:
-  - For full-featured JupyterLab sessions, 1-click **Open in JupyterLab** opens the exact notebook in JupyterLab with authentication pre-configured (`/lab/tree/notebooks/<path>?token=datakilnworks`).
+* **Per-user access**: every notebook, file and kernel endpoint requires a valid session and only serves `Users/<you>/` and `Shared/` (admins see everything). Kernels are per user, so two people opening the same Shared notebook never share variables. There is deliberately no JupyterLab server: one shared server saw every user's folder plus the warehouse files.
+* **Running notebooks and column masking**: notebook kernels can read the warehouse files directly, so masking cannot cover them. By default (`GOVERNANCE_NOTEBOOK_EXECUTION=exempt`) users that a masking policy applies to can open and edit notebooks but not run them; sandboxed execution for them is planned.
 * **Universal Search (`Ctrl+P`) Deep-Linking**: Selecting any notebook result in Universal Search opens it immediately in the interactive in-studio notebook runner.
 
 ### 12. 🎨 Data Kiln Works UI/UX & Themes
@@ -490,22 +489,21 @@ spec:
 | Setting | Default | Effect |
 | :--- | :--- | :--- |
 | `GOVERNANCE_REQUIRE_AUTH` | `false` | `false` keeps the single-user local mode (requests **without credentials** run as the local admin). `true` makes them the least-privilege `anonymous` user and ignores the credential-less `X-User` header. Invalid or expired credentials are **never** admin in either mode. |
-| `GOVERNANCE_RESTRICT_NOTEBOOKS` | `false` | Only hand the JupyterLab URL/token to roles in `GOVERNANCE_NOTEBOOK_ROLES` (default `admin,power_user`). |
+| `GOVERNANCE_NOTEBOOK_EXECUTION` | `exempt` | Who may run notebook code in the Studio. `exempt`: only users no masking policy applies to (others can still open and edit notebooks). `all`: everyone (masking is then not enforced for notebook code). |
 | `JWT_SECRET_KEY` | per-install random | Session signing key. If unset, a random key is created in `warehouse/.metadata/jwt_secret` (existing sessions are signed out once after upgrading). |
 | `COMPUTE_TOKEN` | per-install random | Shared secret (`X-Compute-Token`) the studio sends to compute workers, which reject requests without it. Stored in `warehouse/.metadata/compute_token` when unset. |
-| `JUPYTER_TOKEN` | `datakilnworks` | **Change this for any shared install.** |
 | `GOVERNANCE_ENFORCEMENT` | `enforce` | `enforce` applies masking and statement gating; `audit` computes and logs what would be masked but never changes or blocks a query; `off` disables the gateway. |
 | `GOVERNANCE_ALLOWED_PATHS` | empty | Extra directories (`:`-separated) non-admins may read with file functions, besides warehouse tables, volumes, exports and `/tmp/uploads`. |
 
 **Non-admin file access.** File functions (`read_csv`, `read_parquet`, `delta_scan`, `read_text`, …) accept only literal paths inside warehouse tables, volumes and exports for non-admin roles, regardless of masking policies: reading `.metadata` (session signing key, compute token, auth database) would otherwise let anyone forge an admin session. `query()`/`query_table()` and redefining the `gov_*` mask functions are refused for non-admins.
 
-**What column masking will and will not cover.** Studio queries (SQL editor, dashboards, previews, exports, alerts, Genie) are governed. **JupyterLab notebooks and anything that can read `warehouse/` directly are outside that boundary**, because kernels talk to the warehouse without a user identity. Restrict notebooks by role, use a non-default `JUPYTER_TOKEN`, and do not publish the Jupyter port to untrusted networks. Compute workers (`compute-node-01..03`) are no longer published on the host; they are reachable only on the compose network and require the compute token.
+**What column masking will and will not cover.** Studio queries (SQL editor, dashboards, previews, exports, alerts, Genie, jobs) are governed. **Notebook kernels and anything that can read `warehouse/` directly are outside that boundary**, because a Python process can open the files itself. Notebook execution is therefore limited to users no masking policy applies to (`GOVERNANCE_NOTEBOOK_EXECUTION`). Compute workers (`compute-node-01..03`) are no longer published on the host; they are reachable only on the compose network and require the compute token.
 
 ---
 
 ## 🧪 Interactive Notebook Verification (Port 8890)
 
-Open [`notebooks/sample_lakehouse_pipeline.ipynb`](notebooks/sample_lakehouse_pipeline.ipynb) in JupyterLab:
+Open [`notebooks/sample_lakehouse_pipeline.ipynb`](notebooks/sample_lakehouse_pipeline.ipynb) in the Studio Workspace:
 1. **PySpark DataFrame Transformations**: Create PySpark DataFrames, apply window functions (`dense_rank`), and view rich tables with `display()`.
 2. **Delta Lake Materialization**: Materialize DataFrames to Delta tables via `conn.sql("CREATE OR REPLACE TABLE silver_employees AS SELECT * FROM transformed_df")`.
 3. **Inspect Delta Logs**: Run `dbutils.fs.ls("dbfs:/silver_employees")` to inspect Parquet data and `_delta_log/` transaction files.

@@ -389,15 +389,13 @@ def _workers() -> List[Dict[str, Any]]:
 
 def _posture() -> Dict[str, Any]:
     """The governance trust boundary at a glance (what masking does and does not cover in this install)."""
-    import os
     from web.auth import governance_require_auth
     from web.governance.enforce import enforcement_mode
-    from web.notebook_access import DEFAULT_TOKEN, restrict_notebooks
+    from web.notebook_access import execution_mode
     return {
         "enforcement_mode": enforcement_mode(),
         "require_auth": governance_require_auth(),
-        "notebooks_restricted": restrict_notebooks(),
-        "default_jupyter_token": os.getenv("JUPYTER_TOKEN", DEFAULT_TOKEN) == DEFAULT_TOKEN,
+        "notebook_execution": execution_mode(),
     }
 
 

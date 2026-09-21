@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive \
-    JUPYTER_ENABLE_LAB=yes
+    DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /workspace
 
@@ -20,9 +19,9 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # Directory layout for lakehouse warehouse, notebooks, web app, and ipython startup hooks
 RUN mkdir -p /workspace/warehouse /workspace/notebooks /workspace/web /root/.ipython/profile_default/startup
 
-# Copy IPython bootstrap shim
+# Copy IPython bootstrap shim (used by the in-Studio notebook kernels)
 COPY config/00_databricks_shim.py /root/.ipython/profile_default/startup/00_databricks_shim.py
 
-EXPOSE 8888 8000
+EXPOSE 8000
 
-CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--IdentityProvider.token=datakilnworks", "--ServerApp.token=datakilnworks", "--ServerApp.tornado_settings={\"headers\": {\"Content-Security-Policy\": \"frame-ancestors 'self' *\"}}"]
+CMD ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000"]

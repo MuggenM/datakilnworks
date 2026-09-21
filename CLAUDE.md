@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Data Kiln Works: a local Databricks-style lakehouse (Delta Lake tables on disk, DuckDB as the engine, SQLFrame for the Spark DataFrame API, no JVM). A FastAPI backend plus a single-page Alpine.js UI, and JupyterLab with a Databricks-compat shim. `README.md` has the full feature catalogue; `FEATURE_COMPARISON.md` maps features to Databricks/Snowflake.
+Data Kiln Works: a local Databricks-style lakehouse (Delta Lake tables on disk, DuckDB as the engine, SQLFrame for the Spark DataFrame API, no JVM). A FastAPI backend plus a single-page Alpine.js UI, with an in-Studio notebook runner (per-user kernels, Databricks-compat shim). There is no JupyterLab server. `README.md` has the full feature catalogue; `FEATURE_COMPARISON.md` maps features to Databricks/Snowflake.
 
 ## Running it
 
@@ -18,7 +18,6 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 
 | Service | Port | Entry point |
 | --- | --- | --- |
-| `lakehouse-notebook` | 8890 (Jupyter, token `datakilnworks`) | Dockerfile CMD |
 | `datakilnworks-studio` | 8891 | `uvicorn web.app:app --reload` |
 | `compute-node-01/02/03` | 8001-8003, compose network only (not published; require `X-Compute-Token`) | `uvicorn web.compute_worker:app` |
 
@@ -43,7 +42,7 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 - `ray_engine.py` optionally scales each warehouse with Ray `DuckDBWorkerActor` pools for scatter-gather scans. It degrades gracefully when Ray isn't installed (`RAY_INSTALLED`).
 
 **Notebooks**
-- `config/00_databricks_shim.py` is an IPython startup hook. It injects `spark` (a SQLFrame session sharing the duckrun DuckDB connection), `dbutils`, `display()`, and the `%sql` magic. It also patches `createOrReplaceTempView` so SQLFrame DataFrames are visible to SQL. Notebooks under `notebooks/{Users,Shared}/` are run headless by `notebook_runner.py` (Papermill) and the workflow DAG engine (`workflow.py`).
+- Notebooks run only through `web/notebook_runner.py` (kernels keyed per `(user, notebook)`; endpoints in `app.py` go through `_notebook_user`: authenticated, `can_access_workspace_path`, and `web/notebook_access.py` for execution). Do not add a shared Jupyter server: it would see every user's folder and the warehouse files. `config/00_databricks_shim.py` is an IPython startup hook. It injects `spark` (a SQLFrame session sharing the duckrun DuckDB connection), `dbutils`, `display()`, and the `%sql` magic. It also patches `createOrReplaceTempView` so SQLFrame DataFrames are visible to SQL. Notebooks under `notebooks/{Users,Shared}/` are run headless by `notebook_runner.py` (Papermill) and the workflow DAG engine (`workflow.py`).
 
 **Frontend**
 - `web/templates/index.html` is a single roughly 27k-line Jinja/Alpine.js file containing every view (Chart.js for charts, Monaco for SQL). Expect large, targeted edits with grep, not whole-file reads. Note the recent fix commits for Alpine expression and scope errors, since inline expressions are brittle.

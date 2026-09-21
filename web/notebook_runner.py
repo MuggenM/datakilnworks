@@ -20,7 +20,7 @@ def get_safe_path(rel_path: str) -> str:
     cleaned = rel_path.strip().lstrip("/\\")
     full_path = os.path.abspath(os.path.join(NOTEBOOKS_DIR, cleaned))
     real_base = os.path.abspath(NOTEBOOKS_DIR)
-    if not full_path.startswith(real_base):
+    if os.path.commonpath([full_path, real_base]) != real_base:
         raise ValueError(f"Access denied: path '{rel_path}' escapes notebook directory")
     return full_path
 
@@ -35,8 +35,9 @@ def clean_ansi(text: str) -> str:
 class KernelSession:
     """Manages an active IPython kernel for a specific notebook."""
 
-    def __init__(self, notebook_rel_path: str):
+    def __init__(self, notebook_rel_path: str, owner: str = "anonymous"):
         self.notebook_rel_path = notebook_rel_path
+        self.owner = owner
         self.km: Optional[KernelManager] = None
         self.kc = None
         self.lock = threading.Lock()
@@ -205,30 +206,32 @@ class KernelSession:
             }
 
 
-# Registry of active kernel sessions: { rel_path: KernelSession }
-SESSIONS: Dict[str, KernelSession] = {}
+# Registry of active kernel sessions: { (owner, rel_path): KernelSession }. Kernels are per user: two users who open the
+# same Shared notebook get separate kernels, so one cannot read or alter the other's variables.
+SESSIONS: Dict[tuple, KernelSession] = {}
 SESSIONS_LOCK = threading.Lock()
 
 
-def get_kernel_session(notebook_rel_path: str) -> KernelSession:
-    """Retrieve or create the KernelSession for the given notebook."""
+def get_kernel_session(notebook_rel_path: str, owner: str = "anonymous") -> KernelSession:
+    """Retrieve or create the KernelSession of `owner` for the given notebook."""
     norm_path = notebook_rel_path.strip().replace("\\", "/").lstrip("/")
+    key = (owner, norm_path)
     with SESSIONS_LOCK:
-        if norm_path not in SESSIONS:
-            SESSIONS[norm_path] = KernelSession(norm_path)
-        return SESSIONS[norm_path]
+        if key not in SESSIONS:
+            SESSIONS[key] = KernelSession(norm_path, owner)
+        return SESSIONS[key]
 
 
-def restart_notebook_kernel(notebook_rel_path: str) -> Dict[str, Any]:
+def restart_notebook_kernel(notebook_rel_path: str, owner: str = "anonymous") -> Dict[str, Any]:
     """Restart kernel for a specific notebook."""
-    session = get_kernel_session(notebook_rel_path)
+    session = get_kernel_session(notebook_rel_path, owner)
     session.restart()
     return {"success": True, "status": session.status, "message": "Kernel restarted successfully"}
 
 
-def get_kernel_status(notebook_rel_path: str) -> Dict[str, Any]:
+def get_kernel_status(notebook_rel_path: str, owner: str = "anonymous") -> Dict[str, Any]:
     """Get the live status of the notebook's kernel."""
-    session = get_kernel_session(notebook_rel_path)
+    session = get_kernel_session(notebook_rel_path, owner)
     is_alive = session.km is not None and session.km.is_alive()
     return {
         "status": session.status if is_alive else "stopped",
@@ -315,7 +318,8 @@ def _parse_cell_for_ui(cell, index: int) -> Dict[str, Any]:
 def execute_single_cell(
     notebook_rel_path: str,
     cell_index: int,
-    source_override: Optional[str] = None
+    source_override: Optional[str] = None,
+    owner: str = "anonymous"
 ) -> Dict[str, Any]:
     """
     Executes a single code cell (1-indexed) in the notebook's persistent kernel.
@@ -345,7 +349,7 @@ def execute_single_cell(
             "duration_ms": 0
         }
 
-    session = get_kernel_session(notebook_rel_path)
+    session = get_kernel_session(notebook_rel_path, owner)
     result = session.execute_code(cell.source)
 
     cell.execution_count = result["execution_count"]
@@ -366,7 +370,7 @@ def execute_single_cell(
     }
 
 
-def execute_all_cells(notebook_rel_path: str) -> Dict[str, Any]:
+def execute_all_cells(notebook_rel_path: str, owner: str = "anonymous") -> Dict[str, Any]:
     """
     Sequentially executes all code cells in the notebook, maintaining state in the kernel.
     Persists updated outputs and execution counts to the .ipynb file.
@@ -376,7 +380,7 @@ def execute_all_cells(notebook_rel_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Notebook not found: {notebook_rel_path}")
 
     nb = nbformat.read(full_path, as_version=4)
-    session = get_kernel_session(notebook_rel_path)
+    session = get_kernel_session(notebook_rel_path, owner)
 
     total_start = time.perf_counter()
     executed_count = 0

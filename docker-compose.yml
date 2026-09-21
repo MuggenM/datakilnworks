@@ -1,29 +1,8 @@
 services:
-  lakehouse-notebook:
+  datakilnworks-studio:
     build:
       context: .
       dockerfile: Dockerfile
-    image: localspark-lakehouse-notebook
-    container_name: local-datakilnworks-lakehouse
-    ports:
-      - "${HOST_PORT:-8890}:8888"
-    environment:
-      - WAREHOUSE_DIR=/workspace/warehouse
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-datakilnworks}
-    volumes:
-      - ./notebooks:/workspace/notebooks
-      - ./warehouse:/workspace/warehouse
-      - ./dbt_project:/workspace/dbt_project
-      - ./docs:/workspace/docs
-    deploy:
-      resources:
-        limits:
-          memory: 16G
-        reservations:
-          memory: 2G
-    restart: unless-stopped
-
-  datakilnworks-studio:
     image: localspark-lakehouse-notebook
     container_name: local-datakilnworks-studio
     command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -31,8 +10,6 @@ services:
       - "${STUDIO_PORT:-8891}:8000"
     environment:
       - WAREHOUSE_DIR=/workspace/warehouse
-      - JUPYTER_PORT=${HOST_PORT:-8890}
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-datakilnworks}
       - WH_STARTER_ENDPOINT=http://compute-node-01:8001
       - WH_ANALYTICS_ENDPOINT=http://compute-node-02:8002
       - WH_ETL_ENDPOINT=http://compute-node-03:8003
@@ -52,6 +29,8 @@ services:
 
   compute-node-01:
     image: localspark-lakehouse-notebook
+    depends_on:
+      - datakilnworks-studio
     container_name: local-compute-node-01
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8001"]
     # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
@@ -78,6 +57,8 @@ services:
 
   compute-node-02:
     image: localspark-lakehouse-notebook
+    depends_on:
+      - datakilnworks-studio
     container_name: local-compute-node-02
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8002"]
     # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
@@ -104,6 +85,8 @@ services:
 
   compute-node-03:
     image: localspark-lakehouse-notebook
+    depends_on:
+      - datakilnworks-studio
     container_name: local-compute-node-03
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8003"]
     # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.

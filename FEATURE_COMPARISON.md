@@ -68,7 +68,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Data Retention & Time Travel** | ✅ `TIMESTAMP / VERSION AS OF` | ✅ Time Travel (up to 90d) | ✅ **Delta Time Travel (`VERSION AS OF` / `RESTORE`)** | ✅ Tie |
 | **Zero-Copy Cloning** | ✅ Shallow Clone | ✅ Zero-Copy Clone | ✅ **Delta Shallow Clone** | ✅ Tie |
 | **Tags on Catalog Objects** | ✅ Governed tags (catalog / schema / table / column) | ✅ Object tags with inheritance | ✅ **Tags on catalogs, schemas, tables and columns, downward inheritance, allowed values, audit trail, name-based suggestions** | ✅ Tie |
-| **Tag-Based Policies** | ✅ ABAC column masks on tags | ✅ Tag-based masking policies | ✅ **Masking policies bound to a tag (value and column-type filters, priorities, role/user exemptions), enforced by query rewriting at every egress path** | ✅ Tie. Enforcement is application-level: JupyterLab notebooks and direct file access are outside the boundary (documented) |
+| **Tag-Based Policies** | ✅ ABAC column masks on tags | ✅ Tag-based masking policies | ✅ **Masking policies bound to a tag (value and column-type filters, priorities, role/user exemptions), enforced by query rewriting at every egress path** | ✅ Tie. Enforcement is application-level: notebook kernels can read warehouse files directly, so notebook execution is limited to unmasked users until sandboxed kernels exist (documented) |
 | **Cross-Organization Data Marketplace**| ⚠️ Delta Sharing | ✅ Snowflake Marketplace | ❌ N/A (Internal / Self-Hosted) | 🏆 **Snowflake** |
 
 **Domain Verdict:** **Databricks & DataKilnWorks** provide open-format Unity Catalog parity without proprietary lock-in. DataKilnWorks delivers superior visual volume browsing and lineage exploration for local and enterprise private clouds.
@@ -118,7 +118,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 
 | Feature | Real Databricks | Snowflake | DataKilnWorks Studio | Winner |
 | :--- | :---: | :---: | :---: | :--- |
-| **Interactive Notebooks** | ✅ Databricks Notebooks | ✅ Snowsight Notebooks | ✅ **JupyterLab + In-Studio Monaco Workbench** | 🏆 **Data Kiln / Databricks** |
+| **Interactive Notebooks** | ✅ Databricks Notebooks | ✅ Snowsight Notebooks | ✅ **In-Studio Notebook Runner (per-user kernels) + Monaco Workbench** | 🏆 **Data Kiln / Databricks** |
 | **Multi-Language Notebook Support**| ✅ Python, SQL, Scala, R | ⚠️ Python, SQL | ✅ **Python, SQL, PySpark, Bash, Markdown** | 🏆 **Databricks / Data Kiln** |
 | **PySpark DataFrame Compatibility**| ✅ Native Spark Runtime | ❌ Snowpark syntax only | ✅ **SQLFrame (100% PySpark syntax without JVM)** | 🏆 **Data Kiln / Databricks** |
 | **Monaco SQL Editor** | ✅ Yes | ✅ Yes | ✅ **Yes (Syntax highlight, auto-complete, multi-statement)** | ✅ Tie |

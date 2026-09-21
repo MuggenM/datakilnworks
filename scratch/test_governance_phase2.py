@@ -23,7 +23,7 @@ TMP_ROOT = tempfile.mkdtemp(prefix="governance_p2_")
 TMP_WAREHOUSE = os.path.join(TMP_ROOT, "warehouse")
 os.makedirs(TMP_WAREHOUSE)
 os.environ["WAREHOUSE_DIR"] = TMP_WAREHOUSE
-for var in ("GOVERNANCE_REQUIRE_AUTH", "GOVERNANCE_RESTRICT_NOTEBOOKS", "JWT_SECRET_KEY", "COMPUTE_TOKEN"):
+for var in ("GOVERNANCE_REQUIRE_AUTH", "GOVERNANCE_NOTEBOOK_EXECUTION", "JWT_SECRET_KEY", "COMPUTE_TOKEN"):
     os.environ.pop(var, None)
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

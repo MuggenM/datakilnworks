@@ -7,7 +7,7 @@ Tests:
 2. GOVERNANCE_REQUIRE_AUTH makes credential-less requests anonymous and ignores X-User.
 3. The JWT signing key is a per-install secret, and tokens signed with the old public default are rejected.
 4. Compute workers require X-Compute-Token; compose no longer publishes their ports.
-5. Notebook role gating hands the Jupyter token only to allowed roles.
+5. (Notebook access is covered by scratch/test_notebook_access.py.)
 """
 
 import asyncio
@@ -22,7 +22,7 @@ import tempfile
 TMP_WAREHOUSE = tempfile.mkdtemp(prefix="governance_p0_")
 os.environ["WAREHOUSE_DIR"] = TMP_WAREHOUSE
 os.environ.pop("GOVERNANCE_REQUIRE_AUTH", None)
-os.environ.pop("GOVERNANCE_RESTRICT_NOTEBOOKS", None)
+os.environ.pop("GOVERNANCE_NOTEBOOK_EXECUTION", None)
 os.environ.pop("JWT_SECRET_KEY", None)
 os.environ.pop("COMPUTE_TOKEN", None)
 
@@ -176,45 +176,12 @@ def test_compute_worker_auth():
     check("workers are exposed on the compose network", all(v.get("expose") for v in workers.values()))
 
 
-def test_notebook_gating():
-    print("\n5. Notebook role gating")
-    from fastapi.testclient import TestClient
-    from web import app as app_module
-    client = TestClient(app_module.app)
-    token = app_module.JUPYTER_TOKEN
-    bob = {auth.COOKIE_NAME: token_for("analyst_bob")}
-
-    r = client.get("/api/notebooks/access")
-    check("default: open to everyone", r.status_code == 200 and r.json()["allowed"] and r.json()["token"] == token, r.text)
-
-    os.environ["GOVERNANCE_RESTRICT_NOTEBOOKS"] = "true"
-    try:
-        r = client.get("/api/notebooks/access", cookies=bob)
-        body = r.json()
-        check("restricted: plain user denied, no token", not body["allowed"] and body["token"] == "" and body["port"] is None, body)
-        r = client.get("/api/notebooks/access", cookies={auth.COOKIE_NAME: token_for("admin")})
-        check("restricted: admin allowed with token", r.json()["allowed"] and r.json()["token"] == token, r.text)
-        page = client.get("/").text
-        check("restricted: token not embedded in the page", token not in page)
-        check("restricted: UI starts with notebooks hidden", "notebooksAllowed: false" in page)
-        status = client.get("/api/status", cookies=bob).json()
-        check("restricted: /api/status hides the Jupyter URL", status.get("jupyter_url") is None, status)
-        status = client.get("/api/status", cookies={auth.COOKIE_NAME: token_for("admin")}).json()
-        check("restricted: /api/status shows it to admin", token in (status.get("jupyter_url") or ""), status)
-        r = client.get("/api/notebooks/access", cookies={auth.COOKIE_NAME: "garbage"})
-        check("restricted: bad session -> 401", r.status_code == 401, r.status_code)
-    finally:
-        os.environ.pop("GOVERNANCE_RESTRICT_NOTEBOOKS", None)
-    check("unrestricted page embeds the token as before", token in client.get("/").text)
-
-
 def main():
     try:
         test_auth_never_fails_open()
         test_require_auth_mode()
         test_jwt_secret()
         test_compute_worker_auth()
-        test_notebook_gating()
     finally:
         shutil.rmtree(TMP_WAREHOUSE, ignore_errors=True)
     print()

@@ -985,12 +985,6 @@
         <i class="ph ph-arrows-clockwise text-sm" :class="{ 'animate-spin': isRefreshing }"></i>
       </button>
 
-      <a x-show="notebooksAllowed" :href="jupyterUrl" target="_blank" class="flex items-center space-x-1 hover:text-white transition px-2 py-1 rounded bg-dbx-panel border border-dbx-border">
-        <i class="ph ph-notebook text-sm text-amber-400"></i>
-        <span>JupyterLab</span>
-        <i class="ph ph-arrow-square-out text-[10px]"></i>
-      </a>
-
       <!-- Help Button (Opens index.html documentation in a new tab) -->
       <a href="/docs/" target="_blank" rel="noopener noreferrer" class="flex items-center space-x-1.5 hover:text-white transition px-2.5 py-1 rounded bg-dbx-panel hover:bg-dbx-hover border border-dbx-border text-slate-300 hover:border-slate-500 shadow-xs" title="Help (Manual & Tutorial)">
         <i class="ph ph-question text-sm text-amber-400"></i>
@@ -1656,9 +1650,8 @@
             </template>
             <div class="text-[11px] p-3 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 space-y-1">
               <div class="font-semibold flex items-center space-x-1.5"><i class="ph ph-warning"></i><span>Trust boundary</span></div>
-              <div>JupyterLab notebooks and anything that can read the warehouse files directly are <strong>outside</strong> column masking.
-                <span x-show="govStatus.posture.default_jupyter_token" class="font-semibold"> JupyterLab is still using the default public token: set JUPYTER_TOKEN.</span>
-                <span x-show="!govStatus.posture.notebooks_restricted"> Notebook access is open to all roles (GOVERNANCE_RESTRICT_NOTEBOOKS is off).</span>
+              <div>Notebook code runs in kernels that can read the warehouse files directly, so it is <strong>outside</strong> column masking. Running notebooks is therefore limited to users no masking policy applies to.
+                <span x-show="govStatus.posture.notebook_execution === 'all'" class="font-semibold"> GOVERNANCE_NOTEBOOK_EXECUTION=all lets everyone run notebooks: masking is not enforced for notebook code.</span>
                 <span x-show="!govStatus.posture.require_auth"> Requests without credentials run as the local admin (GOVERNANCE_REQUIRE_AUTH is off).</span></div>
             </div>
           </div>
@@ -4102,19 +4095,6 @@
               <i class="ph ph-arrows-clockwise text-sm"></i>
             </button>
 
-            <div class="h-4 w-px bg-dbx-border mx-1"></div>
-
-            <!-- View Mode Switcher -->
-            <div class="flex items-center bg-slate-900 border border-dbx-border rounded p-0.5 text-xs">
-              <button @click="workspaceViewMode = 'split'" :class="workspaceViewMode === 'split' ? 'bg-dbx-hover text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-200'" class="px-2 py-0.5 rounded flex items-center space-x-1 transition">
-                <i class="ph ph-sidebar-simple text-xs"></i>
-                <span>Browser & Preview</span>
-              </button>
-              <button x-show="notebooksAllowed" @click="workspaceViewMode = 'fullscreen'" :class="workspaceViewMode === 'fullscreen' ? 'bg-dbx-hover text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-200'" class="px-2 py-0.5 rounded flex items-center space-x-1 transition">
-                <i class="ph ph-browsers text-xs"></i>
-                <span>Full JupyterLab</span>
-              </button>
-            </div>
           </div>
         </div>
 
@@ -4189,11 +4169,6 @@
                         <i class="ph ph-plus-circle text-xs"></i>
                       </button>
                     </template>
-                    <template x-if="node.type === 'notebook'">
-                      <button x-show="notebooksAllowed" @click.stop="openInJupyterLab(node.rel_path, true)" title="Open in JupyterLab (New Tab)" class="p-1 text-slate-400 hover:text-dbx-orange rounded hover:bg-slate-700">
-                        <i class="ph ph-arrow-square-out text-xs"></i>
-                      </button>
-                    </template>
                     <button x-show="!node.is_user_home" @click.stop="openWorkspaceRenameModal(node)" title="Rename" class="p-1 text-slate-400 hover:text-slate-200 rounded hover:bg-slate-700">
                       <i class="ph ph-pencil-simple text-xs"></i>
                     </button>
@@ -4264,13 +4239,6 @@
 
                   <!-- Actions Bar on Right -->
                   <div class="flex items-center space-x-2 shrink-0">
-                    <!-- Notebook / Python action: Open in JupyterLab -->
-                    <template x-if="selectedWorkspaceItem.type === 'notebook' || selectedWorkspaceItem.type === 'python'">
-                      <a x-show="notebooksAllowed" :href="jupyterDeepUrl" target="_blank" class="px-2.5 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition" :title="selectedWorkspaceItem.type === 'notebook' ? 'Open selected notebook in JupyterLab (New Tab)' : 'Open file in JupyterLab (New Tab)'">
-                        <span>Open in JupyterLab</span>
-                        <i class="ph ph-arrow-square-out text-xs"></i>
-                      </a>
-                    </template>
 
                     <!-- SQL-specific action: Query in SQL Editor -->
                     <template x-if="selectedWorkspaceItem.type === 'sql' && workspaceFileDetail?.content">
@@ -4305,10 +4273,16 @@
                   <!-- 1. Notebook Interactive Workbench -->
                   <template x-if="selectedWorkspaceItem.type === 'notebook' && workspaceFileDetail">
                     <div class="max-w-4xl mx-auto space-y-4 pb-12">
+                      <template x-if="!notebookExecutionAllowed">
+                        <div class="px-3 py-2 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs flex items-start space-x-2">
+                          <i class="ph ph-lock-key mt-0.5"></i>
+                          <span>Masking policies apply to you, so notebook cells cannot be run here (notebook code can read the warehouse files directly). You can still read and edit this notebook; use the SQL editor to query masked data.</span>
+                        </div>
+                      </template>
                       <!-- Notebook Sticky Command Strip -->
                       <div class="p-3 bg-white dark:bg-dbx-panel/90 border border-slate-200 dark:border-dbx-border rounded-lg flex items-center justify-between shadow-sm sticky top-0 z-10 backdrop-blur-md">
                         <div class="flex items-center space-x-2">
-                          <button @click="runAllNotebookCells()" :disabled="notebookRunningAll" class="px-3 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition disabled:opacity-50">
+                          <button @click="runAllNotebookCells()" :disabled="notebookRunningAll || !notebookExecutionAllowed" class="px-3 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition disabled:opacity-50">
                             <i class="ph" :class="notebookRunningAll ? 'ph-spinner animate-spin' : 'ph-play-fill'"></i>
                             <span x-text="notebookRunningAll ? 'Running All...' : 'Run All Cells'"></span>
                           </button>
@@ -4534,12 +4508,6 @@
                             <span class="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-200/60 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400" x-text="(workspaceFileDetail.lines || (workspaceFileDetail.content ? workspaceFileDetail.content.split('\n').length : 0)) + ' lines'"></span>
                           </div>
                           <div class="flex items-center space-x-2">
-                            <template x-if="selectedWorkspaceItem.type === 'python'">
-                              <a x-show="notebooksAllowed" :href="jupyterDeepUrl" target="_blank" class="text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-dbx-border hover:bg-slate-50 dark:hover:bg-slate-700 transition text-[11px] shadow-xs" title="Open and edit in JupyterLab">
-                                <i class="ph ph-arrow-square-out text-xs"></i>
-                                <span>Edit in JupyterLab</span>
-                              </a>
-                            </template>
                             <template x-if="selectedWorkspaceItem.type === 'sql'">
                               <button @click="loadSqlInEditor(workspaceFileDetail.content)" class="text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-dbx-border hover:bg-slate-50 dark:hover:bg-slate-700 transition text-[11px] shadow-xs">
                                 <i class="ph ph-play-fill text-xs text-emerald-500"></i>
@@ -4623,22 +4591,6 @@
             </template>
           </div>
         </div>
-
-        <!-- 2. FULLSCREEN JUPYTERLAB FRAME -->
-        <div x-show="workspaceViewMode === 'fullscreen'" class="flex-1 bg-slate-900 relative">
-          <!-- Floating Back Bar -->
-          <div class="absolute top-2 right-4 z-20 flex items-center space-x-2 bg-slate-950/90 border border-dbx-border rounded-lg p-1 shadow-xl">
-            <button @click="workspaceViewMode = 'split'" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded flex items-center space-x-1.5 transition">
-              <i class="ph ph-sidebar-simple text-xs"></i>
-              <span>Back to Split Browser</span>
-            </button>
-            <a :href="jupyterDeepUrl" target="_blank" class="px-2.5 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white text-xs rounded flex items-center space-x-1 font-semibold transition">
-              <span>Open in New Tab</span>
-              <i class="ph ph-arrow-square-out text-xs"></i>
-            </a>
-          </div>
-          <iframe :src="notebooksAllowed ? jupyterDeepUrl : 'about:blank'" class="w-full h-full border-0" allow="clipboard-read; clipboard-write"></iframe>
-        </div>
       </div>
 
       <!-- ================= 4. COMPUTE & ENGINE VIEW ================= -->
@@ -4695,7 +4647,7 @@
               <div class="text-slate-300">Local Delta Lake + duckrun</div>
               <div class="text-slate-300">Vectorized DuckDB C++ Engine</div>
               <div class="text-slate-300">Delta Log Auto-Discovery Explorer</div>
-              <div class="text-slate-300">Monaco SQL Workbench + JupyterLab</div>
+              <div class="text-slate-300">Monaco SQL Workbench + In-Studio Notebooks</div>
             </div>
           </div>
         </div>
@@ -6103,7 +6055,7 @@
                 <span>Query History & Audit Log</span>
                 <span class="text-[10px] px-1.5 py-0.5 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded font-mono font-semibold" x-text="historyTotalCount + ' runs'"></span>
               </h2>
-              <p class="text-[11px] text-slate-500 dark:text-slate-400">Live execution history across Monaco SQL, Dashboards, Ingestion, and JupyterLab</p>
+              <p class="text-[11px] text-slate-500 dark:text-slate-400">Live execution history across Monaco SQL, Dashboards, Ingestion, and Notebooks</p>
             </div>
           </div>
 
@@ -6187,7 +6139,7 @@
               <select x-model="historyFilter.client" @change="fetchHistory()" class="bg-slate-900 border border-dbx-border rounded px-2.5 py-1 text-xs text-white focus:outline-none focus:border-amber-500">
                 <option value="ALL">All Sources</option>
                 <option value="SQL_EDITOR">SQL Editor</option>
-                <option value="NOTEBOOK">Notebook (JupyterLab)</option>
+                <option value="NOTEBOOK">Notebook</option>
                 <option value="DASHBOARD">Lakeview Dashboard</option>
                 <option value="INGESTION">Data Ingestion</option>
               </select>
@@ -16368,11 +16320,8 @@
         },
         isLoadingSettings: false,
         isSavingSettings: false,
-        jupyterPort: '{{ jupyter_port }}',
-        jupyterToken: '{{ jupyter_token }}',
-        jupyterUrl: 'http://' + window.location.hostname + ':{{ jupyter_port }}/lab?token={{ jupyter_token }}',
-        // Role gating (GOVERNANCE_RESTRICT_NOTEBOOKS): false until /api/notebooks/access allows this user
-        notebooksAllowed: {{ 'false' if notebooks_restricted else 'true' }},
+        // Whether the caller may run notebook code (masked users can open and edit notebooks, not run them)
+        notebookExecutionAllowed: true,
         status: {},
         catalogs: [],
         selectedTable: null,
@@ -16896,14 +16845,6 @@
         notebookRunningAll: false,
         runningCellIdx: null,
         kernelStatus: 'stopped',
-
-        get jupyterDeepUrl() {
-          const target = this.selectedWorkspaceItem ? this.selectedWorkspaceItem.rel_path : '';
-          if (target) {
-            return 'http://' + window.location.hostname + ':' + this.jupyterPort + '/lab/tree/notebooks/' + encodeURIComponent(target) + '?token=' + this.jupyterToken;
-          }
-          return 'http://' + window.location.hostname + ':' + this.jupyterPort + '/lab?token=' + this.jupyterToken;
-        },
 
         get flattenedWorkspaceTree() {
           const result = [];
@@ -17513,14 +17454,7 @@
         async refreshNotebookAccess() {
           try {
             const res = await fetch('/api/notebooks/access');
-            if (!res.ok) { this.notebooksAllowed = false; this.jupyterToken = ''; return; }
-            const a = await res.json();
-            this.notebooksAllowed = !!a.allowed;
-            this.jupyterToken = a.token || '';
-            if (a.port) { this.jupyterPort = a.port; }
-            this.jupyterUrl = a.allowed
-              ? 'http://' + window.location.hostname + ':' + this.jupyterPort + '/lab?token=' + this.jupyterToken
-              : '';
+            this.notebookExecutionAllowed = res.ok ? !!(await res.json()).execution_allowed : false;
           } catch (e) {
             console.warn('Notebook access check failed:', e);
           }
@@ -19122,18 +19056,6 @@
           }
         },
 
-        openInJupyterLab(relPath = null, newTab = true) {
-          const targetPath = relPath || (this.selectedWorkspaceItem ? this.selectedWorkspaceItem.rel_path : '');
-          const url = targetPath
-            ? `http://${window.location.hostname}:${this.jupyterPort}/lab/tree/notebooks/${encodeURIComponent(targetPath)}?token=${this.jupyterToken}`
-            : `http://${window.location.hostname}:${this.jupyterPort}/lab?token=${this.jupyterToken}`;
-          if (newTab) {
-            window.open(url, '_blank');
-          } else {
-            this.workspaceViewMode = 'fullscreen';
-          }
-        },
-
         getWorkspaceFileLanguage(filename, fileType) {
           if (fileType === 'python') return 'Python';
           if (fileType === 'sql') return 'SQL';
@@ -19441,6 +19363,10 @@
             return;
           }
 
+          if (!this.notebookExecutionAllowed) {
+            this.showToast('Running notebooks is not available while masking policies apply to you.', 'error');
+            return;
+          }
           this.runningCellIdx = cell.index;
           this.kernelStatus = 'busy';
           try {
@@ -19470,6 +19396,10 @@
 
         async runAllNotebookCells() {
           if (!this.selectedWorkspaceItem || this.selectedWorkspaceItem.type !== 'notebook') return;
+          if (!this.notebookExecutionAllowed) {
+            this.showToast('Running notebooks is not available while masking policies apply to you.', 'error');
+            return;
+          }
           this.notebookRunningAll = true;
           this.kernelStatus = 'busy';
           try {

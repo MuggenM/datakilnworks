@@ -985,21 +985,7 @@ services:
     networks:
       - lakehouse-net
 
-  # 2. JupyterLab Notebook Environment
-  jupyter:
-    image: localspark-lakehouse-notebook:latest
-    container_name: local-datakilnworks-lakehouse
-    restart: unless-stopped
-    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='datakilnworks'
-    ports:
-      - "8890:8888"
-    volumes:
-      - ./warehouse:/workspace/warehouse
-      - ./notebooks:/workspace/notebooks
-    networks:
-      - lakehouse-net
-
-  # 3. Ray Distributed Compute Head Node
+  # 2. Ray Distributed Compute Head Node
   ray-head:
     image: rayproject/ray:2.35.0-py311
     container_name: local-ray-head
