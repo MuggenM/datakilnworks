@@ -106,10 +106,20 @@ def init_playground_db():
                     tps_b REAL DEFAULT 0.0,
                     error_a TEXT,
                     error_b TEXT,
+                    user_id TEXT DEFAULT 'admin',
                     created_at TEXT NOT NULL
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_created ON playground_history(created_at DESC);")
+
+            try:
+                conn.execute("ALTER TABLE playground_templates ADD COLUMN user_id TEXT DEFAULT 'admin';")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE playground_history ADD COLUMN user_id TEXT DEFAULT 'admin';")
+            except sqlite3.OperationalError:
+                pass
 
             # Check if templates need seeding
             cur = conn.execute("SELECT COUNT(*) FROM playground_templates;")
@@ -327,6 +337,18 @@ async def get_available_models() -> Dict[str, Any]:
                 "loaded": True
             })
 
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if anthropic_key:
+        for m in ["claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"]:
+            all_models.append({
+                "id": f"anthropic::{m}",
+                "model_name": m,
+                "provider": "anthropic",
+                "host": "https://api.anthropic.com",
+                "label": f"{m} (Cloud)",
+                "loaded": True
+            })
+
     # Default model determination
     default_model_a = None
     default_model_b = None
@@ -356,6 +378,15 @@ async def get_available_models() -> Dict[str, Any]:
             "available": bool(lmstudio_host),
             "host": lmstudio_host,
             "count": len(lmstudio_models)
+        },
+        "openai": {
+            "available": bool(openai_key)
+        },
+        "gemini": {
+            "available": bool(gemini_key)
+        },
+        "anthropic": {
+            "available": bool(anthropic_key)
         },
         "default_model_a": default_model_a or (all_models[0]["id"] if all_models else None),
         "default_model_b": default_model_b or (all_models[1]["id"] if len(all_models) > 1 else default_model_a)
@@ -535,6 +566,44 @@ async def run_single_prompt(
                 t1 = time.time()
                 result["latency_ms"] = round((t1 - t0) * 1000, 1)
                 result["tokens_per_sec"] = round(result["completion_tokens"] / (max(t1 - t0, 0.01)), 1)
+
+        elif provider == "anthropic":
+            key = os.environ.get("ANTHROPIC_API_KEY")
+            if not key:
+                raise RuntimeError("ANTHROPIC_API_KEY environment variable not set")
+            url = "https://api.anthropic.com/v1/messages"
+            headers = {
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+            sys_msg = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+            anthropic_msgs = [
+                {"role": m["role"], "content": m["content"]}
+                for m in messages if m.get("role") in ("user", "assistant")
+            ]
+            payload = {
+                "model": model or "claude-3-5-sonnet-20241022",
+                "messages": anthropic_msgs,
+                "max_tokens": int(max_tokens) or 1024,
+                "temperature": float(temperature)
+            }
+            if sys_msg:
+                payload["system"] = sys_msg
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                res = await client.post(url, json=payload, headers=headers)
+                if res.status_code != 200:
+                    raise RuntimeError(f"Anthropic error ({res.status_code}): {res.text}")
+                data = res.json()
+                content = "".join(b.get("text", "") for b in data.get("content", []))
+                result["content"] = content
+                usage = data.get("usage", {})
+                result["completion_tokens"] = usage.get("output_tokens", 0)
+                result["prompt_tokens"] = usage.get("input_tokens", 0)
+                result["tokens"] = result["completion_tokens"] + result["prompt_tokens"]
+                t1 = time.time()
+                result["latency_ms"] = round((t1 - t0) * 1000, 1)
+                result["tokens_per_sec"] = round(result["completion_tokens"] / (max(t1 - t0, 0.01)), 1)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
@@ -552,7 +621,8 @@ async def run_comparison_prompts(
     rendered_prompt: str,
     raw_prompt: str,
     system_prompt: str = "",
-    variables: Optional[Dict[str, str]] = None
+    variables: Optional[Dict[str, str]] = None,
+    user_id: str = "admin"
 ) -> Dict[str, Any]:
     """Executes side-by-side prompt runs concurrently using asyncio.gather and records history."""
     task_a = run_single_prompt(
@@ -594,8 +664,8 @@ async def run_comparison_prompts(
                     system_prompt, user_prompt, prompt_rendered, variables_json,
                     config_a, config_b, response_a, response_b,
                     latency_a_ms, latency_b_ms, tokens_a, tokens_b,
-                    tps_a, tps_b, error_a, error_b, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    tps_a, tps_b, error_a, error_b, user_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 hist_id,
                 "compare",
@@ -619,6 +689,7 @@ async def run_comparison_prompts(
                 res_b.get("tokens_per_sec", 0.0),
                 res_a.get("error"),
                 res_b.get("error"),
+                user_id or "admin",
                 now
             ))
     except Exception as e:
@@ -637,7 +708,8 @@ async def run_and_record_single(
     rendered_prompt: str,
     raw_prompt: str,
     system_prompt: str = "",
-    variables: Optional[Dict[str, str]] = None
+    variables: Optional[Dict[str, str]] = None,
+    user_id: str = "admin"
 ) -> Dict[str, Any]:
     """Executes a single prompt run and records it into history."""
     res = await run_single_prompt(
@@ -659,8 +731,8 @@ async def run_and_record_single(
                 INSERT INTO playground_history (
                     id, mode, model_a, provider_a,
                     system_prompt, user_prompt, prompt_rendered, variables_json,
-                    config_a, response_a, latency_a_ms, tokens_a, tps_a, error_a, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    config_a, response_a, latency_a_ms, tokens_a, tps_a, error_a, user_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 hist_id,
                 "single",
@@ -676,10 +748,63 @@ async def run_and_record_single(
                 res.get("tokens", 0),
                 res.get("tokens_per_sec", 0.0),
                 res.get("error"),
+                user_id or "admin",
                 now
             ))
     except Exception as e:
         logger.error(f"Failed to record single history: {e}")
+
+    # Automatically log MLflow GenAI Trace for Playground execution
+    try:
+        from web.experiments import mlflow_log_trace
+        trace_req_id = f"tr_{uuid.uuid4().hex[:12]}"
+        trace_sp_id = f"sp_{uuid.uuid4().hex[:10]}"
+        now_ms = int(time.time() * 1000)
+        dur_ms = float(res.get("latency_ms", 0.0))
+        status_code = "ERROR" if res.get("error") else "OK"
+        prompt_tokens = int(res.get("prompt_tokens", 0))
+        comp_tokens = int(res.get("tokens", 0))
+        tot_tokens = prompt_tokens + comp_tokens
+
+        mlflow_log_trace({
+            "request_id": trace_req_id,
+            "experiment_id": "0",
+            "name": f"playground_{config.get('model', 'prompt')}",
+            "timestamp_ms": now_ms,
+            "execution_time_ms": dur_ms,
+            "status": status_code,
+            "request": {"system_prompt": system_prompt, "prompt": rendered_prompt, "variables": variables or {}},
+            "response": {"content": res.get("content", ""), "error": res.get("error")},
+            "tags": {"source": "playground", "model": config.get("model", ""), "provider": config.get("provider", "")},
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": comp_tokens,
+            "total_tokens": tot_tokens,
+            "spans": [{
+                "span_id": trace_sp_id,
+                "request_id": trace_req_id,
+                "parent_id": None,
+                "name": f"{config.get('provider', 'llm')}.chat.completion",
+                "span_type": "LLM",
+                "start_time_ns": now_ms * 1_000_000,
+                "end_time_ns": (now_ms * 1_000_000) + int(dur_ms * 1e6),
+                "duration_ms": dur_ms,
+                "status_code": status_code,
+                "status_message": res.get("error", "") or "",
+                "inputs": {"prompt": rendered_prompt, "system_prompt": system_prompt, "temperature": config.get("temperature")},
+                "outputs": {"content": res.get("content", "")},
+                "attributes": {
+                    "model": config.get("model", ""),
+                    "provider": config.get("provider", ""),
+                    "usage.prompt_tokens": prompt_tokens,
+                    "usage.completion_tokens": comp_tokens,
+                    "usage.total_tokens": tot_tokens,
+                    "tps": res.get("tokens_per_sec", 0.0)
+                },
+                "events": []
+            }]
+        })
+    except Exception as trace_ex:
+        logger.debug(f"Optional MLflow trace logging for playground skipped: {trace_ex}")
 
     return {
         "history_id": hist_id,
@@ -690,18 +815,25 @@ async def run_and_record_single(
 
 # ==================== TEMPLATES & HISTORY CRUD ====================
 
-def get_templates(category: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Returns all saved prompt templates, optionally filtered by category."""
+def get_templates(
+    category: Optional[str] = None,
+    user_id: Optional[str] = None,
+    is_admin: bool = True
+) -> List[Dict[str, Any]]:
+    """Returns prompt templates, optionally filtered by category and user ownership."""
     with get_playground_db() as conn:
+        conditions = []
+        params = []
         if category and category != "All":
-            cur = conn.execute(
-                "SELECT * FROM playground_templates WHERE category = ? ORDER BY is_builtin DESC, title ASC;",
-                (category,)
-            )
-        else:
-            cur = conn.execute(
-                "SELECT * FROM playground_templates ORDER BY is_builtin DESC, title ASC;"
-            )
+            conditions.append("category = ?")
+            params.append(category)
+        if not is_admin and user_id:
+            conditions.append("(is_builtin = 1 OR user_id = ?)")
+            params.append(user_id)
+        
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        sql = f"SELECT * FROM playground_templates {where} ORDER BY is_builtin DESC, title ASC;"
+        cur = conn.execute(sql, tuple(params))
         rows = cur.fetchall()
         result = []
         for r in rows:
@@ -729,18 +861,19 @@ def get_template_by_id(template_id: str) -> Optional[Dict[str, Any]]:
         return d
 
 
-def save_template(data: Dict[str, Any]) -> Dict[str, Any]:
+def save_template(data: Dict[str, Any], user_id: str = "admin") -> Dict[str, Any]:
     """Creates or updates a prompt template."""
     tmpl_id = data.get("id") or f"tmpl_{uuid.uuid4().hex[:10]}"
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     vars_json = json.dumps(data.get("variables") or [])
+    owner = data.get("user_id") or user_id or "admin"
     
     with get_playground_db() as conn:
         conn.execute("""
             INSERT INTO playground_templates (
                 id, title, description, category, system_prompt, user_prompt,
-                temperature, top_p, max_tokens, variables, is_builtin, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                temperature, top_p, max_tokens, variables, is_builtin, user_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -764,23 +897,38 @@ def save_template(data: Dict[str, Any]) -> Dict[str, Any]:
             int(data.get("max_tokens", 1024)),
             vars_json,
             int(data.get("is_builtin", 0)),
+            owner,
             data.get("created_at", now),
             now
         ))
     return get_template_by_id(tmpl_id)
 
 
-def delete_template(template_id: str) -> bool:
-    """Deletes a custom template (prevents deleting built-in starter templates)."""
+def delete_template(template_id: str, user_id: Optional[str] = None, is_admin: bool = True) -> bool:
+    """Deletes a custom template (prevents deleting built-in starter templates, enforces user ownership)."""
     with get_playground_db() as conn:
-        cur = conn.execute("DELETE FROM playground_templates WHERE id = ? AND is_builtin = 0;", (template_id,))
+        if is_admin or not user_id:
+            cur = conn.execute("DELETE FROM playground_templates WHERE id = ? AND is_builtin = 0;", (template_id,))
+        else:
+            cur = conn.execute("DELETE FROM playground_templates WHERE id = ? AND is_builtin = 0 AND user_id = ?;", (template_id, user_id))
         return cur.rowcount > 0
 
 
-def get_history(limit: int = 50) -> List[Dict[str, Any]]:
-    """Returns recent prompt execution benchmark runs."""
+def get_history(limit: int = 50, user_id: Optional[str] = None, is_admin: bool = True) -> List[Dict[str, Any]]:
+    """Returns recent prompt execution benchmark runs, scoped by user for non-admins."""
     with get_playground_db() as conn:
-        cur = conn.execute("SELECT * FROM playground_history ORDER BY created_at DESC LIMIT ?;", (limit,))
+        if not is_admin and user_id:
+            cur = conn.execute(
+                "SELECT * FROM playground_history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?;",
+                (user_id, limit)
+            )
+        elif is_admin and user_id and user_id != "all":
+            cur = conn.execute(
+                "SELECT * FROM playground_history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?;",
+                (user_id, limit)
+            )
+        else:
+            cur = conn.execute("SELECT * FROM playground_history ORDER BY created_at DESC LIMIT ?;", (limit,))
         rows = cur.fetchall()
         result = []
         for r in rows:
@@ -794,17 +942,23 @@ def get_history(limit: int = 50) -> List[Dict[str, Any]]:
         return result
 
 
-def delete_history_item(hist_id: str) -> bool:
+def delete_history_item(hist_id: str, user_id: Optional[str] = None, is_admin: bool = True) -> bool:
     """Deletes a specific history record."""
     with get_playground_db() as conn:
-        cur = conn.execute("DELETE FROM playground_history WHERE id = ?;", (hist_id,))
+        if is_admin or not user_id:
+            cur = conn.execute("DELETE FROM playground_history WHERE id = ?;", (hist_id,))
+        else:
+            cur = conn.execute("DELETE FROM playground_history WHERE id = ? AND user_id = ?;", (hist_id, user_id))
         return cur.rowcount > 0
 
 
-def clear_history() -> bool:
-    """Clears all execution history."""
+def clear_history(user_id: Optional[str] = None, is_admin: bool = True) -> bool:
+    """Clears execution history, scoped by user for non-admins."""
     with get_playground_db() as conn:
-        conn.execute("DELETE FROM playground_history;")
+        if is_admin and not user_id:
+            conn.execute("DELETE FROM playground_history;")
+        else:
+            conn.execute("DELETE FROM playground_history WHERE user_id = ?;", (user_id,))
         return True
 
 

@@ -15,18 +15,25 @@ DBT_DB_PATH = os.path.join(os.getenv("WAREHOUSE_DIR", "/workspace/warehouse"), "
 # In-memory runs cache
 _RUNS_HISTORY: List[Dict[str, Any]] = []
 
-def _load_runs_history() -> List[Dict[str, Any]]:
+def _load_runs_history(user: Optional[str] = None, is_admin: bool = True) -> List[Dict[str, Any]]:
     global _RUNS_HISTORY
+    all_runs = []
     if _RUNS_HISTORY:
-        return _RUNS_HISTORY
-    if os.path.exists(DBT_RUNS_LOG):
+        all_runs = _RUNS_HISTORY
+    elif os.path.exists(DBT_RUNS_LOG):
         try:
             with open(DBT_RUNS_LOG, "r", encoding="utf-8") as f:
                 _RUNS_HISTORY = json.load(f)
-                return _RUNS_HISTORY
+                all_runs = _RUNS_HISTORY
         except Exception as e:
             logger.warning(f"Failed to read dbt runs history: {e}")
-    return []
+            all_runs = []
+
+    if not is_admin and user:
+        return [r for r in all_runs if r.get("user") == user or r.get("user") is None]
+    elif is_admin and user and user != "all":
+        return [r for r in all_runs if r.get("user") == user]
+    return all_runs
 
 def _save_run_record(record: Dict[str, Any]) -> None:
     global _RUNS_HISTORY
@@ -39,7 +46,7 @@ def _save_run_record(record: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning(f"Failed to persist dbt run record: {e}")
 
-def get_dbt_status() -> Dict[str, Any]:
+def get_dbt_status(user: Optional[str] = None, is_admin: bool = True) -> Dict[str, Any]:
     project_exists = os.path.exists(os.path.join(DBT_PROJECT_DIR, "dbt_project.yml"))
     profiles_exists = os.path.exists(os.path.join(DBT_PROJECT_DIR, "profiles.yml"))
 
@@ -48,7 +55,7 @@ def get_dbt_status() -> Dict[str, Any]:
     version_str = "1.12.4"
     
     models = list_dbt_models()
-    runs = _load_runs_history()
+    runs = _load_runs_history(user=user, is_admin=is_admin)
     last_run = runs[0] if runs else None
 
     return {
@@ -227,7 +234,7 @@ def get_dbt_model_detail(model_name: str) -> Optional[Dict[str, Any]]:
         "metadata": meta
     }
 
-def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh: bool = False, target: str = "dev") -> Dict[str, Any]:
+def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh: bool = False, target: str = "dev", user: str = "admin") -> Dict[str, Any]:
     run_id = f"run_{uuid.uuid4().hex[:8]}"
     start_time = datetime.datetime.now()
     
@@ -287,6 +294,7 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
         "exit_code": exit_code,
         "output": output,
         "duration_seconds": duration_s,
+        "user": user or "admin",
         "created_at": start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "summary": {
             "pass": pass_count,

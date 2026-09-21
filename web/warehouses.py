@@ -4,7 +4,7 @@ import time
 import uuid
 import datetime
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from deltalake import DeltaTable
 
 logger = logging.getLogger("localspark.warehouses")
@@ -445,6 +445,7 @@ def get_catalog(cat_id: str) -> Optional[Dict[str, Any]]:
                 path = f"s3://{bucket}" if m.get("type") == "s3" else cfg.get("path", "")
                 return {
                     "id": m.get("catalog_name"),
+                    "catalog_name": m.get("catalog_name"),
                     "name": m.get("name"),
                     "type": m.get("type"),
                     "is_mounted": True,
@@ -563,7 +564,21 @@ def scan_all_catalogs_and_tables(conn=None) -> Dict[str, Any]:
     """Scans all registered catalogs and external storage mounts, returning hierarchical Unity Catalog metadata."""
     catalogs = load_catalogs()
     result = []
-    
+
+    # Discover registered models to include in Unity Catalog 3-level governance
+    try:
+        from web.serving import list_registered_models
+        all_models = list_registered_models()
+    except Exception as e:
+        logger.warning(f"Error loading registered models for catalog hierarchy: {e}")
+        all_models = []
+
+    models_by_cat_schema: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for m in all_models:
+        c_name = m.get("catalog_name") or "warehouse"
+        s_name = m.get("schema_name") or "dbo"
+        models_by_cat_schema.setdefault((c_name, s_name), []).append(m)
+
     for cat in catalogs:
         cat_id = cat["id"]
         cat_path = cat["path"]
@@ -621,7 +636,21 @@ def scan_all_catalogs_and_tables(conn=None) -> Dict[str, Any]:
         if "dbo" not in cat_schemas:
             cat_schemas["dbo"] = []
 
-        schemas_list = [{"name": s_name, "tables": s_tables} for s_name, s_tables in sorted(cat_schemas.items())]
+        # Include schemas that host registered models
+        all_schema_names = set(cat_schemas.keys())
+        for (c_name, s_name) in models_by_cat_schema.keys():
+            if c_name == cat_id:
+                all_schema_names.add(s_name)
+
+        schemas_list = []
+        for s_name in sorted(all_schema_names):
+            s_tables = cat_schemas.get(s_name, [])
+            s_models = models_by_cat_schema.get((cat_id, s_name), [])
+            schemas_list.append({
+                "name": s_name,
+                "tables": s_tables,
+                "models": s_models
+            })
 
         result.append({
             "id": cat_id,
@@ -632,7 +661,8 @@ def scan_all_catalogs_and_tables(conn=None) -> Dict[str, Any]:
             "read_only": cat.get("read_only", False),
             "owner": cat.get("owner", "admin"),
             "schemas": schemas_list,
-            "table_count": sum(len(s["tables"]) for s in schemas_list)
+            "table_count": sum(len(s["tables"]) for s in schemas_list),
+            "model_count": sum(len(s.get("models", [])) for s in schemas_list)
         })
 
     # Append federated external storage mounts

@@ -1,0 +1,1351 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DataKilnWorks Documentation | Zero-JVM Data Lakehouse & AI Operating System</title>
+  <meta name="description" content="Exhaustive manual, architecture guide, and hands-on tutorials for DataKilnWorks Studio: DuckDB, Ray, Delta Lake, Unity Catalog, dbt Core, MLflow, and Genie Spaces.">
+  
+  <!-- Databricks-inspired Docs Minimalist Theme Stylesheet -->
+  <link rel="stylesheet" href="assets/docs.css">
+  
+  <!-- Phosphor Icons (Used by Databricks UI and DataKilnWorks Studio) -->
+  <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+  
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ff3621' stroke-width='2' stroke-linejoin='round'%3E%3Cpolygon points='12,2 21,7.5 21,16.5 12,22 3,16.5 3,7.5' fill='%23ff3621' fill-opacity='0.2'/%3E%3Cpath d='M12 2L21 7.5L12 13L3 7.5L12 2Z' fill='%23ff3621' fill-opacity='0.3'/%3E%3Cpath d='M12 13V22'/%3E%3Cpath d='M12 7.5L15 12C15.2 13.5 14 15 12 15C10 15 8.8 13.5 9 12L12 7.5Z' fill='%23ff3621' stroke='none'/%3E%3C/svg%3E">
+</head>
+<body>
+
+  <!-- Top Navigation Bar -->
+  <header class="docs-header">
+    <div style="display: flex; align-items: center; gap: 1rem;">
+      <button id="mobile-menu-toggle" class="action-btn mobile-menu-btn" title="Toggle Navigation">
+        <i class="ph ph-list text-lg"></i>
+      </button>
+
+      <a href="#overview-architecture" class="docs-brand">
+        <!-- Option 1: The Geometric Forge Prism -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+          <polygon points="12,2 21,7.5 21,16.5 12,22 3,16.5 3,7.5" fill="currentColor" fill-opacity="0.15"/>
+          <path d="M12 2L21 7.5L12 13L3 7.5L12 2Z" fill="currentColor" fill-opacity="0.25"/>
+          <path d="M12 13V22"/>
+          <path d="M12 7.5L15 12C15.2 13.5 14 15 12 15C10 15 8.8 13.5 9 12L12 7.5Z" fill="currentColor" stroke="none"/>
+        </svg>
+        <span>DataKilnWorks</span>
+        <span class="docs-version-badge">v2.4 LTS</span>
+      </a>
+    </div>
+
+    <!-- Center Search -->
+    <div class="header-center">
+      <div class="search-input-wrapper">
+        <i class="ph ph-magnifying-glass"></i>
+        <input type="text" id="docs-search" class="docs-search-input" placeholder="Search documentation, guides, APIs... (Press '/' to focus)">
+        <span class="search-kbd">Ctrl+K</span>
+      </div>
+    </div>
+
+    <!-- Right Header Actions -->
+    <div class="header-actions">
+      <a href="#tutorial-quickstart" class="action-btn">
+        <i class="ph ph-play-circle"></i>
+        <span>Quickstart</span>
+      </a>
+
+      <a href="#resources-deployment" class="action-btn">
+        <i class="ph ph-cube"></i>
+        <span>Install / K8s</span>
+      </a>
+
+      <button id="theme-toggle-btn" class="action-btn" title="Toggle Light/Dark Theme">
+        <i id="theme-icon" class="ph ph-sun"></i>
+      </button>
+
+      <a href="http://localhost:8891" target="_blank" class="action-btn primary" title="Launch DataKilnWorks Studio">
+        <span>Launch Studio</span>
+        <i class="ph ph-arrow-square-out"></i>
+      </a>
+    </div>
+  </header>
+
+  <!-- Main Container Layout -->
+  <div class="docs-layout">
+
+    <!-- Left Navigation Sidebar (Sidebar Topic Order) -->
+    <aside class="docs-sidebar">
+
+      <!-- Group: Overview & Architecture -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">Overview & Architecture</div>
+        <a href="#overview-architecture" class="sidebar-nav-item active">
+          <i class="ph ph-compass"></i>
+          <span>Architecture & Engines</span>
+        </a>
+        <a href="#core-design-decisions" class="sidebar-nav-item">
+          <i class="ph ph-cpu"></i>
+          <span>Core Design Decisions</span>
+        </a>
+        <a href="#platform-comparison" class="sidebar-nav-item">
+          <i class="ph ph-scales"></i>
+          <span>Alternative Comparisons</span>
+        </a>
+      </div>
+
+      <!-- Group: Workspace -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">Workspace</div>
+        <a href="#workspace-environments" class="sidebar-nav-item">
+          <i class="ph ph-folder"></i>
+          <span>Home Directories & RBAC</span>
+          <span class="sidebar-badge">Users/</span>
+        </a>
+        <a href="#scratchpad-notebooks" class="sidebar-nav-item">
+          <i class="ph ph-notebook"></i>
+          <span>Scratchpad Notebooks</span>
+        </a>
+        <a href="#recents-activity" class="sidebar-nav-item">
+          <i class="ph ph-clock-counter-clockwise"></i>
+          <span>Recents & Pinning</span>
+        </a>
+      </div>
+
+      <!-- Group: Catalog & Governance -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">Catalog & Governance</div>
+        <a href="#unity-catalog-namespace" class="sidebar-nav-item">
+          <i class="ph ph-database"></i>
+          <span>Unity Catalog 3-Level</span>
+        </a>
+        <a href="#delta-lake-time-travel" class="sidebar-nav-item">
+          <i class="ph ph-hourglass-high"></i>
+          <span>Delta ACID & Time Travel</span>
+        </a>
+        <a href="#unity-catalog-volumes" class="sidebar-nav-item">
+          <i class="ph ph-hard-drive"></i>
+          <span>Volumes & Unstructured</span>
+        </a>
+        <a href="#interactive-data-lineage" class="sidebar-nav-item">
+          <i class="ph ph-tree-structure"></i>
+          <span>Interactive Lineage DAG</span>
+          <span class="sidebar-badge">22-Node</span>
+        </a>
+      </div>
+
+      <!-- Group: SQL & BI -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">SQL & BI</div>
+        <a href="#monaco-sql-editor" class="sidebar-nav-item">
+          <i class="ph ph-terminal-window"></i>
+          <span>Monaco SQL Workbench</span>
+        </a>
+        <a href="#saved-queries" class="sidebar-nav-item">
+          <i class="ph ph-scroll"></i>
+          <span>Saved Queries</span>
+        </a>
+        <a href="#alerts-webhooks" class="sidebar-nav-item">
+          <i class="ph ph-bell-ringing"></i>
+          <span>Alerts & Notifications</span>
+        </a>
+        <a href="#lakeview-dashboards" class="sidebar-nav-item">
+          <i class="ph ph-chart-line-up"></i>
+          <span>Lakeview BI Dashboards</span>
+        </a>
+        <a href="#query-history-audit" class="sidebar-nav-item">
+          <i class="ph ph-clock"></i>
+          <span>Query History (WAL)</span>
+        </a>
+        <a href="#genie-spaces-ai" class="sidebar-nav-item">
+          <i class="ph ph-sparkle"></i>
+          <span>Genie Space (Text-to-SQL)</span>
+          <span class="sidebar-badge">AI</span>
+        </a>
+        <a href="#sql-warehouses-compute" class="sidebar-nav-item">
+          <i class="ph ph-hard-drives"></i>
+          <span>SQL Warehouses</span>
+        </a>
+      </div>
+
+      <!-- Group: Data Engineering -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">Data Engineering</div>
+        <a href="#data-ingestion-wizard" class="sidebar-nav-item">
+          <i class="ph ph-tray-arrow-down"></i>
+          <span>Data Ingestion Wizard</span>
+        </a>
+        <a href="#dbt-core-transformations" class="sidebar-nav-item">
+          <i class="ph ph-stack"></i>
+          <span>Transformations (dbt Core)</span>
+        </a>
+        <a href="#jobs-pipelines-workflows" class="sidebar-nav-item">
+          <i class="ph ph-git-merge"></i>
+          <span>Jobs & Pipelines DAG</span>
+        </a>
+      </div>
+
+      <!-- Group: Machine Learning & AI -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">Machine Learning & AI</div>
+        <a href="#mlflow-experiments" class="sidebar-nav-item">
+          <i class="ph ph-flask"></i>
+          <span>MLflow Experiments</span>
+        </a>
+        <a href="#mlflow-genai-tracing" class="sidebar-nav-item">
+          <i class="ph ph-activity"></i>
+          <span>LLM Tracing & Gantt</span>
+          <span class="sidebar-badge">Spans</span>
+        </a>
+        <a href="#prompt-playground" class="sidebar-nav-item">
+          <i class="ph ph-code"></i>
+          <span>Prompt Playground</span>
+        </a>
+        <a href="#model-registry-serving" class="sidebar-nav-item">
+          <i class="ph ph-cube"></i>
+          <span>Model Registry & Serving</span>
+        </a>
+        <a href="#sql-native-ai-inference" class="sidebar-nav-item">
+          <i class="ph ph-brain"></i>
+          <span>SQL-Native AI Inference</span>
+        </a>
+      </div>
+
+      <!-- Group: Platform & Governance -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">Platform & Administration</div>
+        <a href="#ray-distributed-engine" class="sidebar-nav-item">
+          <i class="ph ph-cpu"></i>
+          <span>Ray Compute Engine</span>
+        </a>
+        <a href="#iam-security-auth" class="sidebar-nav-item">
+          <i class="ph ph-shield-check"></i>
+          <span>IAM, OAuth, MFA & LDAP</span>
+        </a>
+        <a href="#platform-settings-branding" class="sidebar-nav-item">
+          <i class="ph ph-palette"></i>
+          <span>Branding & Settings</span>
+        </a>
+      </div>
+
+      <!-- Group: Resources & Deployment -->
+      <div class="sidebar-group">
+        <div class="sidebar-group-title">Resources & Deployment</div>
+        <a href="#resources-deployment" class="sidebar-nav-item">
+          <i class="ph ph-docker-logo"></i>
+          <span>Docker Local Install</span>
+        </a>
+        <a href="#kubernetes-deployment" class="sidebar-nav-item">
+          <i class="ph ph-cloud"></i>
+          <span>Kubernetes & KubeRay</span>
+        </a>
+        <a href="#hands-on-tutorial" class="sidebar-nav-item">
+          <i class="ph ph-book-open"></i>
+          <span>End-to-End Tutorial</span>
+        </a>
+        <a href="#rest-api-reference" class="sidebar-nav-item">
+          <i class="ph ph-brackets-curly"></i>
+          <span>REST API Reference</span>
+        </a>
+        <a href="#troubleshooting-faq" class="sidebar-nav-item">
+          <i class="ph ph-question"></i>
+          <span>Troubleshooting & FAQ</span>
+        </a>
+      </div>
+
+    </aside>
+
+    <!-- Center Content Workspace -->
+    <main class="docs-content">
+
+      <!-- Breadcrumbs -->
+      <nav class="breadcrumb">
+        <a href="#overview-architecture">Docs</a>
+        <span>/</span>
+        <a href="#overview-architecture">DataKilnWorks Lakehouse</a>
+        <span>/</span>
+        <span>Reference Manual & Architecture</span>
+      </nav>
+
+      <!-- Page Header -->
+      <h1 class="page-title">DataKilnWorks Lakehouse Platform</h1>
+      <p class="page-subtitle">
+        The complete reference guide, architecture manual, and developer handbook for DataKilnWorks Studio: an open-source, air-gapped, zero-JVM Data Lakehouse and GenAI Operating System.
+      </p>
+
+      <div class="page-meta">
+        <div class="page-meta-item">
+          <i class="ph ph-calendar"></i>
+          <span>Updated: September 2026</span>
+        </div>
+        <div class="page-meta-item">
+          <i class="ph ph-clock"></i>
+          <span>Exhaustive Technical Guide</span>
+        </div>
+        <div class="page-meta-item">
+          <i class="ph ph-seal-check" style="color: var(--dbx-green);"></i>
+          <span>Production Ready (Docker & K8s)</span>
+        </div>
+      </div>
+
+      <!-- SECTION 1: OVERVIEW & ARCHITECTURE -->
+      <section id="overview-architecture" class="doc-section">
+        <h2>1. Overview & Architecture</h2>
+        <p>
+          <strong>DataKilnWorks Studio</strong> is an enterprise-grade, local and on-premises Data Lakehouse and GenAI Platform. Designed as an uncompromised alternative to cloud-only data ecosystems such as Databricks and Snowflake, DataKilnWorks executes entirely on your hardware—delivering sub-second query latency, sub-20ms distributed worker autoscaling, and complete data sovereignty at <strong>$0 cloud operational cost</strong>.
+        </p>
+
+        <p>
+          Rather than relying on legacy Java Virtual Machine (JVM) clusters or proprietary cloud-locked query engines, DataKilnWorks synthesizes modern, high-performance open technologies into a unified operational canvas:
+        </p>
+
+        <div class="feature-card-grid">
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-lightning"></i></div>
+            <div class="feature-card-title">DuckDB Vectorized C++ Engine</div>
+            <div class="feature-card-desc">Zero JVM cold starts, in-process SIMD vectorized query execution, sub-10ms analytics, and direct Apache Arrow streaming.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-arrows-out-cardinal"></i></div>
+            <div class="feature-card-title">Ray Distributed Actor Pools</div>
+            <div class="feature-card-desc">Sub-20 millisecond horizontal worker elasticity (0-16 workers), parallel Map-Reduce, and zero-copy Arrow memory via the Plasma Object Store.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-database"></i></div>
+            <div class="feature-card-title">Open Delta Lake ACID Storage</div>
+            <div class="feature-card-desc">Full transaction log integrity (OCC), multi-version concurrency, time-travel queries, and automated compaction/vacuuming.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-shield-check"></i></div>
+            <div class="feature-card-title">Unity Catalog Governance</div>
+            <div class="feature-card-desc">3-level namespace (<code>catalog.schema.table/model/volume</code>), interactive lineage graph, and multi-user home isolation with RBAC.</div>
+          </div>
+        </div>
+
+        <h3 id="architectural-layers">Architectural Topology</h3>
+        <p>
+          The platform operates across three tightly integrated layers:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-tree-structure"></i>
+              <span>High-Level System Architecture</span>
+            </div>
+            <span class="code-lang-tag">Topology</span>
+          </div>
+          <pre><code>┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                           DATAKILNWORKS CLIENT INTERFACE (Port 8891)                    │
+│  FastAPI Web Application • Alpine.js Reactive State • Monaco Editor • ECharts • Phosphor│
+│  ┌───────────────────┬───────────────────┬────────────────────┬──────────────────────┐  │
+│  │ Workspace (Users) │ Catalog & Volumes │ SQL Editor & BI    │ Genie Space (AI)     │  │
+│  │ Data Ingestion    │ Transformations   │ MLflow Tracing     │ Model Serving        │  │
+│  └───────────────────┴───────────────────┴────────────────────┴──────────────────────┘  │
+└────────────────────────────────────────────┬────────────────────────────────────────────┘
+                                             │ REST API (JSON) + Arrow IPC Stream
+┌────────────────────────────────────────────▼────────────────────────────────────────────┐
+│                  COMPUTE LAYER: SQL WAREHOUSES & RAY DISTRIBUTED ENGINE                 │
+│  - Dynamic SQL Warehouses: Serverless Starter, Analytics Pro, ETL Heavy Batch           │
+│  - Ray Actor Cluster: Distributed DuckDB Worker Actors with sub-20ms dynamic allocation │
+│  - Parallel Scatter-Gather & Map-Reduce over Delta Lake Parquet partitions              │
+│  - Plasma Object Store: Zero-copy in-memory Arrow table passing across workers          │
+│  - In-Memory LRU Result Cache: Instant repeat query execution with TTL management       │
+└────────────────────────────────────────────┬────────────────────────────────────────────┘
+                                             │ Sub-Millisecond In-Memory ATTACH
+┌────────────────────────────────────────────▼────────────────────────────────────────────┐
+│                    STORAGE LAYER: UNITY CATALOG & DELTA LAKE STORAGE                    │
+│  - 3-Level Namespace Hierarchy: catalog.schema.table / view / model / volume           │
+│  - Multi-Catalog Directories: ./warehouse/catalogs/{catalog_id}/ (Delta Lake tables)    │
+│  - Unity Catalog Volumes: POSIX pathing (/Volumes/catalog/schema/volume/)               │
+│  - SQLite Write-Ahead Log (WAL): Query History (history.db) & Audit Trails              │
+│  - MLflow Tracking & Metadata: SQLite / Local Storage for runs, models, and traces      │
+└─────────────────────────────────────────────────────────────────────────────────────────┘</code></pre>
+        </div>
+
+        <h3 id="core-design-decisions">Core Design Decisions</h3>
+        <ul>
+          <li><strong>Zero JVM Overhead:</strong> By substituting the traditional JVM-heavy Apache Spark cluster with <em>DuckDB</em> and <em>SQLFrame</em>, memory consumption drops by 85%, eliminating garbage collection pauses, Java heap sizing, and slow cluster spin-up delays.</li>
+          <li><strong>True Open Formats:</strong> All lakehouse tables are stored in <em>Delta Lake (Parquet + JSON transaction log)</em>. There are no proprietary lock-in formats (such as Snowflake micro-partitions), ensuring full external interoperability.</li>
+          <li><strong>Sub-20ms Elasticity:</strong> Scaling compute workers in standard cloud platforms takes 2 to 5 minutes. DataKilnWorks leverages <em>Ray Worker Actors</em> to allocate or release worker processes in under 20 milliseconds without restarting containers.</li>
+          <li><strong>Complete Air-Gapped Operation:</strong> The platform operates 100% offline with zero external cloud dependencies, making it suitable for defense, healthcare, proprietary IP, and strict data sovereignty environments.</li>
+        </ul>
+
+        <h3 id="platform-comparison">Comparison with Alternative Platforms</h3>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Feature / Metric</th>
+                <th>DataKilnWorks Studio</th>
+                <th>Databricks Lakehouse</th>
+                <th>Snowflake Data Cloud</th>
+                <th>Vanilla DuckDB CLI</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Primary Query Engine</strong></td>
+                <td>DuckDB (Vectorized C++) + Ray</td>
+                <td>Apache Spark + Photon C++</td>
+                <td>Snowflake Proprietary C++</td>
+                <td>DuckDB CLI</td>
+              </tr>
+              <tr>
+                <td><strong>Compute Startup Time</strong></td>
+                <td><span class="badge green">~0.05s (Instant)</span></td>
+                <td>30s to 5 mins (Cluster spinup)</td>
+                <td>1s to 10s (Warehouse resume)</td>
+                <td><span class="badge green">~0.01s</span></td>
+              </tr>
+              <tr>
+                <td><strong>Open Storage Format</strong></td>
+                <td><span class="badge green">Delta Lake (Open)</span></td>
+                <td><span class="badge green">Delta Lake (Open)</span></td>
+                <td>Proprietary Micro-partitions</td>
+                <td>Parquet / DuckDB file</td>
+              </tr>
+              <tr>
+                <td><strong>3-Level Catalog</strong></td>
+                <td><span class="badge green">catalog.schema.table</span></td>
+                <td><span class="badge green">catalog.schema.table</span></td>
+                <td>database.schema.table</td>
+                <td><span class="badge red">Single file/db</span></td>
+              </tr>
+              <tr>
+                <td><strong>PySpark DataFrame API</strong></td>
+                <td><span class="badge green">Yes (SQLFrame, No JVM)</span></td>
+                <td><span class="badge green">Yes (Spark Runtime)</span></td>
+                <td>Snowpark (SQL translation)</td>
+                <td><span class="badge red">No (DuckDB Relational)</span></td>
+              </tr>
+              <tr>
+                <td><strong>Built-in AI Analyst</strong></td>
+                <td><span class="badge green">Genie Space (Local / Cloud)</span></td>
+                <td>Genie Space (Cloud only)</td>
+                <td>Cortex Analyst (Cloud only)</td>
+                <td><span class="badge red">None</span></td>
+              </tr>
+              <tr>
+                <td><strong>GenAI LLM Tracing</strong></td>
+                <td><span class="badge green">MLflow Tracing + Gantt</span></td>
+                <td><span class="badge green">MLflow Tracing (Cloud)</span></td>
+                <td>TruLens / OpenTelemetry</td>
+                <td><span class="badge red">None</span></td>
+              </tr>
+              <tr>
+                <td><strong>Interactive BI Dashboards</strong></td>
+                <td><span class="badge green">Lakeview (13+ Chart types)</span></td>
+                <td>Lakeview (11 types)</td>
+                <td>Snowsight (12 types)</td>
+                <td><span class="badge red">None</span></td>
+              </tr>
+              <tr>
+                <td><strong>Operational Cost</strong></td>
+                <td><span class="badge green"><strong>$0 (Zero Credits/DBUs)</strong></span></td>
+                <td>$$$$ (Cloud VMs + DBUs)</td>
+                <td>$$$$ (Credits / second)</td>
+                <td><span class="badge green">$0</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- SECTION 2: WORKSPACE & USER ENVIRONMENTS -->
+      <section id="workspace-environments" class="doc-section">
+        <h2>2. Workspace & User Environments</h2>
+        <p>
+          DataKilnWorks enforces enterprise-grade multi-tenancy and workspace isolation modeled directly on Databricks Workspaces. Every authenticated user is automatically allocated a private home environment with strict access boundaries.
+        </p>
+
+        <h3 id="user-home-directories">Personal Home Directories (<code>Users/&lt;username&gt;/</code>)</h3>
+        <p>
+          Upon user creation or initial login, the workspace subsystem executes <code>init_user_workspace(username)</code> in <code>web/workspace.py</code>:
+        </p>
+        <ul>
+          <li>Creates the directory <code>/workspace/notebooks/Users/{username}/</code>.</li>
+          <li>Seeds an interactive personal starter scratchpad: <code>{username}_scratchpad.ipynb</code>.</li>
+          <li>Badges the folder in the UI with a distinct <strong>Home</strong> tag and house icon.</li>
+          <li>Auto-expands the user's home folder and loads their personal scratchpad notebook upon login.</li>
+        </ul>
+
+        <div class="callout important">
+          <div class="callout-icon"><i class="ph ph-shield-warning"></i></div>
+          <div class="callout-body">
+            <div class="callout-title">RBAC Boundary & HTTP 403 Enforcement</div>
+            <p>
+              Non-admin users (<code>role == 'user'</code> or <code>'power_user'</code>) are strictly isolated. Any attempt to read, write, rename, or delete files in another user's personal directory (e.g. <code>analyst_bob</code> accessing <code>Users/admin/...</code>) is intercepted by <code>can_access_workspace_path()</code> and returns an immediate <strong>HTTP 403 Forbidden</strong> response.
+            </p>
+          </div>
+        </div>
+
+        <h3 id="scratchpad-notebooks">Scratchpad Notebooks & PySpark via SQLFrame</h3>
+        <p>
+          Personal scratchpads support Python, SQL, and PySpark DataFrame code. Through the built-in <strong>SQLFrame</strong> engine, you can write idiomatic PySpark code that executes directly on DuckDB without starting a JVM:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-file-code"></i>
+              <span>Users/analyst_bob/analyst_bob_scratchpad.ipynb</span>
+            </div>
+            <span class="code-lang-tag">Python (PySpark / SQLFrame)</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-python"># Native PySpark DataFrame execution on DuckDB without JVM
+from sqlframe.duckdb import SparkSession
+from pyspark.sql.functions import col, sum as _sum, avg, to_date
+
+spark = SparkSession.builder.getOrCreate()
+
+# Read directly from an ACID Delta Lake table in Unity Catalog
+df = spark.read.table("warehouse.dbo.silver_yellow_tripdata")
+
+# Standard PySpark transformations
+summary_df = (
+    df.filter(col("trip_distance") > 0)
+      .groupBy("payment_type")
+      .agg(
+          _sum("total_amount").alias("gross_revenue"),
+          avg("trip_distance").alias("mean_distance")
+      )
+      .orderBy(col("gross_revenue").desc())
+)
+
+# Output rendering
+summary_df.show()</code></pre>
+        </div>
+
+        <h3 id="recents-activity">Recents & Activity Tracking</h3>
+        <p>
+          The <strong>Recents</strong> view (<code>currentView = 'recents'</code>) tracks previously opened assets (notebooks, saved queries, and dashboards) per user session. Users can pin critical assets to keep them permanently docked at the top of the sidebar.
+        </p>
+      </section>
+
+      <!-- SECTION 3: CATALOG & GOVERNANCE -->
+      <section id="unity-catalog-namespace" class="doc-section">
+        <h2>3. Catalog & Governance (Unity Catalog)</h2>
+        <p>
+          DataKilnWorks implements full Unity Catalog 3-level namespace compatibility: <code>catalog.schema.table</code>.
+        </p>
+
+        <h3 id="3-level-namespace">Namespace Architecture & Cross-Catalog Joins</h3>
+        <p>
+          Catalogs are stored in separate directories under <code>./warehouse/catalogs/{catalog_id}/</code>. When querying multiple catalogs, secondary catalogs are mounted into DuckDB via in-memory <code>ATTACH</code>. This enables zero-copy joins across isolated catalogs in a single SQL statement:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-terminal-window"></i>
+              <span>Cross-Catalog SQL Join</span>
+            </div>
+            <span class="code-lang-tag">SQL</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-sql">-- Seamless cross-catalog query across warehouse and finance catalogs
+SELECT 
+    w.employee_id,
+    w.employee_name,
+    w.department,
+    f.salary,
+    f.annual_bonus,
+    (f.salary + f.annual_bonus) AS total_compensation
+FROM warehouse.dbo.silver_employees w
+JOIN finance_lake.payroll.salary_records f 
+    ON w.employee_id = f.employee_id
+WHERE w.active = true
+ORDER BY total_compensation DESC;</code></pre>
+        </div>
+
+        <h3 id="delta-lake-time-travel">Delta Lake ACID Logs & Time Travel</h3>
+        <p>
+          Every table mutation writes a forward-compatible JSON commit to the table's <code>_delta_log/</code>. DataKilnWorks supports historical point-in-time reads and rollbacks via standard time-travel syntax:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-hourglass-high"></i>
+              <span>Delta Lake Time Travel Queries</span>
+            </div>
+            <span class="code-lang-tag">SQL</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-sql">-- Query historical version by commit version number
+SELECT * FROM delta_table_version('warehouse.dbo.silver_employees', 2);
+
+-- Compare changes between current snapshot and version 1
+SELECT 
+    curr.employee_id,
+    curr.salary AS current_salary,
+    prev.salary AS historical_salary,
+    (curr.salary - prev.salary) AS salary_change
+FROM warehouse.dbo.silver_employees curr
+JOIN delta_table_version('warehouse.dbo.silver_employees', 1) prev
+    ON curr.employee_id = prev.employee_id
+WHERE curr.salary <> prev.salary;</code></pre>
+        </div>
+
+        <h3 id="unity-catalog-volumes">Unity Catalog Volumes</h3>
+        <p>
+          Volumes govern unstructured and semi-structured assets (raw CSVs, PDF documentation, model weights, audio, images). Volumes are addressed via POSIX-compliant paths:
+        </p>
+        <p><code>/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume_name&gt;/path/to/file.ext</code></p>
+        <ul>
+          <li><strong>Managed Volumes:</strong> Storage is hosted and governed directly inside the studio storage layer (<code>./warehouse/volumes/{catalog}/{schema}/{volume}/</code>).</li>
+          <li><strong>External Volumes:</strong> Mapped to external storage mounts, NFS, or S3-compatible endpoints.</li>
+          <li><strong>Interactive Volume Explorer:</strong> Browse directories, upload files via drag-and-drop, and generate presigned download links directly within the UI.</li>
+        </ul>
+
+        <h3 id="interactive-data-lineage">Interactive Data Lineage (22-Node DAG)</h3>
+        <p>
+          The <strong>Data Lineage</strong> workbench visualizes column-level and table-level lineage. The engine statically parses SQL DDL/DML, dbt schemas, and Delta log operations to construct an interactive Directed Acyclic Graph (DAG) displaying upstream sources and downstream consumers.
+        </p>
+      </section>
+
+      <!-- SECTION 4: SQL & BI -->
+      <section id="monaco-sql-editor" class="doc-section">
+        <h2>4. SQL & Business Intelligence (Lakeview)</h2>
+
+        <h3 id="monaco-sql-workbench">Monaco SQL Workbench</h3>
+        <p>
+          The studio integrates Microsoft's <strong>Monaco Editor</strong> (the core engine powering VS Code) with custom language extensions for DuckDB SQL and Delta Lake dialect:
+        </p>
+        <ul>
+          <li>Context-aware autocompletion across catalogs, schemas, tables, and column names.</li>
+          <li>Live compute warehouse switching dropdown.</li>
+          <li>Multi-statement batch execution with isolated result tabs.</li>
+          <li>Execution cancellation via the <kbd>Escape</kbd> key or Cancel button.</li>
+          <li>Interactive <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code> query plan visualizer.</li>
+        </ul>
+
+        <h3 id="lakeview-dashboards">Lakeview BI Dashboards</h3>
+        <p>
+          The <strong>Lakeview Dashboards</strong> system delivers enterprise BI directly on top of Delta Lake tables. Powered by the high-performance Apache ECharts engine, Lakeview supports 13+ native widget types:
+        </p>
+
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Widget Category</th>
+                <th>Supported Types</th>
+                <th>Features</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Standard Visuals</strong></td>
+                <td>Bar, Line, Area, Scatter, Pie, Donut</td>
+                <td>Multi-series stacking, interactive tooltips, custom color palettes, legends.</td>
+              </tr>
+              <tr>
+                <td><strong>Advanced Visuals</strong></td>
+                <td>Heatmap, Treemap, Radar, Funnel, Network/Graph</td>
+                <td>Hierarchical drilldowns, topological dependencies, density gradients.</td>
+              </tr>
+              <tr>
+                <td><strong>Tabular & Metrics</strong></td>
+                <td>Pivot Table, Big Number KPI Card, Data Grid</td>
+                <td>Sparkline trendlines, conditional alert borders, currency/percentage formatting.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4 id="per-widget-export">Per-Widget Export & Sharing</h4>
+        <p>
+          Every dashboard widget includes an export menu supporting 6 file formats:
+        </p>
+        <ul>
+          <li><strong>CSV:</strong> Standard comma-separated tabular data.</li>
+          <li><strong>Excel (.xlsx):</strong> Formatted spreadsheet with column headers generated via <code>openpyxl</code>.</li>
+          <li><strong>Parquet:</strong> High-performance columnar file generated via <code>PyArrow</code>.</li>
+          <li><strong>JSON:</strong> Structured JSON array representation of result records.</li>
+          <li><strong>PNG / SVG:</strong> High-resolution vector/raster graphic rendering of the chart.</li>
+        </ul>
+
+        <h4 id="iframe-embedding">Responsive Iframe Embedding</h4>
+        <p>
+          Any dashboard can be shared or embedded inside third-party portals. The <strong>Embed Modal</strong> generates a responsive snippet:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-code"></i>
+              <span>Generated Dashboard Embed Snippet</span>
+            </div>
+            <span class="code-lang-tag">HTML</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-html">&lt;!-- DataKilnWorks Responsive Dashboard Embed --&gt;
+&lt;iframe 
+  src="http://localhost:8891/embed/dashboards/executive_kpis?theme=dark" 
+  width="100%" 
+  height="720px" 
+  frameborder="0" 
+  style="border: 1px solid #1e293b; border-radius: 8px;"
+  allowfullscreen&gt;
+&lt;/iframe&gt;</code></pre>
+        </div>
+
+        <h3 id="genie-spaces-ai">Genie Space: Conversational Text-to-SQL AI Analyst</h3>
+        <p>
+          <strong>Genie Space</strong> enables conversational data analysis in plain English. Similar to Databricks Genie and Snowflake Cortex Analyst, Genie converts natural language questions into executable DuckDB SQL.
+        </p>
+
+        <div class="feature-card-grid">
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-tree-structure"></i></div>
+            <div class="feature-card-title">Schema Grounding</div>
+            <div class="feature-card-desc">Injects live Unity Catalog metadata, column types, and actual sample values into the LLM context to prevent hallucinations.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-gauge"></i></div>
+            <div class="feature-card-title">Confidence & Reasoning</div>
+            <div class="feature-card-desc">Computes a confidence score percentage and displays step-by-step reasoning explaining how the query was formulated.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-chart-pie"></i></div>
+            <div class="feature-card-title">Auto-Visualization</div>
+            <div class="feature-card-desc">Automatically infers whether results should be displayed as a Bar Chart, Line Graph, Donut, or Tabular Grid.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-card-icon"><i class="ph ph-lock-key"></i></div>
+            <div class="feature-card-title">Local LLM (Zero Egress)</div>
+            <div class="feature-card-desc">Integrates natively with local Ollama or LM Studio models (e.g. <code>qwen2.5-coder</code>, <code>llama3.2</code>) with zero cloud data egress.</div>
+          </div>
+        </div>
+
+        <h3 id="sql-warehouses-compute">SQL Warehouses (Dynamic Compute Sizing)</h3>
+        <p>
+          Compute endpoints allow isolating analytical workloads from transformation jobs. Warehouses can be scaled dynamically across T-shirt sizes:
+        </p>
+        <ul>
+          <li><strong>2X-Small:</strong> 1 vCPU, 1 GB RAM (Ad-hoc testing, scratchpad exploration)</li>
+          <li><strong>Small:</strong> 2 vCPU, 4 GB RAM (General querying)</li>
+          <li><strong>Medium:</strong> 4 vCPU, 8 GB RAM (Standard BI & dashboards)</li>
+          <li><strong>Large:</strong> 8 vCPU, 16 GB RAM (Complex aggregations & joins)</li>
+          <li><strong>2X-Large:</strong> 16 vCPU, 32 GB RAM (Heavy ETL & compaction jobs)</li>
+        </ul>
+      </section>
+
+      <!-- SECTION 5: DATA ENGINEERING -->
+      <section id="data-ingestion-wizard" class="doc-section">
+        <h2>5. Data Engineering & Pipelines</h2>
+
+        <h3 id="add-data-wizard">Data Ingestion ("Add Data" Wizard)</h3>
+        <p>
+          The <strong>Data Ingestion Wizard</strong> allows drag-and-drop ingestion of raw files into Delta Lake tables:
+        </p>
+        <ol>
+          <li><strong>Upload:</strong> Drop <code>.csv</code>, <code>.tsv</code>, <code>.parquet</code>, or <code>.json</code> files into the upload target.</li>
+          <li><strong>In-Process Schema Inference:</strong> DuckDB samples the file in-process to infer column headers, data types, and nullability without loading the entire file into memory.</li>
+          <li><strong>Destination Configuration:</strong> Select target catalog (e.g. <code>warehouse</code>), schema (e.g. <code>bronze</code>), and destination table name.</li>
+          <li><strong>Write Strategy:</strong> Choose between <code>Overwrite</code> (replace table) or <code>Append</code> (add rows).</li>
+          <li><strong>ACID Materialization:</strong> The engine writes Parquet columnar files and commits the transaction into the table's <code>_delta_log/</code>.</li>
+        </ol>
+
+        <h3 id="dbt-core-transformations">Transformations (dbt Core Native Integration)</h3>
+        <p>
+          DataKilnWorks features a native <strong>dbt Core runner</strong> built directly into the studio. Rather than requiring external dbt Cloud subscriptions or terminal context-switching, users execute dbt workflows inside the UI:
+        </p>
+        <ul>
+          <li><strong>Commands:</strong> One-click execution of <code>dbt run</code>, <code>dbt test</code>, <code>dbt docs generate</code>, and <code>dbt compile</code>.</li>
+          <li><strong>Live Execution Stream:</strong> ANSI-color-decoded stdout and stderr stream live to the browser interface.</li>
+          <li><strong>Model Dependency Graph:</strong> Interactive visualization of dbt model dependencies (e.g. <code>stg_trips</code> &rarr; <code>fact_taxi_trips</code>).</li>
+          <li><strong>Per-User Run History:</strong> Execution logs and test outcomes are archived and scoped per user.</li>
+        </ul>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-file-code"></i>
+              <span>dbt_project/models/marts/fact_taxi_trips.sql</span>
+            </div>
+            <span class="code-lang-tag">SQL (dbt)</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-sql">{{ config(
+    materialized='table',
+    format='delta'
+) }}
+
+WITH staged AS (
+    SELECT * FROM {{ ref('stg_taxi_trips') }}
+)
+
+SELECT
+    vendor_id,
+    pickup_datetime,
+    dropoff_datetime,
+    passenger_count,
+    trip_distance,
+    fare_amount,
+    tip_amount,
+    total_amount,
+    ROUND((tip_amount / NULLIF(fare_amount, 0)) * 100, 2) AS tip_percentage
+FROM staged
+WHERE trip_distance > 0 AND total_amount > 0</code></pre>
+        </div>
+
+        <h3 id="jobs-pipelines-workflows">Jobs & Pipelines (Local Workflows DAG)</h3>
+        <p>
+          The <strong>Jobs & Pipelines</strong> engine orchestrates multi-task workflows without requiring external schedulers (such as Apache Airflow or Celery). Supported task types include:
+        </p>
+        <ul>
+          <li><strong>SQL Transformation (<code>sql</code>):</strong> Vectorized SQL executed directly in DuckDB.</li>
+          <li><strong>Delta Maintenance (<code>optimize</code>):</strong> Compaction and bin-packing via <code>OPTIMIZE</code> and vacuuming via <code>VACUUM</code>.</li>
+          <li><strong>Headless Notebook (<code>notebook</code>):</strong> Parameterized execution of <code>.ipynb</code> notebooks via Papermill.</li>
+          <li><strong>File Ingestion (<code>ingest</code>):</strong> Automated pickup of landing zone files into Delta tables.</li>
+        </ul>
+      </section>
+
+      <!-- SECTION 6: MACHINE LEARNING & AI -->
+      <section id="mlflow-experiments" class="doc-section">
+        <h2>6. Machine Learning & GenAI Observability</h2>
+
+        <h3 id="mlflow-genai-tracing">MLflow GenAI & LLM Tracing</h3>
+        <p>
+          DataKilnWorks provides built-in GenAI observability conforming to the <strong>MLflow 3.x Tracing specification</strong>. Tracing tracks complex agentic workflows, multi-turn RAG chains, and tool invocations:
+        </p>
+
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Span Type</th>
+                <th>Color Badge</th>
+                <th>Workflow Context</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>LLM</code></td>
+                <td><span class="badge purple">Purple</span></td>
+                <td>Model completions, token counts, temperature, raw prompts.</td>
+              </tr>
+              <tr>
+                <td><code>AGENT</code></td>
+                <td><span class="badge blue">Indigo</span></td>
+                <td>Autonomous agent loops, decision planning, reflection steps.</td>
+              </tr>
+              <tr>
+                <td><code>RETRIEVER</code></td>
+                <td><span class="badge green">Emerald</span></td>
+                <td>Vector search embeddings, top-k chunk retrieval, similarity score.</td>
+              </tr>
+              <tr>
+                <td><code>TOOL</code></td>
+                <td><span class="badge amber">Amber</span></td>
+                <td>SQL execution tools, calculator calls, external API fetches.</td>
+              </tr>
+              <tr>
+                <td><code>CHAIN</code></td>
+                <td><span class="badge blue">Cyan</span></td>
+                <td>LangChain / LlamaIndex orchestration sequences.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4 id="gantt-latency-waterfall">Interactive Gantt Waterfall & Assessments</h4>
+        <p>
+          The Tracing interface renders an interactive Gantt chart visualizing execution timing, span dependencies, and token usage breakdown. Operators can log qualitative human feedback through the <strong>Trace Assessment Modal</strong> (1-5 Star Ratings, Thumbs Up/Down, and Rationale notes).
+        </p>
+
+        <h3 id="prompt-playground">Prompt Playground (Multi-Model A/B Benchmark)</h3>
+        <p>
+          The <strong>Prompt Playground</strong> facilitates prompt engineering and side-by-side evaluation across models:
+        </p>
+        <ul>
+          <li><strong>Mustache Variable Syntax:</strong> Parameterize prompts using <code>{{variable_name}}</code> with live preview.</li>
+          <li><strong>Side-by-Side Comparison:</strong> Run Prompt A against Model 1 (e.g. <code>qwen2.5-coder:latest</code>) and Model 2 (e.g. <code>llama3.2:3b</code>) simultaneously.</li>
+          <li><strong>Metric Comparison:</strong> Compare latency (ms), token generation speed (tokens/sec), and outputs side by side.</li>
+          <li><strong>Versioned Templates:</strong> Save custom templates into the repository with user attribution and version tracking.</li>
+        </ul>
+
+        <h3 id="model-registry-serving">Model Registry & Real-Time Model Serving</h3>
+        <p>
+          Models registered within the Unity Catalog (<code>cat.sch.model</code>) can be deployed to production using the built-in <strong>Model Serving Engine</strong>:
+        </p>
+        <ul>
+          <li><strong>Lifecycle Stages:</strong> Models transition between <code>Production</code>, <code>Staging</code>, and <code>Archived</code>.</li>
+          <li><strong>REST Serving Endpoint:</strong> Generates a high-concurrency endpoint: <code>/serving-endpoints/{endpoint_name}/invocations</code>.</li>
+          <li><strong>Databricks Payload Format:</strong> 100% compatible with Databricks Model Serving JSON payload structures:
+            <code>{"dataframe_records": [...]}</code>, <code>{"inputs": [...]}</code>, and <code>{"instances": [...]}</code>.
+          </li>
+          <li><strong>Scale-to-Zero:</strong> Idle endpoints release memory automatically and resume on the next incoming HTTP request.</li>
+        </ul>
+
+        <h3 id="sql-native-ai-inference">SQL-Native AI & ML Inference</h3>
+        <p>
+          You can invoke AI models directly within SQL queries without writing Python glue code:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-brain"></i>
+              <span>SQL-Native Model Inference & Classification</span>
+            </div>
+            <span class="code-lang-tag">SQL</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-sql">-- 1. General LLM Prompting via ai_query()
+SELECT 
+    customer_id,
+    review_text,
+    ai_query('llama3.2:3b', 'Summarize this review in 1 sentence: ' || review_text) AS brief_summary
+FROM warehouse.dbo.customer_reviews
+LIMIT 5;
+
+-- 2. Structured Model Evaluation via predict() with @champion alias
+SELECT 
+    employee_id,
+    salary,
+    tenure_years,
+    predict('hr_analytics.models.turnover_predictor@champion', 
+            json_object('salary', salary, 'tenure_years', tenure_years)) AS turnover_risk,
+    ai_explain('hr_analytics.models.turnover_predictor@champion',
+               json_object('salary', salary, 'tenure_years', tenure_years)) AS explanation
+FROM warehouse.dbo.silver_employees
+WHERE active = true;</code></pre>
+        </div>
+      </section>
+
+      <!-- SECTION 7: PLATFORM & SYSTEM -->
+      <section id="ray-distributed-engine" class="doc-section">
+        <h2>7. Platform & System Administration</h2>
+
+        <h3 id="ray-compute-engine">Ray Distributed Compute Engine</h3>
+        <p>
+          DataKilnWorks incorporates a dynamic <strong>Ray Distributed Compute Fabric</strong>:
+        </p>
+        <ul>
+          <li><strong>Dynamic Actor Pools:</strong> DuckDB worker actors are spun up dynamically per warehouse.</li>
+          <li><strong>Sub-20ms Scaling:</strong> Scale from 0 to 16 compute workers in milliseconds without container recreation.</li>
+          <li><strong>Plasma Object Store:</strong> Workers exchange Apache Arrow RecordBatches via shared memory with zero serialization overhead.</li>
+          <li><strong>Heterogeneous Clusters:</strong> Runs across mixed x86_64 and ARM64 nodes (e.g. Apple Silicon M-series, AWS Graviton, and Raspberry Pi 5).</li>
+        </ul>
+
+        <h3 id="iam-security-auth">Identity, Authentication & Governance</h3>
+        <p>
+          DataKilnWorks includes a native security stack supporting enterprise authentication protocols:
+        </p>
+        <ul>
+          <li><strong>Role-Based Access Control (RBAC):</strong> Three built-in roles: <code>admin</code> (full platform governance), <code>power_user</code> (pipeline/model authoring), and <code>user</code> (query execution & reporting).</li>
+          <li><strong>OAuth 2.0 / OIDC:</strong> Native integration with 8 identity providers: Okta, Azure AD, Google Workspace, GitHub, GitLab, Auth0, Keycloak, and Generic Custom OIDC with PKCE.</li>
+          <li><strong>LDAP / Active Directory:</strong> In-studio LDAP connection testing, credential validation, and automatic group-to-role mapping.</li>
+          <li><strong>Multi-Factor Authentication (MFA):</strong> TOTP (RFC 6238) generation, QR code registration, and 10 self-service emergency backup recovery codes.</li>
+          <li><strong>Row-Level Security (RLS):</strong> Policy manager injecting dynamic SQL filters based on user attributes or group membership, complete with an interactive policy verification tester.</li>
+        </ul>
+      </section>
+
+      <!-- SECTION 8: RESOURCES & DEPLOYMENT -->
+      <section id="resources-deployment" class="doc-section">
+        <h2>8. Resources, Installation & Deployment</h2>
+
+        <h3 id="docker-local-install">Local Installation via Docker Compose</h3>
+        <p>
+          Deploy the complete DataKilnWorks stack locally using Docker Compose:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-file-code"></i>
+              <span>docker-compose.yml</span>
+            </div>
+            <span class="code-lang-tag">YAML</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-yaml">version: '3.8'
+
+services:
+  # 1. DataKilnWorks Studio UI & FastAPI Gateway
+  studio:
+    image: localspark-lakehouse-notebook:latest
+    container_name: local-datakilnworks-studio
+    restart: unless-stopped
+    command: python -m uvicorn web.app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8891:8000"
+    environment:
+      - WAREHOUSE_DIR=/workspace/warehouse
+      - NOTEBOOKS_DIR=/workspace/notebooks
+      - LOG_LEVEL=INFO
+      - RAY_ADDRESS=auto
+    volumes:
+      - ./warehouse:/workspace/warehouse
+      - ./notebooks:/workspace/notebooks
+      - ./dbt_project:/workspace/dbt_project
+      - ./web:/workspace/web
+    networks:
+      - lakehouse-net
+
+  # 2. JupyterLab Notebook Environment
+  jupyter:
+    image: localspark-lakehouse-notebook:latest
+    container_name: local-datakilnworks-lakehouse
+    restart: unless-stopped
+    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='datakilnworks'
+    ports:
+      - "8890:8888"
+    volumes:
+      - ./warehouse:/workspace/warehouse
+      - ./notebooks:/workspace/notebooks
+    networks:
+      - lakehouse-net
+
+  # 3. Ray Distributed Compute Head Node
+  ray-head:
+    image: rayproject/ray:2.35.0-py311
+    container_name: local-ray-head
+    restart: unless-stopped
+    command: ray start --head --port=6379 --dashboard-host=0.0.0.0 --num-cpus=4
+    ports:
+      - "8265:8265"  # Ray Dashboard
+    volumes:
+      - /dev/shm:/dev/shm
+    networks:
+      - lakehouse-net
+
+networks:
+  lakehouse-net:
+    driver: bridge</code></pre>
+        </div>
+
+        <p>Launch the stack with a single command:</p>
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title"><i class="ph ph-terminal"></i> Terminal</div>
+            <span class="code-lang-tag">Bash</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-bash"># Start all containers in detached mode
+docker compose up -d
+
+# Verify container status
+docker compose ps</code></pre>
+        </div>
+
+        <h3 id="kubernetes-deployment">Enterprise Kubernetes Deployment (k3s / k8s / KubeRay)</h3>
+        <p>
+          For high availability and multi-node clusters, deploy DataKilnWorks to Kubernetes using native manifests:
+        </p>
+
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title">
+              <i class="ph ph-file-code"></i>
+              <span>k8s-datakilnworks-deployment.yaml</span>
+            </div>
+            <span class="code-lang-tag">YAML</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datakilnworks-studio
+  namespace: lakehouse
+  labels:
+    app: datakilnworks-studio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: datakilnworks-studio
+  template:
+    metadata:
+      labels:
+        app: datakilnworks-studio
+    spec:
+      containers:
+      - name: studio
+        image: datakilnworks/studio:2.4.0
+        command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests:
+            cpu: "2000m"
+            memory: "4Gi"
+          limits:
+            cpu: "8000m"
+            memory: "16Gi"
+        livenessProbe:
+          httpGet:
+            path: /api/status
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/status
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: lakehouse-storage
+          mountPath: /workspace/warehouse
+      volumes:
+      - name: lakehouse-storage
+        persistentVolumeClaim:
+          claimName: lakehouse-shared-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: datakilnworks-service
+  namespace: lakehouse
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    name: http
+  selector:
+    app: datakilnworks-studio</code></pre>
+        </div>
+
+        <h3 id="hands-on-tutorial">Hands-on Tutorial: End-to-End Lakehouse Pipeline</h3>
+        <p>
+          Follow this 6-step walkthrough to build an end-to-end data lakehouse pipeline from raw ingestion to model serving:
+        </p>
+
+        <div class="step-container">
+          <div class="step-number">1</div>
+          <div class="step-title">Ingest Raw NYC Taxi Data into Bronze Delta Lake</div>
+          <p>
+            Navigate to <strong>Data Ingestion</strong> in the sidebar. Drop a raw trip data file (<code>nyc_taxi_raw.parquet</code>) into the upload target. Set the destination to <code>warehouse.bronze.raw_trips</code> with write mode <code>Overwrite</code>, and click <strong>Create Delta Table</strong>.
+          </p>
+        </div>
+
+        <div class="step-container">
+          <div class="step-number">2</div>
+          <div class="step-title">Run dbt Silver-Layer Transformations</div>
+          <p>
+            Navigate to <strong>Transformations</strong>. Execute <code>dbt run --models tag:silver</code>. DataKilnWorks streams real-time compilation and execution logs, cleaning nulls, filtering invalid trip distances, and persisting the transformed records to <code>warehouse.silver.trips_cleaned</code>.
+          </p>
+        </div>
+
+        <div class="step-container">
+          <div class="step-number">3</div>
+          <div class="step-title">Train and Register an ML Model in Unity Catalog</div>
+          <p>
+            Open your personal scratchpad (<code>Users/admin/admin_scratchpad.ipynb</code>) and execute the model training block:
+          </p>
+          <div class="code-container">
+            <div class="code-header">
+              <div class="code-title"><i class="ph ph-notebook"></i> Scratchpad Cell</div>
+              <span class="code-lang-tag">Python</span>
+              <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+            </div>
+            <pre><code class="language-python">import mlflow
+from sklearn.ensemble import RandomForestRegressor
+from sqlframe.duckdb import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.read.table("warehouse.silver.trips_cleaned").toPandas()
+
+X = df[["trip_distance", "passenger_count", "fare_amount"]]
+y = df["tip_amount"]
+
+with mlflow.start_run(run_name="fare_tip_estimator"):
+    model = RandomForestRegressor(n_estimators=50, random_state=42)
+    model.fit(X, y)
+    
+    mlflow.log_param("n_estimators", 50)
+    mlflow.sklearn.log_model(
+        sk_model=model, 
+        artifact_path="model",
+        registered_model_name="warehouse.models.tip_predictor"
+    )</code></pre>
+          </div>
+        </div>
+
+        <div class="step-container">
+          <div class="step-number">4</div>
+          <div class="step-title">Deploy Real-Time REST Model Serving Endpoint</div>
+          <p>
+            Navigate to <strong>Model Serving</strong>. Promote version 1 of <code>warehouse.models.tip_predictor</code> to the <code>Production</code> stage and assign the alias <code>@champion</code>. Deploy a serving endpoint named <code>taxi-tip-api</code>. Test it via cURL:
+          </p>
+          <div class="code-container">
+            <div class="code-header">
+              <div class="code-title"><i class="ph ph-terminal"></i> Terminal</div>
+              <span class="code-lang-tag">cURL</span>
+              <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+            </div>
+            <pre><code class="language-bash">curl -X POST http://localhost:8891/serving-endpoints/taxi-tip-api/invocations \
+  -H "Content-Type: application/json" \
+  -d '{"dataframe_records": [{"trip_distance": 3.5, "passenger_count": 1, "fare_amount": 16.50}]}'</code></pre>
+          </div>
+        </div>
+
+        <div class="step-container">
+          <div class="step-number">5</div>
+          <div class="step-title">Ask Genie Space to Analyze Revenue Trends</div>
+          <p>
+            Navigate to <strong>Genie Space</strong> and enter the prompt:
+            <br>
+            <em>"Show average tip percentage grouped by passenger count for trips over 2 miles."</em>
+            <br>
+            Genie inspects the catalog metadata, formulates the SQL query, executes it on DuckDB, displays the reasoning steps, and renders an interactive Bar Chart in the chat stream.
+          </p>
+        </div>
+
+        <div class="step-container">
+          <div class="step-number">6</div>
+          <div class="step-title">Publish a Lakeview BI Dashboard</div>
+          <p>
+            Navigate to <strong>Lakeview Dashboards</strong>. Create a dashboard titled <code>Executive Taxi Metrics</code>. Add a Big Number card for Total Gross Revenue and a Donut Chart for Payment Methods. Click <strong>Export &rarr; Excel</strong> to download the underlying data, or <strong>Embed</strong> to generate an iframe snippet.
+          </p>
+        </div>
+
+        <h3 id="rest-api-reference">REST API Reference</h3>
+        <p>
+          DataKilnWorks exposes a comprehensive REST API:
+        </p>
+
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th>Endpoint Path</th>
+                <th>Description</th>
+                <th>Parameters / Payload</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/workspace/tree</code></td>
+                <td>Returns scoped workspace directory tree</td>
+                <td>Scoped by authenticated user session</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/sql/execute</code></td>
+                <td>Executes SQL query on active compute warehouse</td>
+                <td><code>{"query": "SELECT ...", "warehouse": "local_warehouse"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/catalog/catalogs</code></td>
+                <td>Lists all Unity Catalogs and schemas</td>
+                <td>Returns metadata hierarchy</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/genie/ask</code></td>
+                <td>Submits natural language prompt to Genie</td>
+                <td><code>{"prompt": "Show top 5...", "chat_id": "genie_123"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/dbt/run</code></td>
+                <td>Executes dbt transformation models</td>
+                <td><code>{"command": "run", "select": "tag:silver"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/experiments/traces</code></td>
+                <td>Lists MLflow GenAI execution traces</td>
+                <td>Query params: <code>status</code>, <code>search_term</code>, <code>limit</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/serving-endpoints/{endpoint_name}/invocations</code></td>
+                <td>Real-time model prediction invocation</td>
+                <td><code>{"dataframe_records": [...]}</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="troubleshooting-faq">Troubleshooting & Frequently Asked Questions</h3>
+        <div class="callout note">
+          <div class="callout-icon"><i class="ph ph-info"></i></div>
+          <div class="callout-body">
+            <div class="callout-title">Q: How do I recover from a corrupted history.db lock?</div>
+            <p>
+              DataKilnWorks runs SQLite in Write-Ahead Log (WAL) mode. If an unexpected host reboot leaves stale locks, run:
+              <br>
+              <code>sqlite3 warehouse/.metadata/history.db "PRAGMA integrity_check;"</code>
+              <br>
+              If errors are reported, execute <code>sqlite3 warehouse/.metadata/history.db ".recover" | sqlite3 history_recovered.db</code> and replace the file.
+            </p>
+          </div>
+        </div>
+
+        <div class="callout tip">
+          <div class="callout-icon"><i class="ph ph-lightbulb"></i></div>
+          <div class="callout-body">
+            <div class="callout-title">Q: Can I run DataKilnWorks on Apple Silicon M-series chips?</div>
+            <p>
+              Yes. The Docker container and underlying DuckDB/Ray binaries natively support ARM64. Execution utilizes Apple Silicon performance cores with full hardware acceleration.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Document Footer -->
+      <footer style="margin-top: 5rem; padding-top: 2rem; border-top: 1px solid var(--dbx-card-border); color: var(--dbx-text-light); font-size: 0.82rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: gap: 1rem;">
+        <div>
+          DataKilnWorks Lakehouse Studio Documentation &bull; Released under AGPL v3
+        </div>
+        <div>
+          Minimalist Theme &bull; <a href="#overview-architecture">Back to Top &uarr;</a>
+        </div>
+      </footer>
+
+    </main>
+
+    <!-- Right "On this page" In-Page TOC (Databricks style) -->
+    <aside class="docs-toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li class="toc-item"><a href="#overview-architecture" class="toc-link">Overview & Architecture</a></li>
+        <li class="toc-item"><a href="#architectural-layers" class="toc-link" style="padding-left: 1rem;">Architecture Layers</a></li>
+        <li class="toc-item"><a href="#core-design-decisions" class="toc-link" style="padding-left: 1rem;">Core Decisions</a></li>
+        <li class="toc-item"><a href="#platform-comparison" class="toc-link" style="padding-left: 1rem;">Platform Comparison</a></li>
+        <li class="toc-item"><a href="#workspace-environments" class="toc-link">Workspace & Users</a></li>
+        <li class="toc-item"><a href="#scratchpad-notebooks" class="toc-link" style="padding-left: 1rem;">Scratchpads & PySpark</a></li>
+        <li class="toc-item"><a href="#unity-catalog-namespace" class="toc-link">Catalog & Governance</a></li>
+        <li class="toc-item"><a href="#delta-lake-time-travel" class="toc-link" style="padding-left: 1rem;">Delta Time Travel</a></li>
+        <li class="toc-item"><a href="#unity-catalog-volumes" class="toc-link" style="padding-left: 1rem;">Volumes Explorer</a></li>
+        <li class="toc-item"><a href="#interactive-data-lineage" class="toc-link" style="padding-left: 1rem;">Data Lineage DAG</a></li>
+        <li class="toc-item"><a href="#monaco-sql-editor" class="toc-link">SQL & Lakeview BI</a></li>
+        <li class="toc-item"><a href="#lakeview-dashboards" class="toc-link" style="padding-left: 1rem;">Dashboards & Exports</a></li>
+        <li class="toc-item"><a href="#genie-spaces-ai" class="toc-link" style="padding-left: 1rem;">Genie Space (AI)</a></li>
+        <li class="toc-item"><a href="#sql-warehouses-compute" class="toc-link" style="padding-left: 1rem;">SQL Warehouses</a></li>
+        <li class="toc-item"><a href="#data-ingestion-wizard" class="toc-link">Data Engineering</a></li>
+        <li class="toc-item"><a href="#dbt-core-transformations" class="toc-link" style="padding-left: 1rem;">dbt Transformations</a></li>
+        <li class="toc-item"><a href="#jobs-pipelines-workflows" class="toc-link" style="padding-left: 1rem;">Jobs & Workflows</a></li>
+        <li class="toc-item"><a href="#mlflow-experiments" class="toc-link">Machine Learning & AI</a></li>
+        <li class="toc-item"><a href="#mlflow-genai-tracing" class="toc-link" style="padding-left: 1rem;">LLM Tracing & Gantt</a></li>
+        <li class="toc-item"><a href="#prompt-playground" class="toc-link" style="padding-left: 1rem;">Prompt Playground</a></li>
+        <li class="toc-item"><a href="#model-registry-serving" class="toc-link" style="padding-left: 1rem;">Model Serving</a></li>
+        <li class="toc-item"><a href="#sql-native-ai-inference" class="toc-link" style="padding-left: 1rem;">SQL-Native AI</a></li>
+        <li class="toc-item"><a href="#ray-distributed-engine" class="toc-link">Platform & Admin</a></li>
+        <li class="toc-item"><a href="#resources-deployment" class="toc-link">Resources & Deploy</a></li>
+        <li class="toc-item"><a href="#docker-local-install" class="toc-link" style="padding-left: 1rem;">Docker Compose</a></li>
+        <li class="toc-item"><a href="#kubernetes-deployment" class="toc-link" style="padding-left: 1rem;">Kubernetes (K8s)</a></li>
+        <li class="toc-item"><a href="#hands-on-tutorial" class="toc-link" style="padding-left: 1rem;">End-to-End Tutorial</a></li>
+        <li class="toc-item"><a href="#rest-api-reference" class="toc-link" style="padding-left: 1rem;">REST API Reference</a></li>
+        <li class="toc-item"><a href="#troubleshooting-faq" class="toc-link" style="padding-left: 1rem;">Troubleshooting & FAQ</a></li>
+      </ul>
+    </aside>
+
+  </div>
+
+  <!-- Syntax Highlighting (highlight.js) -->
+  <script src="assets/highlight.min.js"></script>
+  <!-- Client-Side JavaScript for Theme Toggle, Tabs, and Search -->
+  <script src="assets/docs.js"></script>
+</body>
+</html>

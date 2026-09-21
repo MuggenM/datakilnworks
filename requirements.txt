@@ -15,4 +15,7 @@ papermill>=2.6.0
 APScheduler>=3.10.0
 requests>=2.31.0
 ray[default]>=2.35.0
+azure-identity>=1.17.0
+azure-storage-file-datalake>=12.14.0
+cryptography>=41.0.0
 

@@ -212,8 +212,14 @@ if ipy is not None:
     }
     if _has_mlflow:
         globals_dict["mlflow"] = mlflow
+        globals_dict["MlflowClient"] = mlflow.MlflowClient
+        try:
+            mlflow.autolog(silent=True)
+        except Exception:
+            pass
     ipy.user_ns.update(globals_dict)
 
 print("⚡ Databricks-local environment ready (SQLFrame + duckrun + DuckDB).")
 print(f"📦 SparkSession initialized. Warehouse path: {WAREHOUSE_DIR}")
 print("🔧 Preloaded globals: 'spark', 'dbutils', 'display()', 'conn', 'mlflow', '%sql' / '%%sql'")
+print("🤖 MLflow Autologging enabled for Scikit-Learn & ML frameworks.")

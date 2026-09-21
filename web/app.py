@@ -17,7 +17,7 @@ import duckrun
 from deltalake import DeltaTable, write_deltalake
 import asyncio
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -27,7 +27,8 @@ from web.auth import (
     get_user_by_username, list_users, create_user, update_user, reset_user_password,
     delete_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db
 )
-from web import auth_frameworks
+from web import auth_frameworks, llm_settings
+from web import onelake
 from web.permissions import (
     can_user_access_catalog, can_user_manage_catalog, can_user_delete_catalog,
     delete_all_catalog_permissions, filter_catalogs_for_user,
@@ -74,7 +75,7 @@ from web.ray_engine import ray_manager, RAY_INSTALLED
 logger = logging.getLogger("databricks_studio")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Databricks Local Studio", version="1.0.0")
+app = FastAPI(title="Data Kiln Works Studio", version="2.4.0", docs_url="/api/docs", redoc_url="/api/redoc")
 
 @app.on_event("startup")
 async def startup_event():
@@ -96,6 +97,16 @@ async def startup_event():
     # Initialize scheduled exports
     from web.scheduled_exports import init_scheduler
     init_scheduler()
+    # Initialize Volume Auto-Loader daemon
+    try:
+        from web.volumes import ensure_default_volumes
+        from web.autoloader import init_autoloader_db, autoloader_daemon_loop, seed_demo_pipeline
+        ensure_default_volumes()
+        init_autoloader_db()
+        seed_demo_pipeline()
+        asyncio.create_task(autoloader_daemon_loop())
+    except Exception as e_al:
+        logger.warning(f"Failed to auto-start autoloader daemon on startup: {e_al}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -114,6 +125,30 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 if os.path.exists(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# Data Kiln Works Documentation & Manual Portal
+DOCS_DIR = os.getenv("DOCS_DIR", "/workspace/docs")
+if not os.path.exists(DOCS_DIR) or not os.path.exists(os.path.join(DOCS_DIR, "index.html")):
+    DOCS_DIR = os.path.join(os.path.dirname(BASE_DIR), "docs")
+if not os.path.exists(DOCS_DIR) or not os.path.exists(os.path.join(DOCS_DIR, "index.html")):
+    DOCS_DIR = os.path.join(BASE_DIR, "docs")
+
+if os.path.exists(DOCS_DIR) and os.path.exists(os.path.join(DOCS_DIR, "index.html")):
+    app.mount("/docs", StaticFiles(directory=DOCS_DIR, html=True), name="docs")
+    logger.info(f"Mounted Data Kiln Works documentation portal from {DOCS_DIR}")
+
+@app.api_route("/documentation", methods=["GET", "HEAD"], response_class=RedirectResponse, include_in_schema=False)
+async def documentation_redirect():
+    return RedirectResponse(url="/docs/")
+
+@app.api_route("/manual", methods=["GET", "HEAD"], response_class=RedirectResponse, include_in_schema=False)
+async def manual_redirect():
+    return RedirectResponse(url="/docs/")
+
+@app.api_route("/tutorial", methods=["GET", "HEAD"], response_class=RedirectResponse, include_in_schema=False)
+async def tutorial_redirect():
+    return RedirectResponse(url="/docs/#hands-on-tutorial")
+
+
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 NOTEBOOKS_DIR = os.getenv("NOTEBOOKS_DIR", "/workspace/notebooks")
 JUPYTER_PORT = os.getenv("JUPYTER_PORT", "8890")
@@ -129,7 +164,17 @@ def get_duckrun_conn():
     global _duckrun_conn
     if _duckrun_conn is None:
         _duckrun_conn = duckrun.connect(WAREHOUSE_DIR, read_only=False)
+        try:
+            _duckrun_conn.sql("SET max_memory = '2GB';")
+            _duckrun_conn.sql("SET preserve_insertion_order = false;")
+        except Exception:
+            pass
         sync_catalogs_with_duckrun(_duckrun_conn)
+        try:
+            from web.ai_sql import register_duckdb_ai_functions
+            register_duckdb_ai_functions(_duckrun_conn.con)
+        except Exception as e:
+            logger.warning(f"Failed registering DuckDB AI UDFs: {e}")
     else:
         sync_catalogs_with_duckrun(_duckrun_conn)
     return _duckrun_conn
@@ -470,6 +515,70 @@ async def update_settings_endpoint(
 
 
 # ==============================================================================
+# PLATFORM LLM ENDPOINTS & CLOUD API KEYS (ADMIN ONLY)
+# ==============================================================================
+
+class PlatformLlmPayload(BaseModel):
+    ollama_host: Optional[str] = None
+    lmstudio_host: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    default_provider: Optional[str] = None
+    default_model: Optional[str] = None
+    auto_load_models: Optional[bool] = None
+
+class PlatformLlmTestPayload(BaseModel):
+    provider: str
+    host: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+
+@app.get("/api/settings/llm")
+async def get_platform_llm_settings(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Returns current platform LLM configuration with secrets masked (admin only)."""
+    cfg = llm_settings.get_masked_llm_config()
+    return {"success": True, "config": cfg}
+
+@app.post("/api/settings/llm")
+async def update_platform_llm_settings(
+    payload: PlatformLlmPayload,
+    current_user: Dict[str, Any] = Depends(require_role(["admin"]))
+):
+    """Updates platform LLM configuration and syncs runtime environments (admin only)."""
+    try:
+        updated = llm_settings.save_llm_config(
+            payload.dict(exclude_unset=True),
+            updated_by=current_user.get("username", "admin")
+        )
+        return {"success": True, "config": updated, "message": "LLM endpoints and API keys saved successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/settings/llm/test")
+async def test_platform_llm_connection(
+    payload: PlatformLlmTestPayload,
+    current_user: Dict[str, Any] = Depends(require_role(["admin"]))
+):
+    """Tests connectivity and authentication for a specific LLM provider (admin only)."""
+    result = llm_settings.test_llm_connection(
+        provider=payload.provider,
+        host=payload.host,
+        api_key=payload.api_key,
+        model=payload.model
+    )
+    return result
+
+@app.post("/api/settings/llm/reset")
+async def reset_platform_llm_settings(
+    current_user: Dict[str, Any] = Depends(require_role(["admin"]))
+):
+    """Resets platform LLM configuration to defaults (admin only)."""
+    cfg = llm_settings.reset_llm_config(updated_by=current_user.get("username", "admin"))
+    return {"success": True, "config": cfg, "message": "LLM settings reset to defaults successfully"}
+
+
+# ==============================================================================
 # AUTHENTICATION FRAMEWORKS & SSO (ADMIN ONLY)
 # ==============================================================================
 
@@ -675,6 +784,248 @@ async def create_catalog_schema_endpoint(cat_id: str, payload: Dict[str, Any]):
         return {"success": True, "catalog": cat_id, "schema": schema_name, "path": path}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# ==================== ONELAKE EXTERNAL CATALOGS ====================
+
+class OneLakeMountRequest(BaseModel):
+    workspace: str
+    lakehouse: str
+    tenant_id: str
+    client_id: str
+    client_secret: str
+    catalog_id: Optional[str] = None
+
+@app.post("/api/catalogs/onelake/mount")
+async def mount_onelake_catalog_endpoint(payload: OneLakeMountRequest, request: Request):
+    """Mount OneLake lakehouse as read-only external catalog."""
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+
+    # Only admins can mount external catalogs
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only administrators can mount external catalogs")
+
+    try:
+        catalog = onelake.mount_onelake_catalog(
+            workspace=payload.workspace,
+            lakehouse=payload.lakehouse,
+            tenant_id=payload.tenant_id,
+            client_id=payload.client_id,
+            client_secret=payload.client_secret,
+            catalog_id=payload.catalog_id
+        )
+
+        # List tables
+        tables = catalog.list_tables()
+
+        return {
+            "success": True,
+            "catalog_id": catalog.catalog_id,
+            "workspace": catalog.workspace,
+            "lakehouse": catalog.lakehouse,
+            "type": "onelake",
+            "read_only": True,
+            "table_count": len(tables),
+            "tables": [
+                {
+                    "name": table,
+                    "catalog": catalog.catalog_id,
+                    "source": "onelake",
+                    "read_only": True
+                }
+                for table in tables
+            ],
+            "message": f"Successfully mounted OneLake catalog '{catalog.catalog_id}' with {len(tables)} tables"
+        }
+
+    except ConnectionError as e:
+        raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
+    except Exception as e:
+        logger.exception("Failed to mount OneLake catalog")
+        raise HTTPException(status_code=500, detail=f"Failed to mount OneLake catalog: {str(e)}")
+
+@app.get("/api/catalogs/onelake")
+async def list_onelake_catalogs_endpoint():
+    """List all mounted OneLake catalogs."""
+    try:
+        catalogs = onelake.list_onelake_catalogs()
+
+        # Add table lists
+        result = []
+        for cat in catalogs:
+            catalog_obj = onelake.get_onelake_catalog(cat['catalog_id'])
+            if catalog_obj:
+                tables = catalog_obj.list_tables()
+                cat['tables'] = tables
+                cat['table_count'] = len(tables)
+            result.append(cat)
+
+        return {
+            "catalogs": result,
+            "count": len(result)
+        }
+
+    except Exception as e:
+        logger.exception("Failed to list OneLake catalogs")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/catalogs/onelake/{catalog_id}")
+async def get_onelake_catalog_endpoint(catalog_id: str):
+    """Get details of a specific OneLake catalog."""
+    catalog = onelake.get_onelake_catalog(catalog_id)
+
+    if not catalog:
+        raise HTTPException(status_code=404, detail=f"OneLake catalog '{catalog_id}' not found")
+
+    try:
+        tables = catalog.list_tables()
+
+        return {
+            "catalog_id": catalog.catalog_id,
+            "workspace": catalog.workspace,
+            "lakehouse": catalog.lakehouse,
+            "type": "onelake",
+            "read_only": True,
+            "table_count": len(tables),
+            "tables": tables,
+            "base_url": catalog.base_url
+        }
+
+    except Exception as e:
+        logger.exception(f"Failed to get OneLake catalog {catalog_id}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/catalogs/onelake/{catalog_id}/tables")
+async def list_onelake_tables_endpoint(catalog_id: str, force_refresh: bool = False):
+    """List tables in OneLake catalog."""
+    catalog = onelake.get_onelake_catalog(catalog_id)
+
+    if not catalog:
+        raise HTTPException(status_code=404, detail=f"OneLake catalog '{catalog_id}' not found")
+
+    try:
+        tables = catalog.list_tables(force_refresh=force_refresh)
+
+        return {
+            "catalog_id": catalog_id,
+            "tables": [
+                {
+                    "name": table,
+                    "catalog": catalog_id,
+                    "source": "onelake",
+                    "read_only": True
+                }
+                for table in tables
+            ],
+            "count": len(tables)
+        }
+
+    except Exception as e:
+        logger.exception(f"Failed to list tables for OneLake catalog {catalog_id}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/catalogs/onelake/{catalog_id}/tables/{table_name}")
+async def get_onelake_table_metadata_endpoint(catalog_id: str, table_name: str):
+    """Get metadata for a specific OneLake table."""
+    catalog = onelake.get_onelake_catalog(catalog_id)
+
+    if not catalog:
+        raise HTTPException(status_code=404, detail=f"OneLake catalog '{catalog_id}' not found")
+
+    try:
+        metadata = catalog.get_table_metadata(table_name)
+        return metadata
+
+    except Exception as e:
+        logger.exception(f"Failed to get metadata for {catalog_id}.{table_name}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class OneLakeQueryRequest(BaseModel):
+    table_name: str
+    sql: Optional[str] = None
+    limit: Optional[int] = 100
+    filters: Optional[List] = None
+
+@app.post("/api/catalogs/onelake/{catalog_id}/query")
+async def query_onelake_table_endpoint(catalog_id: str, payload: OneLakeQueryRequest):
+    """Query OneLake table."""
+    catalog = onelake.get_onelake_catalog(catalog_id)
+
+    if not catalog:
+        raise HTTPException(status_code=404, detail=f"OneLake catalog '{catalog_id}' not found")
+
+    try:
+        if payload.sql:
+            # Execute custom SQL query
+            df = catalog.query_with_duckdb(payload.sql)
+        else:
+            # Simple table read
+            df = catalog.read_table(
+                table_name=payload.table_name,
+                limit=payload.limit,
+                filters=payload.filters
+            )
+
+        return {
+            "catalog_id": catalog_id,
+            "table": payload.table_name,
+            "rows": len(df),
+            "columns": df.columns.tolist(),
+            "data": df.to_dict(orient='records')
+        }
+
+    except Exception as e:
+        logger.exception(f"Failed to query OneLake table {catalog_id}.{payload.table_name}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/catalogs/onelake/{catalog_id}")
+async def unmount_onelake_catalog_endpoint(catalog_id: str, request: Request):
+    """Unmount OneLake catalog."""
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+
+    # Only admins can unmount external catalogs
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only administrators can unmount external catalogs")
+
+    success = onelake.unmount_onelake_catalog(catalog_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail=f"OneLake catalog '{catalog_id}' not found")
+
+    return {
+        "success": True,
+        "catalog_id": catalog_id,
+        "message": f"OneLake catalog '{catalog_id}' unmounted successfully"
+    }
+
+@app.post("/api/catalogs/onelake/{catalog_id}/test")
+async def test_onelake_connection_endpoint(catalog_id: str):
+    """Test OneLake catalog connection."""
+    catalog = onelake.get_onelake_catalog(catalog_id)
+
+    if not catalog:
+        raise HTTPException(status_code=404, detail=f"OneLake catalog '{catalog_id}' not found")
+
+    try:
+        success = catalog.test_connection()
+
+        return {
+            "catalog_id": catalog_id,
+            "connected": success,
+            "message": "Connection successful" if success else "Connection failed"
+        }
+
+    except Exception as e:
+        return {
+            "catalog_id": catalog_id,
+            "connected": False,
+            "error": str(e)
+        }
 
 # ==================== SQL WAREHOUSES (COMPUTE) APIS ====================
 
@@ -983,6 +1334,42 @@ async def get_table_details(schema_name: str, table_name: str, catalog: Optional
             except Exception:
                 pass
 
+            is_partitioned = False
+            is_child_partition = False
+            parent_table = None
+            child_partitions = []
+
+            if m["type"] == "postgres":
+                try:
+                    q_part = f"""
+                    SELECT c.relkind, c.relispartition, p.relname AS parent_name
+                    FROM {catalog}.pg_catalog.pg_class c
+                    JOIN {catalog}.pg_catalog.pg_namespace n ON (c.relnamespace = n.oid)
+                    LEFT JOIN {catalog}.pg_catalog.pg_inherits i ON (i.inhrelid = c.oid)
+                    LEFT JOIN {catalog}.pg_catalog.pg_class p ON (i.inhparent = p.oid)
+                    WHERE n.nspname = '{schema_name}' AND c.relname = '{table_name}';
+                    """
+                    part_info = raw_conn.execute(q_part).fetchone()
+                    if part_info:
+                        relkind, relispartition, p_name = part_info
+                        is_partitioned = (relkind == 'p')
+                        is_child_partition = bool(relispartition)
+                        parent_table = p_name
+
+                        if is_partitioned:
+                            q_children = f"""
+                            SELECT c.relname
+                            FROM {catalog}.pg_catalog.pg_inherits i
+                            JOIN {catalog}.pg_catalog.pg_class c ON (i.inhrelid = c.oid)
+                            JOIN {catalog}.pg_catalog.pg_class p ON (i.inhparent = p.oid)
+                            JOIN {catalog}.pg_catalog.pg_namespace n ON (p.relnamespace = n.oid)
+                            WHERE n.nspname = '{schema_name}' AND p.relname = '{table_name}'
+                            ORDER BY c.relname;
+                            """
+                            child_partitions = [r[0] for r in raw_conn.execute(q_children).fetchall()]
+                except Exception as e_part:
+                    logger.debug(f"Could not inspect postgres partition status: {e_part}")
+
             return {
                 "catalog": catalog,
                 "schema_name": schema_name,
@@ -998,6 +1385,11 @@ async def get_table_details(schema_name: str, table_name: str, catalog: Optional
                 "num_files": len(history) if is_delta else (1 if m["type"] == "s3" else 0),
                 "size_bytes": 0,
                 "is_federated": True,
+                "is_partitioned": is_partitioned,
+                "is_child_partition": is_child_partition,
+                "parent_table": parent_table,
+                "child_partitions": child_partitions,
+                "partition_count": len(child_partitions),
                 "mount_type": m["type"],
                 "mount_name": m["name"],
                 "row_count": row_count,
@@ -1005,7 +1397,7 @@ async def get_table_details(schema_name: str, table_name: str, catalog: Optional
                     "Federation Type": f"Zero-Copy {m['type'].upper()} Mount",
                     "Mount Name": m["name"],
                     "Storage Location": location,
-                    "Format": "Delta Lake (ACID)" if is_delta else ("Parquet" if m["type"] == "s3" else m["type"].upper()),
+                    "Format": "Delta Lake (ACID)" if is_delta else ("Parquet" if m["type"] == "s3" else ("PostgreSQL Declarative Partitioned" if is_partitioned else m["type"].upper())),
                     "Attached Catalog": catalog
                 }
             }
@@ -1254,11 +1646,15 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Active SQL query registry for query cancellation
+ACTIVE_QUERIES: Dict[str, Dict[str, Any]] = {}
+
 class QueryRequest(BaseModel):
     query: str
     warehouse_id: Optional[str] = None
     catalog: Optional[str] = None
     saved_query_id: Optional[str] = None
+    execution_id: Optional[str] = None
 
 @app.post("/api/sql/execute")
 async def execute_sql(payload: QueryRequest, request: Request):
@@ -1286,6 +1682,19 @@ async def execute_sql(payload: QueryRequest, request: Request):
     wh = apply_warehouse_compute(conn, payload.warehouse_id)
     start_time = time.perf_counter()
 
+    execution_id = payload.execution_id or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    active_entry = {
+        "execution_id": execution_id,
+        "query": query,
+        "user": current_user.get("username", "admin"),
+        "started_at": time.time(),
+        "warehouse_id": wh["id"] if wh else "wh_starter",
+        "catalog": payload.catalog or "warehouse",
+        "cursor": None,
+        "cancelled": False
+    }
+    ACTIVE_QUERIES[execution_id] = active_entry
+
     if payload.saved_query_id:
         try:
             from web.saved_queries import record_saved_query_run
@@ -1293,122 +1702,173 @@ async def execute_sql(payload: QueryRequest, request: Request):
         except Exception as e_rec:
             logger.warning(f"Could not record run for saved query {payload.saved_query_id}: {e_rec}")
 
-    # 1. Attempt Clustered Worker Dispatch (if warehouse defines an endpoint)
-    remote_executed = False
-    remote_data = None
-    if wh and wh.get("endpoint"):
-        try:
-            import httpx
-            endpoints_to_try = [wh["endpoint"]]
-            if "compute-node-01" in wh["endpoint"]:
-                endpoints_to_try.append("http://localhost:8001")
-            elif "compute-node-02" in wh["endpoint"]:
-                endpoints_to_try.append("http://localhost:8002")
-            elif "compute-node-03" in wh["endpoint"]:
-                endpoints_to_try.append("http://localhost:8003")
-
-            for ep in endpoints_to_try:
-                try:
-                    with httpx.Client(timeout=45.0) as client:
-                        resp = client.post(
-                            f"{ep}/api/compute/execute",
-                            json={
-                                "query": query,
-                                "warehouse_id": wh["id"],
-                                "catalog": payload.catalog or "warehouse"
-                            }
-                        )
-                    if resp.status_code == 200:
-                        remote_data = resp.json()
-                        remote_executed = True
-                        break
-                except Exception:
-                    continue
-        except Exception as e_rem:
-            logger.warning(f"Remote compute node dispatch failed for {wh.get('endpoint')}: {e_rem}")
-
-    # 2. Attempt Ray Actor Pool Dispatch (if Ray is active or warehouse has ray_workers configured)
-    if not remote_executed and wh and RAY_INSTALLED and (wh.get("id") in ray_manager.actor_pools or wh.get("ray_workers", 0) > 0):
-        try:
-            ray_res = ray_manager.execute_query(wh["id"], query)
-            if ray_res and ray_res.get("success"):
-                remote_data = {
-                    "success": True,
-                    "columns": ray_res.get("columns", []),
-                    "rows": ray_res.get("rows", []),
-                    "row_count": ray_res.get("row_count", 0),
-                    "elapsed_ms": ray_res.get("duration_ms", round((time.perf_counter() - start_time) * 1000, 2)),
-                    "executed_by": ray_res.get("actor_id", f"ray-worker-{wh['id']}"),
-                    "is_mutation": False
-                }
-                remote_executed = True
-        except Exception as e_ray:
-            logger.warning(f"Ray actor pool dispatch failed for {wh.get('id')}: {e_ray}")
-
-    if remote_executed and remote_data is not None:
-        elapsed_ms = remote_data.get("elapsed_ms", round((time.perf_counter() - start_time) * 1000, 2))
-        node_id = remote_data.get("executed_by", "compute-worker")
-        if remote_data.get("success"):
-            try:
-                from web.lineage import record_query_lineage
-                record_query_lineage(query, client="SQL_EDITOR")
-            except Exception:
-                pass
-            qid = log_query(
-                query_text=query,
-                duration_ms=elapsed_ms,
-                rows_produced=remote_data.get("row_count", 0),
-                status="SUCCESS",
-                client="SQL_EDITOR",
-                is_mutation=remote_data.get("is_mutation", False),
-                warehouse_id=wh["id"],
-                catalog=payload.catalog or "warehouse",
-                user=current_user.get("username", "admin"),
-                executed_by=node_id
-            )
-            remote_data["query_id"] = qid
-            remote_data["warehouse_name"] = wh["name"]
-            remote_data["cluster_size"] = wh.get("cluster_size", "Small")
-            return remote_data
-        else:
-            qid = log_query(
-                query_text=query,
-                duration_ms=elapsed_ms,
-                rows_produced=0,
-                status="FAILED",
-                error_message=remote_data.get("error", "Worker execution error"),
-                client="SQL_EDITOR",
-                warehouse_id=wh["id"],
-                catalog=payload.catalog or "warehouse",
-                user=current_user.get("username", "admin"),
-                executed_by=node_id
-            )
-            remote_data["query_id"] = qid
-            return remote_data
-
-    # 2. Local In-Process DuckDB Execution (Fallback or default)
-    fallback_note = "local-studio (worker offline)" if (wh and wh.get("endpoint")) else "local-studio"
     try:
-        res = conn.sql(query)
+        def _execute_sync():
+            # 1. Attempt Clustered Worker Dispatch (if warehouse defines an endpoint)
+            if wh and wh.get("endpoint"):
+                try:
+                    import httpx
+                    endpoints_to_try = [wh["endpoint"]]
+                    if "compute-node-01" in wh["endpoint"]:
+                        endpoints_to_try.append("http://localhost:8001")
+                    elif "compute-node-02" in wh["endpoint"]:
+                        endpoints_to_try.append("http://localhost:8002")
+                    elif "compute-node-03" in wh["endpoint"]:
+                        endpoints_to_try.append("http://localhost:8003")
+
+                    for ep in endpoints_to_try:
+                        try:
+                            active_entry["endpoint"] = ep
+                            with httpx.Client(timeout=45.0) as client:
+                                resp = client.post(
+                                    f"{ep}/api/compute/execute",
+                                    json={
+                                        "query": query,
+                                        "warehouse_id": wh["id"],
+                                        "catalog": payload.catalog or "warehouse",
+                                        "execution_id": execution_id
+                                    }
+                                )
+                            if resp.status_code == 200:
+                                return ("remote", resp.json())
+                        except Exception:
+                            continue
+                except Exception as e_rem:
+                    logger.warning(f"Remote compute node dispatch failed for {wh.get('endpoint')}: {e_rem}")
+
+            # 2. Attempt Ray Actor Pool Dispatch (if Ray is active or warehouse has ray_workers configured)
+            if wh and RAY_INSTALLED and (wh.get("id") in ray_manager.actor_pools or wh.get("ray_workers", 0) > 0):
+                try:
+                    ray_res = ray_manager.execute_query(wh["id"], query)
+                    if ray_res and ray_res.get("success"):
+                        return ("remote", {
+                            "success": True,
+                            "columns": ray_res.get("columns", []),
+                            "rows": ray_res.get("rows", []),
+                            "row_count": ray_res.get("row_count", 0),
+                            "elapsed_ms": ray_res.get("duration_ms", round((time.perf_counter() - start_time) * 1000, 2)),
+                            "executed_by": ray_res.get("actor_id", f"ray-worker-{wh['id']}"),
+                            "is_mutation": False
+                        })
+                except Exception as e_ray:
+                    logger.warning(f"Ray actor pool dispatch failed for {wh.get('id')}: {e_ray}")
+
+            # 3. Local In-Process DuckDB Execution (with dedicated cursor isolation & interrupt support)
+            is_delta_special = (
+                any(k in query.lower() for k in ["describe detail", "describe history", "restore table", "vacuum"])
+                or any(query.strip().lower().startswith(p) for p in ["insert ", "update ", "delete ", "merge "])
+            )
+            if not is_delta_special:
+                cur = conn.con.cursor()
+                active_entry["cursor"] = cur
+                try:
+                    res = cur.sql(query)
+                    if res is not None and hasattr(res, "df"):
+                        df = res.df()
+                        columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
+                        rows = [json_serializable_row(row) for row in df.to_dict(orient="records")]
+                        return ("select", {
+                            "columns": columns,
+                            "rows": rows,
+                            "row_count": len(rows)
+                        })
+                    else:
+                        return ("mutation", {
+                            "message": "Statement executed and committed successfully."
+                        })
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+            else:
+                active_entry["cursor"] = conn.con
+                res = conn.sql(query)
+                if res is not None and hasattr(res, "df"):
+                    df = res.df()
+                    columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
+                    rows = [json_serializable_row(row) for row in df.to_dict(orient="records")]
+                    return ("select", {
+                        "columns": columns,
+                        "rows": rows,
+                        "row_count": len(rows)
+                    })
+                else:
+                    return ("mutation", {
+                        "message": "Statement executed and committed successfully."
+                    })
+
+        res_kind, res_data = await asyncio.to_thread(_execute_sync)
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
         try:
             from web.lineage import record_query_lineage
             record_query_lineage(query, client="SQL_EDITOR")
         except Exception:
             pass
 
-        if res is not None and hasattr(res, "df"):
-            df = res.df()
-            columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
-            rows = [json_serializable_row(row) for row in df.to_dict(orient="records")]
+        if res_kind == "remote":
+            node_id = res_data.get("executed_by", "compute-worker")
+            if res_data.get("cancelled"):
+                qid = log_query(
+                    query_text=query,
+                    duration_ms=elapsed_ms,
+                    rows_produced=0,
+                    status="CANCELLED",
+                    error_message=res_data.get("error", "Query execution was cancelled by user."),
+                    client="SQL_EDITOR",
+                    warehouse_id=wh["id"] if wh else "wh_starter",
+                    catalog=payload.catalog or "warehouse",
+                    user=current_user.get("username", "admin"),
+                    executed_by=node_id
+                )
+                res_data["query_id"] = qid
+                res_data["execution_id"] = execution_id
+                return res_data
+            elif res_data.get("success"):
+                qid = log_query(
+                    query_text=query,
+                    duration_ms=elapsed_ms,
+                    rows_produced=res_data.get("row_count", 0),
+                    status="SUCCESS",
+                    client="SQL_EDITOR",
+                    is_mutation=res_data.get("is_mutation", False),
+                    warehouse_id=wh["id"] if wh else "wh_starter",
+                    catalog=payload.catalog or "warehouse",
+                    user=current_user.get("username", "admin"),
+                    executed_by=node_id
+                )
+                res_data["query_id"] = qid
+                res_data["execution_id"] = execution_id
+                res_data["warehouse_name"] = wh["name"] if wh else "Starter"
+                res_data["cluster_size"] = wh.get("cluster_size", "Small") if wh else "Small"
+                return res_data
+            else:
+                qid = log_query(
+                    query_text=query,
+                    duration_ms=elapsed_ms,
+                    rows_produced=0,
+                    status="FAILED",
+                    error_message=res_data.get("error", "Worker execution error"),
+                    client="SQL_EDITOR",
+                    warehouse_id=wh["id"] if wh else "wh_starter",
+                    catalog=payload.catalog or "warehouse",
+                    user=current_user.get("username", "admin"),
+                    executed_by=node_id
+                )
+                res_data["query_id"] = qid
+                res_data["execution_id"] = execution_id
+                return res_data
+
+        elif res_kind == "select":
             qid = log_query(
                 query_text=query,
                 duration_ms=elapsed_ms,
-                rows_produced=len(rows),
+                rows_produced=res_data["row_count"],
                 status="SUCCESS",
                 client="SQL_EDITOR",
                 is_mutation=False,
-                warehouse_id=wh["id"],
+                warehouse_id=wh["id"] if wh else "wh_starter",
                 catalog=payload.catalog or "warehouse",
                 user=current_user.get("username", "admin"),
                 executed_by=fallback_note
@@ -1416,14 +1876,15 @@ async def execute_sql(payload: QueryRequest, request: Request):
             return {
                 "success": True,
                 "query_id": qid,
+                "execution_id": execution_id,
                 "is_mutation": False,
-                "columns": columns,
-                "rows": rows,
-                "row_count": len(rows),
+                "columns": res_data["columns"],
+                "rows": res_data["rows"],
+                "row_count": res_data["row_count"],
                 "elapsed_ms": elapsed_ms,
-                "warehouse_id": wh["id"],
-                "warehouse_name": wh["name"],
-                "cluster_size": wh.get("cluster_size", "Small"),
+                "warehouse_id": wh["id"] if wh else "wh_starter",
+                "warehouse_name": wh["name"] if wh else "Starter",
+                "cluster_size": wh.get("cluster_size", "Small") if wh else "Small",
                 "executed_by": fallback_note
             }
         else:
@@ -1438,7 +1899,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 status="SUCCESS",
                 client="SQL_EDITOR",
                 is_mutation=True,
-                warehouse_id=wh["id"],
+                warehouse_id=wh["id"] if wh else "wh_starter",
                 catalog=payload.catalog or "warehouse",
                 user=current_user.get("username", "admin"),
                 executed_by=fallback_note
@@ -1446,37 +1907,140 @@ async def execute_sql(payload: QueryRequest, request: Request):
             return {
                 "success": True,
                 "query_id": qid,
+                "execution_id": execution_id,
                 "is_mutation": True,
-                "message": "Statement executed and committed successfully.",
+                "message": res_data.get("message", "Statement executed and committed successfully."),
                 "elapsed_ms": elapsed_ms,
                 "row_count": 0,
-                "warehouse_id": wh["id"],
-                "warehouse_name": wh["name"],
-                "cluster_size": wh.get("cluster_size", "Small"),
+                "warehouse_id": wh["id"] if wh else "wh_starter",
+                "warehouse_name": wh["name"] if wh else "Starter",
+                "cluster_size": wh.get("cluster_size", "Small") if wh else "Small",
                 "executed_by": fallback_note
             }
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        qid = log_query(
-            query_text=query,
-            duration_ms=elapsed_ms,
-            rows_produced=0,
-            status="FAILED",
-            error_message=str(e),
-            client="SQL_EDITOR",
-            warehouse_id=wh["id"] if 'wh' in locals() and wh else "wh_starter",
-            catalog=payload.catalog or "warehouse",
-            user=current_user.get("username", "admin"),
-            executed_by=fallback_note
+        is_interrupted = (
+            active_entry.get("cancelled", False)
+            or "interrupted" in str(e).lower()
+            or "interruptexception" in type(e).__name__.lower()
         )
+        if is_interrupted:
+            qid = log_query(
+                query_text=query,
+                duration_ms=elapsed_ms,
+                rows_produced=0,
+                status="CANCELLED",
+                error_message="Query execution was cancelled by user.",
+                client="SQL_EDITOR",
+                warehouse_id=wh["id"] if 'wh' in locals() and wh else "wh_starter",
+                catalog=payload.catalog or "warehouse",
+                user=current_user.get("username", "admin"),
+                executed_by=fallback_note
+            )
+            return {
+                "success": False,
+                "cancelled": True,
+                "query_id": qid,
+                "execution_id": execution_id,
+                "error": "Query execution was cancelled by user.",
+                "message": "Query cancelled.",
+                "elapsed_ms": elapsed_ms,
+                "warehouse_id": wh["id"] if 'wh' in locals() and wh else "wh_starter",
+                "executed_by": fallback_note
+            }
+        else:
+            qid = log_query(
+                query_text=query,
+                duration_ms=elapsed_ms,
+                rows_produced=0,
+                status="FAILED",
+                error_message=str(e),
+                client="SQL_EDITOR",
+                warehouse_id=wh["id"] if 'wh' in locals() and wh else "wh_starter",
+                catalog=payload.catalog or "warehouse",
+                user=current_user.get("username", "admin"),
+                executed_by=fallback_note
+            )
+            return {
+                "success": False,
+                "query_id": qid,
+                "execution_id": execution_id,
+                "error": str(e),
+                "elapsed_ms": elapsed_ms,
+                "warehouse_id": wh["id"] if 'wh' in locals() and wh else "wh_starter",
+                "executed_by": fallback_note
+            }
+    finally:
+        ACTIVE_QUERIES.pop(execution_id, None)
+
+
+@app.post("/api/sql/cancel/{execution_id}")
+async def cancel_query(execution_id: str, request: Request):
+    """Cancels an ongoing SQL query execution via DuckDB cursor interrupt."""
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+
+    active = ACTIVE_QUERIES.get(execution_id)
+    if not active:
         return {
             "success": False,
-            "query_id": qid,
-            "error": str(e),
-            "elapsed_ms": elapsed_ms,
-            "warehouse_id": wh["id"] if 'wh' in locals() and wh else "wh_starter",
-            "executed_by": fallback_note
+            "message": "Query execution not found or already completed.",
+            "execution_id": execution_id
         }
+
+    # RBAC: Only admin or the user who initiated the query can cancel
+    if current_user.get("role") != "admin" and active.get("user") != current_user.get("username"):
+        raise HTTPException(status_code=403, detail="Permission denied to cancel this query.")
+
+    active["cancelled"] = True
+    cursor = active.get("cursor")
+    interrupted = False
+    if cursor is not None:
+        try:
+            cursor.interrupt()
+            interrupted = True
+            logger.info(f"Query {execution_id} successfully cancelled via cursor.interrupt()")
+        except Exception as e:
+            logger.warning(f"Failed calling interrupt on cursor for {execution_id}: {e}")
+
+    endpoint = active.get("endpoint")
+    if endpoint:
+        try:
+            import httpx
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.post(f"{endpoint}/api/compute/cancel/{execution_id}")
+                if resp.status_code == 200 and resp.json().get("success"):
+                    interrupted = True
+                    logger.info(f"Query {execution_id} cancelled on remote compute worker {endpoint}")
+        except Exception as e_fwd:
+            logger.warning(f"Failed forwarding cancellation to compute worker {endpoint}: {e_fwd}")
+
+    return {
+        "success": True,
+        "interrupted": interrupted,
+        "message": "Cancellation request processed successfully.",
+        "execution_id": execution_id
+    }
+
+
+@app.get("/api/sql/active")
+async def get_active_queries(request: Request):
+    """Lists currently executing SQL queries across the instance."""
+    now = time.time()
+    results = []
+    for eid, info in list(ACTIVE_QUERIES.items()):
+        results.append({
+            "execution_id": eid,
+            "query": info.get("query", "")[:120],
+            "user": info.get("user", "admin"),
+            "warehouse_id": info.get("warehouse_id", "wh_starter"),
+            "catalog": info.get("catalog", "warehouse"),
+            "elapsed_seconds": round(now - info.get("started_at", now), 2),
+            "started_at": info.get("started_at")
+        })
+    return {"queries": results, "count": len(results)}
 
 
 @app.post("/api/sql/export/parquet")
@@ -1931,12 +2495,12 @@ def get_column_query_frequency(table_name: str = None) -> Dict[str, int]:
 
     return column_freq
 
-def analyze_partition_suitability(df: pd.DataFrame, conn) -> List[Dict[str, Any]]:
+def analyze_partition_suitability(df: pd.DataFrame, conn, source_sql: Optional[str] = None, total_rows: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Analyzes columns to determine partition suitability based on:
-    1. Data type and cardinality
+    1. Data type and true dataset cardinality (via approx_count_distinct when source_sql provided)
     2. Historical query patterns (WHERE clause frequency)
-    Returns list of columns with partition_score and partition_rank.
+    Returns list of columns with partition_score, partition_rank, and cardinality_warning.
     """
     column_scores = []
 
@@ -1944,101 +2508,143 @@ def analyze_partition_suitability(df: pd.DataFrame, conn) -> List[Dict[str, Any]
     query_freq = get_column_query_frequency()
     max_freq = max(query_freq.values()) if query_freq else 1
 
+    # Approximate distinct counts across full dataset if source_sql is available
+    approx_distinct_map = {}
+    if source_sql and conn:
+        try:
+            exprs = [f'approx_count_distinct("{c}")' for c in df.columns]
+            agg_sql = f"SELECT {', '.join(exprs)} FROM {source_sql}"
+            agg_res = conn.sql(agg_sql).fetchone()
+            if agg_res and len(agg_res) == len(df.columns):
+                approx_distinct_map = {col: int(agg_res[i]) for i, col in enumerate(df.columns)}
+        except Exception as e:
+            logger.debug(f"approx_count_distinct query notice: {e}")
+
+    effective_total_rows = total_rows if (total_rows and total_rows > 0) else len(df)
+
     for col in df.columns:
         try:
-            dtype = str(df[col].dtype)
-            distinct_count = int(df[col].nunique())
-            total_rows = len(df)
-            cardinality_ratio = distinct_count / max(total_rows, 1)
-
-            # Base score starts at 0
-            score = 0.0
-
-            # Type scoring (higher is better for partitioning)
-            if 'datetime' in dtype or 'timestamp' in dtype:
-                score += 100  # Excellent - dates are ideal for partitioning
-            elif 'date' in dtype:
-                score += 95
-            elif 'object' in dtype or 'string' in dtype:
-                # String types - depends on cardinality
-                if distinct_count <= 20:
-                    score += 80  # Good - low cardinality categories
-                elif distinct_count <= 100:
-                    score += 60  # Moderate - medium cardinality
-                else:
-                    score += 20  # Poor - high cardinality
-            elif 'int' in dtype:
-                if distinct_count <= 50:
-                    score += 70  # Good for low cardinality integers
-                elif distinct_count <= 500:
-                    score += 40
-                else:
-                    score += 10
-            elif 'bool' in dtype:
-                score += 75  # Good - binary partition
+            dtype = str(df[col].dtype).lower()
+            if col in approx_distinct_map:
+                distinct_count = approx_distinct_map[col]
             else:
-                score += 30  # Float or other types - less ideal
+                distinct_count = int(df[col].nunique())
 
-            # Cardinality penalty/bonus
-            if cardinality_ratio < 0.01:  # Less than 1% unique
-                score += 30  # Bonus for very low cardinality
-            elif cardinality_ratio < 0.05:  # Less than 5% unique
-                score += 20
-            elif cardinality_ratio < 0.2:  # Less than 20% unique
-                score += 10
-            elif cardinality_ratio > 0.8:  # More than 80% unique
-                score -= 40  # Penalty for very high cardinality
+            cardinality_ratio = distinct_count / max(effective_total_rows, 1)
 
-            # Check for common partition column name patterns
-            col_lower = str(col).lower()
-            if any(pattern in col_lower for pattern in ['date', 'year', 'month', 'day', 'time']):
+            score = 0.0
+            cardinality_warning = None
+
+            # High-cardinality warning threshold (anti-pattern in Lakehouses due to OOM & small files)
+            if distinct_count > 200:
+                cardinality_warning = f"High cardinality (~{distinct_count:,} unique values). Partitioning will create thousands of small files and risk out-of-memory errors."
+            elif distinct_count > 50:
+                cardinality_warning = f"Moderate cardinality (~{distinct_count:,} unique values). Consider partitioning on a coarser column."
+
+            # Type and cardinality scoring
+            if any(t in dtype for t in ['datetime', 'timestamp', 'date']):
+                if distinct_count <= 20:
+                    score += 95
+                elif distinct_count <= 50:
+                    score += 80
+                elif distinct_count <= 200:
+                    score += 30
+                else:
+                    score -= 80  # High-frequency timestamps cause partition explosion & OOM
+            elif any(t in dtype for t in ['bool', 'boolean']) or distinct_count == 2:
+                score += 75  # Good - binary partition
+            elif any(t in dtype for t in ['str', 'string', 'object', 'varchar']):
+                if distinct_count <= 1:
+                    score -= 50  # Constant column
+                elif distinct_count <= 10:
+                    score += 85  # Ideal category count
+                elif distinct_count <= 30:
+                    score += 70
+                elif distinct_count <= 50:
+                    score += 55
+                elif distinct_count <= 100:
+                    score += 25
+                elif distinct_count <= 500:
+                    score -= 30
+                else:
+                    score -= 80  # High cardinality string / ID
+            elif any(t in dtype for t in ['int', 'integer', 'int64', 'int32', 'int16', 'int8']):
+                if distinct_count <= 1:
+                    score -= 50
+                elif distinct_count <= 10:
+                    score += 70
+                elif distinct_count <= 50:
+                    score += 50
+                elif distinct_count <= 100:
+                    score += 20
+                else:
+                    score -= 60
+            else:
+                score -= 40  # Float or other types
+
+            # Cardinality ratio bonus/penalty
+            if distinct_count > 1 and cardinality_ratio < 0.001:
                 score += 25
-            elif any(pattern in col_lower for pattern in ['region', 'country', 'state', 'category', 'type', 'status']):
+            elif distinct_count > 1 and cardinality_ratio < 0.01:
                 score += 15
-            elif col_lower in ['id', 'uuid', 'guid']:
-                score -= 50  # IDs are typically bad partition keys
+            elif cardinality_ratio > 0.5:
+                score -= 50
 
-            # MAJOR BONUS: Query pattern analysis - columns frequently used in WHERE clauses
-            # This is the BEST indicator of good partition columns
+            # Column name patterns (only rewarding low/moderate cardinality columns)
+            col_lower = str(col).lower()
+            if distinct_count <= 100:
+                if any(pattern in col_lower for pattern in ['category', 'type', 'status', 'region', 'country', 'state', 'year', 'month']):
+                    score += 20
+                elif any(pattern in col_lower for pattern in ['date', 'day']):
+                    score += 10
+
+            if col_lower in ['id', 'uuid', 'guid'] or col_lower.endswith('_id') or col_lower.startswith('_'):
+                score -= 60
+
+            # Query pattern analysis
             col_query_freq = query_freq.get(col_lower, 0)
             pattern_score = get_column_name_pattern_score(str(col))
 
-            if col_query_freq > 0:
-                # Normalize frequency to 0-50 point scale
+            if col_query_freq > 0 and distinct_count <= 100:
                 normalized_freq = min(50, (col_query_freq / max_freq) * 50)
                 score += normalized_freq
                 query_usage_note = f"Used in {int(col_query_freq)} queries"
             else:
-                # No query history - use pattern library heuristic
-                score += pattern_score
-                if pattern_score > 0:
-                    query_usage_note = f"Not yet queried (pattern match: +{int(pattern_score)} pts)"
-                elif pattern_score < 0:
-                    query_usage_note = f"Not yet queried (anti-pattern: {int(pattern_score)} pts)"
+                if distinct_count <= 100 and pattern_score > 0:
+                    score += pattern_score * 0.5
+                    query_usage_note = f"Not yet queried (pattern match: +{int(pattern_score * 0.5)} pts)"
                 else:
                     query_usage_note = "Not yet queried"
 
-            column_scores.append({
+            item = {
                 'name': str(col),
                 'distinct_count': distinct_count,
                 'cardinality_ratio': round(cardinality_ratio, 4),
                 'partition_score': round(score, 2),
                 'query_frequency': int(col_query_freq),
                 'query_usage': query_usage_note
-            })
+            }
+            if cardinality_warning:
+                item['cardinality_warning'] = cardinality_warning
+            column_scores.append(item)
         except Exception as e:
             logger.warning(f"Failed to analyze column {col}: {e}")
             column_scores.append({
                 'name': str(col),
                 'distinct_count': 0,
                 'cardinality_ratio': 0,
-                'partition_score': 0
+                'partition_score': -100
             })
 
-    # Sort by score descending and assign ranks
+    # Sort by score descending and assign ranks (only positive scores get ranks)
     column_scores.sort(key=lambda x: x['partition_score'], reverse=True)
-    for idx, col_score in enumerate(column_scores, 1):
-        col_score['partition_rank'] = idx
+    rank = 1
+    for col_score in column_scores:
+        if col_score['partition_score'] > 20 and col_score.get('distinct_count', 0) <= 100:
+            col_score['partition_rank'] = rank
+            rank += 1
+        else:
+            col_score['partition_rank'] = None
 
     return column_scores
 
@@ -2074,8 +2680,8 @@ async def ingest_preview(file: UploadFile = File(...)):
         count_res = conn.sql(f"SELECT COUNT(*) FROM {source_sql}").fetchone()
         total_rows = int(count_res[0]) if count_res else int(len(df))
 
-        # Analyze partition suitability
-        partition_analysis = analyze_partition_suitability(df, conn)
+        # Analyze partition suitability with true dataset cardinality
+        partition_analysis = analyze_partition_suitability(df, conn, source_sql=source_sql, total_rows=total_rows)
 
         # Merge partition analysis with column info
         columns = []
@@ -2088,12 +2694,14 @@ async def ingest_preview(file: UploadFile = File(...)):
             if col_analysis:
                 col_info.update({
                     "partition_score": col_analysis['partition_score'],
-                    "partition_rank": col_analysis['partition_rank'],
+                    "partition_rank": col_analysis.get('partition_rank'),
                     "distinct_count": col_analysis['distinct_count'],
                     "cardinality_ratio": col_analysis['cardinality_ratio'],
                     "query_frequency": col_analysis.get('query_frequency', 0),
                     "query_usage": col_analysis.get('query_usage', 'Not analyzed')
                 })
+                if 'cardinality_warning' in col_analysis:
+                    col_info["cardinality_warning"] = col_analysis["cardinality_warning"]
             columns.append(col_info)
 
         sample_rows = [json_serializable_row(row) for row in df.to_dict(orient="records")]
@@ -2163,6 +2771,25 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
             logger.warning(f"Could not validate partition columns: {e}")
             valid_partition_cols = [c.strip() for c in raw_partitions if c and c.strip()]
 
+        if valid_partition_cols:
+            parts_expr = ", ".join(f'"{c}"' for c in valid_partition_cols)
+            try:
+                distinct_comb_count = int(conn.sql(f"SELECT COUNT(DISTINCT ({parts_expr})) FROM {source_sql}").fetchone()[0])
+            except Exception:
+                distinct_comb_count = None
+
+            if distinct_comb_count and distinct_comb_count > 200:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Partition safety limit exceeded: Selected partition columns ({', '.join(valid_partition_cols)}) "
+                        f"contain {distinct_comb_count:,} unique partition combinations (safety limit: 200). "
+                        f"Partitioning on high-cardinality keys (such as timestamps or IDs) causes severe "
+                        f"memory exhaustion (OOM), generates thousands of tiny files, and degrades query performance. "
+                        f"Please partition by a low-cardinality categorical column (< 50 distinct values, e.g. status, region) or remove partition columns."
+                    )
+                )
+
     schema_clean = sanitize_identifier(payload.schema_name or "dbo")
     table_clean = sanitize_identifier(payload.table_name)
     target_catalog = payload.catalog or "warehouse"
@@ -2188,14 +2815,14 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
                 s3_table_uri = f"s3://{bucket}/{schema_clean}/{table_clean}"
                 target_rel = f"{cat['id']}.{schema_clean}.{table_clean}"
 
-                # Materialize from DuckDB query to Arrow table
-                arrow_table = conn.sql(f"SELECT * FROM {source_sql}").arrow().read_all()
-                row_count = arrow_table.num_rows
+                # Compute row count first, then open streaming Arrow reader so cursor is not invalidated
+                row_count = int(conn.sql(f"SELECT COUNT(*) FROM {source_sql}").fetchone()[0])
+                arrow_reader = conn.sql(f"SELECT * FROM {source_sql}").arrow()
 
                 mode = "append" if payload.mode.lower() == "append" else "overwrite"
                 schema_mode = "merge" if mode == "append" else "overwrite"
                 partition_by = valid_partition_cols if valid_partition_cols else None
-                write_deltalake(s3_table_uri, arrow_table, storage_options=storage_options, mode=mode, schema_mode=schema_mode, partition_by=partition_by)
+                write_deltalake(s3_table_uri, arrow_reader, storage_options=storage_options, mode=mode, schema_mode=schema_mode, partition_by=partition_by)
 
                 dt = DeltaTable(s3_table_uri, storage_options=storage_options)
                 version = dt.version()
@@ -2253,8 +2880,72 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
                     "elapsed_ms": elapsed_ms,
                     "message": f"Successfully created Delta table {target_rel} on S3 bucket '{bucket}' with {row_count} rows (Version {version}){part_msg}"
                 }
+            elif m_type == "postgres":
+                from web.mounts import ingest_into_postgres_mount
+
+                pg_result = ingest_into_postgres_mount(
+                    conn=conn,
+                    mount=cat,
+                    schema_name=schema_clean,
+                    table_name=table_clean,
+                    source_sql=source_sql,
+                    mode=payload.mode.lower(),
+                    partition_columns=valid_partition_cols,
+                    max_partitions=50
+                )
+                elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
+                # Remove temp uploaded file
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+
+                # Record lineage
+                try:
+                    from web.lineage import upsert_node, upsert_edge, make_table_id
+                    f_name = os.path.basename(payload.file_id)
+                    f_id = f"file:{f_name}"
+                    upsert_node(f_id, f_name, "FILE", layer="RAW_FILE")
+                    t_id = make_table_id(target_catalog, schema_clean, table_clean)
+                    upsert_node(t_id, table_clean, "TABLE", catalog=target_catalog, schema_name=schema_clean)
+                    upsert_edge(f_id, t_id, edge_type="INGESTS_TO")
+                except Exception:
+                    pass
+
+                part_strat = pg_result.get("partition_strategy")
+                c_count = pg_result.get("child_partitions_count", 0)
+                part_msg = f" (PostgreSQL {part_strat} Partitioned: {c_count} child tables)" if part_strat else ""
+
+                log_query(
+                    query_text=f"-- Ingested into PostgreSQL catalog '{target_catalog}'\n{pg_result.get('ddl_summary', '')}",
+                    duration_ms=elapsed_ms,
+                    rows_produced=pg_result["rows_ingested"],
+                    status="SUCCESS",
+                    client="INGESTION",
+                    is_mutation=True,
+                    catalog=target_catalog
+                )
+
+                return {
+                    "success": True,
+                    "catalog": target_catalog,
+                    "schema_name": schema_clean,
+                    "table_name": table_clean,
+                    "full_name": pg_result["full_name"],
+                    "location": f"postgres://{cat.get('config', {}).get('host', 'localhost')}:{cat.get('config', {}).get('port', 5432)}/{cat.get('config', {}).get('database', '')}/{schema_clean}/{table_clean}",
+                    "version": 1,
+                    "rows_ingested": pg_result["rows_ingested"],
+                    "partition_strategy": part_strat,
+                    "partition_columns": pg_result.get("partition_columns", []),
+                    "child_partitions": pg_result.get("child_partitions", []),
+                    "child_partitions_count": c_count,
+                    "elapsed_ms": elapsed_ms,
+                    "message": f"Successfully ingested {pg_result['rows_ingested']} rows into PostgreSQL table '{pg_result['full_name']}'{part_msg}"
+                }
             else:
-                raise HTTPException(status_code=400, detail=f"Ingestion into external mount type '{m_type}' is not supported for Delta table creation.")
+                raise HTTPException(status_code=400, detail=f"Ingestion into external mount type '{m_type}' is not supported.")
 
         target_rel = f"{cat['id']}.{schema_clean}.{table_clean}"
         dt_path = os.path.join(cat["path"], schema_clean, table_clean)
@@ -3899,20 +4590,37 @@ class SavedQueryUpdateRequest(BaseModel):
     tags: Optional[List[str]] = None
 
 @app.get("/api/queries")
-async def list_saved_queries(q: Optional[str] = None, tag: Optional[str] = None):
+async def list_saved_queries(request: Request, q: Optional[str] = None, tag: Optional[str] = None):
     from web.saved_queries import get_saved_queries
+    username = "admin"
+    is_admin = True
     try:
-        queries = get_saved_queries(q=q, tag=tag)
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    try:
+        queries = get_saved_queries(q=q, tag=tag, user_id=username, is_admin=is_admin)
         return {"queries": queries}
     except Exception as e:
         logger.error(f"Failed to list saved queries: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/queries")
-async def create_new_saved_query(payload: SavedQueryCreateRequest):
+async def create_new_saved_query(payload: SavedQueryCreateRequest, request: Request):
     from web.saved_queries import create_saved_query
+    username = "admin"
     try:
-        new_q = create_saved_query(payload.dict())
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+    except Exception:
+        pass
+    try:
+        d = payload.dict()
+        d["owner"] = username
+        d["created_by"] = username
+        new_q = create_saved_query(d)
         return new_q
     except Exception as e:
         logger.error(f"Failed to create saved query: {e}")
@@ -3956,21 +4664,38 @@ async def duplicate_existing_saved_query(query_id: str):
 
 @app.get("/api/history")
 async def list_query_history(
+    request: Request,
     limit: int = 50,
     offset: int = 0,
     status: Optional[str] = None,
     client: Optional[str] = None,
     search: Optional[str] = None,
-    min_duration_ms: Optional[float] = None
+    min_duration_ms: Optional[float] = None,
+    user: Optional[str] = None
 ):
-    return get_query_history(
+    from web.auth import get_current_user
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+
+    target_user = user
+    if current_user and current_user.get("role") == "user":
+        target_user = current_user.get("username", "admin")
+
+    res = get_query_history(
         limit=limit,
         offset=offset,
         status=status,
         client=client,
         search=search,
-        min_duration_ms=min_duration_ms
+        min_duration_ms=min_duration_ms,
+        user=target_user
     )
+    res["current_user_role"] = current_user.get("role", "admin") if current_user else "admin"
+    res["active_user_filter"] = target_user or "ALL"
+    return res
 
 @app.get("/api/history/{query_id}")
 async def get_single_query_history(query_id: str):
@@ -4091,9 +4816,17 @@ class DbtRunRequest(BaseModel):
     target: str = "dev"
 
 @app.get("/api/dbt/status")
-async def get_dbt_status_endpoint():
+async def get_dbt_status_endpoint(request: Request):
     from web.dbt_service import get_dbt_status
-    return get_dbt_status()
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    return get_dbt_status(user=username, is_admin=is_admin)
 
 @app.get("/api/dbt/models")
 async def list_dbt_models_endpoint():
@@ -4109,25 +4842,48 @@ async def get_dbt_model_endpoint(model_name: str):
     return detail
 
 @app.post("/api/dbt/run")
-async def run_dbt_endpoint(payload: DbtRunRequest):
+async def run_dbt_endpoint(payload: DbtRunRequest, request: Request):
     from web.dbt_service import run_dbt_cli
+    username = "admin"
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+    except Exception:
+        pass
     res = run_dbt_cli(
         action=payload.action,
         select=payload.select,
         full_refresh=payload.full_refresh,
-        target=payload.target
+        target=payload.target,
+        user=username
     )
     return res
 
 @app.get("/api/dbt/runs")
-async def list_dbt_runs_endpoint():
+async def list_dbt_runs_endpoint(request: Request):
     from web.dbt_service import _load_runs_history
-    return {"runs": _load_runs_history()}
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    return {"runs": _load_runs_history(user=username, is_admin=is_admin)}
 
 @app.get("/api/dbt/runs/{run_id}")
-async def get_dbt_run_endpoint(run_id: str):
+async def get_dbt_run_endpoint(run_id: str, request: Request):
     from web.dbt_service import _load_runs_history
-    runs = _load_runs_history()
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    runs = _load_runs_history(user=username, is_admin=is_admin)
     matched = next((r for r in runs if r["run_id"] == run_id), None)
     if not matched:
         raise HTTPException(status_code=404, detail="Run record not found")
@@ -4336,51 +5092,98 @@ async def genie_config_endpoint():
     return config
 
 @app.get("/api/genie/chats")
-async def list_genie_chats_endpoint():
-    chats = load_chats()
+async def list_genie_chats_endpoint(request: Request):
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    scope_user = None if is_admin else username
+    chats = load_chats(user=scope_user, is_admin=is_admin)
     return {"chats": chats}
 
 @app.post("/api/genie/chats")
-async def create_genie_chat_endpoint(payload: Optional[CreateChatPayload] = None):
+async def create_genie_chat_endpoint(request: Request, payload: Optional[CreateChatPayload] = None):
     title = payload.title if payload and payload.title else "New Exploration"
-    new_chat = create_chat(title=title)
+    username = "admin"
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+    except Exception:
+        pass
+    new_chat = create_chat(title=title, user=username)
     return new_chat
 
 @app.get("/api/genie/chats/{chat_id}")
-async def get_genie_chat_endpoint(chat_id: str):
-    chat = get_chat(chat_id)
+async def get_genie_chat_endpoint(chat_id: str, request: Request):
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    chat = get_chat(chat_id, user=username, is_admin=is_admin)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     return chat
 
 @app.delete("/api/genie/chats/{chat_id}")
-async def delete_genie_chat_endpoint(chat_id: str):
-    ok = delete_chat(chat_id)
+async def delete_genie_chat_endpoint(chat_id: str, request: Request):
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    ok = delete_chat(chat_id, user=username, is_admin=is_admin)
     if not ok:
         raise HTTPException(status_code=404, detail="Chat not found")
     return {"success": True, "deleted_id": chat_id}
 
 @app.post("/api/genie/chats/{chat_id}/ask")
-async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload):
+async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload, request: Request):
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    username = "admin"
+    is_admin = True
     try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model)
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    try:
+        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin)
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/genie/ask")
-async def quick_ask_genie_endpoint(payload: GenieAskPayload):
+async def quick_ask_genie_endpoint(payload: GenieAskPayload, request: Request):
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
     chat_id = payload.chat_id
     if not chat_id:
-        new_chat = create_chat(title=payload.prompt[:35] + ("..." if len(payload.prompt) > 35 else ""))
+        new_chat = create_chat(title=payload.prompt[:35] + ("..." if len(payload.prompt) > 35 else ""), user=username)
         chat_id = new_chat["id"]
     try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model)
+        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin)
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
@@ -4410,17 +5213,36 @@ async def search_endpoint(
 # ==================== WORKSPACE BROWSER APIS ====================
 
 @app.get("/api/workspace/tree")
-async def get_workspace_tree_endpoint():
+async def get_workspace_tree_endpoint(request: Request):
     from web.workspace import get_workspace_tree
+    from web.auth import get_current_user
+    current_user = None
     try:
-        return {"tree": get_workspace_tree()}
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    try:
+        user_home = f"Users/{current_user['username']}" if current_user else "Users/admin"
+        return {
+            "tree": get_workspace_tree(current_user=current_user),
+            "user_home": user_home,
+            "username": current_user.get("username", "admin") if current_user else "admin"
+        }
     except Exception as e:
         logger.error(f"Failed to fetch workspace tree: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/workspace/file")
-async def get_workspace_file_endpoint(path: str):
-    from web.workspace import get_file_details
+async def get_workspace_file_endpoint(path: str, request: Request):
+    from web.workspace import get_file_details, can_access_workspace_path
+    from web.auth import get_current_user
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    if not can_access_workspace_path(path, current_user):
+        raise HTTPException(status_code=403, detail="Access denied: Cannot access another user's private workspace.")
     try:
         return get_file_details(path)
     except FileNotFoundError:
@@ -4436,11 +5258,21 @@ class WorkspaceCreatePayload(BaseModel):
     notebook_template: Optional[str] = "pyspark"
 
 @app.post("/api/workspace/item")
-async def create_workspace_item_endpoint(payload: WorkspaceCreatePayload):
-    from web.workspace import create_workspace_item
+async def create_workspace_item_endpoint(payload: WorkspaceCreatePayload, request: Request):
+    from web.workspace import create_workspace_item, can_access_workspace_path
+    from web.auth import get_current_user
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    # If target_dir is empty, default to user's home folder
+    target_dir = payload.target_dir or (f"Users/{current_user['username']}" if current_user else "")
+    if not can_access_workspace_path(target_dir, current_user, write=True):
+        raise HTTPException(status_code=403, detail="Access denied: Cannot create items in another user's private workspace.")
     try:
         return create_workspace_item(
-            payload.target_dir,
+            target_dir,
             payload.name,
             payload.type,
             payload.notebook_template or "pyspark"
@@ -4454,8 +5286,16 @@ class WorkspaceRenamePayload(BaseModel):
     new_name: str
 
 @app.put("/api/workspace/item/rename")
-async def rename_workspace_item_endpoint(payload: WorkspaceRenamePayload):
-    from web.workspace import rename_workspace_item
+async def rename_workspace_item_endpoint(payload: WorkspaceRenamePayload, request: Request):
+    from web.workspace import rename_workspace_item, can_access_workspace_path
+    from web.auth import get_current_user
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    if not can_access_workspace_path(payload.old_rel_path, current_user, write=True):
+        raise HTTPException(status_code=403, detail="Access denied: Cannot rename another user's private workspace items.")
     try:
         return rename_workspace_item(payload.old_rel_path, payload.new_name)
     except Exception as e:
@@ -4463,8 +5303,16 @@ async def rename_workspace_item_endpoint(payload: WorkspaceRenamePayload):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.delete("/api/workspace/item")
-async def delete_workspace_item_endpoint(path: str):
-    from web.workspace import delete_workspace_item
+async def delete_workspace_item_endpoint(path: str, request: Request):
+    from web.workspace import delete_workspace_item, can_access_workspace_path
+    from web.auth import get_current_user
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    if not can_access_workspace_path(path, current_user, write=True):
+        raise HTTPException(status_code=403, detail="Access denied: Cannot delete another user's private workspace items.")
     try:
         return delete_workspace_item(path)
     except Exception as e:
@@ -4596,7 +5444,12 @@ class RecentRecordPayload(BaseModel):
 @app.post("/api/recents")
 async def record_recent_endpoint(payload: RecentRecordPayload, request: Request):
     from web.recents import record_recent
-    user = request.headers.get("X-User") or payload.user or "martin"
+    user = "admin"
+    try:
+        current_user = await get_current_user(request)
+        user = current_user.get("username", "admin")
+    except Exception:
+        user = request.headers.get("X-User") or payload.user or "admin"
     try:
         return record_recent(
             item_type=payload.item_type,
@@ -4616,10 +5469,15 @@ async def get_recents_endpoint(
     type: Optional[str] = None,
     search: Optional[str] = None,
     limit: int = 50,
-    user: Optional[str] = "martin"
+    user: Optional[str] = None
 ):
     from web.recents import get_recents
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = user
+    try:
+        current_user = await get_current_user(request)
+        user_id = current_user.get("username", "admin")
+    except Exception:
+        user_id = request.headers.get("X-User") or user or "admin"
     try:
         return get_recents(user_id=user_id, item_type=type, search=search, limit=limit)
     except Exception as e:
@@ -4629,12 +5487,17 @@ async def get_recents_endpoint(
 class RecentPinPayload(BaseModel):
     item_type: str
     item_id: str
-    user: Optional[str] = "martin"
+    user: Optional[str] = None
 
 @app.post("/api/recents/pin")
 async def toggle_pin_recent_endpoint(payload: RecentPinPayload, request: Request):
     from web.recents import toggle_pin_recent
-    user = request.headers.get("X-User") or payload.user or "martin"
+    user = "admin"
+    try:
+        current_user = await get_current_user(request)
+        user = current_user.get("username", "admin")
+    except Exception:
+        user = request.headers.get("X-User") or payload.user or "admin"
     try:
         return toggle_pin_recent(item_type=payload.item_type, item_id=payload.item_id, user_id=user)
     except Exception as e:
@@ -4646,10 +5509,15 @@ async def delete_recent_endpoint(
     request: Request,
     item_type: str,
     item_id: str,
-    user: Optional[str] = "martin"
+    user: Optional[str] = None
 ):
     from web.recents import delete_recent
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = user
+    try:
+        current_user = await get_current_user(request)
+        user_id = current_user.get("username", "admin")
+    except Exception:
+        user_id = request.headers.get("X-User") or user or "admin"
     try:
         success = delete_recent(item_type=item_type, item_id=item_id, user_id=user_id)
         return {"success": success, "item_type": item_type, "item_id": item_id}
@@ -4662,10 +5530,15 @@ async def clear_recents_endpoint(
     request: Request,
     type: Optional[str] = None,
     include_pinned: bool = False,
-    user: Optional[str] = "martin"
+    user: Optional[str] = None
 ):
     from web.recents import clear_recents
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = user
+    try:
+        current_user = await get_current_user(request)
+        user_id = current_user.get("username", "admin")
+    except Exception:
+        user_id = request.headers.get("X-User") or user or "admin"
     try:
         count = clear_recents(user_id=user_id, item_type=type, include_pinned=include_pinned)
         return {"success": True, "deleted_count": count}
@@ -4857,8 +5730,14 @@ async def get_alert_history_endpoint(alert_id: str, limit: int = 50):
 @app.post("/api/2.0/mlflow/experiments/create")
 async def mlflow_create_experiment_api(request: Request):
     from web.experiments import mlflow_create_experiment
+    from web.auth import get_current_user
     body = await request.json()
-    user_id = request.headers.get("X-User", "martin")
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    user_id = current_user.get("username") if current_user else (request.headers.get("X-User") or "admin")
     try:
         res = mlflow_create_experiment(body.get("name", ""), body.get("artifact_location"), user_id=user_id)
         return res
@@ -4866,15 +5745,31 @@ async def mlflow_create_experiment_api(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/2.0/mlflow/experiments/list")
-async def mlflow_list_experiments_api(view_type: str = "ACTIVE_ONLY"):
+async def mlflow_list_experiments_api(request: Request, view_type: str = "ACTIVE_ONLY"):
     from web.experiments import mlflow_list_experiments
-    return {"experiments": mlflow_list_experiments(view_type)}
+    from web.auth import get_current_user
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    user_id = current_user.get("username") if current_user else None
+    is_admin = (current_user.get("role") == "admin") if current_user else True
+    return {"experiments": mlflow_list_experiments(view_type=view_type, user_id=user_id, is_admin=is_admin)}
 
 @app.get("/api/2.0/mlflow/experiments/search")
 @app.post("/api/2.0/mlflow/experiments/search")
-async def mlflow_search_experiments_api(view_type: str = "ACTIVE_ONLY"):
+async def mlflow_search_experiments_api(request: Request, view_type: str = "ACTIVE_ONLY"):
     from web.experiments import mlflow_list_experiments
-    return {"experiments": mlflow_list_experiments(view_type)}
+    from web.auth import get_current_user
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    user_id = current_user.get("username") if current_user else None
+    is_admin = (current_user.get("role") == "admin") if current_user else True
+    return {"experiments": mlflow_list_experiments(view_type=view_type, user_id=user_id, is_admin=is_admin)}
 
 @app.get("/api/2.0/mlflow/experiments/get")
 async def mlflow_get_experiment_api(experiment_id: str):
@@ -4909,11 +5804,47 @@ async def mlflow_delete_experiment_api(request: Request):
     mlflow_delete_experiment(body.get("experiment_id", ""))
     return {}
 
+@app.post("/api/2.0/mlflow/experiments/update")
+async def mlflow_update_experiment_api(request: Request):
+    from web.experiments import mlflow_update_experiment
+    body = await request.json()
+    try:
+        mlflow_update_experiment(body.get("experiment_id", ""), body.get("new_name", ""))
+        return {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/2.0/mlflow/experiments/restore")
+async def mlflow_restore_experiment_api(request: Request):
+    from web.experiments import mlflow_restore_experiment
+    body = await request.json()
+    try:
+        mlflow_restore_experiment(body.get("experiment_id", ""))
+        return {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/2.0/mlflow/experiments/set-experiment-tag")
+async def mlflow_set_experiment_tag_api(request: Request):
+    from web.experiments import mlflow_set_experiment_tag
+    body = await request.json()
+    try:
+        mlflow_set_experiment_tag(body.get("experiment_id", ""), body.get("key", ""), body.get("value", ""))
+        return {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/api/2.0/mlflow/runs/create")
 async def mlflow_create_run_api(request: Request):
     from web.experiments import mlflow_create_run
+    from web.auth import get_current_user
     body = await request.json()
-    user_id = request.headers.get("X-User", "martin")
+    current_user = None
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        pass
+    user_id = current_user.get("username") if current_user else (request.headers.get("X-User") or "admin")
     try:
         run_data = mlflow_create_run(
             experiment_id=body.get("experiment_id", "0"),
@@ -4955,15 +5886,41 @@ async def mlflow_delete_run_api(request: Request):
     mlflow_delete_run(body.get("run_id", ""))
     return {}
 
+@app.post("/api/2.0/mlflow/runs/restore")
+async def mlflow_restore_run_api(request: Request):
+    from web.experiments import mlflow_restore_run
+    body = await request.json()
+    try:
+        mlflow_restore_run(body.get("run_id", ""))
+        return {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/2.0/mlflow/runs/search")
 @app.post("/api/2.0/mlflow/runs/search")
 async def mlflow_search_runs_api(request: Request):
     from web.experiments import mlflow_search_runs
-    body = await request.json()
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        exp_ids = body.get("experiment_ids", ["0"])
+        flt = body.get("filter") or body.get("filter_string")
+        order_by = body.get("order_by")
+        max_results = body.get("max_results", 100)
+    else:
+        q = request.query_params
+        exp_ids = q.get("experiment_ids", "0").split(",")
+        flt = q.get("filter") or q.get("filter_string")
+        order_by = [q.get("order_by")] if q.get("order_by") else None
+        max_results = int(q.get("max_results", 100))
+
     runs = mlflow_search_runs(
-        experiment_ids=body.get("experiment_ids", ["0"]),
-        filter_string=body.get("filter"),
-        order_by=body.get("order_by"),
-        max_results=body.get("max_results", 100)
+        experiment_ids=exp_ids,
+        filter_string=flt,
+        order_by=order_by,
+        max_results=max_results
     )
     return {"runs": runs}
 
@@ -5007,11 +5964,188 @@ async def mlflow_set_tag_api(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/api/2.0/mlflow/runs/delete-tag")
+async def mlflow_delete_tag_api(request: Request):
+    from web.experiments import mlflow_delete_tag
+    body = await request.json()
+    try:
+        mlflow_delete_tag(body.get("run_id", ""), body.get("key", ""))
+        return {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/2.0/mlflow/runs/log-inputs")
+async def mlflow_log_inputs_api(request: Request):
+    from web.experiments import mlflow_log_inputs
+    body = await request.json()
+    try:
+        mlflow_log_inputs(body.get("run_id", ""), body.get("datasets", []))
+        return {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/api/2.0/mlflow/metrics/get-history")
 async def mlflow_get_metric_history_api(run_id: str, metric_key: str):
     from web.experiments import mlflow_get_metric_history
     history = mlflow_get_metric_history(run_id, metric_key)
     return {"metrics": history}
+
+@app.post("/api/2.0/mlflow/artifacts/log")
+async def mlflow_log_artifact_api(request: Request):
+    from web.experiments import mlflow_log_artifact
+    body = await request.json()
+    try:
+        res = mlflow_log_artifact(body["run_id"], body["local_file"], body.get("artifact_path"))
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/2.0/mlflow/artifacts/list")
+async def mlflow_list_artifacts_api(run_id: str, path: Optional[str] = None):
+    from web.experiments import mlflow_list_artifacts
+    artifacts = mlflow_list_artifacts(run_id, path=path)
+    return {"run_id": run_id, "files": artifacts}
+
+@app.get("/api/2.0/mlflow/artifacts/get")
+@app.get("/api/2.0/mlflow/artifacts/download")
+async def mlflow_get_artifact_file_api(run_id: str, path: str):
+    from fastapi.responses import FileResponse
+    from web.experiments import mlflow_get_artifact_path
+    fpath = mlflow_get_artifact_path(run_id, path)
+    if not fpath or not os.path.isfile(fpath):
+        raise HTTPException(status_code=404, detail=f"Artifact '{path}' for run '{run_id}' not found")
+    return FileResponse(fpath, filename=os.path.basename(fpath))
+
+@app.get("/api/experiments/runs/{run_id}/artifacts/content")
+async def get_studio_artifact_content(run_id: str, artifact_path: str):
+    from web.experiments import mlflow_get_artifact_content
+    res = mlflow_get_artifact_content(run_id, artifact_path)
+    if not res:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return res
+
+@app.get("/api/experiments/runs/{run_id}/artifacts/file")
+async def download_studio_artifact_file(run_id: str, artifact_path: str):
+    from fastapi.responses import FileResponse
+    from web.experiments import mlflow_get_artifact_path
+    fpath = mlflow_get_artifact_path(run_id, artifact_path)
+    if not fpath or not os.path.isfile(fpath):
+        raise HTTPException(status_code=404, detail="Artifact file not found")
+    return FileResponse(fpath, filename=os.path.basename(fpath))
+
+# -------------------------------------------------------------------------
+# MLflow 2.14+ GenAI & LLM Tracing Endpoints
+# -------------------------------------------------------------------------
+
+@app.post("/api/2.0/mlflow/traces/log")
+@app.post("/api/2.0/mlflow/traces")
+async def mlflow_log_trace_api(request: Request):
+    from web.experiments import mlflow_log_trace
+    body = await request.json()
+    try:
+        return mlflow_log_trace(body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/2.0/mlflow/traces/search")
+@app.post("/api/2.0/mlflow/traces/search")
+@app.get("/api/2.0/mlflow/traces")
+@app.get("/api/experiments/traces")
+async def mlflow_search_traces_api(
+    request: Request,
+    status: Optional[str] = None,
+    model: Optional[str] = None,
+    min_duration: Optional[float] = None,
+    max_duration: Optional[float] = None,
+    search_term: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0
+):
+    from web.experiments import mlflow_search_traces
+    exp_ids = None
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            exp_ids = body.get("experiment_ids")
+            status = body.get("status", status)
+            model = body.get("model", model)
+            min_duration = body.get("min_duration", min_duration)
+            max_duration = body.get("max_duration", max_duration)
+            search_term = body.get("search_term") or body.get("filter_string", search_term)
+            limit = int(body.get("limit") or body.get("max_results", limit))
+            offset = int(body.get("offset", offset))
+        except Exception:
+            pass
+    else:
+        exp_id_param = request.query_params.get("experiment_id")
+        if exp_id_param:
+            exp_ids = [exp_id_param]
+
+    return mlflow_search_traces(
+        experiment_ids=exp_ids,
+        status=status,
+        model=model,
+        min_duration=min_duration,
+        max_duration=max_duration,
+        search_term=search_term,
+        limit=limit,
+        offset=offset
+    )
+
+@app.get("/api/2.0/mlflow/traces/get")
+@app.get("/api/2.0/mlflow/traces/{request_id}")
+@app.get("/api/experiments/traces/{request_id}")
+async def mlflow_get_trace_api(request_id: Optional[str] = None, request: Request = None):
+    from web.experiments import mlflow_get_trace
+    rid = request_id or (request.query_params.get("request_id") if request else None)
+    if not rid:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    trace = mlflow_get_trace(rid)
+    if not trace:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return trace
+
+@app.post("/api/2.0/mlflow/traces/delete")
+@app.delete("/api/2.0/mlflow/traces/{request_id}")
+@app.delete("/api/experiments/traces/{request_id}")
+async def mlflow_delete_trace_api(request_id: Optional[str] = None, request: Request = None):
+    from web.experiments import mlflow_delete_trace
+    rid = request_id
+    if not rid and request:
+        try:
+            body = await request.json()
+            rid = body.get("request_id")
+        except Exception:
+            rid = request.query_params.get("request_id")
+    if not rid:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    deleted = mlflow_delete_trace(rid)
+    return {"deleted": deleted, "request_id": rid}
+
+@app.post("/api/2.0/mlflow/traces/assessments/log")
+@app.post("/api/2.0/mlflow/traces/{request_id}/assessments")
+@app.post("/api/experiments/traces/{request_id}/assessments")
+async def mlflow_log_assessment_api(request: Request, request_id: Optional[str] = None):
+    from web.experiments import mlflow_log_assessment
+    body = await request.json()
+    tid = request_id or body.get("trace_id") or body.get("request_id")
+    if not tid:
+        raise HTTPException(status_code=400, detail="trace_id is required")
+    res = mlflow_log_assessment(
+        trace_id=tid,
+        name=body.get("name", "user_feedback"),
+        value=body.get("value", "1"),
+        rationale=body.get("rationale", ""),
+        source_type=body.get("source_type", "HUMAN"),
+        source_id=body.get("source_id", "admin")
+    )
+    return res
+
+@app.get("/api/2.0/mlflow/traces/{request_id}/assessments")
+@app.get("/api/experiments/traces/{request_id}/assessments")
+async def mlflow_get_assessments_api(request_id: str):
+    from web.experiments import mlflow_get_assessments
+    return {"assessments": mlflow_get_assessments(request_id)}
 
 # -------------------------------------------------------------------------
 # Studio UI Convenience Endpoints
@@ -5128,7 +6262,7 @@ async def api_playground_models():
     return await get_available_models()
 
 @app.post("/api/playground/run")
-async def api_playground_run(req: PlaygroundSingleRunRequest):
+async def api_playground_run(req: PlaygroundSingleRunRequest, request: Request):
     from web.playground import run_and_record_single
     raw = req.raw_prompt if req.raw_prompt is not None else req.prompt
     config = {
@@ -5139,60 +6273,120 @@ async def api_playground_run(req: PlaygroundSingleRunRequest):
         "top_p": req.top_p,
         "max_tokens": req.max_tokens
     }
+    username = "admin"
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+    except Exception:
+        pass
     return await run_and_record_single(
         config=config,
         rendered_prompt=req.prompt,
         raw_prompt=raw,
         system_prompt=req.system_prompt or "",
-        variables=req.variables
+        variables=req.variables,
+        user_id=username
     )
 
 @app.post("/api/playground/compare")
-async def api_playground_compare(req: PlaygroundCompareRunRequest):
+async def api_playground_compare(req: PlaygroundCompareRunRequest, request: Request):
     from web.playground import run_comparison_prompts
     raw = req.raw_prompt if req.raw_prompt is not None else req.prompt
+    username = "admin"
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+    except Exception:
+        pass
     return await run_comparison_prompts(
         config_a=req.config_a,
         config_b=req.config_b,
         rendered_prompt=req.prompt,
         raw_prompt=raw,
         system_prompt=req.system_prompt or "",
-        variables=req.variables
+        variables=req.variables,
+        user_id=username
     )
 
 @app.get("/api/playground/templates")
-async def api_playground_get_templates(category: Optional[str] = None):
+async def api_playground_get_templates(request: Request, category: Optional[str] = None):
     from web.playground import get_templates
-    return get_templates(category=category)
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    return get_templates(category=category, user_id=username, is_admin=is_admin)
 
 @app.post("/api/playground/templates")
-async def api_playground_save_template(req: PlaygroundTemplateRequest):
+async def api_playground_save_template(req: PlaygroundTemplateRequest, request: Request):
     from web.playground import save_template
-    return save_template(req.dict())
+    username = "admin"
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+    except Exception:
+        pass
+    return save_template(req.dict(), user_id=username)
 
 @app.delete("/api/playground/templates/{template_id}")
-async def api_playground_delete_template(template_id: str):
+async def api_playground_delete_template(template_id: str, request: Request):
     from web.playground import delete_template
-    ok = delete_template(template_id)
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    ok = delete_template(template_id, user_id=username, is_admin=is_admin)
     if not ok:
-        raise HTTPException(status_code=400, detail="Cannot delete template (might be built-in or not found)")
+        raise HTTPException(status_code=400, detail="Cannot delete template (might be built-in, not found, or not owned by you)")
     return {"status": "SUCCESS", "id": template_id}
 
 @app.get("/api/playground/history")
-async def api_playground_get_history(limit: int = 50):
+async def api_playground_get_history(request: Request, limit: int = 50):
     from web.playground import get_history
-    return get_history(limit=limit)
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    return get_history(limit=limit, user_id=username, is_admin=is_admin)
 
 @app.delete("/api/playground/history/{hist_id}")
-async def api_playground_delete_history(hist_id: str):
+async def api_playground_delete_history(hist_id: str, request: Request):
     from web.playground import delete_history_item
-    ok = delete_history_item(hist_id)
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    ok = delete_history_item(hist_id, user_id=username, is_admin=is_admin)
     return {"status": "SUCCESS" if ok else "NOT_FOUND"}
 
 @app.delete("/api/playground/history")
-async def api_playground_clear_history():
+async def api_playground_clear_history(request: Request):
     from web.playground import clear_history
-    clear_history()
+    username = "admin"
+    is_admin = True
+    try:
+        current_user = await get_current_user(request)
+        username = current_user.get("username", "admin")
+        is_admin = current_user.get("role") == "admin"
+    except Exception:
+        pass
+    clear_history(user_id=username, is_admin=is_admin)
     return {"status": "SUCCESS"}
 
 @app.get("/api/playground/schema-tables")
@@ -5280,13 +6474,22 @@ async def preview_table_version_endpoint(
 
 @app.get("/api/lineage/global")
 async def get_global_lineage_endpoint(
+    request: Request,
     layer: Optional[str] = None,
     schema: Optional[str] = None,
     search: Optional[str] = None
 ):
     from web.lineage import get_global_lineage
+    allowed_catalogs = None
     try:
-        return get_global_lineage(layer=layer, schema=schema, search=search)
+        current_user = await get_current_user(request)
+        if current_user.get("role") == "user":
+            perms = current_user.get("catalog_permissions") or []
+            allowed_catalogs = [p["catalog_id"] for p in perms] + ["warehouse", "dbt_analytics"]
+    except Exception:
+        pass
+    try:
+        return get_global_lineage(layer=layer, schema=schema, search=search, allowed_catalogs=allowed_catalogs)
     except Exception as e:
         logger.error(f"Error getting global lineage: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -5336,7 +6539,31 @@ async def list_mounts_endpoint():
     from web.mounts import load_mounts, mask_mount_record
     try:
         raw_mounts = load_mounts()
-        return {"mounts": [mask_mount_record(m) for m in raw_mounts]}
+        mounts_out = [mask_mount_record(m) for m in raw_mounts]
+        # Include OneLake catalogs if mounted
+        try:
+            from web import onelake
+            for cat in onelake.list_onelake_catalogs():
+                mounts_out.append({
+                    "id": f"onelake_{cat['catalog_id']}",
+                    "name": f"OneLake: {cat['lakehouse']}",
+                    "type": "onelake",
+                    "catalog_name": cat['catalog_id'],
+                    "read_only": True,
+                    "enabled": True,
+                    "description": f"Fabric lakehouse {cat['workspace']}/{cat['lakehouse']}",
+                    "config": {
+                        "workspace": cat["workspace"],
+                        "lakehouse": cat["lakehouse"],
+                        "tenant_id": cat["tenant_id"],
+                        "client_id": cat["client_id"],
+                        "client_secret": "********"
+                    },
+                    "status": "ACTIVE"
+                })
+        except Exception as e_ol:
+            logger.debug(f"OneLake mounts append notice: {e_ol}")
+        return {"mounts": mounts_out}
     except Exception as e:
         logger.error(f"Error listing mounts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -5381,12 +6608,55 @@ async def create_or_update_mount_endpoint(payload: Dict[str, Any], request: Requ
         raise HTTPException(status_code=400, detail=clean_err)
 
 
+@app.post("/api/mounts/{mount_id}/duplicate")
+async def duplicate_mount_endpoint(mount_id: str, request: Request):
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: role '{current_user.get('role')}' cannot duplicate mounts. Requires admin or power_user."
+        )
+
+    from web.mounts import duplicate_mount, mask_mount_record
+    res = await asyncio.to_thread(duplicate_mount, mount_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Source mount not found")
+
+    def do_sync():
+        try:
+            conn = get_duckrun_conn()
+            sync_catalogs_with_duckrun(conn)
+        except Exception as e_s:
+            logger.warning(f"Catalog sync warning after duplicate: {e_s}")
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(do_sync), timeout=12.0)
+    except Exception as e_sync:
+        logger.warning(f"Mount sync timeout or notice: {e_sync}")
+
+    return {"success": True, "mount": mask_mount_record(res)}
+
+
 @app.delete("/api/mounts/{mount_id}")
 async def delete_mount_endpoint(mount_id: str, request: Request):
     try:
         current_user = await get_current_user(request)
     except Exception:
         current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+
+    if mount_id.startswith("onelake_"):
+        cat_id = mount_id.replace("onelake_", "")
+        try:
+            from web import onelake
+            onelake.unmount_onelake_catalog(cat_id)
+            return {"success": True, "deleted_id": mount_id}
+        except Exception as e_ol:
+            logger.error(f"Error unmounting OneLake catalog {cat_id}: {e_ol}")
+            raise HTTPException(status_code=500, detail=str(e_ol))
 
     from web.mounts import load_mounts, delete_mount
     mounts = await asyncio.to_thread(load_mounts)
@@ -5401,6 +6671,20 @@ async def delete_mount_endpoint(mount_id: str, request: Request):
         ok = await asyncio.to_thread(delete_mount, mount_id)
         if not ok:
             raise HTTPException(status_code=404, detail="Mount not found")
+
+        # Re-sync active duckrun connection to detach the deleted mount
+        def do_sync():
+            try:
+                conn = get_duckrun_conn()
+                sync_catalogs_with_duckrun(conn)
+            except Exception as e_s:
+                logger.warning(f"Catalog sync warning after delete mount: {e_s}")
+
+        try:
+            await asyncio.wait_for(asyncio.to_thread(do_sync), timeout=12.0)
+        except Exception as e_sync:
+            logger.warning(f"Mount sync timeout or notice: {e_sync}")
+
         return {"success": True, "deleted_id": mount_id}
     except HTTPException:
         raise
@@ -5444,6 +6728,41 @@ async def list_registered_models_endpoint():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/2.0/mlflow/registered-models/get")
+async def get_registered_model_by_query_endpoint(name: str):
+    from web.serving import get_registered_model
+    try:
+        model = get_registered_model(name)
+        if not model:
+            raise HTTPException(status_code=404, detail=f"Model '{name}' not found")
+        return {"registered_model": model}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting registered model {name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/2.0/mlflow/registered-models/get-model-version-by-alias")
+async def get_model_version_by_alias_endpoint(name: str, alias: str):
+    from web.serving import get_registered_model, get_model_version
+    try:
+        m = get_registered_model(name)
+        if not m:
+            raise HTTPException(status_code=404, detail=f"Model '{name}' not found")
+        clean_alias = alias.strip().lstrip("@").lower()
+        version = m.get("aliases", {}).get(clean_alias)
+        if version is None:
+            raise HTTPException(status_code=404, detail=f"Alias '{alias}' not found on model '{name}'")
+        v = get_model_version(name, version)
+        return {"model_version": v}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting model version by alias: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/2.0/mlflow/registered-models/{name}")
 async def get_registered_model_endpoint(name: str):
     from web.serving import get_registered_model
@@ -5460,13 +6779,20 @@ async def get_registered_model_endpoint(name: str):
 
 
 @app.post("/api/2.0/mlflow/registered-models")
+@app.post("/api/2.0/mlflow/registered-models/create")
 async def create_registered_model_endpoint(payload: Dict[str, Any]):
     from web.serving import create_registered_model
     name = payload.get("name")
     if not name:
         raise HTTPException(status_code=400, detail="Model name is required")
     try:
-        m = create_registered_model(name=name, description=payload.get("description", ""), tags=payload.get("tags"))
+        m = create_registered_model(
+            name=name,
+            catalog_name=payload.get("catalog_name", "warehouse"),
+            schema_name=payload.get("schema_name", "dbo"),
+            description=payload.get("description", ""),
+            tags=payload.get("tags")
+        )
         return {"registered_model": m}
     except Exception as e:
         logger.error(f"Error creating registered model: {e}")
@@ -5489,6 +6815,7 @@ async def delete_registered_model_endpoint(name: str):
 
 
 @app.post("/api/2.0/mlflow/model-versions")
+@app.post("/api/2.0/mlflow/model-versions/create")
 async def create_model_version_endpoint(payload: Dict[str, Any]):
     from web.serving import create_model_version
     name = payload.get("name")
@@ -5509,6 +6836,21 @@ async def create_model_version_endpoint(payload: Dict[str, Any]):
     except Exception as e:
         logger.error(f"Error creating model version: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/2.0/mlflow/model-versions/get")
+async def get_model_version_endpoint(name: str, version: int):
+    from web.serving import get_model_version
+    try:
+        v = get_model_version(name, int(version))
+        if not v:
+            raise HTTPException(status_code=404, detail=f"Model version '{name}' v{version} not found")
+        return {"model_version": v}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting model version: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/2.0/mlflow/model-versions/transition-stage")
@@ -5588,6 +6930,352 @@ async def score_model_endpoint(name: str, payload: Dict[str, Any], version: Opti
     except Exception as e:
         logger.error(f"Error scoring model {name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/models/{name}/aliases")
+async def get_model_aliases_endpoint(name: str):
+    from web.serving import get_model_aliases
+    try:
+        aliases = get_model_aliases(name)
+        return {"aliases": aliases}
+    except Exception as e:
+        logger.error(f"Error fetching aliases for model {name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/models/{name}/aliases")
+async def set_model_alias_endpoint(name: str, payload: Dict[str, Any]):
+    from web.serving import set_model_alias
+    alias = payload.get("alias")
+    version = payload.get("version")
+    if not alias or version is None:
+        raise HTTPException(status_code=400, detail="Both 'alias' and 'version' are required")
+    try:
+        set_model_alias(name, str(alias).strip().lstrip("@"), int(version))
+        return {"success": True, "model": name, "alias": alias, "version": int(version)}
+    except Exception as e:
+        logger.error(f"Error setting alias {alias} for {name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/models/{name}/aliases/{alias}")
+async def delete_model_alias_endpoint(name: str, alias: str):
+    from web.serving import delete_model_alias
+    try:
+        ok = delete_model_alias(name, str(alias).strip().lstrip("@"))
+        return {"success": ok, "model": name, "alias": alias}
+    except Exception as e:
+        logger.error(f"Error deleting alias {alias} for {name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/2.0/mlflow/registered-models/alias")
+@app.post("/api/2.0/mlflow/registered-models/set-alias")
+async def mlflow_set_model_alias(payload: Dict[str, Any]):
+    from web.serving import set_model_alias
+    name = payload.get("name")
+    alias = payload.get("alias")
+    version = payload.get("version")
+    if not name or not alias or version is None:
+        raise HTTPException(status_code=400, detail="Fields 'name', 'alias', and 'version' are required")
+    try:
+        set_model_alias(name, str(alias).strip().lstrip("@"), int(version))
+        return {"success": True, "name": name, "alias": alias, "version": int(version)}
+    except Exception as e:
+        logger.error(f"Error setting MLflow alias: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/2.0/mlflow/registered-models/alias")
+@app.post("/api/2.0/mlflow/registered-models/delete-alias")
+async def mlflow_delete_model_alias(payload: Optional[Dict[str, Any]] = None, name: Optional[str] = None, alias: Optional[str] = None):
+    from web.serving import delete_model_alias
+    if payload:
+        name = payload.get("name", name)
+        alias = payload.get("alias", alias)
+    if not name or not alias:
+        raise HTTPException(status_code=400, detail="Fields 'name' and 'alias' are required")
+    try:
+        ok = delete_model_alias(name, str(alias).strip().lstrip("@"))
+        return {"success": ok, "name": name, "alias": alias}
+    except Exception as e:
+        logger.error(f"Error deleting MLflow alias: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
+# UNITY CATALOG VOLUMES & AUTO-LOADER PIPELINES
+# ==============================================================================
+
+@app.get("/api/volumes")
+async def get_volumes_endpoint(catalog: Optional[str] = None, schema: Optional[str] = None):
+    from web.volumes import list_volumes
+    try:
+        vols = list_volumes(catalog, schema)
+        return {"volumes": vols}
+    except Exception as e:
+        logger.error(f"Error listing volumes: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/volumes")
+async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
+    from web.volumes import create_volume
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin"}
+    
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(status_code=403, detail="Only admins and power users can create volumes.")
+
+    cat = payload.get("catalog") or "warehouse"
+    sch = payload.get("schema") or "raw"
+    name = payload.get("name")
+    if not name:
+        raise HTTPException(status_code=400, detail="Volume name is required.")
+
+    try:
+        vol = create_volume(
+            catalog=cat,
+            schema=sch,
+            name=name,
+            description=payload.get("description", ""),
+            volume_type=payload.get("volume_type", "MANAGED"),
+            external_location=payload.get("external_location"),
+            owner=current_user.get("username", "admin")
+        )
+        return vol
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error creating volume: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/volumes/{catalog}/{schema}/{volume_name}")
+async def delete_volume_endpoint(catalog: str, schema: str, volume_name: str, request: Request):
+    from web.volumes import delete_volume
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin"}
+
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(status_code=403, detail="Only admins and power users can delete volumes.")
+
+    ok = delete_volume(catalog, schema, volume_name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Volume not found.")
+    return {"success": True, "message": f"Volume '{catalog}.{schema}.{volume_name}' deleted."}
+
+
+@app.get("/api/volumes/{catalog}/{schema}/{volume_name}/files")
+async def get_volume_files_endpoint(catalog: str, schema: str, volume_name: str, subpath: str = ""):
+    from web.volumes import list_volume_files
+    try:
+        files = list_volume_files(catalog, schema, volume_name, subpath=subpath)
+        return {
+            "catalog": catalog,
+            "schema": schema,
+            "volume_name": volume_name,
+            "volume_path": f"/Volumes/{catalog}/{schema}/{volume_name}",
+            "subpath": subpath,
+            "files": files
+        }
+    except Exception as e:
+        logger.error(f"Error listing volume files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/volumes/{catalog}/{schema}/{volume_name}/upload")
+async def upload_volume_file_endpoint(
+    catalog: str,
+    schema: str,
+    volume_name: str,
+    file: UploadFile = File(...),
+    subpath: str = Form("")
+):
+    from web.volumes import upload_file_to_volume
+    try:
+        content = await file.read()
+        res = upload_file_to_volume(catalog, schema, volume_name, file.filename, content, subpath=subpath)
+        return res
+    except Exception as e:
+        logger.error(f"Error uploading file to volume: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/volumes/{catalog}/{schema}/{volume_name}/files")
+async def delete_volume_file_endpoint(
+    catalog: str,
+    schema: str,
+    volume_name: str,
+    path: str,
+    request: Request
+):
+    from web.volumes import delete_file_from_volume
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin"}
+
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(status_code=403, detail="Only admins and power users can delete files from volumes.")
+
+    try:
+        ok = delete_file_from_volume(catalog, schema, volume_name, path)
+        if not ok:
+            raise HTTPException(status_code=404, detail="File not found in volume.")
+        return {"success": True, "message": f"Deleted '{path}'"}
+    except Exception as e:
+        logger.error(f"Error deleting volume file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/volumes/{catalog}/{schema}/{volume_name}/preview")
+async def preview_volume_file_endpoint(
+    catalog: str,
+    schema: str,
+    volume_name: str,
+    path: str,
+    limit: int = 10
+):
+    from web.volumes import preview_volume_file
+    try:
+        res = preview_volume_file(catalog, schema, volume_name, path, limit=limit)
+        return res
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except Exception as e:
+        logger.error(f"Error previewing volume file: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ------------------------------------------------------------------------------
+# Auto-Loader Pipeline Endpoints
+# ------------------------------------------------------------------------------
+
+@app.get("/api/autoloader/pipelines")
+async def get_autoloader_pipelines():
+    from web.autoloader import list_pipelines
+    try:
+        pipes = list_pipelines()
+        return {"pipelines": pipes}
+    except Exception as e:
+        logger.error(f"Error listing autoloader pipelines: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/autoloader/pipelines")
+async def create_autoloader_pipeline_endpoint(payload: Dict[str, Any], request: Request):
+    from web.autoloader import create_pipeline
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin"}
+
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(status_code=403, detail="Only admins and power users can create Auto-Loader pipelines.")
+
+    try:
+        pipe = create_pipeline(payload, created_by=current_user.get("username", "admin"))
+        return pipe
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error creating pipeline: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/autoloader/pipelines/{pipeline_id}")
+async def get_autoloader_pipeline_endpoint(pipeline_id: str):
+    from web.autoloader import get_pipeline
+    pipe = get_pipeline(pipeline_id)
+    if not pipe:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    return pipe
+
+
+@app.put("/api/autoloader/pipelines/{pipeline_id}")
+async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[str, Any], request: Request):
+    from web.autoloader import update_pipeline
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin"}
+
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(status_code=403, detail="Only admins and power users can modify Auto-Loader pipelines.")
+
+    pipe = update_pipeline(pipeline_id, payload)
+    if not pipe:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    return pipe
+
+
+@app.delete("/api/autoloader/pipelines/{pipeline_id}")
+async def delete_autoloader_pipeline_endpoint(pipeline_id: str, request: Request):
+    from web.autoloader import delete_pipeline
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin"}
+
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(status_code=403, detail="Only admins and power users can delete Auto-Loader pipelines.")
+
+    ok = delete_pipeline(pipeline_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    return {"success": True, "message": f"Pipeline '{pipeline_id}' deleted."}
+
+
+@app.post("/api/autoloader/pipelines/{pipeline_id}/run")
+async def run_autoloader_pipeline_now(pipeline_id: str):
+    from web.autoloader import run_pipeline_cycle
+    try:
+        res = run_pipeline_cycle(pipeline_id)
+        if "error" in res and res.get("files_found") is None:
+            raise HTTPException(status_code=400, detail=res["error"])
+        return res
+    except Exception as e:
+        logger.error(f"Error running pipeline '{pipeline_id}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/autoloader/pipelines/{pipeline_id}/reset")
+async def reset_autoloader_pipeline_checkpoints(pipeline_id: str, request: Request):
+    from web.autoloader import reset_pipeline_checkpoints
+    try:
+        current_user = await get_current_user(request)
+    except Exception:
+        current_user = {"role": "admin", "username": "admin"}
+
+    if current_user.get("role") not in ("admin", "power_user"):
+        raise HTTPException(status_code=403, detail="Only admins and power users can reset checkpoints.")
+
+    res = reset_pipeline_checkpoints(pipeline_id)
+    return res
+
+
+@app.get("/api/autoloader/pipelines/{pipeline_id}/history")
+async def get_autoloader_pipeline_history(pipeline_id: str, limit: int = 50):
+    from web.autoloader import get_pipeline_history
+    hist = get_pipeline_history(pipeline_id, limit=limit)
+    return {"history": hist}
+
+
+@app.get("/api/autoloader/stats")
+async def get_autoloader_stats_endpoint():
+    from web.autoloader import get_autoloader_stats
+    stats = get_autoloader_stats()
+    return stats
+
+
+
+
+
 
 
 

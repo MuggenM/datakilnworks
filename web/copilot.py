@@ -60,7 +60,13 @@ DUCKDB_FUNCTIONS = [
     {"name": "DENSE_RANK", "signature": "DENSE_RANK() OVER (...)", "detail": "Window: Assigns rank without gaps", "snippet": "DENSE_RANK() OVER (ORDER BY ${1:salary} DESC)"},
     {"name": "delta_scan", "signature": "delta_scan(path, [version => N])", "detail": "Delta Lake: Vectorized Delta table scan with optional time-travel", "snippet": "delta_scan('${1:path}', version => ${2:0})"},
     {"name": "read_parquet", "signature": "read_parquet('path/*.parquet')", "detail": "DuckDB: Direct scan of Parquet files", "snippet": "read_parquet('${1:path/*.parquet}')"},
-    {"name": "read_csv_auto", "signature": "read_csv_auto('path/*.csv')", "detail": "DuckDB: Auto-detecting CSV reader", "snippet": "read_csv_auto('${1:path/*.csv}')"}
+    {"name": "predict", "signature": "predict('model_name', features)", "detail": "Databricks MLflow: Evaluates model and returns predicted class or regression value as VARCHAR", "snippet": "predict('${1:employee_turnover_predictor}', {'${2:salary}': ${3:85000}})"},
+    {"name": "predict_score", "signature": "predict_score('model_name', features)", "detail": "Databricks MLflow: Evaluates model and returns primary probability or score as DOUBLE", "snippet": "predict_score('${1:employee_turnover_predictor}', {'${2:salary}': ${3:85000}})"},
+    {"name": "ai_predict", "signature": "ai_predict('model_name', json_object(...))", "detail": "MLflow Inference: Runs model prediction and returns JSON result with metadata", "snippet": "ai_predict('${1:employee_turnover_predictor}', json_object('${2:key}', ${3:val}))"},
+    {"name": "ai_score", "signature": "ai_score('model_name', json_object(...))", "detail": "MLflow Inference: Returns primary continuous probability/score as DOUBLE", "snippet": "ai_score('${1:employee_turnover_predictor}', json_object('${2:key}', ${3:val}))"},
+    {"name": "ai_classify", "signature": "ai_classify('model_name', json_object(...))", "detail": "MLflow Inference: Returns predicted category or risk tier as VARCHAR", "snippet": "ai_classify('${1:employee_turnover_predictor}', json_object('${2:key}', ${3:val}))"},
+    {"name": "ai_explain", "signature": "ai_explain('model_name', json_object(...))", "detail": "MLflow Inference: Returns recommendation and explanation text as VARCHAR", "snippet": "ai_explain('${1:employee_turnover_predictor}', json_object('${2:key}', ${3:val}))"},
+    {"name": "ai_query", "signature": "ai_query('model_or_endpoint', json_object(...))", "detail": "Databricks ai_query(): Queries registered ML model or LLM endpoint", "snippet": "ai_query('${1:employee_turnover_predictor}', json_object('${2:key}', ${3:val}))"}
 ]
 
 
@@ -330,7 +336,7 @@ def generate_copilot_sql(
     """
     from web.genie import (
         extract_schema_context, get_available_providers,
-        call_ollama, call_lmstudio, call_openai, call_gemini
+        call_ollama, call_lmstudio, call_openai, call_gemini, call_anthropic
     )
 
     schema_info = extract_schema_context(conn)
@@ -366,12 +372,15 @@ CRITICAL RULES:
 1. You MUST use the EXACT table names and column names from the Database Schema Information above (e.g. use `silver_employees`, NOT `employees`; use `nyse_tickers`, NOT `stocks`).
 2. Generate valid DuckDB SQL syntax.
 3. If modifying an existing query, preserve the user's intent and update clauses cleanly.
-4. Return response strictly as a JSON object matching this schema:
+1. Always output ONLY valid JSON matching this schema:
 {{
   "sql": "SELECT ...",
-  "explanation": "Concise summary of what the query computes and why.",
-  "tables_used": ["table_name_1"]
+  "explanation": "Brief 1-sentence explanation of what the query does.",
+  "tables_used": ["warehouse.dbo.silver_employees", ...]
 }}
+2. Target DuckDB SQL dialect (support standard SQL-92/99, CTEs, window functions).
+3. Do NOT invent columns or tables. Only use tables from the lakehouse context provided.
+4. Output MUST be valid parseable JSON. Do NOT wrap in markdown code blocks like ```json ... ```. Output raw JSON directly.
 """
 
     user_message = f"{prompt.strip()}{context_text}"
@@ -389,6 +398,8 @@ CRITICAL RULES:
             raw = call_openai(selected_model, messages)
         elif selected_provider == "gemini":
             raw = call_gemini(selected_model, messages)
+        elif selected_provider == "anthropic":
+            raw = call_anthropic(selected_model, messages)
         else:
             raw = call_copilot_heuristic(prompt, current_query, schema_info)
 

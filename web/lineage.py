@@ -20,6 +20,11 @@ from sqlglot import exp
 logger = logging.getLogger("localspark.lineage")
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
+if not os.path.exists(WAREHOUSE_DIR):
+    local_alt = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "warehouse"))
+    if os.path.exists(local_alt):
+        WAREHOUSE_DIR = local_alt
+
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
 DB_PATH = os.path.join(METADATA_DIR, "lineage.db")
 
@@ -86,6 +91,8 @@ def infer_medallion_layer(name: str, node_type: str = "TABLE") -> str:
         return "ANALYTICS"
     elif node_type == "JOB":
         return "ORCHESTRATION"
+    elif node_type == "MODEL":
+        return "MODEL"
 
     if "gold" in name_lower:
         return "GOLD"
@@ -451,11 +458,29 @@ def scan_and_sync_all_assets():
     except Exception as e:
         logger.warning(f"Error scanning dbt models for lineage: {e}")
 
+    # 6. Scan MLflow Experiments & Models for Delta Lineage
+    try:
+        from web.delta_lineage import sync_ml_models_to_lineage_graph
+        sync_ml_models_to_lineage_graph()
+    except Exception as e:
+        logger.warning(f"Error scanning ML models for lineage: {e}")
+
     logger.info("Lakehouse data lineage scan completed successfully.")
 
 
-def get_global_lineage(layer: Optional[str] = None, schema: Optional[str] = None, search: Optional[str] = None) -> Dict[str, Any]:
-    """Returns the full Lakehouse lineage graph with optional filtering."""
+def get_global_lineage(
+    layer: Optional[str] = None,
+    schema: Optional[str] = None,
+    search: Optional[str] = None,
+    allowed_catalogs: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Returns the full Lakehouse lineage graph with optional filtering and catalog RBAC."""
+    try:
+        from web.delta_lineage import sync_ml_models_to_lineage_graph
+        sync_ml_models_to_lineage_graph()
+    except Exception:
+        pass
+
     with get_db_connection() as conn:
         query_nodes = "SELECT * FROM lineage_nodes WHERE 1=1"
         params_nodes = []
@@ -471,6 +496,12 @@ def get_global_lineage(layer: Optional[str] = None, schema: Optional[str] = None
 
         rows_nodes = conn.execute(query_nodes, params_nodes).fetchall()
         node_map = {r["id"]: dict(r) for r in rows_nodes}
+
+        if allowed_catalogs is not None:
+            node_map = {
+                k: v for k, v in node_map.items()
+                if not v.get("catalog") or v.get("catalog") in allowed_catalogs or v.get("node_type") in ("FILE", "QUERY", "JOB")
+            }
         node_ids = set(node_map.keys())
 
         # Parse metadata JSON
@@ -607,6 +638,7 @@ def get_table_lineage(schema_name: str, table_name: str, depth: int = 2) -> Dict
             "dashboards": [n["name"] for n in nodes if n["id"] in downstream_node_ids and n["node_type"] == "DASHBOARD"],
             "queries": [n["name"] for n in nodes if n["id"] in downstream_node_ids and n["node_type"] == "QUERY"],
             "jobs": [n["name"] for n in nodes if n["id"] in downstream_node_ids and n["node_type"] == "JOB"],
+            "models": [n["name"] for n in nodes if n["id"] in downstream_node_ids and n["node_type"] == "MODEL"],
         }
     }
 
@@ -645,5 +677,6 @@ def get_node_impact_analysis(node_id: str) -> Dict[str, Any]:
             "dashboards": len([n for n in impact_nodes if n["node_type"] == "DASHBOARD"]),
             "queries": len([n for n in impact_nodes if n["node_type"] == "QUERY"]),
             "jobs": len([n for n in impact_nodes if n["node_type"] == "JOB"]),
+            "models": len([n for n in impact_nodes if n["node_type"] == "MODEL"]),
         }
     }
