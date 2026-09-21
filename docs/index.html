@@ -496,7 +496,7 @@
           <div class="callout-body">
             <div class="callout-title">Notebooks are per user and run inside the studio</div>
             <p>
-              There is no separate JupyterLab server. Notebooks are edited and run in the embedded runner, every notebook endpoint requires a valid session, and each user reaches only <code>Users/&lt;their name&gt;</code> and <code>Shared</code> (administrators reach everything). Kernels are per user and notebook, so two users on the same shared notebook never share variables. Users a masking policy applies to can read and edit notebooks but not run them; set <code>GOVERNANCE_NOTEBOOK_EXECUTION=all</code> to lift this.
+              There is no separate JupyterLab server. Notebooks are edited and run in the embedded runner, every notebook endpoint requires a valid session, and each user reaches only <code>Users/&lt;their name&gt;</code> and <code>Shared</code> (administrators reach everything). Kernels are per user and notebook, so two users on the same shared notebook never share variables. Users a masking policy applies to run in the <strong>notebook sandbox</strong>: a separate container with no access to the warehouse files, a separate OS user per person, and no network besides the studio. Their <code>spark</code>, <code>conn</code> and <code>%sql</code> read data through the governance gateway, so it arrives masked. Warehouse files, <code>dbutils</code> and writes to the warehouse are not available there. If the sandbox is not running, they can read and edit notebooks but not run them.
             </p>
           </div>
         </div>
@@ -656,7 +656,7 @@ SELECT name, email FROM warehouse.hr.employees;
           <div class="callout-body">
             <div class="callout-title">Limits of masking</div>
             <p>
-              Masking is enforced in the studio's SQL layer. Notebook kernels run arbitrary Python and cannot be masked, so users a masking policy applies to can open and edit notebooks but not run them (see <a href="#security-settings">Security Settings</a>). Row-level filtering is not implemented yet. Direct file access to the warehouse is only possible for administrators.
+              Masking is enforced in the studio's SQL layer. Notebook kernels run arbitrary Python and cannot be masked, so users a masking policy applies to run them in the isolated notebook sandbox, where data is only reachable through the masking gateway (see <a href="#security-settings">Security Settings</a>). Row-level filtering is not implemented yet. Direct file access to the warehouse is only possible for administrators.
             </p>
           </div>
         </div>
@@ -1101,7 +1101,9 @@ docker compose ps</code></pre>
             <tbody>
               <tr><td><code>GOVERNANCE_ENFORCEMENT</code></td><td><code>enforce</code> (default) applies masking and statement gating; <code>audit</code> logs what would be masked without changing queries; <code>off</code> disables the gateway.</td></tr>
               <tr><td><code>GOVERNANCE_REQUIRE_AUTH</code></td><td>Default <code>false</code> (single-user local mode: credential-less requests run as the local admin). <code>true</code> makes them the least-privilege <code>anonymous</code> user. Set it to <code>true</code> for shared deployments.</td></tr>
-              <tr><td><code>GOVERNANCE_NOTEBOOK_EXECUTION</code></td><td>Default: only users no masking policy applies to may run notebooks. <code>all</code> lets everyone run them (masking cannot be enforced inside a kernel).</td></tr>
+              <tr><td><code>GOVERNANCE_NOTEBOOK_EXECUTION</code></td><td><code>sandbox</code> (default): users a masking policy applies to run notebooks in the notebook sandbox, everyone else in the studio's kernels. <code>exempt</code>: only users no policy applies to may run notebooks. <code>all</code>: everyone uses the studio's kernels (masking is then not enforced for notebook code).</td></tr>
+              <tr><td><code>SANDBOX_URL</code>, <code>SANDBOX_TOKEN</code>, <code>SANDBOX_GATEWAY_URL</code></td><td>Where the studio finds the sandbox worker, its token (generated on a volume the studio mounts read-only) and where kernels reach the studio.</td></tr>
+              <tr><td><code>SANDBOX_TOKEN_TTL</code>, <code>SANDBOX_MAX_ROWS</code>, <code>SANDBOX_MAX_KERNELS</code></td><td>Lifetime of a kernel's data token (seconds), rows one sandboxed query may return, concurrent sandbox kernels.</td></tr>
               <tr><td><code>GOVERNANCE_ALLOWED_PATHS</code></td><td>Extra directories non-admins may read with file functions; everything else outside the governed catalog is blocked.</td></tr>
               <tr><td><code>JWT_SECRET_KEY</code></td><td>Session signing key. If unset, a per-install secret is generated and stored under <code>warehouse/.metadata/</code>.</td></tr>
               <tr><td><code>COMPUTE_TOKEN</code></td><td>Shared secret (<code>X-Compute-Token</code>) the studio sends to compute nodes; workers reject requests without it. Generated per install when unset.</td></tr>
@@ -1112,6 +1114,7 @@ docker compose ps</code></pre>
         <ul>
           <li><strong>Compute nodes are not published:</strong> worker containers are only exposed on the internal Docker network and require the compute token, so users cannot bypass the studio's gateway by calling a worker directly.</li>
           <li><strong>File sandbox:</strong> non-admin users cannot read arbitrary files (such as the warehouse's Delta files or metadata) through SQL file functions.</li>
+          <li><strong>Notebook sandbox:</strong> the <code>notebook-sandbox</code> service has no warehouse mount, gives every user a separate OS user, sits on an internal network shared only with the studio, and the studio refuses every route except <code>/api/sandbox/*</code> to it.</li>
           <li><strong>No JupyterLab:</strong> the shared Jupyter server and its token were removed; notebooks run in the per-user embedded runner.</li>
         </ul>
         <p>

@@ -4276,7 +4276,13 @@
                       <template x-if="!notebookExecutionAllowed">
                         <div class="px-3 py-2 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs flex items-start space-x-2">
                           <i class="ph ph-lock-key mt-0.5"></i>
-                          <span>Masking policies apply to you, so notebook cells cannot be run here (notebook code can read the warehouse files directly). You can still read and edit this notebook; use the SQL editor to query masked data.</span>
+                          <span x-text="notebookAccessMode === 'sandbox' ? 'Masking policies apply to you, so your notebook code must run in the notebook sandbox, and the sandbox is not running. Ask an administrator to start the notebook-sandbox service. You can still read and edit this notebook; use the SQL editor to query masked data.' : 'Masking policies apply to you, so notebook cells cannot be run here (notebook code can read the warehouse files directly). You can still read and edit this notebook; use the SQL editor to query masked data.'"></span>
+                        </div>
+                      </template>
+                      <template x-if="!!notebookExecutionAllowed && !!notebookSandboxed">
+                        <div class="px-3 py-2 rounded-lg border border-sky-300 dark:border-sky-800/60 bg-sky-50 dark:bg-sky-950/30 text-sky-900 dark:text-sky-200 text-xs flex items-start space-x-2">
+                          <i class="ph ph-shield-check mt-0.5"></i>
+                          <span>Sandboxed: masking policies apply to you, so this notebook runs in an isolated sandbox. Data is read through the governance gateway and arrives masked. Warehouse files and <code>dbutils</code> are not available; filter or aggregate in <code>spark.sql(...)</code> / <code>%sql</code> to keep results small.</span>
                         </div>
                       </template>
                       <!-- Notebook Sticky Command Strip -->
@@ -16322,6 +16328,8 @@
         isSavingSettings: false,
         // Whether the caller may run notebook code (masked users can open and edit notebooks, not run them)
         notebookExecutionAllowed: true,
+        notebookSandboxed: false,
+        notebookAccessMode: 'sandbox',
         status: {},
         catalogs: [],
         selectedTable: null,
@@ -17454,7 +17462,10 @@
         async refreshNotebookAccess() {
           try {
             const res = await fetch('/api/notebooks/access');
-            this.notebookExecutionAllowed = res.ok ? !!(await res.json()).execution_allowed : false;
+            const access = res.ok ? await res.json() : {};
+            this.notebookExecutionAllowed = !!access.execution_allowed;
+            this.notebookSandboxed = !!access.sandboxed;
+            this.notebookAccessMode = access.mode || 'sandbox';
           } catch (e) {
             console.warn('Notebook access check failed:', e);
           }

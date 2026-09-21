@@ -19,12 +19,56 @@ services:
       - ./web:/workspace/web
       - ./dbt_project:/workspace/dbt_project
       - ./docs:/workspace/docs
+      - sandbox-secret:/run/sandbox:ro
+    networks:
+      - default
+      - sandbox-net
     deploy:
       resources:
         limits:
           memory: 4G
         reservations:
           memory: 1G
+    restart: unless-stopped
+
+  # Runs the notebook kernels of users a masking policy applies to. It has no warehouse mount, is alone with the studio on an
+  # internal network (no internet, no compute nodes), and kernels read data only through the studio's governed endpoint.
+  # See sandbox/worker.py.
+  notebook-sandbox:
+    image: localspark-lakehouse-notebook
+    container_name: local-notebook-sandbox
+    command: ["python", "-m", "uvicorn", "worker:app", "--app-dir", "/opt/sandbox", "--host", "0.0.0.0", "--port", "8000"]
+    expose:
+      - "8000"
+    environment:
+      - SANDBOX_GATEWAY_URL=http://datakilnworks-studio:8000
+      - SANDBOX_MAX_ROWS=${SANDBOX_MAX_ROWS:-1000000}
+    volumes:
+      - ./sandbox:/opt/sandbox:ro
+      - ./web/notebook_runner.py:/opt/runner/notebook_runner.py:ro
+      - sandbox-secret:/run/sandbox
+      - sandbox-state:/sandbox/state
+    tmpfs:
+      - /root
+      - /tmp
+    networks:
+      - sandbox-net
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:            # switching to per-user uids and preparing their homes
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          pids: 1024
     restart: unless-stopped
 
   compute-node-01:
@@ -110,3 +154,11 @@ services:
         reservations:
           memory: 1G
     restart: unless-stopped
+
+networks:
+  sandbox-net:
+    internal: true
+
+volumes:
+  sandbox-secret:
+  sandbox-state:

@@ -117,7 +117,7 @@ def main():
         r3 = client.post("/api/workspace/notebook/cell/run", json={"path": SHARED_NB, "cell_index": 2}, cookies=lead)
         check("another user on the same notebook gets a fresh kernel (variable not defined)", r3.status_code == 200 and "NameError" in str(r3.json()), r3.text[:300])
         keys = sorted(notebook_runner.SESSIONS)
-        check("sessions are registered per (user, notebook)", ("admin", SHARED_NB) in keys and ("lead_engineer", SHARED_NB) in keys, keys)
+        check("sessions are registered per (user, notebook)", ("admin", SHARED_NB, False) in keys and ("lead_engineer", SHARED_NB, False) in keys, keys)
         check("kernel status is per user", client.get("/api/workspace/notebook/kernel/status", params={"path": SHARED_NB}, cookies=bob).json()["is_alive"] is False)
 
         print("\n4. Masked users: read and edit, but no execution")
@@ -135,7 +135,7 @@ def main():
         os.environ["GOVERNANCE_NOTEBOOK_EXECUTION"] = "all"
         try:
             check("GOVERNANCE_NOTEBOOK_EXECUTION=all lets a masked user run", hit(client, "run", BOB_NB, bob).status_code == 200)
-            check("...and the access endpoint agrees", client.get("/api/notebooks/access", cookies=bob).json() == {"execution_allowed": True, "mode": "all"})
+            check("...and the access endpoint agrees", client.get("/api/notebooks/access", cookies=bob).json() == {"execution_allowed": True, "mode": "all", "sandboxed": False})
         finally:
             os.environ.pop("GOVERNANCE_NOTEBOOK_EXECUTION")
 

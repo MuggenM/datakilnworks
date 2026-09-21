@@ -152,8 +152,21 @@ async def shutdown_event():
     from web.scheduled_exports import shutdown_scheduler
     shutdown_scheduler()
 
+from web import sandbox_client, sandbox_gateway
 from web.governance import routes as governance_routes
 app.include_router(governance_routes.router)
+app.include_router(sandbox_gateway.router)
+
+
+@app.middleware("http")
+async def _sandbox_isolation(request: Request, call_next):
+    """
+    Kernels in the notebook sandbox may only call /api/sandbox/*. Without this, a credential-less request from a kernel
+    would be the local admin in the default single-user mode and could read unmasked data through any other route.
+    """
+    if not request.url.path.startswith("/api/sandbox/") and sandbox_client.is_sandbox_peer(request.client.host if request.client else None):
+        return JSONResponse(status_code=403, content={"detail": "Notebook sandboxes may only use /api/sandbox/*."})
+    return await call_next(request)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -5386,6 +5399,12 @@ async def _notebook_user(request: Request, path: str, *, write: bool = False, ex
     return user
 
 
+def _notebook_sandboxed(user: Dict[str, Any]) -> bool:
+    """True when this user's kernels must live in the notebook sandbox (a masking policy applies to them)."""
+    from web.notebook_access import SANDBOX, execution_route
+    return execution_route(user) == SANDBOX
+
+
 class NotebookCellRunPayload(BaseModel):
     path: str
     cell_index: int
@@ -5396,7 +5415,8 @@ async def run_notebook_cell_endpoint(payload: NotebookCellRunPayload, request: R
     from web.notebook_runner import execute_single_cell
     user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return await asyncio.to_thread(execute_single_cell, payload.path, payload.cell_index, payload.source, user.get("username", "anonymous"))
+        return await asyncio.to_thread(execute_single_cell, payload.path, payload.cell_index, payload.source,
+                                       user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error executing notebook cell: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5409,7 +5429,7 @@ async def run_all_notebook_cells_endpoint(payload: NotebookRunAllPayload, reques
     from web.notebook_runner import execute_all_cells
     user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return await asyncio.to_thread(execute_all_cells, payload.path, user.get("username", "anonymous"))
+        return await asyncio.to_thread(execute_all_cells, payload.path, user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error running all notebook cells: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5422,7 +5442,7 @@ async def restart_notebook_kernel_endpoint(payload: NotebookKernelPayload, reque
     from web.notebook_runner import restart_notebook_kernel
     user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return await asyncio.to_thread(restart_notebook_kernel, payload.path, user.get("username", "anonymous"))
+        return await asyncio.to_thread(restart_notebook_kernel, payload.path, user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error restarting notebook kernel: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5432,7 +5452,7 @@ async def get_notebook_kernel_status_endpoint(path: str, request: Request):
     from web.notebook_runner import get_kernel_status
     user = await _notebook_user(request, path)
     try:
-        return get_kernel_status(path, user.get("username", "anonymous"))
+        return await asyncio.to_thread(get_kernel_status, path, user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error checking notebook kernel status: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5491,9 +5511,10 @@ async def clear_notebook_outputs_endpoint(payload: NotebookKernelPayload, reques
 @app.get("/api/notebooks/access")
 async def get_notebook_access(request: Request):
     """Whether the caller may run notebook code (masked users can open and edit notebooks, not run them)."""
-    from web.notebook_access import execution_allowed, execution_mode
+    from web.notebook_access import SANDBOX, execution_mode, execution_route
     user = await resolve_principal(request)
-    return {"execution_allowed": execution_allowed(user), "mode": execution_mode()}
+    route = await asyncio.to_thread(execution_route, user)
+    return {"execution_allowed": route is not None, "mode": execution_mode(), "sandboxed": route == SANDBOX}
 
 
 # ==================== RECENTS APIS (MULTI-USER TRACKING) ====================
