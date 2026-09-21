@@ -43,3 +43,7 @@ warehouse/.metadata/brand_config.json
 
 
 warehouse/
+
+# Ad-hoc test and UI verification scripts
+scratch/test_*.py
+scratch/verify_*.py

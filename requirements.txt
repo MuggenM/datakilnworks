@@ -2,7 +2,10 @@ duckdb>=1.5.4,<1.6.0
 deltalake==1.5.0
 duckrun>=0.4.0
 sqlframe[duckdb]>=3.25.0
-jupyterlab>=4.2.0
+# In-Studio notebook kernels (there is no JupyterLab server)
+ipykernel>=6.29.0
+jupyter_client>=8.6.0
+nbformat>=5.10.0
 itables
 pyarrow
 pandas
@@ -14,6 +17,7 @@ croniter>=6.0.0
 papermill>=2.6.0
 APScheduler>=3.10.0
 requests>=2.31.0
+httpx>=0.27.0   # studio -> compute worker calls (was only present transitively through JupyterLab)
 ray[default]>=2.35.0
 azure-identity>=1.17.0
 azure-storage-file-datalake>=12.14.0

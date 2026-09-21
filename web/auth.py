@@ -7,6 +7,7 @@ SQLite persistence for users and settings, and FastAPI authentication dependenci
 import os
 import sqlite3
 import datetime
+import time
 import hashlib
 import secrets
 import logging
@@ -16,13 +17,18 @@ from datetime import timedelta
 import jwt
 from fastapi import Request, HTTPException, Depends, status
 
+from web.secrets_store import load_or_create_secret
+
 logger = logging.getLogger("localspark.auth")
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
 AUTH_DB_FILE = os.path.join(METADATA_DIR, "auth.db")
 
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "localspark-super-secret-jwt-key-2026-secure")
+
+
+# The previous hard-coded default key lived in the public repository, so anyone could forge an admin token.
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY") or load_or_create_secret("jwt_secret")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
@@ -55,6 +61,15 @@ def init_auth_db():
                 last_login_at TEXT
             );
             """)
+
+            # Columns added after the first release: `auth_source` ('local' = password kept in this database; anything else is
+            # an external identity provider that owns the password) and `password_changed_at` (epoch seconds; sessions issued
+            # before it are no longer accepted).
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "auth_source" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'")
+            if "password_changed_at" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN password_changed_at INTEGER")
 
             conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_permissions (
@@ -347,10 +362,38 @@ def reset_user_password(user_id: str, new_password: str) -> bool:
     try:
         pw_hash = hash_password(new_password)
         with conn:
-            res = conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (pw_hash, user_id))
+            res = conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
+                               (pw_hash, int(time.time()), user_id))
             return res.rowcount > 0
     finally:
         conn.close()
+
+
+MIN_SELF_PASSWORD_LENGTH = 6
+
+
+def change_own_password(user_id: str, current_password: str, new_password: str) -> None:
+    """
+    Lets a user change their own password. Only for accounts whose password lives in this database, and only with the
+    current password (a stolen session alone is not enough). Sessions issued before the change stop working.
+    Raises PermissionError (wrong current password / not a local account) or ValueError (unacceptable new password).
+    """
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT password_hash, auth_source, is_active FROM users WHERE id = ?", (user_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row or row["is_active"] != 1:
+        raise PermissionError("Account not found or deactivated.")
+    if (row["auth_source"] or "local") != "local":
+        raise PermissionError("This account signs in through an external identity provider; change the password there.")
+    if not verify_password(current_password, row["password_hash"]):
+        raise PermissionError("The current password is incorrect.")
+    if len(new_password) < MIN_SELF_PASSWORD_LENGTH:
+        raise ValueError(f"The new password must be at least {MIN_SELF_PASSWORD_LENGTH} characters long.")
+    if new_password == current_password:
+        raise ValueError("The new password must differ from the current one.")
+    reset_user_password(user_id, new_password)
 
 
 def delete_user(user_id: str) -> bool:
@@ -403,12 +446,13 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         payload = decode_access_token(token)
         if payload and "sub" in payload:
             user = get_user_by_id(payload["sub"])
-            if user and user.get("is_active", 1) == 1:
+            changed = user.get("password_changed_at") if user else None
+            if user and user.get("is_active", 1) == 1 and not (changed and int(payload.get("iat", 0)) < int(changed)):
                 return user
 
-    # Fallback to X-User header if supplied
+    # Fallback to X-User header if supplied. It carries no credential, so it is disabled once auth is required.
     x_user = request.headers.get("X-User")
-    if x_user:
+    if x_user and not governance_require_auth():
         user = get_user_by_username(x_user)
         if user and user.get("is_active", 1) == 1:
             return user
@@ -430,6 +474,43 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         detail="Authentication required. Please log in.",
         headers={"WWW-Authenticate": "Bearer"}
     )
+
+
+def governance_require_auth() -> bool:
+    """When true, requests without credentials are anonymous (least privilege) instead of the local admin."""
+    return os.getenv("GOVERNANCE_REQUIRE_AUTH", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+LOCAL_ADMIN = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+ANONYMOUS = {"role": "user", "username": "anonymous", "id": "anonymous"}
+
+
+def _presented_credentials(request: Request) -> bool:
+    """True when the request tried to authenticate (cookie, bearer token or X-User), valid or not."""
+    if request.cookies.get(COOKIE_NAME):
+        return True
+    header = request.headers.get("Authorization") or ""
+    if header.startswith("Bearer ") and header[7:].strip():
+        return True
+    return bool(request.headers.get("X-User")) and not governance_require_auth()
+
+
+async def resolve_principal(request: Request) -> Dict[str, Any]:
+    """
+    Single source of truth for "who is calling" in endpoints that tolerate anonymous access.
+
+    - Valid credentials -> that user.
+    - Credentials presented but invalid/expired/unknown/inactive -> 401. NEVER admin.
+    - No credentials at all -> the local single-user admin (the documented no-login mode), or the
+      least-privilege `anonymous` user when GOVERNANCE_REQUIRE_AUTH is set.
+    - Unexpected errors propagate (500) instead of silently granting admin.
+    """
+    try:
+        return dict(await get_current_user(request))
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED or _presented_credentials(request):
+            raise
+        return dict(ANONYMOUS if governance_require_auth() else LOCAL_ADMIN)
 
 
 def require_role(allowed_roles: List[str]):

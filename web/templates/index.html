@@ -985,12 +985,6 @@
         <i class="ph ph-arrows-clockwise text-sm" :class="{ 'animate-spin': isRefreshing }"></i>
       </button>
 
-      <a :href="jupyterUrl" target="_blank" class="flex items-center space-x-1 hover:text-white transition px-2 py-1 rounded bg-dbx-panel border border-dbx-border">
-        <i class="ph ph-notebook text-sm text-amber-400"></i>
-        <span>JupyterLab</span>
-        <i class="ph ph-arrow-square-out text-[10px]"></i>
-      </a>
-
       <!-- Help Button (Opens index.html documentation in a new tab) -->
       <a href="/docs/" target="_blank" rel="noopener noreferrer" class="flex items-center space-x-1.5 hover:text-white transition px-2.5 py-1 rounded bg-dbx-panel hover:bg-dbx-hover border border-dbx-border text-slate-300 hover:border-slate-500 shadow-xs" title="Help (Manual & Tutorial)">
         <i class="ph ph-question text-sm text-amber-400"></i>
@@ -1037,6 +1031,14 @@
             </div>
 
             <div class="p-1 space-y-0.5">
+              <!-- Local accounts only: change own password -->
+              <button x-show="(currentUser.auth_source || 'local') === 'local'"
+                      @click="userMenuOpen = false; openChangePassword()"
+                      class="w-full flex items-center space-x-2 px-3 py-2 rounded text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-dbx-hover transition text-left">
+                <i class="ph ph-key text-sm text-indigo-500"></i>
+                <span>Change password</span>
+              </button>
+
               <!-- Admin only: IAM Management -->
               <button x-show="currentUser.role === 'admin'" 
                       @click="userMenuOpen = false; openIamModal();" 
@@ -1206,6 +1208,10 @@
           <button @click="currentView = 'compute'" :class="currentView === 'compute' ? 'bg-slate-100 dark:bg-dbx-hover text-slate-900 dark:text-white border-l-2 border-amber-600 dark:border-amber-400 font-semibold' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-dbx-panel dark:hover:text-slate-200'" class="w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded-r text-xs transition text-left">
             <i class="ph ph-cpu text-base text-amber-700 dark:text-amber-400"></i>
             <span>Compute & Engine</span>
+          </button>
+          <button x-show="['admin','power_user'].includes(currentUser?.role)" @click="currentView = 'governance'; initGovernance();" :class="currentView === 'governance' ? 'bg-slate-100 dark:bg-dbx-hover text-slate-900 dark:text-white border-l-2 border-emerald-600 dark:border-emerald-400 font-semibold' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-dbx-panel dark:hover:text-slate-200'" class="w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded-r text-xs transition text-left">
+            <i class="ph ph-shield-check text-base text-emerald-600 dark:text-emerald-400"></i>
+            <span class="flex-1">Governance</span>
           </button>
           <!-- Admin-Only Platform Settings Navigation Button -->
           <button x-show="currentUser?.role === 'admin'" @click="openSettingsModal(); settingsTab = 'llm';" class="w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded-r text-xs transition text-left text-slate-600 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-dbx-panel dark:hover:text-slate-200">
@@ -1625,6 +1631,196 @@
         </div>
       </div>
 
+      <!-- ================= 0C. GOVERNANCE VIEW (tags + masking policies) ================= -->
+      <div x-show="currentView === 'governance'" x-cloak class="flex-1 flex flex-col overflow-y-auto p-6 space-y-5">
+        <div class="flex items-center justify-between border-b border-dbx-border pb-4">
+          <div>
+            <div class="flex items-center space-x-2 text-xs text-slate-500 dark:text-slate-400 mb-1"><span>Platform</span><i class="ph ph-caret-right text-[10px]"></i><span class="text-slate-700 dark:text-slate-200 font-medium">Governance</span></div>
+            <h2 class="text-xl font-bold text-slate-900 dark:text-white flex items-center space-x-2">
+              <i class="ph ph-shield-check text-emerald-600 dark:text-emerald-400"></i><span>Tags &amp; Masking Policies</span>
+            </h2>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-3xl">Tag catalogs, schemas, tables and columns, then write one masking policy against a tag. Masks are applied at query time to every path that reads data (SQL editor, dashboards, previews, exports, Genie, jobs).</p>
+          </div>
+          <button @click="initGovernance()" class="px-3 py-1.5 text-xs rounded border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-dbx-hover flex items-center space-x-1.5"><i class="ph ph-arrows-clockwise"></i><span>Refresh</span></button>
+        </div>
+
+        <!-- Posture -->
+        <template x-if="govStatus && govStatus.posture">
+          <div class="space-y-3">
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Enforcement</div><div class="text-sm font-mono font-bold" :class="govStatus.posture.enforcement_mode === 'enforce' ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'" x-text="govStatus.posture.enforcement_mode"></div></div>
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Policies enabled</div><div class="text-sm font-mono font-bold text-slate-900 dark:text-white" x-text="govStatus.policies_enabled + ' / ' + govStatus.policies_total"></div></div>
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Tag assignments</div><div class="text-sm font-mono font-bold text-slate-900 dark:text-white" x-text="govStatus.tag_assignments"></div></div>
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Mask functions</div><div class="text-sm font-mono font-bold" :class="govStatus.masks_installed ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'" x-text="govStatus.masks_installed ? 'installed' : 'MISSING'"></div></div>
+            </div>
+            <template x-if="(govStatus.workers || []).some(w => w.status === 'ONLINE' && w.masks_installed === false)">
+              <div class="text-[11px] p-3 rounded-lg border border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/30 text-red-800 dark:text-red-200 flex items-center space-x-1.5"><i class="ph ph-warning-octagon"></i><span>A compute node cannot run masked SQL (mask functions are missing). Masked queries routed to it fail closed; restart the node.</span></div>
+            </template>
+            <div class="text-[11px] p-3 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 space-y-1">
+              <div class="font-semibold flex items-center space-x-1.5"><i class="ph ph-warning"></i><span>Trust boundary</span></div>
+              <div>Notebook code runs in kernels that can read the warehouse files directly, so it is <strong>outside</strong> column masking. Running notebooks is therefore limited to users no masking policy applies to.
+                <span x-show="govStatus.posture.notebook_execution === 'all'" class="font-semibold"> GOVERNANCE_NOTEBOOK_EXECUTION=all lets everyone run notebooks: masking is not enforced for notebook code.</span>
+                <span x-show="!govStatus.posture.require_auth"> Requests without credentials run as the local admin (GOVERNANCE_REQUIRE_AUTH is off).</span></div>
+            </div>
+          </div>
+        </template>
+
+        <!-- Tabs -->
+        <div class="flex flex-wrap gap-2 text-xs font-medium">
+          <button @click="govTab = 'tags'" :class="govTab === 'tags' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-tag"></i><span>Tags</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govTags.length"></span></button>
+          <button x-show="currentUser?.role === 'admin'" @click="govTab = 'policies'" :class="govTab === 'policies' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-eye-slash"></i><span>Masking Policies</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govPolicies.length"></span></button>
+          <button @click="govTab = 'suggestions'" :class="govTab === 'suggestions' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-magic-wand"></i><span>Suggestions</span></button>
+          <button x-show="currentUser?.role === 'admin'" @click="govTab = 'preview'; if (!govUsers.length) fetchGovUsers();" :class="govTab === 'preview' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-user-focus"></i><span>Preview as user</span></button>
+          <button x-show="currentUser?.role === 'admin'" @click="govTab = 'audit'; fetchGovAudit(); fetchGovCoverage();" :class="govTab === 'audit' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-list-checks"></i><span>Audit &amp; Coverage</span></button>
+        </div>
+
+        <!-- TAB: Tags -->
+        <div x-show="govTab === 'tags'" class="space-y-4">
+          <div x-show="currentUser?.role === 'admin'" class="p-4 rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel space-y-3">
+            <div class="text-xs font-semibold text-slate-700 dark:text-slate-200">Define a tag</div>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-2 text-xs">
+              <input x-model="govNewTag.tag_key" placeholder="tag key, e.g. pii" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white">
+              <input x-model="govNewTag.allowed_values" placeholder="allowed values (comma separated, optional)" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white">
+              <input x-model="govNewTag.description" placeholder="description" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white">
+              <button @click="createGovTag()" class="px-3 py-2 rounded bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold">Create tag</button>
+            </div>
+          </div>
+          <div class="rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel overflow-hidden">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-100 dark:bg-slate-900 text-slate-500 dark:text-slate-400 uppercase text-[10px] tracking-wider"><tr><th class="py-2 px-4">Tag</th><th class="py-2 px-4">Allowed values</th><th class="py-2 px-4">Description</th><th class="py-2 px-4 text-right">Objects</th><th class="py-2 px-4 text-right">Policies</th><th class="py-2 px-4"></th></tr></thead>
+              <tbody class="divide-y divide-slate-100 dark:divide-dbx-border/40 text-slate-700 dark:text-slate-300">
+                <template x-for="t in govTags" :key="t.tag_key">
+                  <tr class="hover:bg-slate-50 dark:hover:bg-dbx-hover/40">
+                    <td class="py-2 px-4 font-mono font-semibold text-emerald-700 dark:text-emerald-400" x-text="t.tag_key"></td>
+                    <td class="py-2 px-4 font-mono text-[11px]" x-text="t.allowed_values ? t.allowed_values.join(', ') : 'any'"></td>
+                    <td class="py-2 px-4" x-text="t.description"></td>
+                    <td class="py-2 px-4 text-right font-mono"><span x-text="t.assignments"></span><span x-show="!!(t.orphaned_assignments)" class="text-amber-600 dark:text-amber-400" x-text="' (+' + t.orphaned_assignments + ' orphaned)'"></span></td>
+                    <td class="py-2 px-4 text-right font-mono" x-text="t.policies"></td>
+                    <td class="py-2 px-4 text-right space-x-1 whitespace-nowrap">
+                      <button @click="showGovTagUsage(t.tag_key)" class="px-2 py-1 rounded border border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover">Where used</button>
+                      <button x-show="currentUser?.role === 'admin'" @click="deleteGovTag(t)" class="px-2 py-1 rounded border border-rose-300 dark:border-rose-900/60 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40"><i class="ph ph-trash"></i></button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <template x-if="govUsageTag">
+            <div class="rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel overflow-hidden">
+              <div class="px-4 py-2 text-xs font-semibold bg-slate-100 dark:bg-slate-900 flex items-center justify-between"><span x-text="'Objects tagged ' + govUsageTag"></span><button @click="govUsageTag = null" class="text-slate-400 hover:text-slate-700 dark:hover:text-white"><i class="ph ph-x"></i></button></div>
+              <div x-show="govUsage.length === 0" class="p-4 text-xs text-slate-500">Nothing carries this tag yet. Tag columns from the Catalog Explorer or accept suggestions.</div>
+              <template x-for="a in govUsage" :key="a.id">
+                <div class="px-4 py-1.5 text-xs font-mono flex items-center justify-between border-t border-slate-100 dark:border-dbx-border/40"><span class="text-slate-800 dark:text-slate-200" x-text="a.object"></span><span class="text-slate-500"><span x-text="a.level"></span> · <span class="text-emerald-700 dark:text-emerald-400" x-text="a.tag_value || '(no value)'"></span><span x-show="!!(a.orphaned)" class="text-amber-600 dark:text-amber-400"> · orphaned</span></span></div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <!-- TAB: Masking policies -->
+        <div x-show="govTab === 'policies' && currentUser?.role === 'admin'" class="space-y-4">
+          <div class="flex items-center justify-between">
+            <p class="text-xs text-slate-500 dark:text-slate-400">A policy masks every column carrying its tag for everyone except the exempt roles/users. Lower priority number wins.</p>
+            <button @click="openGovPolicyModal(null)" class="px-3.5 py-1.5 rounded bg-dbx-orange hover:bg-dbx-orange/90 text-white text-xs font-semibold flex items-center space-x-1.5"><i class="ph ph-plus-circle"></i><span>New policy</span></button>
+          </div>
+          <div x-show="govPolicies.length === 0" class="p-8 text-center text-xs text-slate-500 rounded-xl border border-dashed border-slate-300 dark:border-dbx-border">No masking policies yet. Create one to start protecting tagged columns.</div>
+          <template x-for="p in govPolicies" :key="p.id">
+            <div class="rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div class="space-y-1 min-w-0">
+                <div class="flex items-center space-x-2"><span class="text-sm font-semibold text-slate-900 dark:text-white" x-text="p.name"></span>
+                  <span class="text-[10px] px-1.5 py-0.5 rounded font-mono" :class="p.enabled ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300' : 'bg-slate-200 dark:bg-slate-800 text-slate-500'" x-text="p.enabled ? 'ENABLED' : 'DISABLED'"></span></div>
+                <div class="text-[11px] font-mono text-slate-600 dark:text-slate-400">
+                  <span>tag </span><span class="text-emerald-700 dark:text-emerald-400" x-text="p.tag_key + (p.tag_value ? '=' + p.tag_value : '')"></span>
+                  <span> → </span><span class="text-amber-700 dark:text-amber-300 font-semibold" x-text="p.mask_type"></span>
+                  <span x-show="!!(p.applies_to_types)" x-text="' on ' + (p.applies_to_types || []).join('/') + ' columns'"></span>
+                  <span x-text="' · priority ' + p.priority"></span>
+                </div>
+                <div class="text-[11px] text-slate-500">Exempt: <span class="font-mono" x-text="[...(p.except_roles || []).map(r => 'role:' + r), ...(p.except_users || []).map(u => 'user:' + u)].join(', ') || 'nobody'"></span></div>
+              </div>
+              <div class="flex items-center space-x-1.5 text-xs shrink-0">
+                <button @click="toggleGovPolicy(p)" class="px-2.5 py-1 rounded border border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover" x-text="p.enabled ? 'Disable' : 'Enable'"></button>
+                <button @click="openGovPolicyModal(p)" class="px-2.5 py-1 rounded border border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover">Edit</button>
+                <button @click="deleteGovPolicy(p)" class="px-2.5 py-1 rounded border border-rose-300 dark:border-rose-900/60 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40"><i class="ph ph-trash"></i></button>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- TAB: Suggestions -->
+        <div x-show="govTab === 'suggestions'" class="space-y-3">
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <input x-model="govSuggestCatalog" placeholder="catalog" class="w-40 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white">
+            <input x-model="govSuggestSchema" placeholder="schema (optional)" class="w-44 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white">
+            <button @click="scanGovSuggestions()" class="px-3 py-2 rounded bg-slate-800 hover:bg-slate-700 text-white font-semibold flex items-center space-x-1.5"><i class="ph ph-magnifying-glass"></i><span>Scan column names</span></button>
+            <button x-show="!!(govSuggestions.length)" @click="applyGovSuggestions()" class="px-3 py-2 rounded bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold"><span x-text="'Apply ' + govSuggestSelectedCount + ' selected'"></span></button>
+            <span class="text-slate-500" x-show="!!(govSuggestScanned)" x-text="govSuggestScanned + ' columns scanned (names only, no data is read)'"></span>
+          </div>
+          <div x-show="govSuggestScanDone && govSuggestions.length === 0" class="p-6 text-center text-xs text-slate-500 rounded-xl border border-dashed border-slate-300 dark:border-dbx-border">Nothing to suggest: no untagged column names look sensitive.</div>
+          <div x-show="!!(govSuggestions.length)" class="rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel overflow-hidden">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-100 dark:bg-slate-900 text-slate-500 uppercase text-[10px] tracking-wider"><tr><th class="py-2 px-3 w-8"></th><th class="py-2 px-3">Column</th><th class="py-2 px-3">Suggested tag</th><th class="py-2 px-3">Confidence</th><th class="py-2 px-3">Why</th></tr></thead>
+              <tbody class="divide-y divide-slate-100 dark:divide-dbx-border/40 text-slate-700 dark:text-slate-300">
+                <template x-for="(s, i) in govSuggestions" :key="i">
+                  <tr><td class="py-1.5 px-3"><input type="checkbox" x-model="govSuggestSel[i]"></td>
+                    <td class="py-1.5 px-3 font-mono" x-text="s.catalog + '.' + s.schema_name + '.' + s.table_name + '.' + s.column_name"></td>
+                    <td class="py-1.5 px-3 font-mono text-emerald-700 dark:text-emerald-400" x-text="s.tag_key + '=' + s.tag_value"></td>
+                    <td class="py-1.5 px-3 font-mono" x-text="Math.round(s.confidence * 100) + '%'"></td>
+                    <td class="py-1.5 px-3 text-[11px] text-slate-500" x-text="s.reason"></td></tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- TAB: Preview as user -->
+        <div x-show="govTab === 'preview' && currentUser?.role === 'admin'" class="space-y-3">
+          <p class="text-xs text-slate-500 dark:text-slate-400">See exactly what a user would run for a query: the rewritten SQL and which columns are masked. Nothing is executed.</p>
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <select x-model="govPreviewUser" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white">
+              <option value="">Choose a user…</option>
+              <template x-for="u in govUsers" :key="u.username"><option :value="u.username" x-text="u.username + ' (' + u.role + ')'"></option></template>
+            </select>
+            <button @click="runGovPreviewAs()" class="px-3 py-2 rounded bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold">Preview</button>
+          </div>
+          <textarea x-model="govPreviewSql" rows="4" placeholder="SELECT * FROM warehouse.hr.employees" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-xs font-mono text-slate-900 dark:text-white"></textarea>
+          <template x-if="govPreviewResult">
+            <div class="space-y-2 text-xs">
+              <div class="p-3 rounded-lg border" :class="govPreviewResult.blocked ? 'border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/30 text-red-800 dark:text-red-200' : 'border-emerald-300 dark:border-emerald-800/60 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-200'">
+                <span x-show="!!(govPreviewResult.blocked)" x-text="'Blocked for ' + govPreviewResult.as_user + ': ' + govPreviewResult.blocked"></span>
+                <span x-show="!govPreviewResult.blocked" x-text="govPreviewResult.masked_columns.length ? (govPreviewResult.masked_columns.length + ' column(s) masked for ' + govPreviewResult.as_user) : ('Nothing is masked for ' + govPreviewResult.as_user + ' in this query')"></span>
+              </div>
+              <div x-show="!!(govPreviewResult.masked_columns.length)" class="flex flex-wrap gap-1.5"><template x-for="m in govPreviewResult.masked_columns" :key="m.table + m.column"><span class="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-200 font-mono text-[11px]" x-text="m.table + '.' + m.column + ' → ' + m.mask + ' (' + m.policy + ')'"></span></template></div>
+              <div x-show="!!(govPreviewResult.rewritten_sql)"><div class="text-[10px] uppercase text-slate-500 mb-1">Rewritten SQL</div><pre class="p-3 rounded bg-slate-900 text-slate-200 font-mono text-[11px] whitespace-pre-wrap" x-text="govPreviewResult.rewritten_sql"></pre></div>
+            </div>
+          </template>
+        </div>
+
+        <!-- TAB: Audit & coverage -->
+        <div x-show="govTab === 'audit' && currentUser?.role === 'admin'" class="space-y-4">
+          <template x-if="govCoverage">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Assignments by level</div><div class="font-mono mt-1" x-text="Object.entries(govCoverage.by_level).map(([k, v]) => k + ': ' + v).join('  ·  ') || 'none'"></div></div>
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Orphaned tags</div><div class="font-mono mt-1" :class="govCoverage.orphaned ? 'text-amber-600 dark:text-amber-400' : ''" x-text="govCoverage.orphaned"></div><button @click="reconcileGovTags()" class="mt-1 text-[11px] underline text-slate-500 hover:text-slate-800 dark:hover:text-white">Re-check against the catalog</button></div>
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Policies matching nothing</div><div class="font-mono mt-1" :class="govCoverage.policies_without_matches.length ? 'text-amber-600 dark:text-amber-400' : ''" x-text="govCoverage.policies_without_matches.join(', ') || 'none'"></div></div>
+            </div>
+          </template>
+          <div class="flex items-center space-x-2 text-xs">
+            <select x-model="govAuditFilter" @change="fetchGovAudit()" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white">
+              <option value="">All events</option><option>MASK_APPLIED</option><option>EXEMPT_READ</option><option>QUERY_BLOCKED</option><option>TAG_SET</option><option>TAG_UNSET</option><option>POLICY_CREATE</option><option>POLICY_UPDATE</option><option>POLICY_DELETE</option>
+            </select>
+            <span class="text-slate-500">Values and SQL text are never stored, only tables, columns and policy names.</span>
+          </div>
+          <div class="rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel overflow-hidden">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-100 dark:bg-slate-900 text-slate-500 uppercase text-[10px] tracking-wider"><tr><th class="py-2 px-3">When (UTC)</th><th class="py-2 px-3">Who</th><th class="py-2 px-3">Event</th><th class="py-2 px-3">Object / detail</th></tr></thead>
+              <tbody class="divide-y divide-slate-100 dark:divide-dbx-border/40 text-slate-700 dark:text-slate-300">
+                <template x-for="e in govAudit" :key="e.id"><tr><td class="py-1.5 px-3 font-mono text-[11px]" x-text="e.ts"></td><td class="py-1.5 px-3 font-mono" x-text="e.actor"></td><td class="py-1.5 px-3 font-mono font-semibold" :class="e.action === 'QUERY_BLOCKED' ? 'text-red-600 dark:text-red-400' : (e.action === 'EXEMPT_READ' ? 'text-amber-600 dark:text-amber-400' : '')" x-text="e.action"></td><td class="py-1.5 px-3 font-mono text-[11px]" x-text="(e.object || '') + ' ' + (e.detail && (e.detail.columns || e.detail.reason || e.detail.tag) ? JSON.stringify(e.detail.columns || e.detail.reason || e.detail.tag) : '')"></td></tr></template>
+              </tbody>
+            </table>
+            <div x-show="govAudit.length === 0" class="p-6 text-center text-xs text-slate-500">No events yet.</div>
+          </div>
+        </div>
+      </div>
+
       <!-- ================= 0B. VOLUME AUTO-LOADER VIEW ================= -->
       <div x-show="currentView === 'autoloader'" class="flex-1 flex flex-col overflow-y-auto p-6 space-y-6">
         <!-- Header -->
@@ -1809,7 +2005,7 @@
                     <div class="text-purple-600 dark:text-purple-400 truncate font-medium">
                       <span x-text="p.file_pattern"></span>
                       <span class="text-slate-400"> • </span>
-                      <span x-text="p.poll_interval_seconds + 's interval'"></span>
+                      <span x-text="p.cron_schedule ? ('cron ' + p.cron_schedule + ' UTC') : (p.poll_interval_seconds + 's interval')"></span>
                     </div>
                   </div>
                 </div>
@@ -2150,6 +2346,14 @@
               <div class="flex-1 overflow-y-auto p-4">
 
                 <!-- 1. Schema Tab -->
+                <!-- Governance: table-level tags -->
+                <div x-show="activeCatalogTab === 'schema'" class="mb-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                  <span class="text-slate-500 uppercase text-[10px] tracking-wider flex items-center space-x-1"><i class="ph ph-tag"></i><span>Tags</span></span>
+                  <span class="contents" x-html="govChipsHtml(govTableTags(), 'table', false)"></span>
+                  <span x-show="govTableTags().length === 0" class="text-slate-500">none</span>
+                  <button x-show="['admin','power_user'].includes(currentUser?.role)" @click="openTagModal('table', '')" class="px-2 py-0.5 rounded border border-slate-700 text-slate-300 hover:bg-dbx-hover flex items-center space-x-1"><i class="ph ph-plus"></i><span>tag table</span></button>
+                  <span x-show="!!(tableGov && tableGov.masked_count)" class="px-2 py-0.5 rounded bg-amber-950/60 text-amber-300 border border-amber-800/60 flex items-center space-x-1" :title="'Masked for you: ' + (tableGov?.masked_columns || []).join(', ')"><i class="ph ph-lock-key"></i><span x-text="((tableGov && tableGov.masked_count) || 0) + ' column(s) masked for you'"></span></span>
+                </div>
                 <div x-show="activeCatalogTab === 'schema'" class="border border-dbx-border rounded-lg overflow-hidden bg-dbx-panel">
                   <table class="w-full text-left text-xs">
                     <thead class="bg-slate-900/80 text-slate-400 border-b border-dbx-border font-semibold uppercase tracking-wider text-[11px]">
@@ -2157,6 +2361,8 @@
                         <th class="py-2.5 px-4">Column Name</th>
                         <th class="py-2.5 px-4">Data Type</th>
                         <th class="py-2.5 px-4">Nullable</th>
+                        <th class="py-2.5 px-4">Tags</th>
+                        <th class="py-2.5 px-4">Access</th>
                       </tr>
                     </thead>
                     <tbody class="divide-y divide-dbx-border/50 text-slate-300">
@@ -2166,6 +2372,18 @@
                           <td class="py-2 px-4 font-mono text-sky-400" x-text="col.type"></td>
                           <td class="py-2 px-4">
                             <span :class="col.nullable ? 'text-slate-400' : 'text-amber-400 font-semibold'" x-text="col.nullable ? 'true' : 'false'"></span>
+                          </td>
+                          <td class="py-2 px-4">
+                            <div class="flex flex-wrap items-center gap-1">
+                              <span class="contents" x-html="govChipsHtml(govColTags(col.name), 'column', true)"></span>
+                              <button x-show="['admin','power_user'].includes(currentUser?.role)" @click="openTagModal('column', col.name)" class="px-1 py-0.5 rounded border border-slate-700 text-slate-400 hover:text-white hover:bg-dbx-hover" title="Tag this column"><i class="ph ph-plus text-[10px]"></i></button>
+                            </div>
+                          </td>
+                          <td class="py-2 px-4">
+                            <template x-if="govColMasked(col.name)">
+                              <span class="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded bg-amber-950/60 text-amber-300 border border-amber-800/60 text-[10px] font-mono" :title="'Masked by policy ' + govColMasked(col.name).name"><i class="ph ph-lock-key"></i><span x-text="govColMasked(col.name).mask_type"></span></span>
+                            </template>
+                            <span x-show="!govColMasked(col.name)" class="text-slate-500 text-[10px]">visible</span>
                           </td>
                         </tr>
                       </template>
@@ -2362,8 +2580,8 @@
                             <div class="p-3 bg-dbx-panel border border-dbx-border rounded-lg shadow-sm hover:border-slate-600 transition flex items-center justify-between group">
                               <div class="flex items-center space-x-2.5 min-w-0">
                                 <div class="h-7 w-7 rounded flex items-center justify-center shrink-0"
-                                     :class="n.node_type === 'FILE' ? 'bg-slate-800 text-slate-300' : (n.layer === 'BRONZE' ? 'bg-amber-950/80 text-amber-400' : 'bg-sky-950/80 text-sky-400')">
-                                  <i :class="n.node_type === 'FILE' ? 'ph ph-file' : (n.node_type === 'JOB' ? 'ph ph-git-merge' : 'ph ph-database')" class="text-sm"></i>
+                                     :class="n.node_type === 'FILE' || n.node_type === 'VOLUME' ? 'bg-slate-800 text-slate-300' : (n.layer === 'BRONZE' ? 'bg-amber-950/80 text-amber-400' : 'bg-sky-950/80 text-sky-400')">
+                                  <i :class="n.node_type === 'FILE' ? 'ph ph-file' : (n.node_type === 'VOLUME' ? 'ph ph-folder-open' : (n.node_type === 'JOB' ? 'ph ph-git-merge' : 'ph ph-database'))" class="text-sm"></i>
                                 </div>
                                 <div class="min-w-0">
                                   <div class="text-xs font-semibold text-slate-200 truncate font-mono" x-text="n.name"></div>
@@ -3293,6 +3511,18 @@
               </div>
             </template>
 
+            <!-- Governance: masked columns banner -->
+            <template x-if="queryResult && queryResult.success && queryResult.masked_columns && queryResult.masked_columns.length">
+              <div class="px-3 py-1.5 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs flex items-center space-x-2 shrink-0" :title="queryResult.masked_columns.map(m => m.table + '.' + m.column + ' (' + m.policy + ')').join('\n')">
+                <i class="ph ph-lock-key"></i>
+                <span x-show="maskedInResult.length" x-text="maskedInResult.length + ' column' + (maskedInResult.length === 1 ? '' : 's') + ' masked by governance policy: ' + maskedInResult.map(m => m.column).join(', ')"></span>
+                <span x-show="!maskedInResult.length" x-text="'Sensitive columns of the tables this query reads are masked by governance policy (' + queryResult.masked_columns.length + ')'"></span>
+              </div>
+            </template>
+            <template x-if="queryResult && !queryResult.success && queryResult.governance_blocked">
+              <div class="px-3 py-1.5 rounded-lg border border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/30 text-red-800 dark:text-red-200 text-xs flex items-center space-x-2 shrink-0"><i class="ph ph-shield-warning"></i><span>Blocked by governance: this statement could reveal masked data.</span></div>
+            </template>
+
             <!-- TAB 1: Results Grid -->
             <template x-if="activeSqlTab === 'table' && queryResult && queryResult.success && !queryResult.is_mutation">
               <div class="flex-1 min-h-0 border border-slate-200 dark:border-dbx-border rounded-lg overflow-auto bg-white dark:bg-dbx-panel sql-results-grid relative shadow-xs">
@@ -3301,7 +3531,10 @@
                     <tr>
                       <th class="py-2 px-3 text-slate-400 dark:text-slate-500 w-12 text-center sticky top-0 z-10 bg-slate-100 dark:bg-slate-900 border-b border-slate-200 dark:border-dbx-border font-semibold">#</th>
                       <template x-for="col in queryResult.columns" :key="col.name">
-                        <th class="py-2 px-3 whitespace-nowrap sticky top-0 z-10 bg-slate-100 dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-b border-slate-200 dark:border-dbx-border font-semibold" x-text="col.name"></th>
+                        <th class="py-2 px-3 whitespace-nowrap sticky top-0 z-10 bg-slate-100 dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-b border-slate-200 dark:border-dbx-border font-semibold">
+                          <span x-text="col.name"></span>
+                          <i x-show="maskedResultColumns.includes(String(col.name).toLowerCase())" class="ph ph-lock-key text-amber-500 ml-1" title="Masked by a governance policy"></i>
+                        </th>
                       </template>
                     </tr>
                   </thead>
@@ -3870,19 +4103,6 @@
               <i class="ph ph-arrows-clockwise text-sm"></i>
             </button>
 
-            <div class="h-4 w-px bg-dbx-border mx-1"></div>
-
-            <!-- View Mode Switcher -->
-            <div class="flex items-center bg-slate-900 border border-dbx-border rounded p-0.5 text-xs">
-              <button @click="workspaceViewMode = 'split'" :class="workspaceViewMode === 'split' ? 'bg-dbx-hover text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-200'" class="px-2 py-0.5 rounded flex items-center space-x-1 transition">
-                <i class="ph ph-sidebar-simple text-xs"></i>
-                <span>Browser & Preview</span>
-              </button>
-              <button @click="workspaceViewMode = 'fullscreen'" :class="workspaceViewMode === 'fullscreen' ? 'bg-dbx-hover text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-200'" class="px-2 py-0.5 rounded flex items-center space-x-1 transition">
-                <i class="ph ph-browsers text-xs"></i>
-                <span>Full JupyterLab</span>
-              </button>
-            </div>
           </div>
         </div>
 
@@ -3957,11 +4177,6 @@
                         <i class="ph ph-plus-circle text-xs"></i>
                       </button>
                     </template>
-                    <template x-if="node.type === 'notebook'">
-                      <button @click.stop="openInJupyterLab(node.rel_path, true)" title="Open in JupyterLab (New Tab)" class="p-1 text-slate-400 hover:text-dbx-orange rounded hover:bg-slate-700">
-                        <i class="ph ph-arrow-square-out text-xs"></i>
-                      </button>
-                    </template>
                     <button x-show="!node.is_user_home" @click.stop="openWorkspaceRenameModal(node)" title="Rename" class="p-1 text-slate-400 hover:text-slate-200 rounded hover:bg-slate-700">
                       <i class="ph ph-pencil-simple text-xs"></i>
                     </button>
@@ -4032,13 +4247,6 @@
 
                   <!-- Actions Bar on Right -->
                   <div class="flex items-center space-x-2 shrink-0">
-                    <!-- Notebook / Python action: Open in JupyterLab -->
-                    <template x-if="selectedWorkspaceItem.type === 'notebook' || selectedWorkspaceItem.type === 'python'">
-                      <a :href="jupyterDeepUrl" target="_blank" class="px-2.5 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition" :title="selectedWorkspaceItem.type === 'notebook' ? 'Open selected notebook in JupyterLab (New Tab)' : 'Open file in JupyterLab (New Tab)'">
-                        <span>Open in JupyterLab</span>
-                        <i class="ph ph-arrow-square-out text-xs"></i>
-                      </a>
-                    </template>
 
                     <!-- SQL-specific action: Query in SQL Editor -->
                     <template x-if="selectedWorkspaceItem.type === 'sql' && workspaceFileDetail?.content">
@@ -4073,10 +4281,22 @@
                   <!-- 1. Notebook Interactive Workbench -->
                   <template x-if="selectedWorkspaceItem.type === 'notebook' && workspaceFileDetail">
                     <div class="max-w-4xl mx-auto space-y-4 pb-12">
+                      <template x-if="!notebookExecutionAllowed">
+                        <div class="px-3 py-2 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs flex items-start space-x-2">
+                          <i class="ph ph-lock-key mt-0.5"></i>
+                          <span x-text="notebookAccessMode === 'sandbox' ? 'Masking policies apply to you, so your notebook code must run in the notebook sandbox, and the sandbox is not running. Ask an administrator to start the notebook-sandbox service. You can still read and edit this notebook; use the SQL editor to query masked data.' : 'Masking policies apply to you, so notebook cells cannot be run here (notebook code can read the warehouse files directly). You can still read and edit this notebook; use the SQL editor to query masked data.'"></span>
+                        </div>
+                      </template>
+                      <template x-if="!!notebookExecutionAllowed && !!notebookSandboxed">
+                        <div class="px-3 py-2 rounded-lg border border-sky-300 dark:border-sky-800/60 bg-sky-50 dark:bg-sky-950/30 text-sky-900 dark:text-sky-200 text-xs flex items-start space-x-2">
+                          <i class="ph ph-shield-check mt-0.5"></i>
+                          <span>Sandboxed: masking policies apply to you, so this notebook runs in an isolated sandbox. Data is read through the governance gateway and arrives masked. Warehouse files and <code>dbutils</code> are not available; filter or aggregate in <code>spark.sql(...)</code> / <code>%sql</code> to keep results small.</span>
+                        </div>
+                      </template>
                       <!-- Notebook Sticky Command Strip -->
                       <div class="p-3 bg-white dark:bg-dbx-panel/90 border border-slate-200 dark:border-dbx-border rounded-lg flex items-center justify-between shadow-sm sticky top-0 z-10 backdrop-blur-md">
                         <div class="flex items-center space-x-2">
-                          <button @click="runAllNotebookCells()" :disabled="notebookRunningAll" class="px-3 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition disabled:opacity-50">
+                          <button @click="runAllNotebookCells()" :disabled="notebookRunningAll || !notebookExecutionAllowed" class="px-3 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition disabled:opacity-50">
                             <i class="ph" :class="notebookRunningAll ? 'ph-spinner animate-spin' : 'ph-play-fill'"></i>
                             <span x-text="notebookRunningAll ? 'Running All...' : 'Run All Cells'"></span>
                           </button>
@@ -4302,12 +4522,6 @@
                             <span class="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-200/60 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400" x-text="(workspaceFileDetail.lines || (workspaceFileDetail.content ? workspaceFileDetail.content.split('\n').length : 0)) + ' lines'"></span>
                           </div>
                           <div class="flex items-center space-x-2">
-                            <template x-if="selectedWorkspaceItem.type === 'python'">
-                              <a :href="jupyterDeepUrl" target="_blank" class="text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-dbx-border hover:bg-slate-50 dark:hover:bg-slate-700 transition text-[11px] shadow-xs" title="Open and edit in JupyterLab">
-                                <i class="ph ph-arrow-square-out text-xs"></i>
-                                <span>Edit in JupyterLab</span>
-                              </a>
-                            </template>
                             <template x-if="selectedWorkspaceItem.type === 'sql'">
                               <button @click="loadSqlInEditor(workspaceFileDetail.content)" class="text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-dbx-border hover:bg-slate-50 dark:hover:bg-slate-700 transition text-[11px] shadow-xs">
                                 <i class="ph ph-play-fill text-xs text-emerald-500"></i>
@@ -4391,22 +4605,6 @@
             </template>
           </div>
         </div>
-
-        <!-- 2. FULLSCREEN JUPYTERLAB FRAME -->
-        <div x-show="workspaceViewMode === 'fullscreen'" class="flex-1 bg-slate-900 relative">
-          <!-- Floating Back Bar -->
-          <div class="absolute top-2 right-4 z-20 flex items-center space-x-2 bg-slate-950/90 border border-dbx-border rounded-lg p-1 shadow-xl">
-            <button @click="workspaceViewMode = 'split'" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded flex items-center space-x-1.5 transition">
-              <i class="ph ph-sidebar-simple text-xs"></i>
-              <span>Back to Split Browser</span>
-            </button>
-            <a :href="jupyterDeepUrl" target="_blank" class="px-2.5 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white text-xs rounded flex items-center space-x-1 font-semibold transition">
-              <span>Open in New Tab</span>
-              <i class="ph ph-arrow-square-out text-xs"></i>
-            </a>
-          </div>
-          <iframe :src="jupyterDeepUrl" class="w-full h-full border-0" allow="clipboard-read; clipboard-write"></iframe>
-        </div>
       </div>
 
       <!-- ================= 4. COMPUTE & ENGINE VIEW ================= -->
@@ -4463,7 +4661,7 @@
               <div class="text-slate-300">Local Delta Lake + duckrun</div>
               <div class="text-slate-300">Vectorized DuckDB C++ Engine</div>
               <div class="text-slate-300">Delta Log Auto-Discovery Explorer</div>
-              <div class="text-slate-300">Monaco SQL Workbench + JupyterLab</div>
+              <div class="text-slate-300">Monaco SQL Workbench + In-Studio Notebooks</div>
             </div>
           </div>
         </div>
@@ -5871,7 +6069,7 @@
                 <span>Query History & Audit Log</span>
                 <span class="text-[10px] px-1.5 py-0.5 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded font-mono font-semibold" x-text="historyTotalCount + ' runs'"></span>
               </h2>
-              <p class="text-[11px] text-slate-500 dark:text-slate-400">Live execution history across Monaco SQL, Dashboards, Ingestion, and JupyterLab</p>
+              <p class="text-[11px] text-slate-500 dark:text-slate-400">Live execution history across Monaco SQL, Dashboards, Ingestion, and Notebooks</p>
             </div>
           </div>
 
@@ -5955,7 +6153,7 @@
               <select x-model="historyFilter.client" @change="fetchHistory()" class="bg-slate-900 border border-dbx-border rounded px-2.5 py-1 text-xs text-white focus:outline-none focus:border-amber-500">
                 <option value="ALL">All Sources</option>
                 <option value="SQL_EDITOR">SQL Editor</option>
-                <option value="NOTEBOOK">Notebook (JupyterLab)</option>
+                <option value="NOTEBOOK">Notebook</option>
                 <option value="DASHBOARD">Lakeview Dashboard</option>
                 <option value="INGESTION">Data Ingestion</option>
               </select>
@@ -7905,7 +8103,8 @@
           </div>
 
           <!-- Right Column: Waterfall Timeline & Span Details Inspector (w-2/3) -->
-          <div class="flex-1 flex flex-col bg-slate-50 dark:bg-slate-950 overflow-hidden" x-show="selectedTrace">
+          <template x-if="selectedTrace">
+          <div class="flex-1 flex flex-col bg-slate-50 dark:bg-slate-950 overflow-hidden">
             <!-- Selected Trace Header Banner -->
             <div class="p-4 border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-sidebar/60 flex items-center justify-between shrink-0">
               <div class="flex items-center space-x-3">
@@ -7961,7 +8160,7 @@
                 <div class="px-2.5 py-1 rounded bg-white dark:bg-dbx-sidebar border border-amber-300 dark:border-amber-800 flex items-center space-x-2 text-[11px] shrink-0 shadow-xs">
                   <span class="font-bold text-slate-800 dark:text-slate-200" x-text="ass.name"></span>
                   <span :class="ass.value === '1' ? 'text-emerald-600 font-bold' : (ass.value === '-1' ? 'text-red-600 font-bold' : 'text-amber-600 font-bold')" x-text="'= ' + ass.value"></span>
-                  <span class="text-slate-400 italic text-[10px]" x-show="ass.rationale" x-text="'(\"' + ass.rationale + '\")'"></span>
+                  <span class="text-slate-400 italic text-[10px]" x-show="ass.rationale" x-text="'(&quot;' + ass.rationale + '&quot;)'"></span>
                   <span class="text-[9px] text-slate-400 font-mono" x-text="ass.source_type"></span>
                 </div>
               </template>
@@ -8031,7 +8230,8 @@
               </div>
 
               <!-- Bottom Half: Selected Span Inspector (Inputs, Outputs, Attributes) -->
-              <div class="h-1/2 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950" x-show="selectedSpan">
+              <template x-if="selectedSpan">
+              <div class="h-1/2 flex flex-col overflow-hidden bg-slate-50 dark:bg-slate-950">
                 <!-- Span Header Bar -->
                 <div class="h-10 border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-sidebar/80 px-4 flex items-center justify-between shrink-0">
                   <div class="flex items-center space-x-2 truncate">
@@ -8100,6 +8300,7 @@
                   </div>
                 </div>
               </div>
+              </template>
 
               <!-- Empty Span Details State -->
               <div class="h-1/2 flex items-center justify-center text-slate-400 p-6" x-show="!selectedSpan">
@@ -8138,6 +8339,7 @@
               </div>
             </div>
           </div>
+          </template>
 
           <!-- Empty Detail State (No Trace Selected) -->
           <div class="flex-1 flex flex-col items-center justify-center p-8 text-center" x-show="!selectedTrace">
@@ -8652,20 +8854,20 @@
                   <i class="ph ph-tray-arrow-down text-slate-500 dark:text-slate-400"></i>
                   <span>1. Sources & Files</span>
                 </span>
-                <span class="text-[10px] px-1.5 py-0.2 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-400 font-mono font-semibold" x-text="filteredGlobalLineageNodes('RAW_FILE', 'FILE').length"></span>
+                <span class="text-[10px] px-1.5 py-0.2 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-400 font-mono font-semibold" x-text="filteredGlobalLineageNodes('RAW_FILE', 'FILE,VOLUME').length"></span>
               </div>
               <div class="flex-1 overflow-y-auto p-3 space-y-2.5">
-                <template x-for="n in filteredGlobalLineageNodes('RAW_FILE', 'FILE')" :key="n.id">
+                <template x-for="n in filteredGlobalLineageNodes('RAW_FILE', 'FILE,VOLUME')" :key="n.id">
                   <div @click="selectLineageNode(n)"
                        :data-node-id="n.id"
                        :class="selectedLineageNode?.id === n.id ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/30' : 'border-slate-200 hover:border-slate-400 dark:border-dbx-border dark:hover:border-slate-600 bg-white dark:bg-dbx-panel/80'"
                        class="p-3 border rounded-lg cursor-pointer transition shadow-xs space-y-1 group">
                     <div class="flex items-center space-x-2">
-                      <i class="ph ph-file-text text-slate-500 dark:text-slate-400 text-sm shrink-0"></i>
+                      <i :class="n.node_type === 'VOLUME' ? 'ph ph-folder-open text-emerald-600 dark:text-emerald-400' : 'ph ph-file-text text-slate-500 dark:text-slate-400'" class="text-sm shrink-0"></i>
                       <span class="text-xs font-mono font-bold text-slate-800 dark:text-slate-200 truncate" x-text="n.name"></span>
                     </div>
                     <div class="flex items-center justify-between text-[10px] text-slate-500">
-                      <span class="uppercase font-semibold">FILE / INGESTION</span>
+                      <span class="uppercase font-semibold" x-text="n.node_type === 'VOLUME' ? 'VOLUME / AUTO-LOADER' : 'FILE / INGESTION'"></span>
                       <span class="text-emerald-600 dark:text-emerald-400 font-mono font-semibold" x-text="getNodeConnectionsCount(n.id) + ' edges'"></span>
                     </div>
                   </div>
@@ -10614,6 +10816,89 @@
     </div>
   </div>
 
+  <!-- Modal: Tag an object (catalog explorer) -->
+  <div x-show="tagModal.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="tagModal.open = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-md shadow-2xl p-5 space-y-4" @click.outside="tagModal.open = false">
+      <div class="flex items-center justify-between border-b border-dbx-border pb-3">
+        <h3 class="text-sm font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-tag text-emerald-500"></i><span x-text="'Tags on ' + tagModal.label"></span></h3>
+        <button @click="tagModal.open = false" class="text-slate-400 hover:text-white"><i class="ph ph-x"></i></button>
+      </div>
+      <div class="space-y-1.5 text-xs">
+        <div class="text-[10px] uppercase text-slate-500">Direct tags</div>
+        <template x-if="tagModal.direct.length === 0"><div class="text-slate-500">No tags set directly on this object.</div></template>
+        <template x-for="d in tagModal.direct" :key="d.tag">
+          <div class="flex items-center justify-between px-2.5 py-1.5 rounded bg-slate-100 dark:bg-slate-900 font-mono"><span><span class="text-emerald-700 dark:text-emerald-400" x-text="d.tag"></span><span x-show="!!(d.val)" x-text="' = ' + d.val"></span></span><button @click="removeGovTagAssignment(d.tag)" class="text-rose-500 hover:text-rose-400"><i class="ph ph-trash"></i></button></div>
+        </template>
+      </div>
+      <div class="grid grid-cols-2 gap-2 text-xs">
+        <select x-model="tagModal.key" @change="tagModal.value = ''" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-2 font-mono text-slate-900 dark:text-white">
+          <option value="">Tag…</option>
+          <template x-for="t in govTags" :key="t.tag_key"><option :value="t.tag_key" x-text="t.tag_key"></option></template>
+        </select>
+        <div>
+          <template x-if="tagAllowedValues.length">
+            <select x-model="tagModal.value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-2 font-mono text-slate-900 dark:text-white">
+              <option value="">Value…</option>
+              <template x-for="v in tagAllowedValues" :key="v"><option :value="v" x-text="v"></option></template>
+            </select>
+          </template>
+          <template x-if="!tagAllowedValues.length">
+            <input x-model="tagModal.value" placeholder="value (optional)" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-2 font-mono text-slate-900 dark:text-white">
+          </template>
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-2 border-t border-dbx-border">
+        <button @click="tagModal.open = false" class="px-3 py-1.5 text-xs rounded border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-200">Close</button>
+        <button @click="saveGovTagAssignment()" :disabled="!tagModal.key" class="px-4 py-1.5 text-xs rounded bg-dbx-orange hover:bg-dbx-orange/90 disabled:opacity-40 text-white font-semibold">Add tag</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Masking policy editor -->
+  <div x-show="govPolicyModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="govPolicyModal = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-2xl max-h-[92vh] overflow-y-auto shadow-2xl p-6 space-y-4" @click.outside="govPolicyModal = false">
+      <div class="flex items-center justify-between border-b border-dbx-border pb-3">
+        <h3 class="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-eye-slash text-amber-500"></i><span x-text="govPolicyForm.id ? 'Edit masking policy' : 'New masking policy'"></span></h3>
+        <button @click="govPolicyModal = false" class="text-slate-400 hover:text-white"><i class="ph ph-x"></i></button>
+      </div>
+      <div class="grid grid-cols-2 gap-3 text-xs">
+        <div class="col-span-2"><label class="block text-[10px] uppercase text-slate-500 mb-1">Name</label><input x-model="govPolicyForm.name" placeholder="Mask PII for analysts" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white"></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Applies to tag</label>
+          <select x-model="govPolicyForm.tag_key" @change="govPolicyForm.tag_value = ''" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"><option value="">Choose a tag…</option><template x-for="t in govTags" :key="t.tag_key"><option :value="t.tag_key" x-text="t.tag_key"></option></template></select></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Tag value (optional)</label>
+          <template x-if="policyTagValues.length"><select x-model="govPolicyForm.tag_value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"><option value="">Any value</option><template x-for="v in policyTagValues" :key="v"><option :value="v" x-text="v"></option></template></select></template>
+          <template x-if="!policyTagValues.length"><input x-model="govPolicyForm.tag_value" placeholder="any value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></template></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Mask</label>
+          <select x-model="govPolicyForm.mask_type" @change="onGovMaskChange()" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white">
+            <option value="redact">redact (****)</option><option value="hash">hash (stable pseudonym)</option><option value="partial">partial (keep last chars)</option><option value="email">email (a***@domain)</option><option value="null">null</option><option value="generalize">generalize (bucket / year)</option><option value="custom">custom expression</option></select></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Priority (lower wins)</label><input type="number" x-model.number="govPolicyForm.priority" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+        <div class="col-span-2" x-show="govPolicyForm.mask_type === 'custom'"><label class="block text-[10px] uppercase text-slate-500 mb-1">Expression (use {col} for the column)</label>
+          <textarea x-model="govPolicyForm.mask_expr" @input.debounce.500ms="validateGovPolicyDraft()" rows="2" placeholder="left({col}, 2) || '***'" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></textarea></div>
+        <div class="col-span-2"><label class="block text-[10px] uppercase text-slate-500 mb-1">Only columns of type (none checked = all)</label>
+          <div class="flex flex-wrap gap-3 text-slate-700 dark:text-slate-300"><template x-for="f in ['string','numeric','temporal','boolean']" :key="f"><label class="flex items-center space-x-1"><input type="checkbox" :value="f" x-model="govPolicyForm.applies_to_types" @change="validateGovPolicyDraft()"><span x-text="f"></span></label></template></div></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt roles</label>
+          <div class="flex flex-wrap gap-3 text-slate-700 dark:text-slate-300"><template x-for="r in ['admin','power_user','user']" :key="r"><label class="flex items-center space-x-1"><input type="checkbox" :value="r" x-model="govPolicyForm.except_roles"><span x-text="r"></span></label></template></div></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt users (comma separated)</label><input x-model="govPolicyForm.except_users_text" placeholder="lead_engineer, martin" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+      </div>
+      <!-- live behaviour + tester -->
+      <div class="rounded-lg border border-slate-200 dark:border-dbx-border p-3 space-y-2 text-xs">
+        <div class="text-[10px] uppercase text-slate-500">What this mask does per column type</div>
+        <template x-if="govPolicyValidation && govPolicyValidation.behaviour">
+          <div class="grid grid-cols-2 md:grid-cols-5 gap-2"><template x-for="b in govBehaviourList" :key="b.family"><div class="p-2 rounded bg-slate-100 dark:bg-slate-900"><div class="font-semibold text-slate-700 dark:text-slate-200" x-text="b.family"></div><div class="text-[11px] text-slate-500" x-text="b.what"></div></div></template></div>
+        </template>
+        <template x-if="govPolicyValidation && govPolicyValidation.custom && !govPolicyValidation.custom.ok"><div class="p-2 rounded bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300" x-text="govPolicyValidation.custom.errors.join(' ')"></div></template>
+        <div class="flex items-center gap-2"><select x-model="govPolicyTest.data_type" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"><option>VARCHAR</option><option>INTEGER</option><option>DECIMAL(12,2)</option><option>DATE</option><option>TIMESTAMP</option></select>
+          <input x-model="govPolicyTest.value" placeholder="try a value, e.g. ada@example.com" class="flex-1 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white">
+          <button @click="testGovPolicyMask()" class="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white">Test</button></div>
+        <div x-show="govPolicyTest.result !== null" class="font-mono"><span class="text-slate-500">→ </span><span class="text-amber-700 dark:text-amber-300 font-semibold" x-text="govPolicyTest.result === '' ? '(empty)' : govPolicyTest.result"></span></div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-2 border-t border-dbx-border">
+        <button @click="govPolicyModal = false" class="px-3 py-1.5 text-xs rounded border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-200">Cancel</button>
+        <button @click="saveGovPolicy()" class="px-4 py-1.5 text-xs rounded bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold flex items-center space-x-1.5"><i class="ph ph-check"></i><span>Save policy</span></button>
+      </div>
+    </div>
+  </div>
+
   <!-- Modal: Create Auto-Loader Pipeline -->
   <div x-show="showCreatePipelineModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showCreatePipelineModal = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-lg shadow-2xl p-6 space-y-4" @click.outside="showCreatePipelineModal = false">
@@ -10651,8 +10936,20 @@
               <option value="10">Standard (10 seconds)</option>
               <option value="30">30 seconds</option>
               <option value="60">1 minute</option>
+              <option value="cron">Scheduled (Cron, UTC)</option>
             </select>
           </div>
+        </div>
+
+        <div x-show="newPipelineForm.poll_interval_seconds === 'cron'" class="space-y-1.5">
+          <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Cron Expression (UTC)</label>
+          <input type="text" x-model="newPipelineForm.cron_schedule" placeholder="*/15 * * * *" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="preset in [['Every 5 min','*/5 * * * *'],['Hourly','0 * * * *'],['Daily 02:00','0 2 * * *'],['Weekdays 06:00','0 6 * * 1-5']]" :key="preset[1]">
+              <button type="button" @click="newPipelineForm.cron_schedule = preset[1]" class="px-2 py-0.5 text-[10px] rounded border border-slate-300 dark:border-dbx-border text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-dbx-hover" x-text="preset[0]"></button>
+            </template>
+          </div>
+          <p class="text-[10px] text-slate-500">The pipeline scans its volume only when a cron tick has elapsed. Missed ticks run once on catch-up.</p>
         </div>
 
         <div class="p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg space-y-3">
@@ -10687,6 +10984,7 @@
             <select x-model="newPipelineForm.schema_evolution" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-medium focus:outline-none focus:border-dbx-orange">
               <option value="addNewColumns">Add New Columns Automatically</option>
               <option value="failOnNewColumns">Fail on Schema Mismatch</option>
+              <option value="rescue">Rescue Unknown Columns into _rescued_data (JSON)</option>
             </select>
           </div>
         </div>
@@ -12021,7 +12319,7 @@
             <div class="flex items-center space-x-2">
               <span x-show="selectedExpRunDetail?.tags_dict?.['delta.table_version']" class="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-100 dark:bg-purple-950/80 text-purple-800 dark:text-purple-300 border border-purple-300 dark:border-purple-800 font-bold flex items-center space-x-1">
                 <i class="ph ph-clock-counter-clockwise text-xs"></i>
-                <span x-text="'DELTA COMMIT v' + selectedExpRunDetail.tags_dict['delta.table_version']"></span>
+                <span x-text="'DELTA COMMIT v' + selectedExpRunDetail?.tags_dict?.['delta.table_version']"></span>
               </span>
               <button @click="openLineageForRun(selectedExpRunDetail)" class="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-700 text-white font-semibold text-[11px] flex items-center space-x-1.5 shadow-sm transition">
                 <i class="ph ph-graph text-xs"></i>
@@ -15113,6 +15411,36 @@
     </div>
   </div>
 
+  <!-- Modal: Change my own password (local accounts) -->
+  <div x-show="changePasswordOpen" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="changePasswordOpen = false">
+    <form @submit.prevent="submitChangePassword()" class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-sm shadow-2xl p-5 space-y-4" @click.outside="changePasswordOpen = false">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
+        <h4 class="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-1.5">
+          <i class="ph ph-key text-indigo-500"></i>
+          <span>Change password</span>
+        </h4>
+        <button type="button" @click="changePasswordOpen = false" class="text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+      <div>
+        <label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Current password</label>
+        <input type="password" x-model="changePasswordForm.current" autocomplete="current-password" required class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-indigo-500">
+      </div>
+      <div>
+        <label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">New password</label>
+        <input type="password" x-model="changePasswordForm.next" autocomplete="new-password" placeholder="Min 6 characters" required class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-indigo-500">
+      </div>
+      <div>
+        <label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Repeat new password</label>
+        <input type="password" x-model="changePasswordForm.repeat" autocomplete="new-password" required class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-indigo-500">
+      </div>
+      <p class="text-[11px] text-rose-500" x-show="!!changePasswordForm.error" x-text="changePasswordForm.error"></p>
+      <div class="flex items-center justify-end space-x-2 pt-2 border-t border-slate-200 dark:border-dbx-border text-xs">
+        <button type="button" @click="changePasswordOpen = false" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-300 rounded-lg">Cancel</button>
+        <button type="submit" :disabled="changePasswordForm.busy || !changePasswordForm.current || changePasswordForm.next.length < 6" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg shadow transition">Change password</button>
+      </div>
+    </form>
+  </div>
+
   <!-- Modal: Reset User Password Prompt -->
   <div x-show="resetPasswordModalOpen" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="resetPasswordModalOpen = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-sm shadow-2xl p-5 space-y-4" @click.outside="resetPasswordModalOpen = false">
@@ -15762,6 +16090,34 @@
         showNewModal: false,
 
         // Auto-Loader & Volumes State
+        // Governance (tags + masking policies)
+        govTab: 'tags',
+        govLoading: false,
+        govStatus: null,
+        govTags: [],
+        govPolicies: [],
+        govAudit: [],
+        govAuditFilter: '',
+        govCoverage: null,
+        govNewTag: { tag_key: '', description: '', allowed_values: '' },
+        govUsageTag: null,
+        govUsage: [],
+        govPolicyModal: false,
+        govPolicyForm: { id: null, name: '', description: '', tag_key: '', tag_value: '', mask_type: 'partial', mask_expr: '', applies_to_types: [], except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true },
+        govPolicyValidation: null,
+        govPolicyTest: { data_type: 'VARCHAR', value: '', result: null },
+        govSuggestCatalog: 'warehouse',
+        govSuggestSchema: '',
+        govSuggestions: [],
+        govSuggestScanned: 0,
+        govSuggestScanDone: false,
+        govSuggestSel: {},
+        govUsers: [],
+        govPreviewUser: '',
+        govPreviewSql: '',
+        govPreviewResult: null,
+        tableGov: null,
+        tagModal: { open: false, level: 'column', column: '', label: '', key: '', value: '', direct: [] },
         autoloaderTab: 'pipelines',
         autoloaderPipelines: [],
         autoloaderStats: {
@@ -15786,6 +16142,7 @@
           merge_keys: '',
           schema_evolution: 'addNewColumns',
           poll_interval_seconds: 10,
+          cron_schedule: '',
           enabled: true
         },
         pipelineHistoryModalOpen: false,
@@ -15824,6 +16181,8 @@
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
+        changePasswordOpen: false,
+        changePasswordForm: { current: '', next: '', repeat: '', error: '', busy: false },
         resetPasswordModalOpen: false,
         resetPasswordTarget: null,
         resetPasswordNewVal: '',
@@ -16007,9 +16366,10 @@
         },
         isLoadingSettings: false,
         isSavingSettings: false,
-        jupyterPort: '{{ jupyter_port }}',
-        jupyterToken: '{{ jupyter_token }}',
-        jupyterUrl: 'http://' + window.location.hostname + ':{{ jupyter_port }}/lab?token={{ jupyter_token }}',
+        // Whether the caller may run notebook code (masked users can open and edit notebooks, not run them)
+        notebookExecutionAllowed: true,
+        notebookSandboxed: false,
+        notebookAccessMode: 'sandbox',
         status: {},
         catalogs: [],
         selectedTable: null,
@@ -16533,14 +16893,6 @@
         notebookRunningAll: false,
         runningCellIdx: null,
         kernelStatus: 'stopped',
-
-        get jupyterDeepUrl() {
-          const target = this.selectedWorkspaceItem ? this.selectedWorkspaceItem.rel_path : '';
-          if (target) {
-            return 'http://' + window.location.hostname + ':' + this.jupyterPort + '/lab/tree/notebooks/' + encodeURIComponent(target) + '?token=' + this.jupyterToken;
-          }
-          return 'http://' + window.location.hostname + ':' + this.jupyterPort + '/lab?token=' + this.jupyterToken;
-        },
 
         get flattenedWorkspaceTree() {
           const result = [];
@@ -17147,7 +17499,20 @@
           await this.onUserChanged();
         },
 
+        async refreshNotebookAccess() {
+          try {
+            const res = await fetch('/api/notebooks/access');
+            const access = res.ok ? await res.json() : {};
+            this.notebookExecutionAllowed = !!access.execution_allowed;
+            this.notebookSandboxed = !!access.sandboxed;
+            this.notebookAccessMode = access.mode || 'sandbox';
+          } catch (e) {
+            console.warn('Notebook access check failed:', e);
+          }
+        },
+
         async onUserChanged() {
+          await this.refreshNotebookAccess();
           const username = this.currentUser?.username || 'admin';
           console.log(`[MultiUser] Scoping studio state to user: ${username}`);
 
@@ -17370,6 +17735,32 @@
           this.resetPasswordTarget = user;
           this.resetPasswordNewVal = '';
           this.resetPasswordModalOpen = true;
+        },
+
+        openChangePassword() {
+          this.changePasswordForm = { current: '', next: '', repeat: '', error: '', busy: false };
+          this.changePasswordOpen = true;
+        },
+
+        async submitChangePassword() {
+          const f = this.changePasswordForm;
+          if (f.next !== f.repeat) { f.error = 'The new passwords do not match.'; return; }
+          f.error = ''; f.busy = true;
+          try {
+            const res = await fetch('/api/auth/change-password', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ current_password: f.current, new_password: f.next })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { f.error = data.detail || 'Could not change the password.'; return; }
+            this.changePasswordOpen = false;
+            this.showToast('Password changed. Other sessions were signed out.', 'success');
+          } catch (e) {
+            f.error = 'Error: ' + e.message;
+          } finally {
+            f.busy = false;
+          }
         },
 
         async submitResetPassword() {
@@ -18328,6 +18719,7 @@
 
         async initApp() {
           await this.checkAuth();
+          await this.refreshNotebookAccess();
           this.applyTheme(this.isDarkMode);
           this.$watch('currentView', (val) => {
             if (val) localStorage.setItem('dbx_current_view', val);
@@ -18741,18 +19133,6 @@
           }
         },
 
-        openInJupyterLab(relPath = null, newTab = true) {
-          const targetPath = relPath || (this.selectedWorkspaceItem ? this.selectedWorkspaceItem.rel_path : '');
-          const url = targetPath
-            ? `http://${window.location.hostname}:${this.jupyterPort}/lab/tree/notebooks/${encodeURIComponent(targetPath)}?token=${this.jupyterToken}`
-            : `http://${window.location.hostname}:${this.jupyterPort}/lab?token=${this.jupyterToken}`;
-          if (newTab) {
-            window.open(url, '_blank');
-          } else {
-            this.workspaceViewMode = 'fullscreen';
-          }
-        },
-
         getWorkspaceFileLanguage(filename, fileType) {
           if (fileType === 'python') return 'Python';
           if (fileType === 'sql') return 'SQL';
@@ -19060,6 +19440,10 @@
             return;
           }
 
+          if (!this.notebookExecutionAllowed) {
+            this.showToast('Running notebooks is not available while masking policies apply to you.', 'error');
+            return;
+          }
           this.runningCellIdx = cell.index;
           this.kernelStatus = 'busy';
           try {
@@ -19089,6 +19473,10 @@
 
         async runAllNotebookCells() {
           if (!this.selectedWorkspaceItem || this.selectedWorkspaceItem.type !== 'notebook') return;
+          if (!this.notebookExecutionAllowed) {
+            this.showToast('Running notebooks is not available while masking policies apply to you.', 'error');
+            return;
+          }
           this.notebookRunningAll = true;
           this.kernelStatus = 'busy';
           try {
@@ -19309,6 +19697,7 @@
             const res = await fetch(`/api/table/${schemaName}/${tableName}${catParam}`);
             if (res.ok) {
               this.selectedTable = await res.json();
+              this.fetchTableGovernance(catalog, schemaName, tableName);
               // Ensure we show the schema & tests tab by default if no tab is active
               if (!this.activeCatalogTab) {
                 this.activeCatalogTab = 'schema';
@@ -23740,6 +24129,326 @@
         },
 
         // ==================== VOLUME AUTO-LOADER & VOLUMES METHODS ====================
+        // ==================== GOVERNANCE (tags + masking policies) ====================
+        get maskedResultColumns() {
+          return ((this.queryResult && this.queryResult.masked_columns) || []).map(m => (m.column || '').toLowerCase());
+        },
+        // masked at the table scan AND present in the result grid (columns the query did not select are not "masked in the result")
+        get maskedInResult() {
+          const r = this.queryResult;
+          if (!r || !r.masked_columns) return [];
+          const shown = new Set((r.columns || []).map(c => String(typeof c === 'string' ? c : c.name).toLowerCase()));
+          return r.masked_columns.filter(m => shown.has(String(m.column).toLowerCase()));
+        },
+        get tagAllowedValues() {
+          const t = this.govTags.find(x => x.tag_key === this.tagModal.key);
+          return (t && t.allowed_values) || [];
+        },
+        get policyTagValues() {
+          const t = this.govTags.find(x => x.tag_key === this.govPolicyForm.tag_key);
+          return (t && t.allowed_values) || [];
+        },
+        get govSuggestSelectedCount() {
+          return Object.values(this.govSuggestSel).filter(Boolean).length;
+        },
+
+        async govFetch(url, opts) {
+          const res = await fetch(url, opts);
+          let data = null;
+          try { data = await res.json(); } catch (e) { data = null; }
+          if (!res.ok) {
+            const detail = data && (typeof data.detail === 'string' ? data.detail : (data.error || JSON.stringify(data.detail || '')));
+            throw new Error(detail || ('Request failed (' + res.status + ')'));
+          }
+          return data;
+        },
+        govJson(method, body) {
+          return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+        },
+
+        async initGovernance() {
+          this.govLoading = true;
+          const isAdmin = this.currentUser?.role === 'admin';
+          try {
+            await Promise.all([
+              this.fetchGovTags(),
+              isAdmin ? this.fetchGovPolicies() : Promise.resolve(),
+              isAdmin ? this.fetchGovStatus() : Promise.resolve()
+            ]);
+          } finally {
+            this.govLoading = false;
+          }
+          if (!isAdmin && ['policies', 'preview', 'audit'].includes(this.govTab)) this.govTab = 'tags';
+        },
+        async fetchGovTags() {
+          try { this.govTags = (await this.govFetch('/api/governance/tags')).tags || []; }
+          catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async fetchGovPolicies() {
+          try { this.govPolicies = (await this.govFetch('/api/governance/masking-policies')).policies || []; }
+          catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async fetchGovStatus() {
+          try { this.govStatus = await this.govFetch('/api/governance/status'); }
+          catch (e) { this.govStatus = null; }
+        },
+        async fetchGovUsers() {
+          try { this.govUsers = (await this.govFetch('/api/users')).users || []; }
+          catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async fetchGovAudit() {
+          try {
+            const q = '/api/governance/audit?limit=100' + (this.govAuditFilter ? '&action=' + encodeURIComponent(this.govAuditFilter) : '');
+            this.govAudit = (await this.govFetch(q)).events || [];
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async fetchGovCoverage() {
+          try { this.govCoverage = await this.govFetch('/api/governance/coverage'); }
+          catch (e) { this.govCoverage = null; }
+        },
+        async reconcileGovTags() {
+          try {
+            const r = await this.govFetch('/api/governance/reconcile', { method: 'POST' });
+            this.showToast(`Checked ${r.checked} assignments: ${r.orphaned} newly orphaned, ${r.restored} restored`, 'success');
+            this.fetchGovCoverage(); this.fetchGovTags();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+
+        async createGovTag() {
+          const f = this.govNewTag;
+          if (!f.tag_key.trim()) { this.showToast('Enter a tag key', 'error'); return; }
+          try {
+            const values = f.allowed_values.split(',').map(v => v.trim()).filter(Boolean);
+            await this.govFetch('/api/governance/tags', this.govJson('POST', { tag_key: f.tag_key.trim(), description: f.description, allowed_values: values.length ? values : null }));
+            this.govNewTag = { tag_key: '', description: '', allowed_values: '' };
+            this.showToast('Tag defined', 'success');
+            this.fetchGovTags();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async deleteGovTag(t) {
+          if (!confirm(`Delete the tag '${t.tag_key}'?`)) return;
+          try {
+            await this.govFetch('/api/governance/tags/' + encodeURIComponent(t.tag_key), { method: 'DELETE' });
+          } catch (e) {
+            if (/in use/i.test(e.message) && confirm(e.message + '\n\nRemove it everywhere, including its masking policies?')) {
+              try { await this.govFetch('/api/governance/tags/' + encodeURIComponent(t.tag_key) + '?force=true', { method: 'DELETE' }); }
+              catch (e2) { this.showToast(e2.message, 'error'); return; }
+            } else if (!/in use/i.test(e.message)) { this.showToast(e.message, 'error'); return; }
+            else { return; }
+          }
+          this.showToast('Tag deleted', 'success');
+          this.fetchGovTags(); this.fetchGovPolicies(); this.fetchGovStatus();
+        },
+        async showGovTagUsage(key) {
+          try {
+            const d = await this.govFetch('/api/governance/tags/' + encodeURIComponent(key) + '/usage');
+            this.govUsage = d.assignments || [];
+            this.govUsageTag = key;
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+
+        openGovPolicyModal(p) {
+          this.govPolicyForm = p ? {
+            id: p.id, name: p.name, description: p.description || '', tag_key: p.tag_key, tag_value: p.tag_value || '',
+            mask_type: p.mask_type, mask_expr: p.mask_expr || '', applies_to_types: [...(p.applies_to_types || [])],
+            except_roles: [...(p.except_roles || [])], except_users_text: (p.except_users || []).join(', '),
+            priority: p.priority, enabled: p.enabled
+          } : {
+            id: null, name: '', description: '', tag_key: '', tag_value: '', mask_type: 'partial', mask_expr: '',
+            applies_to_types: [], except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true
+          };
+          this.govPolicyTest = { data_type: 'VARCHAR', value: '', result: null };
+          this.govPolicyValidation = null;
+          this.govPolicyModal = true;
+          this.validateGovPolicyDraft();
+        },
+        onGovMaskChange() { this.govPolicyTest.result = null; this.validateGovPolicyDraft(); },
+        govPolicyDraftBody(extra) {
+          const f = this.govPolicyForm;
+          return Object.assign({
+            mask_type: f.mask_type,
+            mask_expr: f.mask_type === 'custom' ? f.mask_expr : null,
+            applies_to_types: f.applies_to_types.length ? f.applies_to_types : null
+          }, extra || {});
+        },
+        async validateGovPolicyDraft() {
+          try { this.govPolicyValidation = await this.govFetch('/api/governance/masking-policies/validate', this.govJson('POST', this.govPolicyDraftBody())); }
+          catch (e) { this.govPolicyValidation = null; }
+        },
+        async testGovPolicyMask() {
+          const t = this.govPolicyTest;
+          try {
+            const d = await this.govFetch('/api/governance/masking-policies/validate', this.govJson('POST', this.govPolicyDraftBody({ data_type: t.data_type, value: t.value })));
+            this.govPolicyValidation = d;
+            if (d.custom && !d.custom.ok) { t.result = d.custom.errors.join(' '); return; }
+            t.result = d.sample ? (d.sample.ok ? (d.sample.masked === null ? 'NULL' : d.sample.masked) : ('error: ' + d.sample.error)) : '';
+          } catch (e) { t.result = 'error: ' + e.message; }
+        },
+        async saveGovPolicy() {
+          const f = this.govPolicyForm;
+          const body = {
+            name: f.name, description: f.description, tag_key: f.tag_key, tag_value: f.tag_value || null,
+            mask_type: f.mask_type, mask_expr: f.mask_type === 'custom' ? f.mask_expr : null,
+            applies_to_types: f.applies_to_types.length ? f.applies_to_types : null,
+            except_roles: f.except_roles, except_users: f.except_users_text.split(',').map(u => u.trim()).filter(Boolean),
+            priority: Number(f.priority), enabled: f.enabled
+          };
+          try {
+            await this.govFetch(f.id ? '/api/governance/masking-policies/' + f.id : '/api/governance/masking-policies', this.govJson(f.id ? 'PUT' : 'POST', body));
+            this.govPolicyModal = false;
+            this.showToast('Masking policy saved', 'success');
+            this.fetchGovPolicies(); this.fetchGovStatus(); this.fetchGovTags();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async toggleGovPolicy(p) {
+          try {
+            await this.govFetch('/api/governance/masking-policies/' + p.id, this.govJson('PUT', { enabled: !p.enabled }));
+            this.fetchGovPolicies(); this.fetchGovStatus();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async deleteGovPolicy(p) {
+          if (!confirm(`Delete the masking policy '${p.name}'? The columns it protected become visible.`)) return;
+          try {
+            await this.govFetch('/api/governance/masking-policies/' + p.id, { method: 'DELETE' });
+            this.showToast('Policy deleted', 'success');
+            this.fetchGovPolicies(); this.fetchGovStatus(); this.fetchGovTags();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+
+        async scanGovSuggestions() {
+          try {
+            const q = new URLSearchParams({ catalog: this.govSuggestCatalog || 'warehouse' });
+            if (this.govSuggestSchema) q.set('schema_name', this.govSuggestSchema);
+            const d = await this.govFetch('/api/governance/suggestions?' + q.toString());
+            this.govSuggestions = d.suggestions || [];
+            this.govSuggestScanned = d.scanned_columns || 0;
+            this.govSuggestSel = Object.fromEntries(this.govSuggestions.map((s, i) => [i, s.confidence >= 0.7]));
+            this.govSuggestScanDone = true;
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async applyGovSuggestions() {
+          const picked = this.govSuggestions.filter((s, i) => this.govSuggestSel[i]).map(s => ({
+            catalog: s.catalog, schema_name: s.schema_name, table_name: s.table_name, column_name: s.column_name,
+            tag_key: s.tag_key, tag_value: s.tag_value, source: 'suggested'
+          }));
+          if (!picked.length) { this.showToast('Select at least one suggestion', 'error'); return; }
+          try {
+            const r = await this.govFetch('/api/governance/tags/apply', this.govJson('POST', { assignments: picked }));
+            this.showToast(`Applied ${r.applied} tag(s)` + (r.failed ? `, ${r.failed} failed` : ''), r.failed ? 'info' : 'success');
+            this.fetchGovTags();
+            this.scanGovSuggestions();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+
+        async runGovPreviewAs() {
+          if (!this.govPreviewUser || !this.govPreviewSql.trim()) { this.showToast('Choose a user and enter SQL', 'error'); return; }
+          try {
+            this.govPreviewResult = await this.govFetch('/api/governance/preview-as', this.govJson('POST', { sql: this.govPreviewSql, as_user: this.govPreviewUser, catalog: 'warehouse' }));
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+
+        // ---- catalog explorer: tags and masking on the selected table
+        async fetchTableGovernance(catalog, schemaName, tableName) {
+          this.tableGov = null;
+          try {
+            const base = `/api/governance/${'{KIND}'}/${encodeURIComponent(catalog || 'warehouse')}/${encodeURIComponent(schemaName)}/${encodeURIComponent(tableName)}`;
+            const [tagsRes, effRes] = await Promise.all([
+              fetch(base.replace('{KIND}', 'objects') + '/tags'),
+              fetch(base.replace('{KIND}', 'effective'))
+            ]);
+            if (!tagsRes.ok || !effRes.ok) return;      // e.g. federated tables that are not in the local engine
+            const tagData = await tagsRes.json();
+            const eff = await effRes.json();
+            this.tableGov = { tags: tagData, eff: eff, masked_columns: eff.masked_columns || [], masked_count: (eff.masked_columns || []).length };
+          } catch (e) { this.tableGov = null; }
+        },
+        // NOTE: x-for over plain object arrays only. This Alpine build throws when items are removed from an x-for
+        // that destructures ([k, v] in Object.entries(...)).
+        govTableTags() {
+          const g = this.tableGov && this.tableGov.tags;
+          if (!g) return [];
+          const merged = {};
+          for (const [k, v] of Object.entries(g.catalog_tags || {})) merged[k] = { name: k, value: v, level: 'catalog' };
+          for (const [k, v] of Object.entries(g.schema_tags || {})) merged[k] = { name: k, value: v, level: 'schema' };
+          for (const [k, v] of Object.entries(g.table_tags || {})) merged[k] = { name: k, value: v, level: 'table' };
+          return Object.values(merged);
+        },
+        govColTags(name) {
+          const c = ((this.tableGov && this.tableGov.tags && this.tableGov.tags.columns) || []).find(x => x.column === name);
+          return c ? Object.entries(c.effective).map(([k, v]) => ({ name: k, value: v.value, level: v.level })) : [];
+        },
+        govEsc(value) {
+          return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        },
+        // Tag chips are rendered as one escaped HTML string: nested x-for lists that shrink (a tag removed, or the table
+        // governance state reloading) crash this Alpine build.
+        govChipsHtml(list, ownLevel, small) {
+          return (list || []).map(t => {
+            const own = t.level === ownLevel;
+            const cls = (small ? 'px-1.5 py-0.5 text-[10px] ' : 'px-2 py-0.5 ') + 'rounded border font-mono ' +
+              (own ? 'bg-emerald-950/70 text-emerald-300 border-emerald-800/60' : 'bg-slate-800 text-slate-400 border-slate-700');
+            const title = 'Set at ' + t.level + ' level' + (own ? '' : ' (inherited)');
+            return `<span class="${cls}" title="${this.govEsc(title)}">${this.govEsc(t.name)}${t.value ? '=' + this.govEsc(t.value) : ''}</span>`;
+          }).join('');
+        },
+        get govBehaviourList() {
+          const b = this.govPolicyValidation && this.govPolicyValidation.behaviour;
+          return b ? Object.entries(b).map(([family, what]) => ({ family, what })) : [];
+        },
+        govColMasked(name) {
+          const c = ((this.tableGov && this.tableGov.eff && this.tableGov.eff.columns) || []).find(x => x.column === name);
+          return c && c.masked && c.policy ? { name: c.policy.name, mask_type: c.policy.mask_type } : null;
+        },
+        openTagModal(level, column) {
+          const t = this.selectedTable;
+          if (!t) return;
+          const cat = t.catalog || 'warehouse';
+          const label = [cat, t.schema_name, t.table_name, level === 'column' ? column : null].filter(Boolean).join('.');
+          const g = this.tableGov && this.tableGov.tags;
+          let direct = {};
+          if (level === 'column') {
+            const c = ((g && g.columns) || []).find(x => x.column === column);
+            direct = (c && c.direct) || {};
+          } else {
+            direct = (g && g.table_tags) || {};
+          }
+          this.tagModal = { open: true, level, column: column || '', label, key: '', value: '',
+            direct: Object.entries(direct).map(([tag, val]) => ({ tag, val })) };
+          if (!this.govTags.length) this.fetchGovTags();
+        },
+        govTagUrl() {
+          const t = this.selectedTable;
+          const base = `/api/governance/objects/${encodeURIComponent(t.catalog || 'warehouse')}/${encodeURIComponent(t.schema_name)}/${encodeURIComponent(t.table_name)}`;
+          return this.tagModal.level === 'column' ? `${base}/columns/${encodeURIComponent(this.tagModal.column)}/tags` : `${base}/tags`;
+        },
+        async saveGovTagAssignment() {
+          if (!this.tagModal.key) return;
+          try {
+            await this.govFetch(this.govTagUrl(), this.govJson('PUT', { set: [{ tag_key: this.tagModal.key, tag_value: this.tagModal.value || '' }] }));
+            await this.afterGovTagChange();
+            this.tagModal.key = ''; this.tagModal.value = '';
+            this.showToast('Tag added', 'success');
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async removeGovTagAssignment(key) {
+          try {
+            await this.govFetch(this.govTagUrl(), this.govJson('PUT', { unset: [key] }));
+            await this.afterGovTagChange();
+            this.showToast('Tag removed', 'success');
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async afterGovTagChange() {
+          const t = this.selectedTable;
+          await this.fetchTableGovernance(t.catalog || 'warehouse', t.schema_name, t.table_name);
+          const g = this.tableGov && this.tableGov.tags;
+          const m = this.tagModal;
+          let direct = {};
+          if (m.level === 'column') { const c = ((g && g.columns) || []).find(x => x.column === m.column); direct = (c && c.direct) || {}; }
+          else { direct = (g && g.table_tags) || {}; }
+          this.tagModal.direct = Object.entries(direct).map(([tag, val]) => ({ tag, val }));
+          this.fetchGovTags();
+        },
+
         async initAutoLoader() {
           await Promise.all([
             this.fetchAutoloaderPipelines(),
@@ -23865,7 +24574,9 @@
             const res = await fetch('/api/autoloader/pipelines', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(this.newPipelineForm)
+              body: JSON.stringify(this.newPipelineForm.poll_interval_seconds === 'cron'
+                ? { ...this.newPipelineForm, poll_interval_seconds: 10 }
+                : { ...this.newPipelineForm, cron_schedule: '' })
             });
             const data = await res.json();
             if (res.ok) {
@@ -26371,6 +27082,10 @@
             this.currentView = 'jobs';
           } else if (node.node_type === 'FILE') {
             this.currentView = 'workspace';
+          } else if (node.node_type === 'VOLUME') {
+            this.currentView = 'autoloader';
+            this.autoloaderTab = 'volumes';
+            this.initAutoLoader();
           } else if (node.node_type === 'MODEL') {
             this.currentView = 'experiments';
             const rid = node.metadata?.run_id;

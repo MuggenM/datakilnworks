@@ -62,6 +62,11 @@ def init_history_db():
                 conn.execute("ALTER TABLE query_history ADD COLUMN executed_by TEXT DEFAULT 'local-studio';")
             except sqlite3.OperationalError:
                 pass
+            try:
+                # number of columns column-masking replaced in this query's result (governance)
+                conn.execute("ALTER TABLE query_history ADD COLUMN masked_columns INTEGER NOT NULL DEFAULT 0;")
+            except sqlite3.OperationalError:
+                pass
     except Exception as e:
         logger.error(f"Failed to initialize history database: {e}")
 
@@ -80,7 +85,8 @@ def log_query(
     warehouse_id: str = "wh_starter",
     catalog: str = "warehouse",
     profile_json: Optional[str] = None,
-    executed_by: Optional[str] = None
+    executed_by: Optional[str] = None,
+    masked_columns: int = 0
 ) -> str:
     query_id = f"q_{uuid.uuid4().hex[:8]}"
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -92,8 +98,8 @@ def log_query(
                 INSERT INTO query_history (
                     query_id, query_text, executed_at, duration_ms,
                     rows_produced, status, error_message, client,
-                    is_mutation, user, warehouse_id, catalog, profile_json, executed_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_mutation, user, warehouse_id, catalog, profile_json, executed_by, masked_columns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     query_id,
@@ -109,7 +115,8 @@ def log_query(
                     warehouse_id,
                     catalog,
                     profile_json,
-                    node_source
+                    node_source,
+                    int(masked_columns or 0)
                 )
             )
         return query_id

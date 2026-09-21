@@ -29,6 +29,7 @@ DEFAULT_JOBS = [
         "description": "Auto-ingests raw sensor telemetry, cleanses to silver layer, aggregates gold metrics, and compacts Delta files.",
         "schedule_cron": "0 * * * *",
         "enabled": True,
+        "created_by": "system",
         "created_at": "2026-09-12 03:00:00",
         "tasks": [
             {
@@ -190,7 +191,19 @@ def resolve_table_path(table_ref: str) -> str:
         return dbo_path
     return direct
 
-def execute_task(task: Dict[str, Any], conn) -> Dict[str, Any]:
+def job_principal(job: Dict[str, Any]):
+    """
+    Jobs run as their owner (`created_by`, set server-side when saved), so a masked owner cannot use a job to copy raw
+    columns into an untagged table. The seeded default jobs are system jobs; a job with no recorded owner is anonymous.
+    """
+    from web.governance import gateway
+    owner = job.get("created_by")
+    if not owner and job.get("id") in {j["id"] for j in DEFAULT_JOBS}:
+        owner = "system"
+    return gateway.principal_for_username(owner)
+
+
+def execute_task(task: Dict[str, Any], conn, principal=None) -> Dict[str, Any]:
     task_type = task.get("type", "sql").lower()
     task_name = task.get("name", task.get("id"))
     params = task.get("parameters", {})
@@ -202,7 +215,17 @@ def execute_task(task: Dict[str, Any], conn) -> Dict[str, Any]:
             query = params.get("query", "").strip()
             if not query:
                 raise ValueError("SQL task missing query parameter")
-            res = conn.sql(query)
+            from web.governance import gateway
+            gateway.ensure_masks(conn)
+            governed = gateway.govern_sql(query, principal, client="job", con=getattr(conn, "con", conn).cursor())
+            if governed.blocked:
+                raise ValueError(f"Blocked by governance: {governed.blocked}")
+            res = conn.sql(governed.sql)
+            if governed.exempt_reads:
+                try:
+                    gateway.propagate_tags(query, principal, governed, con=getattr(conn, "con", conn).cursor())
+                except Exception as e_prop:
+                    logger.warning(f"Tag propagation failed for job task: {e_prop}")
             duration_sec = round(time.perf_counter() - t0, 3)
             row_count = 0
             if res is not None and hasattr(res, "df"):
@@ -261,6 +284,8 @@ def execute_task(task: Dict[str, Any], conn) -> Dict[str, Any]:
             }
 
         elif task_type == "notebook":
+            from web.governance import gateway
+            gateway.deny_if_subject(principal, "Notebook tasks")
             nb_rel = params.get("notebook_path", "").strip()
             if not nb_rel:
                 raise ValueError("Notebook task missing notebook_path parameter")
@@ -357,6 +382,8 @@ def execute_task(task: Dict[str, Any], conn) -> Dict[str, Any]:
             }
 
         elif task_type == "dbt":
+            from web.governance import gateway
+            gateway.deny_if_subject(principal, "dbt tasks")
             from web.dbt_service import run_dbt_cli
             action = params.get("action", "run")
             select = params.get("select", None)
@@ -426,10 +453,11 @@ def topological_sort_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return tasks
     return sorted_tasks
 
-def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None) -> Dict[str, Any]:
+def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None, principal=None) -> Dict[str, Any]:
     job = get_job(job_id)
     if not job:
         raise ValueError(f"Job {job_id} not found")
+    principal = principal or job_principal(job)
 
     if conn is None:
         import duckrun
@@ -474,7 +502,7 @@ def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None) -> Dict[str, A
             overall_status = "FAILED"
             continue
 
-        res = execute_task(task, conn)
+        res = execute_task(task, conn, principal=principal)
         task_runs.append(res)
         if res["status"] != "SUCCESS":
             failed_tasks.add(task["id"])

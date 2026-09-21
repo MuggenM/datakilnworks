@@ -265,7 +265,15 @@ def execute_alert_check(alert_id: str, triggered_by: str = "scheduler", user_id:
         duck_conn = duckrun.connect(WAREHOUSE_DIR, read_only=True)
         sync_catalogs_with_duckrun(duck_conn)
 
-        rel = duck_conn.sql(query_text)
+        # The alert runs as its owner: a masked owner evaluates the condition on masked values.
+        from web.governance import gateway
+        gateway.ensure_masks(duck_conn)
+        owner = gateway.principal_for_username(alert.get("user_id"))
+        governed = gateway.govern_sql(query_text, owner, client="alert", con=duck_conn.con.cursor())
+        if governed.blocked:
+            raise ValueError(f"Blocked by governance: {governed.blocked}")
+
+        rel = duck_conn.sql(governed.sql)
         columns = rel.columns or []
         rows = rel.fetchall()
 

@@ -23,11 +23,14 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from web.auth import (
-    get_current_user, require_role, create_access_token, verify_password,
+    get_current_user, resolve_principal, require_role, create_access_token, verify_password,
     get_user_by_username, list_users, create_user, update_user, reset_user_password,
     delete_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db
 )
 from web import auth_frameworks, llm_settings
+from web.compute_auth import compute_headers
+from web.governance import gateway as gov_gateway
+from web.governance.enforce import GovernanceBlocked
 from web import onelake
 from web.permissions import (
     can_user_access_catalog, can_user_manage_catalog, can_user_delete_catalog,
@@ -77,8 +80,43 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Data Kiln Works Studio", version="2.4.0", docs_url="/api/docs", redoc_url="/api/redoc")
 
+async def _governance_reconcile_loop(interval_seconds: int = 6 * 3600):
+    """Flags tags whose table/column no longer exists (orphans) at startup and every few hours; never deletes them."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            from web.governance import tags as gov_tags
+            cur = get_duckrun_conn().con.cursor()
+            try:
+                result = await asyncio.to_thread(gov_tags.reconcile, cur, "system")
+            finally:
+                cur.close()
+            if result["orphaned"] or result["restored"]:
+                logger.info(f"Governance reconcile: {result}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e_rec:
+            logger.warning(f"Governance reconcile failed: {e_rec}")
+        await asyncio.sleep(interval_seconds)
+
+
+def _log_security_posture():
+    """Warns about configurations that undermine the governance trust boundary."""
+    from web.auth import governance_require_auth
+    from web.notebook_access import execution_mode
+    if not governance_require_auth():
+        logger.warning("Governance: GOVERNANCE_REQUIRE_AUTH is off; requests without credentials run as the local admin.")
+    if execution_mode() == "all":
+        logger.warning("Governance: GOVERNANCE_NOTEBOOK_EXECUTION=all; notebook code can read warehouse files directly, "
+                       "so column masking does not apply to it.")
+
+
 @app.on_event("startup")
 async def startup_event():
+    _log_security_posture()
+    from web.governance.store import init_governance_db
+    init_governance_db()
+    asyncio.create_task(_governance_reconcile_loop())
     asyncio.create_task(cron_scheduler_loop())
     init_auth_db()
     from web.alerts import alerts_scheduler_loop, init_alerts_db
@@ -113,6 +151,22 @@ async def shutdown_event():
     """Cleanup on shutdown."""
     from web.scheduled_exports import shutdown_scheduler
     shutdown_scheduler()
+
+from web import sandbox_client, sandbox_gateway
+from web.governance import routes as governance_routes
+app.include_router(governance_routes.router)
+app.include_router(sandbox_gateway.router)
+
+
+@app.middleware("http")
+async def _sandbox_isolation(request: Request, call_next):
+    """
+    Kernels in the notebook sandbox may only call /api/sandbox/*. Without this, a credential-less request from a kernel
+    would be the local admin in the default single-user mode and could read unmasked data through any other route.
+    """
+    if not request.url.path.startswith("/api/sandbox/") and sandbox_client.is_sandbox_peer(request.client.host if request.client else None):
+        return JSONResponse(status_code=403, content={"detail": "Notebook sandboxes may only use /api/sandbox/*."})
+    return await call_next(request)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -151,8 +205,6 @@ async def tutorial_redirect():
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 NOTEBOOKS_DIR = os.getenv("NOTEBOOKS_DIR", "/workspace/notebooks")
-JUPYTER_PORT = os.getenv("JUPYTER_PORT", "8890")
-JUPYTER_TOKEN = os.getenv("JUPYTER_TOKEN", "databricks")
 
 os.makedirs(WAREHOUSE_DIR, exist_ok=True)
 os.makedirs(NOTEBOOKS_DIR, exist_ok=True)
@@ -175,9 +227,26 @@ def get_duckrun_conn():
             register_duckdb_ai_functions(_duckrun_conn.con)
         except Exception as e:
             logger.warning(f"Failed registering DuckDB AI UDFs: {e}")
+        try:
+            from web.governance.macros import install_governance_macros
+            install_governance_macros(_duckrun_conn.con)
+        except Exception as e:
+            logger.error(f"Failed installing governance masks (masking policies will fail closed): {e}")
     else:
         sync_catalogs_with_duckrun(_duckrun_conn)
     return _duckrun_conn
+
+
+# Governance runs its metadata lookups (existence checks, column listings) on an isolated cursor.
+governance_routes.set_connection_provider(lambda: get_duckrun_conn().con.cursor())
+
+
+def _gov_or_403(sql: str, user, *, catalog: Optional[str] = None, client: str = "sql", trusted: bool = False) -> str:
+    """Runs `sql` through the governance gateway for `user`; returns the SQL to execute or raises HTTP 403."""
+    try:
+        return gov_gateway.governed_sql_or_raise(sql, user, catalog=catalog, client=client, trusted=trusted)
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 def clean_json_value(v: Any) -> Any:
     """Sanitizes individual values for RFC 7159/8259 compliant JSON serialization, replacing NaNs/Infs/NAs with None."""
@@ -268,16 +337,13 @@ async def index(request: Request):
     resp = templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={
-            "jupyter_port": JUPYTER_PORT,
-            "jupyter_token": JUPYTER_TOKEN,
-            "warehouse_dir": WAREHOUSE_DIR
-        }
+        context={"warehouse_dir": WAREHOUSE_DIR}
     )
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
+
 
 @app.get("/api/status")
 async def get_status():
@@ -289,8 +355,7 @@ async def get_status():
         "duckrun_version": getattr(duckrun, "__version__", "0.4.68"),
         "warehouse_dir": WAREHOUSE_DIR,
         "table_count": len(tables),
-        "status": "RUNNING",
-        "jupyter_url": f"http://localhost:{JUPYTER_PORT}/lab?token={JUPYTER_TOKEN}"
+        "status": "RUNNING"
     }
 
 # ==============================================================================
@@ -317,6 +382,10 @@ class UserUpdateRequest(BaseModel):
     is_active: Optional[bool] = None
 
 class PasswordResetRequest(BaseModel):
+    new_password: str
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
     new_password: str
 
 class CatalogPermissionRequest(BaseModel):
@@ -354,6 +423,23 @@ async def login_endpoint(payload: LoginRequest):
         samesite="lax",
         secure=False
     )
+    return resp
+
+
+@app.post("/api/auth/change-password")
+async def change_password_endpoint(payload: PasswordChangeRequest, request: Request):
+    """A signed-in user changes their own password (local accounts only; needs the current password)."""
+    from web.auth import change_own_password
+    user = await get_current_user(request)          # never resolve_principal: no credentials must not mean "local admin"
+    try:
+        change_own_password(user["id"], payload.current_password, payload.new_password)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    fresh = get_user_by_username(user["username"])
+    resp = JSONResponse(content={"success": True, "message": "Password changed. Other sessions were signed out."})
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh), max_age=86400, httponly=True, samesite="lax", secure=False)
     return resp
 
 
@@ -626,10 +712,7 @@ async def test_oidc_endpoint(
 
 @app.get("/api/catalogs")
 async def get_catalogs(request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     conn = get_duckrun_conn()
     sync_catalogs_with_duckrun(conn)
@@ -647,10 +730,7 @@ async def create_catalog_endpoint(
     payload: Dict[str, Any],
     request: Request
 ):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(
@@ -679,10 +759,7 @@ async def create_catalog_endpoint(
 
 @app.delete("/api/catalogs/{cat_id}")
 async def delete_catalog_endpoint(cat_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if cat_id == "warehouse":
         raise HTTPException(
@@ -720,10 +797,7 @@ async def delete_catalog_endpoint(cat_id: str, request: Request):
 
 @app.get("/api/catalogs/{cat_id}/permissions")
 async def get_catalog_permissions_endpoint(cat_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if not can_user_manage_catalog(current_user, cat_id):
         raise HTTPException(
@@ -739,10 +813,7 @@ async def grant_catalog_permission_endpoint(
     payload: CatalogPermissionRequest,
     request: Request
 ):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     target = payload.user_id or payload.username
     if not target:
@@ -762,10 +833,7 @@ async def revoke_catalog_permission_endpoint(
     target_user_id: str,
     request: Request
 ):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     ok = revoke_catalog_permission(
         catalog_id=cat_id,
@@ -798,10 +866,7 @@ class OneLakeMountRequest(BaseModel):
 @app.post("/api/catalogs/onelake/mount")
 async def mount_onelake_catalog_endpoint(payload: OneLakeMountRequest, request: Request):
     """Mount OneLake lakehouse as read-only external catalog."""
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Only admins can mount external catalogs
     if current_user.get("role") != "admin":
@@ -949,8 +1014,15 @@ class OneLakeQueryRequest(BaseModel):
     filters: Optional[List] = None
 
 @app.post("/api/catalogs/onelake/{catalog_id}/query")
-async def query_onelake_table_endpoint(catalog_id: str, payload: OneLakeQueryRequest):
+async def query_onelake_table_endpoint(catalog_id: str, payload: OneLakeQueryRequest, request: Request):
     """Query OneLake table."""
+    onelake_user = await resolve_principal(request)
+    if not can_user_access_catalog(onelake_user, catalog_id, action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot query catalog '{catalog_id}'.")
+    try:
+        gov_gateway.deny_if_subject(onelake_user, "Direct OneLake queries")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     catalog = onelake.get_onelake_catalog(catalog_id)
 
     if not catalog:
@@ -983,10 +1055,7 @@ async def query_onelake_table_endpoint(catalog_id: str, payload: OneLakeQueryReq
 @app.delete("/api/catalogs/onelake/{catalog_id}")
 async def unmount_onelake_catalog_endpoint(catalog_id: str, request: Request):
     """Unmount OneLake catalog."""
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Only admins can unmount external catalogs
     if current_user.get("role") != "admin":
@@ -1198,8 +1267,13 @@ async def scale_warehouse_endpoint(wh_id: str, payload: Dict[str, Any]):
     return res
 
 @app.post("/api/compute/warehouses/{wh_id}/distributed-query")
-async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any]):
+async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any], request: Request):
     """Executes a distributed Map-Reduce query across Delta Lake Parquet partitions using Ray tasks."""
+    scan_user = await resolve_principal(request)
+    try:
+        gov_gateway.deny_if_subject(scan_user, "Distributed Delta scans")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     table_path = payload.get("table_path")
     select_clause = payload.get("select", "*")
     where_clause = payload.get("where", "")
@@ -1209,6 +1283,10 @@ async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any]):
 
     if not os.path.isabs(table_path):
         table_path = os.path.join(WAREHOUSE_DIR, table_path)
+    if scan_user.get("role") != "admin":
+        from web.governance.enforce import resolve_path
+        if resolve_path(table_path, "warehouse").kind != "table":
+            raise HTTPException(status_code=403, detail="Only warehouse tables can be scanned.")
 
     res = ray_manager.execute_distributed_delta_scan(
         warehouse_id=wh_id,
@@ -1219,10 +1297,13 @@ async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any]):
     return res
 
 @app.delete("/api/table/{schema_name}/{table_name}")
-async def drop_table_api(schema_name: str, table_name: str, catalog: Optional[str] = "warehouse"):
+async def drop_table_api(schema_name: str, table_name: str, request: Request, catalog: Optional[str] = "warehouse"):
     schema_clean = sanitize_identifier(schema_name)
     table_clean = sanitize_identifier(table_name)
     target_catalog = catalog or "warehouse"
+    drop_user = await resolve_principal(request)
+    if not can_user_access_catalog(drop_user, target_catalog, action="WRITE"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot modify catalog '{target_catalog}'.")
 
     conn = get_duckrun_conn()
     if target_catalog != "warehouse":
@@ -1248,6 +1329,14 @@ async def drop_table_api(schema_name: str, table_name: str, catalog: Optional[st
     except Exception as e:
         logger.warning(f"Error removing dropped table directory {dt_path}: {e}")
 
+    try:
+        from web.governance import tags as gov_tags
+        removed = gov_tags.drop_object(target_catalog, schema_clean, table_clean, actor=drop_user.get("username", "system"))
+        if removed:
+            logger.info(f"Removed {removed} governance tag(s) of dropped table {table_ref}")
+    except Exception as e_tags:
+        logger.warning(f"Could not clean governance tags of {table_ref}: {e_tags}")
+
     return {
         "success": True,
         "message": f"Successfully dropped table {table_ref}"
@@ -1256,13 +1345,9 @@ async def drop_table_api(schema_name: str, table_name: str, catalog: Optional[st
 @app.get("/api/table/{schema_name}/{table_name}")
 async def get_table_details(schema_name: str, table_name: str, catalog: Optional[str] = None, request: Request = None):
     cat_id = catalog or "warehouse"
-    if request:
-        try:
-            current_user = await get_current_user(request)
-        except Exception:
-            current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
-        if not can_user_access_catalog(current_user, cat_id, action="READ"):
-            raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
+    current_user = await resolve_principal(request)
+    if not can_user_access_catalog(current_user, cat_id, action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
     # Check if catalog is an external storage mount
     from web.mounts import load_mounts
     mounts = {m["catalog_name"]: m for m in load_mounts() if m.get("enabled", True)}
@@ -1516,10 +1601,7 @@ async def get_table_details(schema_name: str, table_name: str, catalog: Optional
 async def preview_table(schema_name: str, table_name: str, limit: int = 50, version: Optional[int] = None, catalog: Optional[str] = None, request: Request = None):
     cat_id = catalog or "warehouse"
     if request:
-        try:
-            current_user = await get_current_user(request)
-        except Exception:
-            current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+        current_user = await resolve_principal(request)
         if not can_user_access_catalog(current_user, cat_id, action="READ"):
             raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
     conn = get_duckrun_conn()
@@ -1558,7 +1640,8 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
             else:
                 query_target = f"{catalog}.{schema_name}.{table_name}"
 
-            df = conn.sql(f"SELECT * FROM {query_target} LIMIT {int(limit)}").df()
+            preview_sql = _gov_or_403(f"SELECT * FROM {query_target} LIMIT {int(limit)}", current_user, catalog=catalog, client="preview")
+            df = conn.sql(preview_sql).df()
             df_clean = df.replace({np.nan: None, np.inf: None, -np.inf: None})
             rows = [
                 {col: clean_json_value(val) for col, val in row.items()}
@@ -1634,7 +1717,7 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
         else:
             query = f"SELECT * FROM delta_scan('{target_path}') LIMIT {limit}"
 
-        res = conn.sql(query)
+        res = conn.sql(_gov_or_403(query, current_user, catalog=catalog, client="preview"))
         df = res.df()
         columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
         rows = [json_serializable_row(row) for row in df.to_dict(orient="records")]
@@ -1643,6 +1726,8 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
             "rows": rows,
             "row_count": len(rows)
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1662,10 +1747,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
     if not query:
         return {"success": False, "error": "Empty query"}
 
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Enforce zero-trust catalog permissions
     try:
@@ -1681,6 +1763,19 @@ async def execute_sql(payload: QueryRequest, request: Request):
     conn = get_duckrun_conn()
     wh = apply_warehouse_compute(conn, payload.warehouse_id)
     start_time = time.perf_counter()
+
+    # Column masking / statement gating. `query` stays the user's text (history, lineage); `run_sql` is what executes,
+    # and it is what every dispatch path below (worker, Ray, local) receives.
+    fallback_note = "Studio (local DuckDB)"        # executed_by label when no worker/Ray pool ran the query
+    gov = await asyncio.to_thread(gov_gateway.govern_sql, query, current_user, catalog=payload.catalog, client="sql_editor")
+    if gov.blocked:
+        qid = log_query(query_text=query, duration_ms=0, rows_produced=0, status="FAILED", error_message=gov.blocked,
+                        client="SQL_EDITOR", warehouse_id=wh["id"] if wh else "wh_starter", catalog=payload.catalog or "warehouse",
+                        user=current_user.get("username", "admin"))
+        return {"success": False, "query_id": qid, "error": gov.blocked, "governance_blocked": True, "elapsed_ms": 0,
+                "warehouse_id": wh["id"] if wh else "wh_starter"}
+    run_sql = gov.sql
+    masked_info = gov_gateway.masked_columns_payload(gov)
 
     execution_id = payload.execution_id or f"exec_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
     active_entry = {
@@ -1719,11 +1814,11 @@ async def execute_sql(payload: QueryRequest, request: Request):
                     for ep in endpoints_to_try:
                         try:
                             active_entry["endpoint"] = ep
-                            with httpx.Client(timeout=45.0) as client:
+                            with httpx.Client(timeout=45.0, headers=compute_headers()) as client:
                                 resp = client.post(
                                     f"{ep}/api/compute/execute",
                                     json={
-                                        "query": query,
+                                        "query": run_sql,
                                         "warehouse_id": wh["id"],
                                         "catalog": payload.catalog or "warehouse",
                                         "execution_id": execution_id
@@ -1739,7 +1834,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
             # 2. Attempt Ray Actor Pool Dispatch (if Ray is active or warehouse has ray_workers configured)
             if wh and RAY_INSTALLED and (wh.get("id") in ray_manager.actor_pools or wh.get("ray_workers", 0) > 0):
                 try:
-                    ray_res = ray_manager.execute_query(wh["id"], query)
+                    ray_res = ray_manager.execute_query(wh["id"], run_sql)
                     if ray_res and ray_res.get("success"):
                         return ("remote", {
                             "success": True,
@@ -1755,14 +1850,14 @@ async def execute_sql(payload: QueryRequest, request: Request):
 
             # 3. Local In-Process DuckDB Execution (with dedicated cursor isolation & interrupt support)
             is_delta_special = (
-                any(k in query.lower() for k in ["describe detail", "describe history", "restore table", "vacuum"])
-                or any(query.strip().lower().startswith(p) for p in ["insert ", "update ", "delete ", "merge "])
+                any(k in run_sql.lower() for k in ["describe detail", "describe history", "restore table", "vacuum"])
+                or any(run_sql.strip().lower().startswith(p) for p in ["insert ", "update ", "delete ", "merge "])
             )
             if not is_delta_special:
                 cur = conn.con.cursor()
                 active_entry["cursor"] = cur
                 try:
-                    res = cur.sql(query)
+                    res = cur.sql(run_sql)
                     if res is not None and hasattr(res, "df"):
                         df = res.df()
                         columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
@@ -1783,7 +1878,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                         pass
             else:
                 active_entry["cursor"] = conn.con
-                res = conn.sql(query)
+                res = conn.sql(run_sql)
                 if res is not None and hasattr(res, "df"):
                     df = res.df()
                     columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
@@ -1800,6 +1895,13 @@ async def execute_sql(payload: QueryRequest, request: Request):
 
         res_kind, res_data = await asyncio.to_thread(_execute_sync)
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
+        # An exempt user who materialises raw tagged columns into a new table must not create an untagged raw copy.
+        if gov.exempt_reads and (res_kind in ("select", "mutation") or (res_kind == "remote" and res_data.get("success"))):
+            try:
+                await asyncio.to_thread(gov_gateway.propagate_tags, query, current_user, gov, catalog=payload.catalog)
+            except Exception as e_prop:
+                logger.warning(f"Tag propagation failed: {e_prop}")
 
         try:
             from web.lineage import record_query_lineage
@@ -1826,6 +1928,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 res_data["execution_id"] = execution_id
                 return res_data
             elif res_data.get("success"):
+                res_data["masked_columns"] = masked_info
                 qid = log_query(
                     query_text=query,
                     duration_ms=elapsed_ms,
@@ -1836,7 +1939,8 @@ async def execute_sql(payload: QueryRequest, request: Request):
                     warehouse_id=wh["id"] if wh else "wh_starter",
                     catalog=payload.catalog or "warehouse",
                     user=current_user.get("username", "admin"),
-                    executed_by=node_id
+                    executed_by=node_id,
+                    masked_columns=len(masked_info)
                 )
                 res_data["query_id"] = qid
                 res_data["execution_id"] = execution_id
@@ -1871,10 +1975,12 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 warehouse_id=wh["id"] if wh else "wh_starter",
                 catalog=payload.catalog or "warehouse",
                 user=current_user.get("username", "admin"),
-                executed_by=fallback_note
+                executed_by=fallback_note,
+                masked_columns=len(masked_info)
             )
             return {
                 "success": True,
+                "masked_columns": masked_info,
                 "query_id": qid,
                 "execution_id": execution_id,
                 "is_mutation": False,
@@ -1977,10 +2083,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
 @app.post("/api/sql/cancel/{execution_id}")
 async def cancel_query(execution_id: str, request: Request):
     """Cancels an ongoing SQL query execution via DuckDB cursor interrupt."""
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     active = ACTIVE_QUERIES.get(execution_id)
     if not active:
@@ -2009,7 +2112,7 @@ async def cancel_query(execution_id: str, request: Request):
     if endpoint:
         try:
             import httpx
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, headers=compute_headers()) as client:
                 resp = client.post(f"{endpoint}/api/compute/cancel/{execution_id}")
                 if resp.status_code == 200 and resp.json().get("success"):
                     interrupted = True
@@ -2095,11 +2198,17 @@ async def export_sql_parquet_endpoint(payload: Dict[str, Any], request: Request)
     # Strategy 2: If query is provided, execute COPY via active DuckDB session
     if query:
         import tempfile
+        export_user = await resolve_principal(request)
+        try:
+            enforce_sql_permissions(query, export_user, action="READ")
+        except HTTPException as e_perm:
+            raise HTTPException(status_code=403, detail=e_perm.detail)
+        governed_query = await asyncio.to_thread(_gov_or_403, query.rstrip("; \t\n"), export_user, client="export")
         try:
             def do_export_query():
                 conn = get_duckrun_conn()
                 raw_conn = getattr(conn, "con", conn)
-                clean_q = query.rstrip("; \t\n")
+                clean_q = governed_query
                 with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
                     tmp_path = tmp.name
                 try:
@@ -2136,10 +2245,7 @@ async def profile_sql(payload: QueryRequest, request: Request):
     if not query:
         return {"success": False, "error": "Empty query"}
 
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     # Enforce zero-trust catalog permissions
     try:
@@ -2156,8 +2262,12 @@ async def profile_sql(payload: QueryRequest, request: Request):
     wh = apply_warehouse_compute(conn, payload.warehouse_id)
     start_time = time.perf_counter()
 
+    gov = await asyncio.to_thread(gov_gateway.govern_sql, query, current_user, catalog=payload.catalog, client="profile")
+    if gov.blocked:
+        return {"success": False, "error": gov.blocked, "governance_blocked": True, "elapsed_ms": 0, "profile": None}
+
     try:
-        res = execute_profiled_query(conn, query)
+        res = execute_profiled_query(conn, gov.sql)
         elapsed_ms = res["elapsed_ms"]
         profile_obj = res.get("profile")
         profile_json_str = json.dumps(profile_obj) if profile_obj else None
@@ -2254,7 +2364,8 @@ async def get_copilot_providers_api():
 
 
 @app.get("/api/workspace/files")
-async def get_workspace_files():
+async def get_workspace_files(request: Request):
+    await resolve_principal(request)
     files = []
     if os.path.exists(NOTEBOOKS_DIR):
         for name in sorted(os.listdir(NOTEBOOKS_DIR)):
@@ -2264,8 +2375,7 @@ async def get_workspace_files():
                     "name": name,
                     "size_bytes": os.path.getsize(full),
                     "modified": datetime.datetime.fromtimestamp(os.path.getmtime(full)).strftime("%Y-%m-%d %H:%M"),
-                    "is_notebook": name.endswith(".ipynb"),
-                    "url": f"http://localhost:{JUPYTER_PORT}/lab/tree/notebooks/{name}?token={JUPYTER_TOKEN}"
+                    "is_notebook": name.endswith(".ipynb")
                 })
     return {"files": files}
 
@@ -2734,14 +2844,15 @@ class IngestCommitRequest(BaseModel):
 
 @app.post("/api/ingest/create")
 async def ingest_create(payload: IngestCommitRequest, request: Request):
+    # file_id comes back from the client: it must be exactly the id /api/ingest/preview handed out, or the wizard
+    # becomes an arbitrary file reader (e.g. ingesting a tagged table's parquet files into an untagged table).
+    if not re.fullmatch(r"upload_[0-9a-f]{12}\.[A-Za-z0-9]{1,8}", payload.file_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid upload id.")
     temp_path = os.path.join(UPLOADS_DIR, payload.file_id)
     if not os.path.exists(temp_path):
         raise HTTPException(status_code=404, detail="Uploaded file session expired or not found. Please upload again.")
 
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     target_catalog = payload.catalog or "warehouse"
     if not can_user_access_catalog(current_user, target_catalog, action="WRITE"):
@@ -3058,7 +3169,7 @@ async def list_dashboards():
     }
 
 @app.get("/api/dashboards/{dashboard_id}")
-async def get_dashboard(dashboard_id: str, params: Optional[str] = None):
+async def get_dashboard(dashboard_id: str, request: Request, params: Optional[str] = None):
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -3074,12 +3185,13 @@ async def get_dashboard(dashboard_id: str, params: Optional[str] = None):
         except Exception:
             pass
 
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
-    filter_data = get_dashboard_filter_options(conn, target["id"])
+    filter_data = get_dashboard_filter_options(conn, target["id"], principal=current_user)
     hydrated_widgets = []
     for w in target.get("widgets", []):
         w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], parsed_params)
+        exec_res = execute_widget_query(conn, w["query"], parsed_params, principal=current_user)
         w_copy["result"] = exec_res
         hydrated_widgets.append(w_copy)
 
@@ -3097,17 +3209,18 @@ class DashboardQueryParams(BaseModel):
     parameters: Optional[Dict[str, Any]] = {}
 
 @app.post("/api/dashboards/{dashboard_id}/query")
-async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams):
+async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams, request: Request):
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Dashboard not found")
 
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     hydrated_widgets = []
     for w in target.get("widgets", []):
         w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], payload.parameters or {})
+        exec_res = execute_widget_query(conn, w["query"], payload.parameters or {}, principal=current_user)
         w_copy["result"] = exec_res
         hydrated_widgets.append(w_copy)
 
@@ -3117,9 +3230,10 @@ async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams):
     }
 
 @app.get("/api/dashboards/{dashboard_id}/filters")
-async def get_dashboard_filters(dashboard_id: str):
+async def get_dashboard_filters(dashboard_id: str, request: Request):
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
-    return get_dashboard_filter_options(conn, dashboard_id)
+    return get_dashboard_filter_options(conn, dashboard_id, principal=current_user)
 
 class CreateDashboardRequest(BaseModel):
     name: str
@@ -3177,7 +3291,7 @@ class WidgetPayload(BaseModel):
     history_query_id: Optional[str] = None
 
 @app.post("/api/dashboards/{dashboard_id}/widgets")
-async def add_widget(dashboard_id: str, payload: WidgetPayload):
+async def add_widget(dashboard_id: str, payload: WidgetPayload, request: Request):
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -3205,9 +3319,10 @@ async def add_widget(dashboard_id: str, payload: WidgetPayload):
     target["widgets"].append(new_widget)
     save_dashboards_store(dashboards)
 
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     new_widget_copy = dict(new_widget)
-    new_widget_copy["result"] = execute_widget_query(conn, new_widget["query"])
+    new_widget_copy["result"] = execute_widget_query(conn, new_widget["query"], principal=current_user)
     return new_widget_copy
 
 @app.delete("/api/dashboards/{dashboard_id}/widgets/{widget_id}")
@@ -3222,7 +3337,7 @@ async def delete_widget(dashboard_id: str, widget_id: str):
     return {"success": True, "deleted_widget_id": widget_id}
 
 @app.get("/api/dashboards/{dashboard_id}/widgets/{widget_id}/export")
-async def export_widget(dashboard_id: str, widget_id: str, format: str = "csv", params: Optional[str] = None):
+async def export_widget(dashboard_id: str, widget_id: str, request: Request, format: str = "csv", params: Optional[str] = None):
     """
     Export widget data in CSV or Parquet format.
     Params:
@@ -3250,9 +3365,10 @@ async def export_widget(dashboard_id: str, widget_id: str, format: str = "csv", 
             filter_params = {}
 
     # Execute the query
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     query = target_widget.get("query", "")
-    result = execute_widget_query(conn, query, filter_params)
+    result = execute_widget_query(conn, query, filter_params, principal=current_user)
 
     if not result.get("success"):
         raise HTTPException(status_code=500, detail=f"Query failed: {result.get('error')}")
@@ -4563,9 +4679,10 @@ class PreviewWidgetRequest(BaseModel):
     query: str
 
 @app.post("/api/dashboards/preview-widget")
-async def preview_widget(payload: PreviewWidgetRequest):
+async def preview_widget(payload: PreviewWidgetRequest, request: Request):
+    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
-    exec_res = execute_widget_query(conn, payload.query.strip())
+    exec_res = execute_widget_query(conn, payload.query.strip(), principal=current_user)
     return exec_res
 
 
@@ -4592,14 +4709,9 @@ class SavedQueryUpdateRequest(BaseModel):
 @app.get("/api/queries")
 async def list_saved_queries(request: Request, q: Optional[str] = None, tag: Optional[str] = None):
     from web.saved_queries import get_saved_queries
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     try:
         queries = get_saved_queries(q=q, tag=tag, user_id=username, is_admin=is_admin)
         return {"queries": queries}
@@ -4610,12 +4722,8 @@ async def list_saved_queries(request: Request, q: Optional[str] = None, tag: Opt
 @app.post("/api/queries")
 async def create_new_saved_query(payload: SavedQueryCreateRequest, request: Request):
     from web.saved_queries import create_saved_query
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     try:
         d = payload.dict()
         d["owner"] = username
@@ -4674,11 +4782,7 @@ async def list_query_history(
     user: Optional[str] = None
 ):
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
 
     target_user = user
     if current_user and current_user.get("role") == "user":
@@ -4705,7 +4809,8 @@ async def get_single_query_history(query_id: str):
     return record
 
 @app.get("/api/history/{query_id}/profile")
-async def get_history_query_profile(query_id: str):
+async def get_history_query_profile(query_id: str, request: Request):
+    profile_user = await resolve_principal(request)
     record = get_query_by_id(query_id)
     if not record:
         raise HTTPException(status_code=404, detail="Query audit record not found")
@@ -4719,7 +4824,10 @@ async def get_history_query_profile(query_id: str):
 
     # If not previously profiled, execute profiled query on-demand
     conn = get_duckrun_conn()
-    res = execute_profiled_query(conn, record["query_text"])
+    governed = await asyncio.to_thread(gov_gateway.govern_sql, record["query_text"], profile_user, client="history-profile")
+    if governed.blocked:
+        return {"success": False, "error": governed.blocked}
+    res = execute_profiled_query(conn, governed.sql)
     if res.get("profile"):
         save_query_profile(query_id, json.dumps(res["profile"]))
         return {"success": True, "query_id": query_id, "profile": res["profile"]}
@@ -4769,7 +4877,13 @@ async def list_jobs_endpoint():
     return {"jobs": enriched}
 
 @app.post("/api/jobs")
-async def save_job_endpoint(payload: Dict[str, Any]):
+async def save_job_endpoint(payload: Dict[str, Any], request: Request):
+    user = await resolve_principal(request)
+    existing = get_job(payload.get("id")) if payload.get("id") else None
+    if existing and existing.get("created_by") and user.get("role") != "admin" and existing["created_by"] != user.get("username"):
+        raise HTTPException(status_code=403, detail="Only the job's owner or an admin can change it.")
+    # Ownership is server-side: jobs run as their owner, so the client must not be able to name one.
+    payload["created_by"] = (existing or {}).get("created_by") or user.get("username")
     saved = create_or_update_job(payload)
     return saved
 
@@ -4782,14 +4896,19 @@ async def get_job_endpoint(job_id: str):
     return {"job": job, "runs": runs}
 
 @app.delete("/api/jobs/{job_id}")
-async def delete_job_endpoint(job_id: str):
+async def delete_job_endpoint(job_id: str, request: Request):
+    user = await resolve_principal(request)
+    existing = get_job(job_id)
+    if existing and existing.get("created_by") and user.get("role") != "admin" and existing["created_by"] != user.get("username"):
+        raise HTTPException(status_code=403, detail="Only the job's owner or an admin can delete it.")
     ok = delete_job(job_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"success": True, "deleted_id": job_id}
 
 @app.post("/api/jobs/{job_id}/run")
-async def trigger_job_run_endpoint(job_id: str):
+async def trigger_job_run_endpoint(job_id: str, request: Request):
+    await resolve_principal(request)          # authentication only: the job itself runs as its owner
     try:
         res = run_pipeline(job_id, trigger="MANUAL")
         return res
@@ -4818,14 +4937,9 @@ class DbtRunRequest(BaseModel):
 @app.get("/api/dbt/status")
 async def get_dbt_status_endpoint(request: Request):
     from web.dbt_service import get_dbt_status
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return get_dbt_status(user=username, is_admin=is_admin)
 
 @app.get("/api/dbt/models")
@@ -4844,12 +4958,13 @@ async def get_dbt_model_endpoint(model_name: str):
 @app.post("/api/dbt/run")
 async def run_dbt_endpoint(payload: DbtRunRequest, request: Request):
     from web.dbt_service import run_dbt_cli
-    username = "admin"
+    current_user = await resolve_principal(request)
     try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+        # dbt executes model SQL as the system and materialises raw results into an ungoverned database
+        gov_gateway.deny_if_subject(current_user, "Running dbt")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    username = current_user.get("username", "admin")
     res = run_dbt_cli(
         action=payload.action,
         select=payload.select,
@@ -4862,27 +4977,17 @@ async def run_dbt_endpoint(payload: DbtRunRequest, request: Request):
 @app.get("/api/dbt/runs")
 async def list_dbt_runs_endpoint(request: Request):
     from web.dbt_service import _load_runs_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return {"runs": _load_runs_history(user=username, is_admin=is_admin)}
 
 @app.get("/api/dbt/runs/{run_id}")
 async def get_dbt_run_endpoint(run_id: str, request: Request):
     from web.dbt_service import _load_runs_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     runs = _load_runs_history(user=username, is_admin=is_admin)
     matched = next((r for r in runs if r["run_id"] == run_id), None)
     if not matched:
@@ -4890,12 +4995,20 @@ async def get_dbt_run_endpoint(run_id: str, request: Request):
     return matched
 
 @app.get("/api/dbt/preview/{model_name}")
-async def preview_dbt_model_endpoint(model_name: str, limit: int = 50):
+async def preview_dbt_model_endpoint(model_name: str, request: Request, limit: int = 50):
+    try:
+        gov_gateway.deny_if_subject(await resolve_principal(request), "dbt model preview")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     from web.dbt_service import preview_dbt_model_data
     return preview_dbt_model_data(model_name, limit=limit)
 
 @app.get("/api/dbt/cte-preview/{model_name}/{cte_name}")
-async def preview_dbt_cte_endpoint(model_name: str, cte_name: str, limit: int = 50):
+async def preview_dbt_cte_endpoint(model_name: str, cte_name: str, request: Request, limit: int = 50):
+    try:
+        gov_gateway.deny_if_subject(await resolve_principal(request), "dbt CTE preview")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     from web.dbt_service import preview_cte_step
     return preview_cte_step(model_name, cte_name, limit=limit)
 
@@ -5021,7 +5134,11 @@ async def delete_dbt_source_endpoint(payload: DbtSourceDeleteRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/dbt/sources/{source_name}/{table_name}/preview")
-async def preview_dbt_source_endpoint(source_name: str, table_name: str, limit: int = 50):
+async def preview_dbt_source_endpoint(source_name: str, table_name: str, request: Request, limit: int = 50):
+    try:
+        gov_gateway.deny_if_subject(await resolve_principal(request), "dbt source preview")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     from web.dbt_service import preview_dbt_source
     return preview_dbt_source(source_name=source_name, table_name=table_name, limit=limit)
 
@@ -5093,14 +5210,9 @@ async def genie_config_endpoint():
 
 @app.get("/api/genie/chats")
 async def list_genie_chats_endpoint(request: Request):
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     scope_user = None if is_admin else username
     chats = load_chats(user=scope_user, is_admin=is_admin)
     return {"chats": chats}
@@ -5108,25 +5220,16 @@ async def list_genie_chats_endpoint(request: Request):
 @app.post("/api/genie/chats")
 async def create_genie_chat_endpoint(request: Request, payload: Optional[CreateChatPayload] = None):
     title = payload.title if payload and payload.title else "New Exploration"
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     new_chat = create_chat(title=title, user=username)
     return new_chat
 
 @app.get("/api/genie/chats/{chat_id}")
 async def get_genie_chat_endpoint(chat_id: str, request: Request):
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     chat = get_chat(chat_id, user=username, is_admin=is_admin)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -5134,14 +5237,9 @@ async def get_genie_chat_endpoint(chat_id: str, request: Request):
 
 @app.delete("/api/genie/chats/{chat_id}")
 async def delete_genie_chat_endpoint(chat_id: str, request: Request):
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     ok = delete_chat(chat_id, user=username, is_admin=is_admin)
     if not ok:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -5151,16 +5249,11 @@ async def delete_genie_chat_endpoint(chat_id: str, request: Request):
 async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload, request: Request):
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-    username = "admin"
-    is_admin = True
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
-    try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin)
+        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
@@ -5170,20 +5263,15 @@ async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload, req
 async def quick_ask_genie_endpoint(payload: GenieAskPayload, request: Request):
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     chat_id = payload.chat_id
     if not chat_id:
         new_chat = create_chat(title=payload.prompt[:35] + ("..." if len(payload.prompt) > 35 else ""), user=username)
         chat_id = new_chat["id"]
     try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin)
+        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
@@ -5216,11 +5304,7 @@ async def search_endpoint(
 async def get_workspace_tree_endpoint(request: Request):
     from web.workspace import get_workspace_tree
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     try:
         user_home = f"Users/{current_user['username']}" if current_user else "Users/admin"
         return {
@@ -5236,11 +5320,7 @@ async def get_workspace_tree_endpoint(request: Request):
 async def get_workspace_file_endpoint(path: str, request: Request):
     from web.workspace import get_file_details, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     if not can_access_workspace_path(path, current_user):
         raise HTTPException(status_code=403, detail="Access denied: Cannot access another user's private workspace.")
     try:
@@ -5261,11 +5341,7 @@ class WorkspaceCreatePayload(BaseModel):
 async def create_workspace_item_endpoint(payload: WorkspaceCreatePayload, request: Request):
     from web.workspace import create_workspace_item, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     # If target_dir is empty, default to user's home folder
     target_dir = payload.target_dir or (f"Users/{current_user['username']}" if current_user else "")
     if not can_access_workspace_path(target_dir, current_user, write=True):
@@ -5289,11 +5365,7 @@ class WorkspaceRenamePayload(BaseModel):
 async def rename_workspace_item_endpoint(payload: WorkspaceRenamePayload, request: Request):
     from web.workspace import rename_workspace_item, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     if not can_access_workspace_path(payload.old_rel_path, current_user, write=True):
         raise HTTPException(status_code=403, detail="Access denied: Cannot rename another user's private workspace items.")
     try:
@@ -5306,11 +5378,7 @@ async def rename_workspace_item_endpoint(payload: WorkspaceRenamePayload, reques
 async def delete_workspace_item_endpoint(path: str, request: Request):
     from web.workspace import delete_workspace_item, can_access_workspace_path
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     if not can_access_workspace_path(path, current_user, write=True):
         raise HTTPException(status_code=403, detail="Access denied: Cannot delete another user's private workspace items.")
     try:
@@ -5337,16 +5405,39 @@ async def upload_workspace_file_endpoint(file: UploadFile = File(...), target_di
 
 # ==================== NOTEBOOK EXECUTION APIS (NATIVE RUNNER) ====================
 
+async def _notebook_user(request: Request, path: str, *, write: bool = False, execute: bool = False) -> Dict[str, Any]:
+    """
+    Every notebook endpoint: authenticated, restricted to the caller's own Users/<name> folder and Shared (admins see all),
+    and code execution limited to principals that masking policies do not apply to (see web/notebook_access.py).
+    """
+    from web.notebook_access import execution_allowed, execution_denied_message
+    from web.workspace import can_access_workspace_path
+    user = await resolve_principal(request)
+    if not can_access_workspace_path(path, user, write=write or execute):
+        raise HTTPException(status_code=403, detail="Access denied: you cannot access this notebook.")
+    if execute and not execution_allowed(user):
+        raise HTTPException(status_code=403, detail=execution_denied_message())
+    return user
+
+
+def _notebook_sandboxed(user: Dict[str, Any]) -> bool:
+    """True when this user's kernels must live in the notebook sandbox (a masking policy applies to them)."""
+    from web.notebook_access import SANDBOX, execution_route
+    return execution_route(user) == SANDBOX
+
+
 class NotebookCellRunPayload(BaseModel):
     path: str
     cell_index: int
     source: Optional[str] = None
 
 @app.post("/api/workspace/notebook/cell/run")
-async def run_notebook_cell_endpoint(payload: NotebookCellRunPayload):
+async def run_notebook_cell_endpoint(payload: NotebookCellRunPayload, request: Request):
     from web.notebook_runner import execute_single_cell
+    user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return execute_single_cell(payload.path, payload.cell_index, payload.source)
+        return await asyncio.to_thread(execute_single_cell, payload.path, payload.cell_index, payload.source,
+                                       user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error executing notebook cell: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5355,10 +5446,11 @@ class NotebookRunAllPayload(BaseModel):
     path: str
 
 @app.post("/api/workspace/notebook/run_all")
-async def run_all_notebook_cells_endpoint(payload: NotebookRunAllPayload):
+async def run_all_notebook_cells_endpoint(payload: NotebookRunAllPayload, request: Request):
     from web.notebook_runner import execute_all_cells
+    user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return execute_all_cells(payload.path)
+        return await asyncio.to_thread(execute_all_cells, payload.path, user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error running all notebook cells: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5367,19 +5459,21 @@ class NotebookKernelPayload(BaseModel):
     path: str
 
 @app.post("/api/workspace/notebook/kernel/restart")
-async def restart_notebook_kernel_endpoint(payload: NotebookKernelPayload):
+async def restart_notebook_kernel_endpoint(payload: NotebookKernelPayload, request: Request):
     from web.notebook_runner import restart_notebook_kernel
+    user = await _notebook_user(request, payload.path, execute=True)
     try:
-        return restart_notebook_kernel(payload.path)
+        return await asyncio.to_thread(restart_notebook_kernel, payload.path, user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error restarting notebook kernel: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/workspace/notebook/kernel/status")
-async def get_notebook_kernel_status_endpoint(path: str):
+async def get_notebook_kernel_status_endpoint(path: str, request: Request):
     from web.notebook_runner import get_kernel_status
+    user = await _notebook_user(request, path)
     try:
-        return get_kernel_status(path)
+        return await asyncio.to_thread(get_kernel_status, path, user.get("username", "anonymous"), _notebook_sandboxed(user))
     except Exception as e:
         logger.error(f"Error checking notebook kernel status: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -5390,8 +5484,9 @@ class NotebookCellSavePayload(BaseModel):
     source: str
 
 @app.post("/api/workspace/notebook/cell/save")
-async def save_notebook_cell_endpoint(payload: NotebookCellSavePayload):
+async def save_notebook_cell_endpoint(payload: NotebookCellSavePayload, request: Request):
     from web.notebook_runner import save_cell_source
+    await _notebook_user(request, payload.path, write=True)
     try:
         return save_cell_source(payload.path, payload.cell_index, payload.source)
     except Exception as e:
@@ -5404,8 +5499,9 @@ class NotebookCellAddPayload(BaseModel):
     type: str = "code"
 
 @app.post("/api/workspace/notebook/cell/add")
-async def add_notebook_cell_endpoint(payload: NotebookCellAddPayload):
+async def add_notebook_cell_endpoint(payload: NotebookCellAddPayload, request: Request):
     from web.notebook_runner import add_new_cell
+    await _notebook_user(request, payload.path, write=True)
     try:
         return add_new_cell(payload.path, payload.after_index, payload.type)
     except Exception as e:
@@ -5413,8 +5509,9 @@ async def add_notebook_cell_endpoint(payload: NotebookCellAddPayload):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.delete("/api/workspace/notebook/cell")
-async def delete_notebook_cell_endpoint(path: str, cell_index: int):
+async def delete_notebook_cell_endpoint(path: str, cell_index: int, request: Request):
     from web.notebook_runner import delete_cell
+    await _notebook_user(request, path, write=True)
     try:
         return delete_cell(path, cell_index)
     except Exception as e:
@@ -5422,13 +5519,23 @@ async def delete_notebook_cell_endpoint(path: str, cell_index: int):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/workspace/notebook/clear_outputs")
-async def clear_notebook_outputs_endpoint(payload: NotebookKernelPayload):
+async def clear_notebook_outputs_endpoint(payload: NotebookKernelPayload, request: Request):
     from web.notebook_runner import clear_notebook_outputs
+    await _notebook_user(request, payload.path, write=True)
     try:
         return clear_notebook_outputs(payload.path)
     except Exception as e:
         logger.error(f"Error clearing notebook outputs: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/notebooks/access")
+async def get_notebook_access(request: Request):
+    """Whether the caller may run notebook code (masked users can open and edit notebooks, not run them)."""
+    from web.notebook_access import SANDBOX, execution_mode, execution_route
+    user = await resolve_principal(request)
+    route = await asyncio.to_thread(execution_route, user)
+    return {"execution_allowed": route is not None, "mode": execution_mode(), "sandboxed": route == SANDBOX}
 
 
 # ==================== RECENTS APIS (MULTI-USER TRACKING) ====================
@@ -5444,12 +5551,8 @@ class RecentRecordPayload(BaseModel):
 @app.post("/api/recents")
 async def record_recent_endpoint(payload: RecentRecordPayload, request: Request):
     from web.recents import record_recent
-    user = "admin"
-    try:
-        current_user = await get_current_user(request)
-        user = current_user.get("username", "admin")
-    except Exception:
-        user = request.headers.get("X-User") or payload.user or "admin"
+    current_user = await resolve_principal(request)
+    user = current_user.get("username", "admin")
     try:
         return record_recent(
             item_type=payload.item_type,
@@ -5472,12 +5575,8 @@ async def get_recents_endpoint(
     user: Optional[str] = None
 ):
     from web.recents import get_recents
-    user_id = user
-    try:
-        current_user = await get_current_user(request)
-        user_id = current_user.get("username", "admin")
-    except Exception:
-        user_id = request.headers.get("X-User") or user or "admin"
+    current_user = await resolve_principal(request)
+    user_id = current_user.get("username", "admin")
     try:
         return get_recents(user_id=user_id, item_type=type, search=search, limit=limit)
     except Exception as e:
@@ -5492,12 +5591,8 @@ class RecentPinPayload(BaseModel):
 @app.post("/api/recents/pin")
 async def toggle_pin_recent_endpoint(payload: RecentPinPayload, request: Request):
     from web.recents import toggle_pin_recent
-    user = "admin"
-    try:
-        current_user = await get_current_user(request)
-        user = current_user.get("username", "admin")
-    except Exception:
-        user = request.headers.get("X-User") or payload.user or "admin"
+    current_user = await resolve_principal(request)
+    user = current_user.get("username", "admin")
     try:
         return toggle_pin_recent(item_type=payload.item_type, item_id=payload.item_id, user_id=user)
     except Exception as e:
@@ -5512,12 +5607,8 @@ async def delete_recent_endpoint(
     user: Optional[str] = None
 ):
     from web.recents import delete_recent
-    user_id = user
-    try:
-        current_user = await get_current_user(request)
-        user_id = current_user.get("username", "admin")
-    except Exception:
-        user_id = request.headers.get("X-User") or user or "admin"
+    current_user = await resolve_principal(request)
+    user_id = current_user.get("username", "admin")
     try:
         success = delete_recent(item_type=item_type, item_id=item_id, user_id=user_id)
         return {"success": success, "item_type": item_type, "item_id": item_id}
@@ -5533,12 +5624,8 @@ async def clear_recents_endpoint(
     user: Optional[str] = None
 ):
     from web.recents import clear_recents
-    user_id = user
-    try:
-        current_user = await get_current_user(request)
-        user_id = current_user.get("username", "admin")
-    except Exception:
-        user_id = request.headers.get("X-User") or user or "admin"
+    current_user = await resolve_principal(request)
+    user_id = current_user.get("username", "admin")
     try:
         count = clear_recents(user_id=user_id, item_type=type, include_pinned=include_pinned)
         return {"success": True, "deleted_count": count}
@@ -5732,11 +5819,7 @@ async def mlflow_create_experiment_api(request: Request):
     from web.experiments import mlflow_create_experiment
     from web.auth import get_current_user
     body = await request.json()
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else (request.headers.get("X-User") or "admin")
     try:
         res = mlflow_create_experiment(body.get("name", ""), body.get("artifact_location"), user_id=user_id)
@@ -5748,11 +5831,7 @@ async def mlflow_create_experiment_api(request: Request):
 async def mlflow_list_experiments_api(request: Request, view_type: str = "ACTIVE_ONLY"):
     from web.experiments import mlflow_list_experiments
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else None
     is_admin = (current_user.get("role") == "admin") if current_user else True
     return {"experiments": mlflow_list_experiments(view_type=view_type, user_id=user_id, is_admin=is_admin)}
@@ -5762,11 +5841,7 @@ async def mlflow_list_experiments_api(request: Request, view_type: str = "ACTIVE
 async def mlflow_search_experiments_api(request: Request, view_type: str = "ACTIVE_ONLY"):
     from web.experiments import mlflow_list_experiments
     from web.auth import get_current_user
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else None
     is_admin = (current_user.get("role") == "admin") if current_user else True
     return {"experiments": mlflow_list_experiments(view_type=view_type, user_id=user_id, is_admin=is_admin)}
@@ -5839,11 +5914,7 @@ async def mlflow_create_run_api(request: Request):
     from web.experiments import mlflow_create_run
     from web.auth import get_current_user
     body = await request.json()
-    current_user = None
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
     user_id = current_user.get("username") if current_user else (request.headers.get("X-User") or "admin")
     try:
         run_data = mlflow_create_run(
@@ -6273,12 +6344,8 @@ async def api_playground_run(req: PlaygroundSingleRunRequest, request: Request):
         "top_p": req.top_p,
         "max_tokens": req.max_tokens
     }
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     return await run_and_record_single(
         config=config,
         rendered_prompt=req.prompt,
@@ -6292,12 +6359,8 @@ async def api_playground_run(req: PlaygroundSingleRunRequest, request: Request):
 async def api_playground_compare(req: PlaygroundCompareRunRequest, request: Request):
     from web.playground import run_comparison_prompts
     raw = req.raw_prompt if req.raw_prompt is not None else req.prompt
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     return await run_comparison_prompts(
         config_a=req.config_a,
         config_b=req.config_b,
@@ -6311,38 +6374,24 @@ async def api_playground_compare(req: PlaygroundCompareRunRequest, request: Requ
 @app.get("/api/playground/templates")
 async def api_playground_get_templates(request: Request, category: Optional[str] = None):
     from web.playground import get_templates
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return get_templates(category=category, user_id=username, is_admin=is_admin)
 
 @app.post("/api/playground/templates")
 async def api_playground_save_template(req: PlaygroundTemplateRequest, request: Request):
     from web.playground import save_template
-    username = "admin"
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
     return save_template(req.dict(), user_id=username)
 
 @app.delete("/api/playground/templates/{template_id}")
 async def api_playground_delete_template(template_id: str, request: Request):
     from web.playground import delete_template
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     ok = delete_template(template_id, user_id=username, is_admin=is_admin)
     if not ok:
         raise HTTPException(status_code=400, detail="Cannot delete template (might be built-in, not found, or not owned by you)")
@@ -6351,41 +6400,26 @@ async def api_playground_delete_template(template_id: str, request: Request):
 @app.get("/api/playground/history")
 async def api_playground_get_history(request: Request, limit: int = 50):
     from web.playground import get_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     return get_history(limit=limit, user_id=username, is_admin=is_admin)
 
 @app.delete("/api/playground/history/{hist_id}")
 async def api_playground_delete_history(hist_id: str, request: Request):
     from web.playground import delete_history_item
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     ok = delete_history_item(hist_id, user_id=username, is_admin=is_admin)
     return {"status": "SUCCESS" if ok else "NOT_FOUND"}
 
 @app.delete("/api/playground/history")
 async def api_playground_clear_history(request: Request):
     from web.playground import clear_history
-    username = "admin"
-    is_admin = True
-    try:
-        current_user = await get_current_user(request)
-        username = current_user.get("username", "admin")
-        is_admin = current_user.get("role") == "admin"
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    username = current_user.get("username", "admin")
+    is_admin = current_user.get("role") == "admin"
     clear_history(user_id=username, is_admin=is_admin)
     return {"status": "SUCCESS"}
 
@@ -6410,15 +6444,20 @@ async def get_table_diff_endpoint(
     table_name: str,
     v1: int,
     v2: int,
+    request: Request,
     catalog: Optional[str] = "warehouse",
     limit: int = 50
 ):
     from web.time_travel import resolve_table_path, compare_table_versions
+    diff_user = await resolve_principal(request)
+    if not can_user_access_catalog(diff_user, catalog or "warehouse", action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
     try:
-        return compare_table_versions(path, v1, v2, sample_limit=limit)
+        return compare_table_versions(path, v1, v2, sample_limit=limit, user=diff_user, catalog=cat_id or catalog or "warehouse",
+                                      schema_name=schema_name, table_name=table_name)
     except Exception as e:
         logger.error(f"Error diffing table versions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -6454,15 +6493,20 @@ async def preview_table_version_endpoint(
     schema_name: str,
     table_name: str,
     version: int,
+    request: Request,
     catalog: Optional[str] = "warehouse",
     limit: int = 50
 ):
     from web.time_travel import resolve_table_path, get_version_preview
+    preview_user = await resolve_principal(request)
+    if not can_user_access_catalog(preview_user, catalog or "warehouse", action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
     try:
-        return get_version_preview(path, version, limit=limit)
+        return get_version_preview(path, version, limit=limit, user=preview_user, catalog=cat_id or catalog or "warehouse",
+                                   schema_name=schema_name, table_name=table_name)
     except Exception as e:
         logger.error(f"Error previewing version: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -6481,13 +6525,10 @@ async def get_global_lineage_endpoint(
 ):
     from web.lineage import get_global_lineage
     allowed_catalogs = None
-    try:
-        current_user = await get_current_user(request)
-        if current_user.get("role") == "user":
-            perms = current_user.get("catalog_permissions") or []
-            allowed_catalogs = [p["catalog_id"] for p in perms] + ["warehouse", "dbt_analytics"]
-    except Exception:
-        pass
+    current_user = await resolve_principal(request)
+    if current_user.get("role") == "user":
+        perms = current_user.get("catalog_permissions") or []
+        allowed_catalogs = [p["catalog_id"] for p in perms] + ["warehouse", "dbt_analytics"]
     try:
         return get_global_lineage(layer=layer, schema=schema, search=search, allowed_catalogs=allowed_catalogs)
     except Exception as e:
@@ -6571,10 +6612,7 @@ async def list_mounts_endpoint():
 
 @app.post("/api/mounts")
 async def create_or_update_mount_endpoint(payload: Dict[str, Any], request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(
@@ -6610,10 +6648,7 @@ async def create_or_update_mount_endpoint(payload: Dict[str, Any], request: Requ
 
 @app.post("/api/mounts/{mount_id}/duplicate")
 async def duplicate_mount_endpoint(mount_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(
@@ -6643,10 +6678,7 @@ async def duplicate_mount_endpoint(mount_id: str, request: Request):
 
 @app.delete("/api/mounts/{mount_id}")
 async def delete_mount_endpoint(mount_id: str, request: Request):
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin", "id": "u_admin_01"}
+    current_user = await resolve_principal(request)
 
     if mount_id.startswith("onelake_"):
         cat_id = mount_id.replace("onelake_", "")
@@ -7021,10 +7053,7 @@ async def get_volumes_endpoint(catalog: Optional[str] = None, schema: Optional[s
 @app.post("/api/volumes")
 async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
     from web.volumes import create_volume
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
     
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can create volumes.")
@@ -7056,10 +7085,7 @@ async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
 @app.delete("/api/volumes/{catalog}/{schema}/{volume_name}")
 async def delete_volume_endpoint(catalog: str, schema: str, volume_name: str, request: Request):
     from web.volumes import delete_volume
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete volumes.")
@@ -7115,10 +7141,7 @@ async def delete_volume_file_endpoint(
     request: Request
 ):
     from web.volumes import delete_file_from_volume
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete files from volumes.")
@@ -7170,10 +7193,7 @@ async def get_autoloader_pipelines():
 @app.post("/api/autoloader/pipelines")
 async def create_autoloader_pipeline_endpoint(payload: Dict[str, Any], request: Request):
     from web.autoloader import create_pipeline
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can create Auto-Loader pipelines.")
@@ -7200,15 +7220,15 @@ async def get_autoloader_pipeline_endpoint(pipeline_id: str):
 @app.put("/api/autoloader/pipelines/{pipeline_id}")
 async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[str, Any], request: Request):
     from web.autoloader import update_pipeline
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can modify Auto-Loader pipelines.")
 
-    pipe = update_pipeline(pipeline_id, payload)
+    try:
+        pipe = update_pipeline(pipeline_id, payload)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     if not pipe:
         raise HTTPException(status_code=404, detail="Pipeline not found")
     return pipe
@@ -7217,10 +7237,7 @@ async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[st
 @app.delete("/api/autoloader/pipelines/{pipeline_id}")
 async def delete_autoloader_pipeline_endpoint(pipeline_id: str, request: Request):
     from web.autoloader import delete_pipeline
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete Auto-Loader pipelines.")
@@ -7232,6 +7249,7 @@ async def delete_autoloader_pipeline_endpoint(pipeline_id: str, request: Request
 
 
 @app.post("/api/autoloader/pipelines/{pipeline_id}/run")
+@app.post("/api/autoloader/pipelines/{pipeline_id}/run-now")
 async def run_autoloader_pipeline_now(pipeline_id: str):
     from web.autoloader import run_pipeline_cycle
     try:
@@ -7247,10 +7265,7 @@ async def run_autoloader_pipeline_now(pipeline_id: str):
 @app.post("/api/autoloader/pipelines/{pipeline_id}/reset")
 async def reset_autoloader_pipeline_checkpoints(pipeline_id: str, request: Request):
     from web.autoloader import reset_pipeline_checkpoints
-    try:
-        current_user = await get_current_user(request)
-    except Exception:
-        current_user = {"role": "admin", "username": "admin"}
+    current_user = await resolve_principal(request)
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can reset checkpoints.")

@@ -264,6 +264,14 @@ def delete_chat(chat_id: str, user: Optional[str] = None, is_admin: bool = True)
 
 # ==================== SCHEMA CONTEXT BUILDER ====================
 
+def _tags_in_use() -> bool:
+    try:
+        from web.governance import tags
+        return tags.has_any_tags()
+    except Exception:
+        return True          # if governance state cannot be read, assume tags exist (mask/omit samples)
+
+
 def extract_schema_context(conn=None) -> Dict[str, Any]:
     """
     Extracts table schemas, column data types, and sample rows
@@ -299,8 +307,16 @@ def extract_schema_context(conn=None) -> Dict[str, Any]:
 
             sample_rows = []
             try:
-                samples = conn.sql(f"SELECT * FROM {cat_name}.{schema_name}.{tbl_name} LIMIT 2").fetchall()
-                sample_rows = [list(sr) for sr in samples]
+                sample_sql = f'SELECT * FROM "{cat_name}"."{schema_name}"."{tbl_name}" LIMIT 2'
+                if _tags_in_use():
+                    # Samples go into LLM prompts: compute them as the LLM-context principal so tagged values are masked.
+                    from web.governance import gateway
+                    gateway.ensure_masks(conn)
+                    gov = gateway.govern_sql(sample_sql, gateway.LLM_CONTEXT, con=conn.con.cursor(), trusted=True)
+                    sample_sql = None if gov.blocked else gov.sql
+                if sample_sql:
+                    samples = conn.sql(sample_sql).fetchall()
+                    sample_rows = [list(sr) for sr in samples]
             except Exception:
                 pass
 
@@ -606,8 +622,11 @@ def call_heuristic_fallback(user_prompt: str, schema_info: Dict[str, Any]) -> Di
 
 # ==================== QUERY EXECUTION & LOGGING ====================
 
-def execute_genie_sql(sql: str, conn=None) -> Dict[str, Any]:
-    """Executes generated SQL in DuckDB and formats results for table & chart rendering."""
+def execute_genie_sql(sql: str, conn=None, principal=None) -> Dict[str, Any]:
+    """
+    Executes generated SQL in DuckDB and formats results for table & chart rendering.
+    The SQL runs as `principal` (a user dict or Principal; None means least privilege): LLM-written SQL gets no extra rights.
+    """
     if conn is None:
         import duckrun
         conn = duckrun.connect(WAREHOUSE_DIR, read_only=True)
@@ -615,7 +634,12 @@ def execute_genie_sql(sql: str, conn=None) -> Dict[str, Any]:
     start_time = time.perf_counter()
     try:
         clean_sql = sql.strip().rstrip(";")
-        cursor = conn.sql(clean_sql)
+        from web.governance import gateway
+        gateway.ensure_masks(conn)
+        governed = gateway.govern_sql(clean_sql, principal, client="genie", con=conn.con.cursor())
+        if governed.blocked:
+            raise ValueError(f"Blocked by governance: {governed.blocked}")
+        cursor = conn.sql(governed.sql)
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         desc = cursor.description or []
@@ -682,7 +706,8 @@ def ask_genie(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     user: str = "admin",
-    is_admin: bool = True
+    is_admin: bool = True,
+    principal=None
 ) -> Dict[str, Any]:
     """
     Main conversational pipeline:
@@ -799,7 +824,7 @@ def ask_genie(
     y_col = generated_plan.get("y_axis", "")
 
     # Execute query
-    exec_result = execute_genie_sql(sql_query)
+    exec_result = execute_genie_sql(sql_query, principal=principal)
 
     # If first query fails and we were using an LLM, attempt 1 quick self-correction
     if not exec_result["success"] and chosen_provider in ["ollama", "lmstudio", "openai", "gemini", "anthropic"]:
@@ -824,7 +849,7 @@ def ask_genie(
             if fixed_plan.get("sql"):
                 sql_query = fixed_plan["sql"]
                 explanation = fixed_plan.get("explanation", explanation) + " (Auto-corrected)"
-                exec_result = execute_genie_sql(sql_query)
+                exec_result = execute_genie_sql(sql_query, principal=principal)
         except Exception:
             pass
 

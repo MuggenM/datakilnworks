@@ -1,4 +1,5 @@
 import os
+import posixpath
 import json
 import shutil
 import time
@@ -57,7 +58,10 @@ def can_access_workspace_path(rel_path: str, current_user: Optional[Dict[str, An
     if role == "admin":
         return True
     username = (current_user.get("username") or "").strip().lower()
-    norm = (rel_path or "").strip().lstrip("/\\").replace("\\", "/")
+    # Normalise first: `Users/me/../someone_else/x` must be judged by where it actually lands, not by its prefix.
+    norm = posixpath.normpath("/" + (rel_path or "").strip().replace("\\", "/")).lstrip("/")
+    if norm == ".." or norm.startswith("../"):
+        return False
     
     if norm.startswith("Users/") or norm == "Users":
         parts = norm.split("/")

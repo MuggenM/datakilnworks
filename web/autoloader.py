@@ -13,6 +13,10 @@ from typing import Dict, Any, List, Optional
 
 import duckdb
 import pyarrow as pa
+try:
+    from croniter import croniter
+except ImportError:  # requirements.txt ships croniter; guard like web/workflow.py
+    croniter = None
 from deltalake import DeltaTable, write_deltalake
 
 from web.volumes import resolve_volume_posix_path, get_volume_physical_path
@@ -76,6 +80,11 @@ def init_autoloader_db():
     );
     """)
 
+    # Additive migrations for databases created by earlier versions
+    existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(autoloader_pipelines)").fetchall()}
+    if "cron_schedule" not in existing_cols:
+        cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN cron_schedule TEXT")
+
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_file_history_pipeline ON autoloader_file_history(pipeline_id);
     """)
@@ -118,6 +127,36 @@ def get_pipeline(pipeline_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def normalize_cron(expr: Optional[str]) -> Optional[str]:
+    """Validates a 5-field cron expression (evaluated in UTC); returns None for empty input."""
+    expr = " ".join((expr or "").split())
+    if not expr:
+        return None
+    if croniter is None:
+        raise ValueError("Cron schedules require the 'croniter' package.")
+    if len(expr.split(" ")) != 5 or not croniter.is_valid(expr):
+        raise ValueError(f"Invalid cron expression '{expr}'. Use 5 fields, e.g. '*/15 * * * *'.")
+    return expr
+
+
+def cron_is_due(expr: str, last_run_iso: Optional[str], now: datetime) -> bool:
+    """True when a cron tick has elapsed since the last run (UTC). A never-run pipeline is due immediately."""
+    if not last_run_iso:
+        return True
+    last_run = datetime.strptime(last_run_iso, "%Y-%m-%d %H:%M:%S")
+    return croniter(expr, last_run).get_next(datetime) <= now
+
+
+INGEST_MODES = ("append", "merge", "overwrite")
+
+
+def _validate_pipeline_mode(ingest_mode: str, merge_keys: str):
+    if ingest_mode not in INGEST_MODES:
+        raise ValueError(f"Unknown ingest mode '{ingest_mode}'. Use append, merge or overwrite.")
+    if ingest_mode == "merge" and not _parse_merge_keys(merge_keys):
+        raise ValueError("Merge mode requires at least one merge key (comma-separated column names).")
+
+
 def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str, Any]:
     """Creates a new Auto-Loader pipeline."""
     init_autoloader_db()
@@ -131,10 +170,12 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     target_tbl = (data.get("target_table") or "").strip().lower()
     ingest_mode = (data.get("ingest_mode") or "append").strip().lower()
     merge_keys = (data.get("merge_keys") or "").strip()
-    schema_evol = (data.get("schema_evolution") or "addNewColumns").strip()
+    schema_evol = normalize_schema_evolution(data.get("schema_evolution"))
     poll_sec = max(5, int(data.get("poll_interval_seconds", 10)))
     enabled = 1 if data.get("enabled", True) else 0
 
+    _validate_pipeline_mode(ingest_mode, merge_keys)
+    cron_schedule = normalize_cron(data.get("cron_schedule"))
     if not source_vol:
         raise ValueError("Source volume path is required (e.g. /Volumes/warehouse/raw/iot_stream).")
     if not target_tbl:
@@ -148,19 +189,21 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
             id, name, description, source_volume_path, file_pattern,
             target_catalog, target_schema, target_table, ingest_mode,
             merge_keys, schema_evolution, poll_interval_seconds, enabled,
-            status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0)
+            status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested, cron_schedule
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?)
     """, (
         pipeline_id, name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        created_by, now_iso
+        created_by, now_iso, cron_schedule
     ))
     conn.commit()
     conn.close()
 
     logger.info(f"Created Auto-Loader pipeline '{name}' ({pipeline_id}): {source_vol} -> {target_cat}.{target_sch}.{target_tbl}")
-    return get_pipeline(pipeline_id)
+    created = get_pipeline(pipeline_id)
+    sync_pipeline_lineage(created)
+    return created
 
 
 def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -178,31 +221,40 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     target_tbl = data.get("target_table", pipe["target_table"])
     ingest_mode = data.get("ingest_mode", pipe["ingest_mode"])
     merge_keys = data.get("merge_keys", pipe["merge_keys"])
-    schema_evol = data.get("schema_evolution", pipe["schema_evolution"])
+    schema_evol = normalize_schema_evolution(data.get("schema_evolution", pipe["schema_evolution"]))
     poll_sec = max(5, int(data.get("poll_interval_seconds", pipe["poll_interval_seconds"])))
     enabled = 1 if data.get("enabled", pipe["enabled"]) else 0
+    ingest_mode = (ingest_mode or "append").strip().lower()
+    _validate_pipeline_mode(ingest_mode, merge_keys)
+    cron_schedule = normalize_cron(data["cron_schedule"]) if "cron_schedule" in data else pipe.get("cron_schedule")
 
     conn = get_db()
     conn.execute("""
         UPDATE autoloader_pipelines SET
             name = ?, description = ?, source_volume_path = ?, file_pattern = ?,
             target_catalog = ?, target_schema = ?, target_table = ?, ingest_mode = ?,
-            merge_keys = ?, schema_evolution = ?, poll_interval_seconds = ?, enabled = ?
+            merge_keys = ?, schema_evolution = ?, poll_interval_seconds = ?, enabled = ?,
+            cron_schedule = ?
         WHERE id = ?
     """, (
         name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        pipeline_id
+        cron_schedule, pipeline_id
     ))
     conn.commit()
     conn.close()
 
-    return get_pipeline(pipeline_id)
+    updated = get_pipeline(pipeline_id)
+    sync_pipeline_lineage(updated)
+    return updated
 
 
 def delete_pipeline(pipeline_id: str) -> bool:
     """Deletes an Auto-Loader pipeline and its execution history."""
+    pipe = get_pipeline(pipeline_id)
+    if pipe:
+        _remove_pipeline_lineage(pipe)
     conn = get_db()
     conn.execute("DELETE FROM autoloader_file_history WHERE pipeline_id = ?", (pipeline_id,))
     cur = conn.execute("DELETE FROM autoloader_pipelines WHERE id = ?", (pipeline_id,))
@@ -284,6 +336,198 @@ def _resolve_target_delta_path(catalog: str, schema: str, table_name: str) -> st
         return os.path.join(cat_dir, sch_clean, tbl_clean)
 
 
+SCHEMA_EVOLUTION_MODES = {
+    "addnewcolumns": "addNewColumns",
+    "failonnewcolumns": "failOnNewColumns",
+    "fail": "failOnNewColumns",
+    "rescue": "rescue",
+}
+RESCUED_COLUMN = "_rescued_data"
+BATCH_ROWS = int(os.getenv("AUTOLOADER_BATCH_ROWS", "100000"))
+
+
+def normalize_schema_evolution(value: Optional[str]) -> str:
+    """Maps user/UI input to a canonical schema-evolution policy name."""
+    key = (value or "addNewColumns").strip().lower()
+    if key not in SCHEMA_EVOLUTION_MODES:
+        raise ValueError(
+            f"Unknown schema evolution policy '{value}'. Use addNewColumns, failOnNewColumns or rescue."
+        )
+    return SCHEMA_EVOLUTION_MODES[key]
+
+
+def _plan_schema_policy(columns: List[str], target_path: str, policy: str) -> List[str]:
+    """
+    Enforces the schema-evolution policy for a file's columns against an existing target table.
+    - addNewColumns: nothing to do (Delta schema_mode='merge' adds the columns on write).
+    - failOnNewColumns: raises if the file has columns unknown to the target.
+    - rescue: returns the unknown columns, which the caller folds into `_rescued_data`.
+    """
+    if policy == "addNewColumns" or not target_path or not os.path.exists(os.path.join(target_path, "_delta_log")):
+        return []
+    known = {f.name.lower() for f in DeltaTable(target_path).schema().fields}
+    known.discard(RESCUED_COLUMN)
+    extra = [c for c in columns if c.lower() not in known]
+    if extra and policy == "failOnNewColumns":
+        raise ValueError(
+            f"Schema mismatch: unknown column(s) {extra} (policy failOnNewColumns). "
+            "Change the pipeline's schema evolution policy or update the target table."
+        )
+    return extra if policy == "rescue" else []
+
+
+def _rescue_schema(schema: pa.Schema, extra: List[str]) -> pa.Schema:
+    """Output schema of a rescue-policy stream: known columns plus a JSON string `_rescued_data`."""
+    fields = [f for f in schema if f.name not in extra]
+    return pa.schema(fields + [pa.field(RESCUED_COLUMN, pa.string())])
+
+
+def _rescue_batch(batch: pa.RecordBatch, extra: List[str]) -> List[pa.RecordBatch]:
+    """Moves `extra` columns of a batch into a JSON `_rescued_data` column (NULL when nothing was rescued)."""
+    table = pa.Table.from_batches([batch])
+    if extra:
+        rescued = [json.dumps(r, default=str) for r in table.select(extra).to_pylist()]
+        table = table.drop_columns(extra)
+    else:
+        rescued = [None] * table.num_rows
+    return table.append_column(RESCUED_COLUMN, pa.array(rescued, type=pa.string())).to_batches()
+
+
+def _evolve_schema_for_merge(target_path: str, schema: pa.Schema):
+    """
+    Adds columns that the source has but the target lacks through an empty schema-merging append.
+    delta-rs MERGE cannot add columns itself, so this must run before it.
+    """
+    existing = {f.name for f in DeltaTable(target_path).schema().fields}
+    if any(f.name not in existing for f in schema):
+        write_deltalake(target_path, schema.empty_table(), mode="append", schema_mode="merge")
+
+
+def _build_merge_predicate(keys: List[str], source_columns: List[str]) -> str:
+    """
+    Builds the MERGE join predicate. Each key must be an actual source column (matched case-insensitively)
+    and is emitted as a quoted identifier, so pipeline config can never inject SQL.
+    """
+    by_lower = {c.lower(): c for c in source_columns}
+    clauses = []
+    for key in keys:
+        column = by_lower.get(key.lower())
+        if column is None:
+            raise ValueError(f"Merge key '{key}' is not a column of the incoming file (columns: {source_columns}).")
+        quoted = '"' + column.replace('"', '""') + '"'
+        clauses.append(f"target.{quoted} = source.{quoted}")
+    return " AND ".join(clauses)
+
+
+def _parse_merge_keys(raw: Optional[str]) -> List[str]:
+    return [k.strip() for k in (raw or "").split(",") if k.strip()]
+
+
+def _open_source_reader(duck_conn, file_path: str, ext_lower: str) -> pa.RecordBatchReader:
+    """Opens a streaming Arrow reader over a source file; nothing is materialized in memory."""
+    safe_path = file_path.replace("'", "''")
+    if ext_lower in ("csv", "tsv", "txt"):
+        query = f"SELECT * FROM read_csv_auto('{safe_path}')"
+    elif ext_lower == "parquet":
+        query = f"SELECT * FROM read_parquet('{safe_path}')"
+    elif ext_lower in ("json", "jsonl", "ndjson"):
+        query = f"SELECT * FROM read_json_auto('{safe_path}')"
+    else:
+        raise ValueError(f"Unsupported file format '.{ext_lower}' for Auto-Loader.")
+    return duck_conn.sql(query).fetch_arrow_reader(batch_size=BATCH_ROWS)
+
+
+def _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash, file_size,
+                     elapsed_ms, now_iso, err) -> Dict[str, Any]:
+    """Moves a malformed file into `_quarantine/`, records it in the checkpoint DB and returns the result."""
+    quarantine_dir = os.path.join(base_source_dir, "_quarantine")
+    os.makedirs(quarantine_dir, exist_ok=True)
+    quarantine_file_dest = os.path.join(quarantine_dir, f"{os.path.basename(file_path)}.{int(time.time())}.bad")
+    try:
+        shutil.move(file_path, quarantine_file_dest)
+        logger.warning(f"Quarantined corrupt file '{file_path}' -> '{quarantine_file_dest}': {err}")
+    except Exception as q_err:
+        logger.error(f"Failed to move file to quarantine: {q_err}")
+
+    db = get_db()
+    db.execute("""
+        INSERT OR REPLACE INTO autoloader_file_history (
+            pipeline_id, file_path, file_hash, file_size_bytes,
+            status, rows_ingested, execution_ms, error_message, ingested_at
+        ) VALUES (?, ?, ?, ?, 'QUARANTINED', 0, ?, ?, ?)
+    """, (pipeline_id, rel_path, file_hash, file_size, elapsed_ms, str(err), now_iso))
+    db.commit()
+    db.close()
+    return {
+        "status": "QUARANTINED",
+        "file_path": rel_path,
+        "rows": 0,
+        "error": str(err),
+        "execution_ms": elapsed_ms
+    }
+
+
+def _remove_pipeline_lineage(pipeline: Dict[str, Any]):
+    """Drops the pipeline's lineage edge, and the volume node when no other pipeline still reads it."""
+    try:
+        from web.lineage import delete_node, get_db_connection, make_table_id
+        vol_id = _volume_lineage_id(pipeline["source_volume_path"])
+        table_id = make_table_id(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
+        with get_db_connection() as conn:
+            conn.execute("DELETE FROM lineage_edges WHERE source_id = ? AND target_id = ? AND edge_type = 'AUTOLOADED_TO'",
+                         (vol_id, table_id))
+            remaining = conn.execute("SELECT COUNT(*) FROM lineage_edges WHERE source_id = ?", (vol_id,)).fetchone()[0]
+        if remaining == 0:
+            delete_node(vol_id)
+    except Exception as lin_err:
+        logger.debug(f"Lineage cleanup notice: {lin_err}")
+
+
+def _volume_lineage_id(source_volume_path: str) -> str:
+    """Lineage node id for the volume behind a pipeline (`volume:/Volumes/cat/schema/vol`)."""
+    parts = [p for p in (source_volume_path or "").strip().replace("\\", "/").split("/") if p]
+    if parts and parts[0].lower() == "volumes":
+        parts = parts[1:]
+    return "volume:/Volumes/" + "/".join(parts[:3]).lower()
+
+
+def sync_pipeline_lineage(pipeline: Dict[str, Any], last_file: Optional[str] = None):
+    """
+    Records `VOLUME --AUTOLOADED_TO--> TABLE` in the lineage graph. The pipeline id rides on the edge
+    (job_id), so a volume feeding several tables (or several volumes feeding one table) stays unambiguous.
+    Best effort: lineage must never break ingestion.
+    """
+    try:
+        from web.lineage import upsert_node, upsert_edge, make_table_id
+        vol_id = _volume_lineage_id(pipeline["source_volume_path"])
+        vol_path = vol_id[len("volume:"):]
+        vol_parts = vol_path.split("/")  # ['', 'Volumes', catalog, schema, volume]
+        vol_catalog = vol_parts[2] if len(vol_parts) > 2 else "warehouse"
+        vol_schema = vol_parts[3] if len(vol_parts) > 3 else "dbo"
+        vol_name = vol_parts[-1] or vol_path
+        table_id = make_table_id(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
+
+        # layer RAW_FILE + type VOLUME puts the node in the "Raw Files / Ingestion" column of the lineage graph
+        upsert_node(vol_id, vol_name, "VOLUME", layer="RAW_FILE", catalog=vol_catalog, schema_name=vol_schema,
+                    metadata={"posix_path": vol_path, "pipeline_id": pipeline["id"], "last_file": last_file})
+        upsert_node(table_id, pipeline["target_table"], "TABLE",
+                    catalog=pipeline["target_catalog"], schema_name=pipeline["target_schema"])
+        upsert_edge(vol_id, table_id, edge_type="AUTOLOADED_TO", job_id=pipeline["id"])
+    except Exception as lin_err:
+        logger.debug(f"Lineage graph update notice: {lin_err}")
+
+
+def purge_legacy_lineage_nodes():
+    """Removes the per-file VOLUME_FILE and per-pipeline AUTOLOADER nodes written by earlier versions."""
+    try:
+        from web.lineage import delete_nodes_by_type
+        removed = sum(delete_nodes_by_type(t) for t in ("VOLUME_FILE", "AUTOLOADER"))
+        if removed:
+            logger.info(f"Auto-Loader: removed {removed} legacy lineage nodes")
+    except Exception as err:
+        logger.debug(f"Legacy lineage purge skipped: {err}")
+
+
 def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_dir: str) -> Dict[str, Any]:
     """
     Ingests a single file into the pipeline's target Delta Lake table.
@@ -308,87 +552,64 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
 
     now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Step 1: Read source file using DuckDB into PyArrow Table
+    # Step 1+2: Stream the source file through DuckDB into a single Delta commit.
+    # Batches flow lazily reader -> generator -> delta-rs, so memory stays bounded by BATCH_ROWS.
+    # The commit happens only after the whole stream is consumed, so a bad row midway aborts atomically.
     duck_conn = duckdb.connect(":memory:")
+    read_state = {"opened": False, "error": None, "rows": 0}
     try:
-        if ext_lower in ("csv", "tsv", "txt"):
-            query = f"SELECT * FROM read_csv_auto('{file_path}')"
-        elif ext_lower == "parquet":
-            query = f"SELECT * FROM read_parquet('{file_path}')"
-        elif ext_lower in ("json", "jsonl", "ndjson"):
-            query = f"SELECT * FROM read_json_auto('{file_path}')"
-        else:
-            raise ValueError(f"Unsupported file format '.{ext_lower}' for Auto-Loader.")
+        reader = _open_source_reader(duck_conn, file_path, ext_lower)
+        read_state["opened"] = True
 
-        arrow_reader = duck_conn.sql(query).arrow()
-        arrow_table = arrow_reader.read_all()
-        row_count = arrow_table.num_rows
-
-    except Exception as read_err:
-        duck_conn.close()
-        # Quarantine malformed file
-        quarantine_dir = os.path.join(base_source_dir, "_quarantine")
-        os.makedirs(quarantine_dir, exist_ok=True)
-        quarantine_file_dest = os.path.join(quarantine_dir, f"{os.path.basename(file_path)}.{int(time.time())}.bad")
-        try:
-            shutil.move(file_path, quarantine_file_dest)
-            logger.warning(f"Quarantined corrupt file '{file_path}' -> '{quarantine_file_dest}': {read_err}")
-        except Exception as q_err:
-            logger.error(f"Failed to move file to quarantine: {q_err}")
-
-        # Record in history
-        elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        db = get_db()
-        db.execute("""
-            INSERT OR REPLACE INTO autoloader_file_history (
-                pipeline_id, file_path, file_hash, file_size_bytes,
-                status, rows_ingested, execution_ms, error_message, ingested_at
-            ) VALUES (?, ?, ?, ?, 'QUARANTINED', 0, ?, ?, ?)
-        """, (pipeline_id, rel_path, file_hash, file_size, elapsed_ms, str(read_err), now_iso))
-        db.commit()
-        db.close()
-
-        return {
-            "status": "QUARANTINED",
-            "file_path": rel_path,
-            "rows": 0,
-            "error": str(read_err),
-            "execution_ms": elapsed_ms
-        }
-    finally:
-        duck_conn.close()
-
-    # Step 2: Write into Delta Lake with Schema Evolution & Ingest Mode
-    try:
         table_exists = os.path.exists(target_path) and os.path.exists(os.path.join(target_path, "_delta_log"))
         ingest_mode = pipeline.get("ingest_mode", "append").lower()
-        schema_evol = pipeline.get("schema_evolution", "addNewColumns")
+        schema_evol = normalize_schema_evolution(pipeline.get("schema_evolution"))
+
+        out_schema = reader.schema
+        extra_cols: List[str] = []
+        if schema_evol == "rescue":
+            # A fresh (or overwritten) table has nothing to rescue against, but keeps the column for later files.
+            replacing = not table_exists or ingest_mode == "overwrite"
+            extra_cols = _plan_schema_policy(reader.schema.names, "" if replacing else target_path, schema_evol)
+            out_schema = _rescue_schema(reader.schema, extra_cols)
+        elif not (not table_exists or ingest_mode == "overwrite"):
+            _plan_schema_policy(reader.schema.names, target_path, schema_evol)
+
+        def _batches():
+            try:
+                for batch in reader:
+                    read_state["rows"] += batch.num_rows
+                    if schema_evol == "rescue":
+                        yield from _rescue_batch(batch, extra_cols)
+                    else:
+                        yield batch
+            except Exception as stream_err:
+                read_state["error"] = stream_err
+                raise
+
+        source = pa.RecordBatchReader.from_batches(out_schema, _batches())
 
         if not table_exists or ingest_mode == "overwrite":
-            write_deltalake(target_path, arrow_table, mode="overwrite")
+            write_deltalake(target_path, source, mode="overwrite", schema_mode="overwrite" if table_exists else None)
         elif ingest_mode == "append":
-            schema_mode = "merge" if schema_evol == "addNewColumns" else "error"
-            write_deltalake(target_path, arrow_table, mode="append", schema_mode=schema_mode)
+            write_deltalake(target_path, source, mode="append", schema_mode="merge")
         elif ingest_mode == "merge":
             # Primary-Key Upsert
-            dt = DeltaTable(target_path)
-            raw_keys = pipeline.get("merge_keys") or ""
-            keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-            if not keys:
-                # Fallback to append if no merge keys defined
-                write_deltalake(target_path, arrow_table, mode="append", schema_mode="merge")
-            else:
-                predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
-                (dt.merge(
-                    source=arrow_table,
-                    predicate=predicate,
-                    source_alias="source",
-                    target_alias="target"
-                )
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute())
+            predicate = _build_merge_predicate(_parse_merge_keys(pipeline.get("merge_keys")), out_schema.names)
+            _evolve_schema_for_merge(target_path, out_schema)
+            (DeltaTable(target_path).merge(
+                source=source,
+                predicate=predicate,
+                source_alias="source",
+                target_alias="target"
+            )
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute())
+        else:
+            raise ValueError(f"Unknown ingest mode '{ingest_mode}'.")
 
+        row_count = read_state["rows"]
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         # Step 3: Record Successful Checkpoint
@@ -412,22 +633,18 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
         db.commit()
         db.close()
 
-        # Step 4: Lineage DAG Sync
-        try:
-            from web.lineage import upsert_node, upsert_edge, make_table_id
-            v_name = os.path.basename(pipeline["source_volume_path"])
-            file_node_id = f"volume_file:{v_name}/{rel_path}"
-            pipe_node_id = f"pipeline:{pipeline['id']}"
-            table_node_id = make_table_id(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
+        # Rescued columns may hold values of unknown columns (potentially personal data): flag them for review.
+        if schema_evol == "rescue":
+            try:
+                from web.governance import tags as gov_tags
+                gov_tags.set_tag(catalog=pipeline["target_catalog"], schema_name=pipeline["target_schema"],
+                                 table_name=pipeline["target_table"], column_name=RESCUED_COLUMN, tag_key="sensitivity",
+                                 tag_value="unclassified", actor="autoloader", source="propagated")
+            except Exception as gov_err:
+                logger.debug(f"Governance tag for {RESCUED_COLUMN} skipped: {gov_err}")
 
-            upsert_node(file_node_id, os.path.basename(rel_path), "VOLUME_FILE", layer="RAW")
-            upsert_node(pipe_node_id, pipeline["name"], "AUTOLOADER", layer="INGESTION")
-            upsert_node(table_node_id, pipeline["target_table"], "TABLE", catalog=pipeline["target_catalog"], schema_name=pipeline["target_schema"])
-
-            upsert_edge(file_node_id, pipe_node_id, edge_type="CONSUMED_BY")
-            upsert_edge(pipe_node_id, table_node_id, edge_type="AUTOLOADS_TO")
-        except Exception as lin_err:
-            logger.debug(f"Lineage graph update notice: {lin_err}")
+        # Step 4: Lineage DAG Sync (one VOLUME -> TABLE edge per pipeline, not one node per file)
+        sync_pipeline_lineage(pipeline, last_file=rel_path)
 
         logger.info(f"AutoLoader [{pipeline['name']}]: Ingested '{rel_path}' ({row_count} rows, {elapsed_ms}ms) -> {pipeline['target_catalog']}.{pipeline['target_schema']}.{pipeline['target_table']}")
 
@@ -440,6 +657,10 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
 
     except Exception as write_err:
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        if not read_state["opened"] or read_state["error"] is not None:
+            # The source itself is unreadable/corrupt (not a Delta problem): quarantine it and keep going.
+            return _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash,
+                                    file_size, elapsed_ms, now_iso, read_state["error"] or write_err)
         db = get_db()
         db.execute("""
             INSERT OR REPLACE INTO autoloader_file_history (
@@ -459,6 +680,8 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
             "error": str(write_err),
             "execution_ms": elapsed_ms
         }
+    finally:
+        duck_conn.close()
 
 
 def run_pipeline_cycle(pipeline_id: str) -> Dict[str, Any]:
@@ -555,6 +778,7 @@ async def autoloader_daemon_loop():
     Runs asynchronously alongside the main FastAPI web server.
     """
     logger.info("Volume Auto-Loader Background Daemon started.")
+    await asyncio.to_thread(purge_legacy_lineage_nodes)
     last_run_map: Dict[str, float] = {}
 
     while True:
@@ -567,10 +791,19 @@ async def autoloader_daemon_loop():
                 if not p.get("enabled", 1):
                     continue
 
-                interval = max(5, int(p.get("poll_interval_seconds", 10)))
-                last_time = last_run_map.get(p_id, 0.0)
+                cron_expr = p.get("cron_schedule")
+                if cron_expr:
+                    # Scheduled pipelines run when a cron tick (UTC) has elapsed since the last run in the DB.
+                    try:
+                        due = cron_is_due(cron_expr, p.get("last_run_at") or p.get("created_at"), datetime.utcnow())
+                    except Exception as cron_err:
+                        logger.error(f"Auto-Loader pipeline {p_id}: bad cron '{cron_expr}': {cron_err}")
+                        continue
+                else:
+                    interval = max(5, int(p.get("poll_interval_seconds", 10)))
+                    due = (now - last_run_map.get(p_id, 0.0)) >= interval
 
-                if (now - last_time) >= interval:
+                if due:
                     last_run_map[p_id] = now
                     # Run cycle in background thread to avoid blocking asyncio event loop
                     await asyncio.to_thread(run_pipeline_cycle, p_id)

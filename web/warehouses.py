@@ -246,6 +246,7 @@ def get_compute_nodes_status() -> List[Dict[str, Any]]:
     """Polls real-time telemetry from all clustered Docker compute worker nodes."""
     results = []
     import httpx
+    from web.compute_auth import compute_headers
     for node in KNOWN_WORKER_NODES:
         endpoints_to_try = [node["endpoint"], node.get("host_endpoint", "")]
         node_res = {
@@ -274,7 +275,7 @@ def get_compute_nodes_status() -> List[Dict[str, Any]]:
                 continue
             try:
                 t0 = time.perf_counter()
-                with httpx.Client(timeout=1.0) as client:
+                with httpx.Client(timeout=1.0, headers=compute_headers()) as client:
                     resp = client.get(f"{ep}/api/compute/status")
                 latency = round((time.perf_counter() - t0) * 1000, 1)
                 if resp.status_code == 200:
@@ -292,7 +293,8 @@ def get_compute_nodes_status() -> List[Dict[str, Any]]:
                         "avg_duration_ms": data.get("avg_duration_ms", 0.0),
                         "duckdb_version": data.get("duckdb_version", "1.5.5"),
                         "duckrun_version": data.get("duckrun_version", "0.4.68"),
-                        "last_query_at": data.get("last_query_at")
+                        "last_query_at": data.get("last_query_at"),
+                        "governance_masks_installed": data.get("governance_masks_installed")
                     })
                     break
             except Exception:

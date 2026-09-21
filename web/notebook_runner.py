@@ -6,6 +6,8 @@ import logging
 import threading
 from typing import Dict, Any, List, Optional
 
+import hashlib
+
 import nbformat
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_output
 from jupyter_client import KernelManager
@@ -20,7 +22,7 @@ def get_safe_path(rel_path: str) -> str:
     cleaned = rel_path.strip().lstrip("/\\")
     full_path = os.path.abspath(os.path.join(NOTEBOOKS_DIR, cleaned))
     real_base = os.path.abspath(NOTEBOOKS_DIR)
-    if not full_path.startswith(real_base):
+    if os.path.commonpath([full_path, real_base]) != real_base:
         raise ValueError(f"Access denied: path '{rel_path}' escapes notebook directory")
     return full_path
 
@@ -35,8 +37,9 @@ def clean_ansi(text: str) -> str:
 class KernelSession:
     """Manages an active IPython kernel for a specific notebook."""
 
-    def __init__(self, notebook_rel_path: str):
+    def __init__(self, notebook_rel_path: str, owner: str = "anonymous"):
         self.notebook_rel_path = notebook_rel_path
+        self.owner = owner
         self.km: Optional[KernelManager] = None
         self.kc = None
         self.lock = threading.Lock()
@@ -44,14 +47,23 @@ class KernelSession:
         self.status = "stopped"
         self.execution_count = 0
 
+    # Subclasses (the sandbox worker's kernels) change how the kernel process is created.
+    kernel_name = "python3"
+
+    def _start_kwargs(self) -> Dict[str, Any]:
+        return {}
+
+    def is_alive(self) -> bool:
+        return self.km is not None and self.km.is_alive()
+
     def start(self, timeout: int = 15):
         with self.lock:
             if self.km is not None and self.km.is_alive():
                 return
             logger.info(f"Starting kernel for notebook: {self.notebook_rel_path}")
             self.status = "starting"
-            km = KernelManager(kernel_name="python3")
-            km.start_kernel()
+            km = KernelManager(kernel_name=self.kernel_name)
+            km.start_kernel(**self._start_kwargs())
             kc = km.client()
             kc.start_channels()
             kc.wait_for_ready(timeout=timeout)
@@ -205,35 +217,108 @@ class KernelSession:
             }
 
 
-# Registry of active kernel sessions: { rel_path: KernelSession }
-SESSIONS: Dict[str, KernelSession] = {}
+class RemoteKernelSession:
+    """
+    A kernel that lives in the notebook sandbox container (see sandbox/worker.py) instead of in this process.
+
+    Used for users a masking policy applies to: the sandbox has no access to the warehouse files, runs each user's
+    kernels under a separate OS user, and reads data only through the governed endpoint /api/sandbox/sql with a token
+    that is bound to that user. Same interface as KernelSession, so the notebook endpoints do not care which they get.
+    """
+
+    def __init__(self, notebook_rel_path: str, owner: str):
+        self.notebook_rel_path = notebook_rel_path
+        self.owner = owner
+        self.status = "stopped"
+        self.execution_count = 0
+        self.kid = hashlib.sha256(f"{owner}\0{notebook_rel_path}".encode()).hexdigest()[:32]
+        self._alive = False
+
+    def _call(self, method: str, suffix: str = "", body: Optional[dict] = None, timeout: float = 30.0):
+        from web import sandbox_client
+        return sandbox_client.call(method, f"/kernels/{self.kid}{suffix}", body, timeout=timeout)
+
+    def is_alive(self) -> bool:
+        try:
+            self._alive = bool(self._call("GET", "/status", timeout=5).get("is_alive"))
+        except Exception:
+            self._alive = False
+        return self._alive
+
+    def start(self, timeout: int = 15):
+        pass  # created on first execution by the worker
+
+    def shutdown(self):
+        try:
+            self._call("DELETE")
+        except Exception:
+            pass
+        self.status = "stopped"
+
+    def restart(self, timeout: int = 15):
+        from web import sandbox_client
+        self._call("POST", "/restart", {"owner": self.owner, "notebook": self.notebook_rel_path,
+                                        "token": sandbox_client.mint_kernel_token(self.owner)}, timeout=60)
+        self.status = "idle"
+
+    def execute_code(self, code: str, timeout: int = 120) -> Dict[str, Any]:
+        from web import sandbox_client
+        self.status = "busy"
+        try:
+            result = self._call("POST", "/execute", {
+                "owner": self.owner, "notebook": self.notebook_rel_path, "code": code, "timeout": timeout,
+                "token": sandbox_client.mint_kernel_token(self.owner)}, timeout=timeout + 45)
+        except Exception as exc:
+            return {"status": "error", "execution_count": self.execution_count, "duration_ms": 0, "outputs": [{
+                "output_type": "error", "ename": "SandboxError", "evalue": str(exc), "traceback": [f"SandboxError: {exc}"]}]}
+        finally:
+            self.status = "idle"
+        self.execution_count = result.get("execution_count") or self.execution_count
+        return result
+
+
+# Registry of active kernel sessions: { (owner, rel_path, sandboxed): session }. Kernels are per user: two users who open
+# the same Shared notebook get separate kernels, so one cannot read or alter the other's variables. A user who becomes
+# subject to a masking policy stops using their unrestricted local kernel: it is shut down and a sandboxed one replaces it.
+SESSIONS: Dict[tuple, Any] = {}
 SESSIONS_LOCK = threading.Lock()
 
 
-def get_kernel_session(notebook_rel_path: str) -> KernelSession:
-    """Retrieve or create the KernelSession for the given notebook."""
+def get_kernel_session(notebook_rel_path: str, owner: str = "anonymous", sandboxed: bool = False):
+    """Retrieve or create the session of `owner` for the given notebook (in the sandbox container when `sandboxed`)."""
     norm_path = notebook_rel_path.strip().replace("\\", "/").lstrip("/")
+    key = (owner, norm_path, bool(sandboxed))
+    stale = None
     with SESSIONS_LOCK:
-        if norm_path not in SESSIONS:
-            SESSIONS[norm_path] = KernelSession(norm_path)
-        return SESSIONS[norm_path]
+        if sandboxed:
+            stale = SESSIONS.pop((owner, norm_path, False), None)
+        if key not in SESSIONS:
+            SESSIONS[key] = RemoteKernelSession(norm_path, owner) if sandboxed else KernelSession(norm_path, owner)
+        session = SESSIONS[key]
+    if stale is not None:
+        try:
+            stale.shutdown()
+        except Exception:
+            pass
+    return session
 
 
-def restart_notebook_kernel(notebook_rel_path: str) -> Dict[str, Any]:
+def restart_notebook_kernel(notebook_rel_path: str, owner: str = "anonymous", sandboxed: bool = False) -> Dict[str, Any]:
     """Restart kernel for a specific notebook."""
-    session = get_kernel_session(notebook_rel_path)
+    session = get_kernel_session(notebook_rel_path, owner, sandboxed)
     session.restart()
     return {"success": True, "status": session.status, "message": "Kernel restarted successfully"}
 
 
-def get_kernel_status(notebook_rel_path: str) -> Dict[str, Any]:
+def get_kernel_status(notebook_rel_path: str, owner: str = "anonymous", sandboxed: bool = False) -> Dict[str, Any]:
     """Get the live status of the notebook's kernel."""
-    session = get_kernel_session(notebook_rel_path)
-    is_alive = session.km is not None and session.km.is_alive()
+    session = get_kernel_session(notebook_rel_path, owner, sandboxed)
+    is_alive = session.is_alive()
     return {
         "status": session.status if is_alive else "stopped",
         "is_alive": is_alive,
-        "execution_count": session.execution_count
+        "execution_count": session.execution_count,
+        "sandboxed": bool(sandboxed)
     }
 
 
@@ -315,7 +400,9 @@ def _parse_cell_for_ui(cell, index: int) -> Dict[str, Any]:
 def execute_single_cell(
     notebook_rel_path: str,
     cell_index: int,
-    source_override: Optional[str] = None
+    source_override: Optional[str] = None,
+    owner: str = "anonymous",
+    sandboxed: bool = False
 ) -> Dict[str, Any]:
     """
     Executes a single code cell (1-indexed) in the notebook's persistent kernel.
@@ -345,7 +432,7 @@ def execute_single_cell(
             "duration_ms": 0
         }
 
-    session = get_kernel_session(notebook_rel_path)
+    session = get_kernel_session(notebook_rel_path, owner, sandboxed)
     result = session.execute_code(cell.source)
 
     cell.execution_count = result["execution_count"]
@@ -366,7 +453,7 @@ def execute_single_cell(
     }
 
 
-def execute_all_cells(notebook_rel_path: str) -> Dict[str, Any]:
+def execute_all_cells(notebook_rel_path: str, owner: str = "anonymous", sandboxed: bool = False) -> Dict[str, Any]:
     """
     Sequentially executes all code cells in the notebook, maintaining state in the kernel.
     Persists updated outputs and execution counts to the .ipynb file.
@@ -376,7 +463,7 @@ def execute_all_cells(notebook_rel_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Notebook not found: {notebook_rel_path}")
 
     nb = nbformat.read(full_path, as_version=4)
-    session = get_kernel_session(notebook_rel_path)
+    session = get_kernel_session(notebook_rel_path, owner, sandboxed)
 
     total_start = time.perf_counter()
     executed_count = 0

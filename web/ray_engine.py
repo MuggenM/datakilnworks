@@ -55,6 +55,11 @@ if RAY_INSTALLED:
                 self.con.sql(f"SET max_memory = '{max_memory}'")
             except Exception:
                 pass
+            try:
+                from web.governance.macros import install_governance_macros
+                install_governance_macros(getattr(self.con, "con", self.con))
+            except Exception as e:
+                logger.error(f"Failed installing governance masks on Ray actor {actor_id} (masked queries will fail closed): {e}")
             self.queries_executed = 0
             self.created_at = time.time()
             self.last_active_at = self.created_at

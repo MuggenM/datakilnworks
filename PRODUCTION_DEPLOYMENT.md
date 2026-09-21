@@ -465,13 +465,6 @@ spec:
           value: "/workspace/warehouse"
         - name: RAY_ADDRESS
           value: "ray://databricks-ray-cluster-head-svc.datakilnworks.svc.cluster.local:10001"
-        - name: JUPYTER_PORT
-          value: "8888"
-        - name: JUPYTER_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: databricks-secrets
-              key: jupyter-token
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
@@ -559,7 +552,6 @@ spec:
 # Create secrets
 kubectl create secret generic databricks-secrets \
   --namespace datakilnworks \
-  --from-literal=jupyter-token=$(openssl rand -hex 32) \
   --from-literal=database-url=postgresql://user:pass@host/db
 ```
 

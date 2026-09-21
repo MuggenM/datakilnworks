@@ -21,7 +21,7 @@ Includes **Data Kiln Works**—a powerful data lakehouse web workbench with **Da
 │  - Jobs & Pipelines / Local Workflows (DAG engine, Delta compaction & Papermill) │
 │  - Unity Catalog Explorer (3-Level Namespace: catalog.schema.table, ACID log)    │
 │  - Monaco SQL Editor (Live compute warehouse selector, cross-catalog joins)      │
-│  - Workspace (Embedded JupyterLab integration on Port 8890)                      │
+│  - Workspace (In-Studio notebook runner, per-user folders, per-user kernels)     │
 │  - Compute Monitor (DuckDB engine stats & active cluster pools)                  │
 └────────────────────────┬─────────────────────────────────────────────────────────┘
                          │ REST APIs (FastAPI)
@@ -63,7 +63,6 @@ docker compose up -d
 | Interface | URL | Credentials / Notes |
 | :--- | :--- | :--- |
 | **Data Kiln Works** | [http://localhost:8891](http://localhost:8891) | **No password required.** Includes Data Ingestion wizard, Unity Catalog tree, Monaco SQL Workbench, Time Travel, and Compute stats. |
-| **JupyterLab** | [http://localhost:8890](http://localhost:8890) | Token: `datakilnworks` (pre-injected globals: `spark`, `dbutils`, `display()`, `%sql`) |
 
 ---
 
@@ -192,7 +191,7 @@ docker compose up -d
   - **Saved Queries**: Top-priority library queries with direct execution in the SQL Editor.
   - **Tables & Catalogs**: Search across all lakehouse catalogs with direct navigation to table inspection.
   - **Columns & Data Types**: Instant fuzzy search across table schemas (e.g. `price`, `salary`, `market_cap_b`) with direct routing to the Schema tab.
-  - **Notebooks**: Recursive discovery in `./notebooks/*.ipynb` with deep-linking into JupyterLab.
+  - **Notebooks**: Recursive discovery in `./notebooks/*.ipynb` opened in the in-Studio notebook runner.
   - **Lakeview Dashboards**: Match by dashboard names and widget titles.
   - **Jobs & Pipelines**: Match workflow DAGs and individual task names.
   - **Query History**: Search historical SQL executions from SQLite WAL logs with 1-click loading into the Monaco SQL Editor.
@@ -201,7 +200,7 @@ docker compose up -d
 * **Keyboard Navigation**: Full arrow key navigation (<kbd>↑</kbd> / <kbd>↓</kbd>), <kbd>Enter</kbd> to open, <kbd>Shift+Enter</kbd> to query table in editor, <kbd>Tab</kbd> to cycle categories, and <kbd>Esc</kbd> to close.
 
 ### 11. 📁 Workspace Browser & Native In-Studio Notebook Runner
-* **Native In-Studio Notebook Execution (Zero JupyterLab Overhead)**:
+* **Native In-Studio Notebook Execution (no separate Jupyter server)**:
   - **Direct In-Browser Cell Execution**: Execute any code cell directly inside the Data Kiln Works right-pane with the **▶ Run** button or <kbd>Shift+Enter</kbd> / <kbd>Ctrl+Enter</kbd>.
   - **Persistent Stateful Kernel Sessions**: Built-in `IPython` / `ipykernel` runner maintains live in-memory state across cell executions (variables, DataFrames, and imports persist from cell to cell).
   - **Pre-Loaded Databricks Globals**: Native access to `spark` (SQLFrame session), `conn` (duckrun Delta session), `dbutils`, `display()` (rich DataTables & HTML previews), and `%sql` / `%%sql` magics.
@@ -217,7 +216,7 @@ docker compose up -d
     - Expandable and collapsible directory tree with persistent open/closed state.
     - Live file filter search box to quickly locate notebooks and scripts across nested directories.
     - Type-specific icons: Jupyter Notebooks (`.ipynb`, purple), Python scripts (`.py`, blue), SQL scripts (`.sql`, green), and Folders (amber).
-    - Quick actions per item: New Notebook inside folder, Open in JupyterLab tab, Rename, and Delete.
+    - Quick actions per item: New Notebook inside folder, Rename, and Delete.
   - **Right Pane (In-Studio Workbench)**:
     - Dedicated interactive notebook environment, text/script viewer with one-click "Query in Monaco SQL Editor", and folder overview cards.
 * **Workspace Management Operations**:
@@ -225,8 +224,8 @@ docker compose up -d
   - `+ New Folder`: Creates nested subdirectories on the local filesystem.
   - `Upload`: Upload notebooks or scripts from your desktop directly into any workspace folder.
   - In-place renaming and deletion with confirmation safeguards and path traversal protection.
-* **Seamless JupyterLab Deep-Linking (Optional)**:
-  - For full-featured JupyterLab sessions, 1-click **Open in JupyterLab** opens the exact notebook in JupyterLab with authentication pre-configured (`/lab/tree/notebooks/<path>?token=datakilnworks`).
+* **Per-user access**: every notebook, file and kernel endpoint requires a valid session and only serves `Users/<you>/` and `Shared/` (admins see everything). Kernels are per user, so two people opening the same Shared notebook never share variables. There is deliberately no JupyterLab server: one shared server saw every user's folder plus the warehouse files.
+* **Running notebooks and column masking**: notebook kernels can read the warehouse files directly, so masking cannot cover them. Users that a masking policy applies to therefore never get such a kernel: by default (`GOVERNANCE_NOTEBOOK_EXECUTION=sandbox`) their notebooks run in the **notebook sandbox**, a separate container with no warehouse mount (see *Notebook sandbox* below). Everyone else runs in the Studio's own kernels. If the sandbox is not running, masked users can open and edit notebooks but not run them.
 * **Universal Search (`Ctrl+P`) Deep-Linking**: Selecting any notebook result in Universal Search opens it immediately in the interactive in-studio notebook runner.
 
 ### 12. 🎨 Data Kiln Works UI/UX & Themes
@@ -460,11 +459,60 @@ spec:
 * **Generic REST Webhooks**:
   - Webhook payloads for PagerDuty, Discord, or automated orchestration pipelines.
 
+### 27. 📂 Unity Catalog Volumes & Volume Auto-Loader (Snowpipe / Databricks Auto Loader equivalent)
+* **Volumes** (`/Volumes/<catalog>/<schema>/<volume>/`): create, browse, upload, preview and delete files; paths are traversal-guarded and stored under `warehouse/volumes/`.
+* **Auto-Loader pipelines**: a background daemon polls a volume folder (`*.csv`, `*.tsv`, `*.json`, `*.jsonl`, `*.parquet`) every 5s or more, or on a 5-field cron schedule (UTC; missed ticks run once on catch-up), and loads new files into a Delta table.
+  - **Exactly-once**: each file is fingerprinted (size + mtime + first 64KB) in a SQLite checkpoint (`.metadata/autoloader.db`) and committed as one Delta transaction.
+  - **Streaming reads**: files stream through DuckDB into delta-rs in `AUTOLOADER_BATCH_ROWS` (default 100,000) batches, so memory does not scale with file size.
+  - **Load modes**: `append`, `merge` (upsert on `merge_keys`, which must be columns of the incoming file) and `overwrite`.
+  - **Schema evolution policies**: `addNewColumns`, `failOnNewColumns` and `rescue` (unknown columns go to a JSON `_rescued_data` column).
+  - **Quarantine**: unreadable or corrupt files move to `_quarantine/` while the pipeline continues; Delta write and schema-policy failures are logged as `FAILED` and retried on the next cycle.
+  - **Observability**: per-file history (rows, latency, error), KPI cards in the UI, and lineage `VOLUME → TABLE` (shown in the Raw Files column, created with the pipeline).
+* **API**: `/api/volumes/...` and `/api/autoloader/pipelines/...` (create, update, delete, `run` / `run-now`, `reset`, `history`, `stats`).
+* **Verification**: `python scratch/test_autoloader.py` (backend, throwaway warehouse) and `AUTOLOADER_UI_URL=<throwaway studio> python3 scratch/verify_autoloader_ui.py` (Playwright; it creates pipelines, so never point it at real data).
+
+### 28. 🛡️ Data Governance: Tags & Tag-Driven Column Masking
+* **Tags** on catalogs, schemas, tables and columns (`pii=email`, `sensitivity=confidential`), stored in `warehouse/.metadata/governance.db`. Tags **inherit downward** (catalog → schema → table → column, most specific wins), so new columns from schema evolution or the Auto-Loader are covered automatically. Optional allowed-value lists, an audit trail, orphan detection when a column is dropped, and a name-based **classifier** that suggests tags without reading any data.
+* **Masking policies** point at a tag, not at objects: *"mask everything tagged `pii` for everyone except admins"* protects every current and future column carrying that tag. Mask types: `redact`, `hash` (stable keyed pseudonym, joins still work), `partial`, `email`, `null`, `generalize` and validated `custom` expressions. Masks are type-aware and always cast back to the column's type; a mask that does not fit a type yields `NULL`, so a policy can never leak because it did not apply. Exemptions by role and by user, priorities, and a per-type filter.
+* **Enforced at query time by rewriting the SQL** (`web/governance/enforce.py`): each scan of a table with masked columns becomes `(SELECT * REPLACE (mask AS col) FROM table)`, so filters, joins, aggregates and `ORDER BY` only ever see masked values (no `WHERE ssn = '…'` oracle). Views are inlined recursively, path scans (`delta_scan('…')`, `read_parquet('…')`) map back to their table, and the rewritten SQL is what workers, Ray and the local engine execute. Masked principals get a default-deny statement allowlist; anything that cannot be verified is refused, never run unmasked.
+* **Every data-egress path is governed**: SQL editor, exports, profiles, previews, version diffs (Arrow-level masking), dashboards (with a result cache keyed by the mask set), Genie (LLM prompt samples are *always* masked, whoever asks), alerts, scheduled exports and jobs (run as their owner). Features that read data outside the governed catalogs (dbt, direct OneLake queries, distributed scans) are refused for masked users. `scratch/test_governance_coverage.py` fails when a new unreviewed DuckDB execution site appears.
+* **UI**: a *Governance* view (tags, policies with a live mask tester, suggestions, *preview as user*, audit and coverage), tag chips and lock badges in the Catalog Explorer, and masked-column indicators in SQL results. Admins are exempt by default (`except_roles`), and their reads of tagged columns are audited (`EXEMPT_READ`).
+* **Lifecycle**: when an exempt user (an admin, say) materialises tagged columns with `CREATE TABLE AS` / `INSERT ... SELECT` (SQL editor or a job), the new table is tagged like its sources (`source=propagated`); computed columns are tagged `sensitivity=unclassified` for review. Dropping a table removes its tags, tags of dropped columns are flagged as orphans (never silently deleted), and the Auto-Loader's `_rescued_data` column is flagged `unclassified`.
+* **Cost**: secret-free masks are SQL macros and run at native speed (about 50-70 M rows/s on one thread in our benchmark); the keyed `hash` mask is a vectorised Python UDF (about 1 M rows/s), so prefer `partial`/`email`/`generalize` on very large scans and reserve `hash` for join keys. Rewriting a query takes about 5-9 ms; installs without tags skip catalog lookups entirely.
+* **Rollout**: `GOVERNANCE_ENFORCEMENT=audit` computes and logs what would be masked without changing results; `enforce` (default) applies it; `off` disables the gateway.
+* **Verification**: `scratch/test_governance_phase{0..6}.py`, `scratch/test_governance_coverage.py`, and `scratch/verify_governance_ui.py` (Playwright, throwaway instance only).
+
+---
+
+## 🔐 Security Settings & Governance Trust Boundary
+
+| Setting | Default | Effect |
+| :--- | :--- | :--- |
+| `GOVERNANCE_REQUIRE_AUTH` | `false` | `false` keeps the single-user local mode (requests **without credentials** run as the local admin). `true` makes them the least-privilege `anonymous` user and ignores the credential-less `X-User` header. Invalid or expired credentials are **never** admin in either mode. |
+| `GOVERNANCE_NOTEBOOK_EXECUTION` | `sandbox` | Where notebook code runs. `sandbox`: users no masking policy applies to use the Studio's kernels, users a policy applies to use the notebook sandbox. `exempt`: only users no policy applies to may run notebooks (others can open and edit them). `all`: everyone uses the Studio's kernels (masking is then not enforced for notebook code). |
+| `SANDBOX_URL` / `SANDBOX_TOKEN` / `SANDBOX_GATEWAY_URL` | `http://notebook-sandbox:8000` / generated / `http://datakilnworks-studio:8000` | Where the studio finds the sandbox worker, its token (generated by the worker on a volume the studio mounts read-only; set `SANDBOX_TOKEN` to override), and where kernels reach the studio. |
+| `SANDBOX_TOKEN_TTL` / `SANDBOX_MAX_ROWS` / `SANDBOX_MAX_KERNELS` | `900` / `1000000` / `32` | Lifetime in seconds of the per-user token a kernel presents (renewed on every cell run), rows a sandboxed kernel may pull in one query, and concurrent sandbox kernels. |
+| `JWT_SECRET_KEY` | per-install random | Session signing key. If unset, a random key is created in `warehouse/.metadata/jwt_secret` (existing sessions are signed out once after upgrading). |
+| `COMPUTE_TOKEN` | per-install random | Shared secret (`X-Compute-Token`) the studio sends to compute workers, which reject requests without it. Stored in `warehouse/.metadata/compute_token` when unset. |
+| `GOVERNANCE_ENFORCEMENT` | `enforce` | `enforce` applies masking and statement gating; `audit` computes and logs what would be masked but never changes or blocks a query; `off` disables the gateway. |
+| `GOVERNANCE_ALLOWED_PATHS` | empty | Extra directories (`:`-separated) non-admins may read with file functions, besides warehouse tables, volumes, exports and `/tmp/uploads`. |
+
+**Non-admin file access.** File functions (`read_csv`, `read_parquet`, `delta_scan`, `read_text`, …) accept only literal paths inside warehouse tables, volumes and exports for non-admin roles, regardless of masking policies: reading `.metadata` (session signing key, compute token, auth database) would otherwise let anyone forge an admin session. `query()`/`query_table()` and redefining the `gov_*` mask functions are refused for non-admins.
+
+**Notebook sandbox.** The `notebook-sandbox` service runs the kernels of users a masking policy applies to. From the outside in:
+
+* *Container:* no warehouse, metadata or notebooks mounted; read-only root; `cap_drop: ALL` plus only what switching users needs; PID and memory limits; it is alone with the studio on an `internal` network (no internet, no compute nodes, no Ray).
+* *OS user:* every Studio user gets a separate uid and each kernel drops to it before any user code runs, so kernels of different users cannot read each other's files, memory or connection keys, and cannot regain root.
+* *Data:* kernels read data only through `/api/sandbox/sql`, with a short-lived token bound to the user (readable only by that uid). The endpoint applies the same permission check, masking rewrite, statement gating and audit as the SQL editor, and re-resolves the user on every call, so a changed policy or disabled account applies immediately. The studio refuses every other route to the sandbox's address, so the credential-less "local admin" of single-user mode is not reachable from a kernel.
+* *Inside the kernel:* `spark`, `conn` and `%sql` work on a private in-memory DuckDB. A query that only reads warehouse tables is answered by the studio in one round trip (joins, filters and aggregates run there); a query that also touches local DataFrames pulls the tables it names (already masked, capped at `SANDBOX_MAX_ROWS`) and runs locally. `dbutils`, warehouse files and MLflow are not available in the sandbox, and it is read-only towards the warehouse.
+
+**What column masking will and will not cover.** Studio queries (SQL editor, dashboards, previews, exports, alerts, Genie, jobs) are governed. **Notebook kernels and anything that can read `warehouse/` directly are outside that boundary**, because a Python process can open the files itself. Notebook code of users a masking policy applies to therefore runs in the notebook sandbox instead (`GOVERNANCE_NOTEBOOK_EXECUTION`). Compute workers (`compute-node-01..03`) are no longer published on the host; they are reachable only on the compose network and require the compute token.
+
 ---
 
 ## 🧪 Interactive Notebook Verification (Port 8890)
 
-Open [`notebooks/sample_lakehouse_pipeline.ipynb`](notebooks/sample_lakehouse_pipeline.ipynb) in JupyterLab:
+Open [`notebooks/sample_lakehouse_pipeline.ipynb`](notebooks/sample_lakehouse_pipeline.ipynb) in the Studio Workspace:
 1. **PySpark DataFrame Transformations**: Create PySpark DataFrames, apply window functions (`dense_rank`), and view rich tables with `display()`.
 2. **Delta Lake Materialization**: Materialize DataFrames to Delta tables via `conn.sql("CREATE OR REPLACE TABLE silver_employees AS SELECT * FROM transformed_df")`.
 3. **Inspect Delta Logs**: Run `dbutils.fs.ls("dbfs:/silver_employees")` to inspect Parquet data and `_delta_log/` transaction files.

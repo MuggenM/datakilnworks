@@ -63,11 +63,12 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Interactive File Explorer for Volumes**| ⚠️ Basic | ⚠️ Snowsight Stage UI | ✅ **Full File Tree + Presigned Upload/Download** | 🏆 **Data Kiln Works** |
 | **Interactive Data Lineage** | ✅ System Lineage Table | ✅ Object Dependencies | ✅ **Interactive 22-node visual graph + Column Lineage** | 🏆 **Data Kiln Works** |
 | **Catalog-Scoped Lineage Filtering** | ✅ Yes | ⚠️ Global only | ✅ **Yes (`allowed_catalogs` RBAC scoping)** | ✅ Tie |
-| **Row-Level Security (RLS)** | ✅ Row Filters | ✅ Row Access Policies | ✅ **Full RLS Engine + Policy Testing API** | 🏆 **Data Kiln Works** |
-| **Dynamic Column Masking** | ✅ Column Masking | ✅ Dynamic Masking | ✅ **View-based & Schema Masking** | 🏆 **Databricks / Snowflake** |
+| **Row-Level Security (RLS)** | ✅ Row Filters | ✅ Row Access Policies | ❌ **Not implemented** (catalog-level ACLs only). The governance gateway already resolves every table scan, so a row filter is a planned extension | 🏆 **Databricks / Snowflake** |
+| **Dynamic Column Masking** | ✅ Column Masking | ✅ Dynamic Masking | ✅ **Tag-driven masking evaluated at query time (redact, hash, partial, email, null, generalize, custom)** | ✅ Tie |
 | **Data Retention & Time Travel** | ✅ `TIMESTAMP / VERSION AS OF` | ✅ Time Travel (up to 90d) | ✅ **Delta Time Travel (`VERSION AS OF` / `RESTORE`)** | ✅ Tie |
 | **Zero-Copy Cloning** | ✅ Shallow Clone | ✅ Zero-Copy Clone | ✅ **Delta Shallow Clone** | ✅ Tie |
-| **Tag-Based Policies** | ✅ Yes | ✅ Yes | ⚠️ Manual Tag Rules | 🏆 **Databricks / Snowflake** |
+| **Tags on Catalog Objects** | ✅ Governed tags (catalog / schema / table / column) | ✅ Object tags with inheritance | ✅ **Tags on catalogs, schemas, tables and columns, downward inheritance, allowed values, audit trail, name-based suggestions** | ✅ Tie |
+| **Tag-Based Policies** | ✅ ABAC column masks on tags | ✅ Tag-based masking policies | ✅ **Masking policies bound to a tag (value and column-type filters, priorities, role/user exemptions), enforced by query rewriting at every egress path** | ✅ Tie. Enforcement is application-level: notebook code of masked users runs in a separate sandbox container with per-user uids that reads data only through the governed SQL endpoint |
 | **Cross-Organization Data Marketplace**| ⚠️ Delta Sharing | ✅ Snowflake Marketplace | ❌ N/A (Internal / Self-Hosted) | 🏆 **Snowflake** |
 
 **Domain Verdict:** **Databricks & DataKilnWorks** provide open-format Unity Catalog parity without proprietary lock-in. DataKilnWorks delivers superior visual volume browsing and lineage exploration for local and enterprise private clouds.
@@ -117,7 +118,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 
 | Feature | Real Databricks | Snowflake | DataKilnWorks Studio | Winner |
 | :--- | :---: | :---: | :---: | :--- |
-| **Interactive Notebooks** | ✅ Databricks Notebooks | ✅ Snowsight Notebooks | ✅ **JupyterLab + In-Studio Monaco Workbench** | 🏆 **Data Kiln / Databricks** |
+| **Interactive Notebooks** | ✅ Databricks Notebooks | ✅ Snowsight Notebooks | ✅ **In-Studio Notebook Runner (per-user kernels) + Monaco Workbench** | 🏆 **Data Kiln / Databricks** |
 | **Multi-Language Notebook Support**| ✅ Python, SQL, Scala, R | ⚠️ Python, SQL | ✅ **Python, SQL, PySpark, Bash, Markdown** | 🏆 **Databricks / Data Kiln** |
 | **PySpark DataFrame Compatibility**| ✅ Native Spark Runtime | ❌ Snowpark syntax only | ✅ **SQLFrame (100% PySpark syntax without JVM)** | 🏆 **Data Kiln / Databricks** |
 | **Monaco SQL Editor** | ✅ Yes | ✅ Yes | ✅ **Yes (Syntax highlight, auto-complete, multi-statement)** | ✅ Tie |
@@ -208,6 +209,11 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Per-User Execution History** | ⚠️ Job run history | ⚠️ Query history | ✅ **dbt Run History partitioned by user** | 🏆 **Data Kiln Works** |
 | **Orchestration & Scheduling** | ✅ Databricks Workflows | ✅ Tasks & Streams | ✅ **APScheduler + Native Cron Scheduling** | 🏆 **Databricks / Snowflake** |
 | **Continuous Streaming Ingestion** | ✅ Structured Streaming | ✅ Snowpipe / Streaming | ⚠️ Micro-batch / File Ingestion | 🏆 **Databricks / Snowflake** |
+| **Continuous File Ingestion (Auto-Loader / Snowpipe)** | ✅ Auto Loader (`cloudFiles`, event notifications) | ✅ Snowpipe (auto-ingest via cloud event notifications) | ✅ **Volume Auto-Loader**: polling daemon (5s minimum) or cron schedule over `/Volumes/...` folders into Delta tables, with exactly-once file checkpoints and per-file audit log | 🏆 **Databricks / Snowflake** (event-driven, cloud-scale). Data Kiln is polling-based and single-node |
+| **Schema Drift Handling on Load** | ✅ `addNewColumns` / `rescue` / `failOnNewColumns` | ⚠️ `MATCH_BY_COLUMN_NAME` + Schema Evolution (`ENABLE_SCHEMA_EVOLUTION`) | ✅ **`addNewColumns`, `failOnNewColumns`, `rescue` (JSON `_rescued_data`)** | ✅ Tie with Databricks |
+| **Load Modes** | ⚠️ Append (merge via `foreachBatch`) | ⚠️ Append (`COPY INTO`); merge via Streams + Tasks | ✅ **Append, Merge (upsert on keys), Overwrite** | 🏆 **Data Kiln Works** |
+| **Bad-File Handling** | ✅ `badRecordsPath` | ✅ `ON_ERROR = SKIP_FILE` / `COPY_HISTORY` | ✅ **Auto-quarantine to `_quarantine/` + FAILED/QUARANTINED history; pipeline keeps going** | ✅ Tie |
+| **Load History / Audit** | ✅ Auto Loader checkpoints & events | ✅ `COPY_HISTORY` / `PIPE_USAGE_HISTORY` | ✅ **Per-file rows, latency & error log; lineage `VOLUME → TABLE`** | ✅ Tie |
 
 **Domain Verdict:** **DataKilnWorks Studio** is unique in providing a **first-class native GUI and API for dbt Core**, running transformations directly within the studio without requiring a separate dbt Cloud subscription.
 

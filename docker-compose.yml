@@ -1,29 +1,8 @@
 services:
-  lakehouse-notebook:
+  datakilnworks-studio:
     build:
       context: .
       dockerfile: Dockerfile
-    image: localspark-lakehouse-notebook
-    container_name: local-datakilnworks-lakehouse
-    ports:
-      - "${HOST_PORT:-8890}:8888"
-    environment:
-      - WAREHOUSE_DIR=/workspace/warehouse
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-datakilnworks}
-    volumes:
-      - ./notebooks:/workspace/notebooks
-      - ./warehouse:/workspace/warehouse
-      - ./dbt_project:/workspace/dbt_project
-      - ./docs:/workspace/docs
-    deploy:
-      resources:
-        limits:
-          memory: 16G
-        reservations:
-          memory: 2G
-    restart: unless-stopped
-
-  datakilnworks-studio:
     image: localspark-lakehouse-notebook
     container_name: local-datakilnworks-studio
     command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -31,8 +10,6 @@ services:
       - "${STUDIO_PORT:-8891}:8000"
     environment:
       - WAREHOUSE_DIR=/workspace/warehouse
-      - JUPYTER_PORT=${HOST_PORT:-8890}
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-datakilnworks}
       - WH_STARTER_ENDPOINT=http://compute-node-01:8001
       - WH_ANALYTICS_ENDPOINT=http://compute-node-02:8002
       - WH_ETL_ENDPOINT=http://compute-node-03:8003
@@ -42,6 +19,10 @@ services:
       - ./web:/workspace/web
       - ./dbt_project:/workspace/dbt_project
       - ./docs:/workspace/docs
+      - sandbox-secret:/run/sandbox:ro
+    networks:
+      - default
+      - sandbox-net
     deploy:
       resources:
         limits:
@@ -50,12 +31,55 @@ services:
           memory: 1G
     restart: unless-stopped
 
+  # Runs the notebook kernels of users a masking policy applies to. It has no warehouse mount, is alone with the studio on an
+  # internal network (no internet, no compute nodes), and kernels read data only through the studio's governed endpoint.
+  # See sandbox/worker.py.
+  notebook-sandbox:
+    image: localspark-lakehouse-notebook
+    container_name: local-notebook-sandbox
+    command: ["python", "-m", "uvicorn", "worker:app", "--app-dir", "/opt/sandbox", "--host", "0.0.0.0", "--port", "8000"]
+    expose:
+      - "8000"
+    environment:
+      - SANDBOX_GATEWAY_URL=http://datakilnworks-studio:8000
+      - SANDBOX_MAX_ROWS=${SANDBOX_MAX_ROWS:-1000000}
+    volumes:
+      - ./sandbox:/opt/sandbox:ro
+      - ./web/notebook_runner.py:/opt/runner/notebook_runner.py:ro
+      - sandbox-secret:/run/sandbox
+      - sandbox-state:/sandbox/state
+    tmpfs:
+      - /root
+      - /tmp
+    networks:
+      - sandbox-net
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:            # switching to per-user uids and preparing their homes
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          pids: 1024
+    restart: unless-stopped
+
   compute-node-01:
     image: localspark-lakehouse-notebook
+    depends_on:
+      - datakilnworks-studio
     container_name: local-compute-node-01
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8001"]
-    ports:
-      - "8001:8001"
+    # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
+    expose:
+      - "8001"
     environment:
       - WORKER_NODE_ID=compute-node-01
       - WORKER_NODE_NAME=Compute Worker 01 (Starter Node)
@@ -77,10 +101,13 @@ services:
 
   compute-node-02:
     image: localspark-lakehouse-notebook
+    depends_on:
+      - datakilnworks-studio
     container_name: local-compute-node-02
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8002"]
-    ports:
-      - "8002:8002"
+    # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
+    expose:
+      - "8002"
     environment:
       - WORKER_NODE_ID=compute-node-02
       - WORKER_NODE_NAME=Compute Worker 02 (Analytics Pro)
@@ -102,10 +129,13 @@ services:
 
   compute-node-03:
     image: localspark-lakehouse-notebook
+    depends_on:
+      - datakilnworks-studio
     container_name: local-compute-node-03
     command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "8003"]
-    ports:
-      - "8003:8003"
+    # Workers run arbitrary SQL, so they are reachable only on the compose network and require X-Compute-Token.
+    expose:
+      - "8003"
     environment:
       - WORKER_NODE_ID=compute-node-03
       - WORKER_NODE_NAME=Compute Worker 03 (ETL Batch)
@@ -124,3 +154,11 @@ services:
         reservations:
           memory: 1G
     restart: unless-stopped
+
+networks:
+  sandbox-net:
+    internal: true
+
+volumes:
+  sandbox-secret:
+  sandbox-state:

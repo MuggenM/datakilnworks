@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Data Kiln Works: a local Databricks-style lakehouse (Delta Lake tables on disk, DuckDB as the engine, SQLFrame for the Spark DataFrame API, no JVM). A FastAPI backend plus a single-page Alpine.js UI, and JupyterLab with a Databricks-compat shim. `README.md` has the full feature catalogue; `FEATURE_COMPARISON.md` maps features to Databricks/Snowflake.
+Data Kiln Works: a local Databricks-style lakehouse (Delta Lake tables on disk, DuckDB as the engine, SQLFrame for the Spark DataFrame API, no JVM). A FastAPI backend plus a single-page Alpine.js UI, with an in-Studio notebook runner (per-user kernels, Databricks-compat shim). There is no JupyterLab server. `README.md` has the full feature catalogue; `FEATURE_COMPARISON.md` maps features to Databricks/Snowflake.
 
 ## Running it
 
@@ -18,9 +18,9 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 
 | Service | Port | Entry point |
 | --- | --- | --- |
-| `lakehouse-notebook` | 8890 (Jupyter, token `datakilnworks`) | Dockerfile CMD |
 | `datakilnworks-studio` | 8891 | `uvicorn web.app:app --reload` |
-| `compute-node-01/02/03` | 8001-8003 | `uvicorn web.compute_worker:app` |
+| `notebook-sandbox` | none (internal `sandbox-net` only) | `uvicorn worker:app --app-dir /opt/sandbox` (code in `sandbox/`) |
+| `compute-node-01/02/03` | 8001-8003, compose network only (not published; require `X-Compute-Token`) | `uvicorn web.compute_worker:app` |
 
 - `./web`, `./notebooks`, `./warehouse` and `./docs` are bind-mounted, and the studio uses `--reload`, so edits to `web/*.py` apply without a rebuild. Only `requirements.txt`/`Dockerfile`/`config/00_databricks_shim.py` changes need `docker compose build`. The shim is copied into the image, not mounted.
 - Swagger UI is at `/api/docs`; the built-in manual is served from `docs/index.html` at `/docs/`.
@@ -43,11 +43,20 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 - `ray_engine.py` optionally scales each warehouse with Ray `DuckDBWorkerActor` pools for scatter-gather scans. It degrades gracefully when Ray isn't installed (`RAY_INSTALLED`).
 
 **Notebooks**
-- `config/00_databricks_shim.py` is an IPython startup hook. It injects `spark` (a SQLFrame session sharing the duckrun DuckDB connection), `dbutils`, `display()`, and the `%sql` magic. It also patches `createOrReplaceTempView` so SQLFrame DataFrames are visible to SQL. Notebooks under `notebooks/{Users,Shared}/` are run headless by `notebook_runner.py` (Papermill) and the workflow DAG engine (`workflow.py`).
+- Notebooks run only through `web/notebook_runner.py` (kernels keyed per `(user, notebook)`; endpoints in `app.py` go through `_notebook_user`: authenticated, `can_access_workspace_path`, and `web/notebook_access.py` for execution). Do not add a shared Jupyter server: it would see every user's folder and the warehouse files. Users a masking policy applies to run in the notebook sandbox instead (`RemoteKernelSession` in `notebook_runner.py` calls `sandbox/worker.py` through `web/sandbox_client.py`; routing is `notebook_access.execution_route`). Sandboxed kernels have no warehouse and read data only through `POST /api/sandbox/sql` (`web/sandbox_gateway.py`, governed like the SQL editor, token bound to the user); the middleware in `app.py` refuses every other route to the sandbox's address, so never add an unauthenticated route that a kernel could reach. `sandbox/shim.py` is the sandbox's IPython startup file. Test: `scratch/test_notebook_sandbox.py` runs against a throwaway sandbox + studio container pair (see its docstring). `config/00_databricks_shim.py` is an IPython startup hook. It injects `spark` (a SQLFrame session sharing the duckrun DuckDB connection), `dbutils`, `display()`, and the `%sql` magic. It also patches `createOrReplaceTempView` so SQLFrame DataFrames are visible to SQL. Notebooks under `notebooks/{Users,Shared}/` are run headless by `notebook_runner.py` (Papermill) and the workflow DAG engine (`workflow.py`).
 
 **Frontend**
 - `web/templates/index.html` is a single roughly 27k-line Jinja/Alpine.js file containing every view (Chart.js for charts, Monaco for SQL). Expect large, targeted edits with grep, not whole-file reads. Note the recent fix commits for Alpine expression and scope errors, since inline expressions are brittle.
 - The MLflow shim (`mlflow_shim.py`), model serving (`serving.py`) and SQL-native inference functions (`ai_sql.py`, exposing `predict`, `ai_query` and similar as DuckDB UDFs) emulate Databricks MLflow, serving and AI functions locally. LLM backends (LM Studio and Ollama) are configured in `llm_settings.py`.
+
+## Governance (tags + column masking)
+
+- `web/governance/` holds tags (`tags.py`), masking policies and masks (`policies.py`, `masks.py`, `macros.py`), the query gateway (`enforce.py`, `gateway.py`) and the REST router (`routes.py`). State lives in `warehouse/.metadata/governance.db`.
+- **Every code path that runs SQL on behalf of a user must go through the gateway** (`gateway.govern_sql`, `governed_sql_or_raise`, `_gov_or_403` in `app.py`, `masked_relation`, or `mask_arrow` for data Python already holds). Use the *rewritten* SQL for execution and the user's own text for history. Identity comes from `resolve_principal(request)` (never fall back to admin on errors), or `gateway.principal_for_username(owner)` for background work; a missing identity is least privilege.
+- `scratch/test_governance_coverage.py` scans `web/*.py` for DuckDB execution sites; a new one must call the gateway or be added to `web/governance/ALLOWLIST.md` with a reason.
+- Statements that create tables from tagged columns are followed by `gateway.propagate_tags(...)` (SQL editor, job SQL tasks); do the same in any new path that runs user DML.
+- Caches of query results must be keyed by `gateway.fingerprint(result)` (the set of masks the result was computed under).
+- Tests: `scratch/test_governance_phase{0..6}.py` (run inside the studio container against a throwaway warehouse whose directory is named `warehouse`), `scratch/test_governance_coverage.py` (host), `scratch/verify_governance_ui.py` (Playwright, throwaway instance only).
 
 ## Conventions
 
