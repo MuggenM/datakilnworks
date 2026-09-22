@@ -14654,6 +14654,17 @@
               </div>
             </div>
 
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">User Search Base <span class="text-slate-400 normal-case">(optional, else Base Search DN)</span></label>
+                <input type="text" x-model="authConfig.ldap.user_search_base" placeholder="ou=Employees,dc=company,dc=internal" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:border-indigo-500">
+              </div>
+              <div>
+                <label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Group Search Base <span class="text-slate-400 normal-case">(optional, else Base Search DN)</span></label>
+                <input type="text" x-model="authConfig.ldap.group_search_base" placeholder="ou=Groups,dc=company,dc=internal" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:border-indigo-500">
+              </div>
+            </div>
+
             <!-- LDAP Role Mappings -->
             <div class="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-dbx-border rounded-xl space-y-2">
               <span class="font-bold text-slate-800 dark:text-white block text-[11px] uppercase tracking-wider text-slate-500">Directory Group to Studio Role Mappings</span>
@@ -14678,17 +14689,33 @@
             </div>
 
             <!-- LDAP Test Connection Action & Feedback -->
-            <div class="flex items-center justify-between pt-1">
+            <div class="flex flex-wrap items-center gap-2 pt-1">
               <button type="button" @click="testLdapConnection()" :disabled="isTestingLdap"
                       class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
                 <i class="ph" :class="isTestingLdap ? 'ph-spinner animate-spin' : 'ph-plugs-connected'"></i>
-                <span>Test LDAP Connectivity</span>
+                <span>Test Connectivity</span>
+              </button>
+              <button type="button" @click="testLdapBind()" :disabled="isTestingLdapBind"
+                      title="Binds as the service account and runs a search, using the currently saved bind password if the field still shows dots"
+                      class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
+                <i class="ph" :class="isTestingLdapBind ? 'ph-spinner animate-spin' : 'ph-key'"></i>
+                <span>Test Bind &amp; Search</span>
+              </button>
+              <button type="button" @click="syncLdapUsers()" :disabled="isSyncingLdap"
+                      title="Re-checks every LDAP-provisioned user's role against the directory now, and deactivates any that were removed there"
+                      class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
+                <i class="ph" :class="isSyncingLdap ? 'ph-spinner animate-spin' : 'ph-arrows-clockwise'"></i>
+                <span>Sync LDAP Users Now</span>
               </button>
 
               <div x-show="ldapTestResult" class="text-xs flex items-center space-x-1.5 px-3 py-1 rounded-lg"
                    :class="ldapTestResult?.success ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800' : 'bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800'">
                 <i class="ph" :class="ldapTestResult?.success ? 'ph-check-circle' : 'ph-warning-circle'"></i>
                 <span x-text="ldapTestResult?.message"></span>
+              </div>
+              <div x-show="ldapSyncResult" class="text-xs flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800">
+                <i class="ph ph-info"></i>
+                <span x-text="ldapSyncResult ? (ldapSyncResult.checked + ' checked, ' + ldapSyncResult.updated + ' updated, ' + ldapSyncResult.deactivated + ' deactivated' + (ldapSyncResult.errors.length ? (', ' + ldapSyncResult.errors.length + ' error(s)') : '')) : ''"></span>
               </div>
             </div>
           </div>
@@ -16395,6 +16422,9 @@
         },
         isTestingLdap: false,
         ldapTestResult: null,
+        isTestingLdapBind: false,
+        isSyncingLdap: false,
+        ldapSyncResult: null,
         isTestingOidc: false,
         oidcTestResult: null,
         slackConfig: {
@@ -18734,6 +18764,39 @@
             this.ldapTestResult = { success: false, message: 'Network error testing LDAP: ' + e.message };
           } finally {
             this.isTestingLdap = false;
+          }
+        },
+
+        async testLdapBind() {
+          this.isTestingLdapBind = true;
+          this.ldapTestResult = null;
+          try {
+            const res = await fetch('/api/auth/frameworks/ldap/test-bind', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(this.authConfig.ldap)
+            });
+            this.ldapTestResult = await res.json();
+          } catch (e) {
+            this.ldapTestResult = { success: false, message: 'Network error testing the LDAP bind: ' + e.message };
+          } finally {
+            this.isTestingLdapBind = false;
+          }
+        },
+
+        async syncLdapUsers() {
+          this.isSyncingLdap = true;
+          this.ldapSyncResult = null;
+          try {
+            const res = await fetch('/api/auth/frameworks/ldap/sync', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) { this.showToast(data.detail || 'LDAP sync failed', 'error'); return; }
+            this.ldapSyncResult = data;
+            this.showToast(`LDAP sync: ${data.checked} checked, ${data.updated} updated, ${data.deactivated} deactivated`, data.errors.length ? 'error' : 'success');
+          } catch (e) {
+            this.showToast('Error syncing LDAP users: ' + e.message, 'error');
+          } finally {
+            this.isSyncingLdap = false;
           }
         },
 
