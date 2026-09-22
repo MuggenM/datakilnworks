@@ -418,10 +418,11 @@ spec:
 * **Centralized Identity & Access Management (IAM)**:
   - Configure corporate identity providers under **Platform Settings > Authentication**.
   - Passwords hashed with salted `PBKDF2-HMAC-SHA256` with JWT cookie sessions (`dbx_session`).
-* **LDAP & Active Directory Integration**:
-  - Connect to OpenLDAP or Windows Server Active Directory (`ldap://` / `ldaps://`).
-  - Configurable Bind DN, search base, user filter (`(sAMAccountName={username})`), and group mappings.
-  - Interactive "Test Connection" tool directly in the settings workbench.
+* **LDAP & Active Directory Integration** (`web/ldap_auth.py`; real bind/search/sync, not a stub):
+  - Login for an unknown or LDAP-provisioned username does a real service-account bind, searches for the user (username filter-escaped against LDAP injection), then re-binds *as that user's DN* with the password given — the actual credential check, so a directory-side password change or account lock takes effect on the next login, never a cached hash.
+  - Group membership (reverse search, `member`/`uniqueMember`, configurable) maps to a role via `admin_group` / `power_user_group` / `default_role`; the local account is created or updated with `auth_source='ldap'` and a random password hash nobody knows, so it can only ever authenticate through LDAP. An existing **local** username is always refused here first, so an LDAP login attempt can never take over a local account.
+  - **Sync**: `POST /api/auth/frameworks/ldap/sync` (or the *Sync LDAP Users Now* button) re-resolves every LDAP-provisioned account's role against the directory and deactivates it locally if the directory entry is gone.
+  - **Test Bind & Search** (beyond the existing TCP/TLS-only *Test Connection*) does the real service bind and a bounded search, for a config that is actually usable, not just reachable.
 * **OIDC & OAuth 2.0 Providers**:
   - Federate logins with Azure AD, Okta, Keycloak, or Google Identity.
   - Auto-discovery via `.well-known/openid-configuration`.

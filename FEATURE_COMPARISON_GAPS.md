@@ -29,7 +29,6 @@ code (`grep` for the implementation, not just the claim).
 
 | Feature | Claimed (Domain) | What actually exists | Verdict |
 | --- | --- | --- | --- |
-| LDAP / Active Directory Sync | "Built-in LDAP auth, connection test & user sync (All tiers)" (Domain 11) | `web/auth_frameworks.py::test_ldap_connection` opens a TCP/TLS socket and reports latency. There is no bind, no user search, no group mapping, no sync, and no LDAP login path — `get_current_user` never consults LDAP. `ldap3` isn't even in `requirements.txt`. | **Loss.** Databricks/Snowflake have real directory sync; DKW has a "can I reach the server" ping. |
 | OAuth 2.0 / 8 providers | "8 Native Providers... OAuth 2.0" (Domain 11) | `web/auth_frameworks.py` only does OIDC discovery-document validation (`test_oidc_connection`). There is no `/api/auth/oidc/callback` handler, no token exchange, no session issuance from an external IdP — login is local-username/password only. | **Loss**, or at best "configuration screen only." |
 | Multi-Factor Authentication (MFA) | "Native TOTP + 10 Backup Codes" (Domain 11) | No `pyotp`, no TOTP secret column, no backup-code table, no verification step in the login flow. Zero matches for `totp`/`mfa_secret`/`backup_code` anywhere in `web/`. | **Loss.** This is entirely fictional. |
 | Git Version Control Integration | "Native Git Repositories + Commit/Push/Pull" (Domain 4) | No git library, no git subprocess calls, no repo endpoints anywhere in `web/`. | **Loss** (or "Not implemented"), not a tie. |
@@ -83,15 +82,19 @@ architecture. Roughly ordered by how much they'd change the honest scorecard:
 > **Update:** item 1 below, Row-Level Security, has since been implemented (tag-driven row filter policies in
 > `web/governance/row_filters.py`, enforced through the same rewrite as column masking). `FEATURE_COMPARISON.md`'s RLS
 > row has been corrected from a loss to a tie, Domain 1 from 9/11 to 10/11, and the total from 94/98 (96%) to 95/98
-> (97%). It's left here, struck through, as a record of what this document originally flagged.
+> (97%). Item 2, real LDAP authentication, has also since been implemented (`web/ldap_auth.py`): a real
+> service-account bind, user search, bind-as-user credential check, group-to-role mapping, auto-provisioning
+> (`auth_source='ldap'`) and a sync that deactivates accounts removed from the directory, verified against a real
+> `lldap` server, not a mock. `FEATURE_COMPARISON.md`'s LDAP row is corrected accordingly. Both are left here,
+> struck through, as a record of what this document originally flagged.
 
 1. ~~**Row-Level Security.**~~ *(Done.)* The governance gateway (`web/governance/enforce.py`) already rewrote every
    scan with `SELECT * REPLACE (...)`; adding a `WHERE` predicate keyed by tag/policy the same way column masks are
    was a natural, scoped extension of code that already existed.
-2. **Real LDAP authentication.** Add `ldap3`, implement a service-account bind + user search + user bind-as-check,
-   map `memberOf` to `admin`/`power_user`/`user`, and set `auth_source='ldap'` on the resulting user (the column
-   already exists from the recent password-change work). This is the natural next step from the current
-   connection-test-only stub, and a local LDAP server like `lldap` is already available for testing.
+2. ~~**Real LDAP authentication.**~~ *(Done.)* `ldap3` + a service-account bind + user search + user bind-as-check,
+   mapping group membership to `admin`/`power_user`/`user`, and `auth_source='ldap'` on the resulting user (the
+   column already existed from the password-change work). This was the natural next step from the
+   connection-test-only stub, and the local LDAP server (`lldap`) mentioned below was what it was tested against.
 3. **A real OIDC/OAuth login flow.** Token exchange, `/api/auth/oidc/callback`, session issuance, and the same
    `auth_source` tagging so those accounts are correctly excluded from local password changes.
 4. **TOTP-based MFA with backup codes.** `pyotp` + a QR-code enrollment screen + a verification step in

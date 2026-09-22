@@ -244,7 +244,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **OAuth Providers Supported** | Major enterprise (Okta, Azure, Google) | Major enterprise | **8 Native Providers (Okta, Azure AD, Google, GitHub, GitLab, Auth0, Keycloak, Custom OIDC with PKCE)** | 🏆 **Data Kiln Works** |
 | **Multi-Factor Authentication (MFA)**| ✅ Duo / Cloud MFA | ✅ Duo Push / TOTP | ✅ **Native TOTP (Google/MS/Authy) + 10 Backup Codes** | 🏆 **Data Kiln Works** |
 | **MFA Configuration & Stats** | ⚠️ Admin console only | ⚠️ SQL commands | ✅ **Full GUI: Policy enforcement, grace period, reset, stats** | 🏆 **Data Kiln Works** |
-| **LDAP / Active Directory Sync** | ✅ SCIM / Enterprise only | ✅ SCIM / Enterprise only | ✅ **Built-in LDAP auth, connection test & user sync (All tiers)**| 🏆 **Data Kiln Works** |
+| **LDAP / Active Directory Sync** | ✅ SCIM / Enterprise only | ✅ SCIM / Enterprise only | ✅ **Real bind-as-user auth, group-to-role mapping, auto-provisioning, and a sync that deactivates accounts removed from the directory (all tiers)** | 🏆 **Data Kiln Works** |
 | **Multi-User Workspace Isolation**| ✅ Personal folders | ⚠️ Worksheets list | ✅ **Personal home directories (`Users/<username>/`) with 403 enforcement** | 🏆 **Databricks / Data Kiln** |
 | **Role-Based Access Control (RBAC)**| ✅ Full RBAC | ✅ Hierarchical RBAC | ✅ **Admin, Power User, User roles with UI & API enforcement** | ✅ Tie |
 | **Network Policies / IP Allowlists**| ✅ Yes | ✅ Yes | ⚠️ Kubernetes / Ingress level | 🏆 **Databricks / Snowflake** |
