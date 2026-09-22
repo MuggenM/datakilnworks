@@ -131,7 +131,7 @@
         </a>
         <a href="#tags-masking-policies" class="sidebar-nav-item">
           <i class="ph ph-shield-check"></i>
-          <span>Tags & Masking Policies</span>
+          <span>Tags, Masking & Row Security</span>
           <span class="sidebar-badge">New</span>
         </a>
       </div>
@@ -627,18 +627,19 @@ WHERE curr.salary <> prev.salary;</code></pre>
           The <strong>Data Lineage</strong> workbench visualizes column-level and table-level lineage. The engine statically parses SQL DDL/DML, dbt schemas, and Delta log operations to construct an interactive Directed Acyclic Graph (DAG) displaying upstream sources and downstream consumers.
         </p>
 
-        <h3 id="tags-masking-policies">Tags & Tag-Driven Masking Policies</h3>
+        <h3 id="tags-masking-policies">Tags, Tag-Driven Masking Policies & Row-Level Security</h3>
         <p>
-          Tags classify data once; masking policies then protect every column carrying a tag, wherever it is queried. Tags can be attached to catalogs, schemas, tables and columns, are stored in SQLite (<code>warehouse/.metadata/governance.db</code>), and are inherited downwards: a tag on a schema applies to every table and column beneath it, and a more specific tag overrides the inherited one.
+          Tags classify data once; masking policies then protect every column carrying a tag, and row filter policies restrict which rows of every table carrying a tag are visible, wherever they are queried. Tags can be attached to catalogs, schemas, tables and columns, are stored in SQLite (<code>warehouse/.metadata/governance.db</code>), and are inherited downwards: a tag on a schema applies to every table and column beneath it, and a more specific tag overrides the inherited one.
         </p>
         <ul>
           <li><strong>Tags:</strong> a key with an optional list of allowed values (for example <code>pii</code> = <code>email</code>, <code>phone</code>, <code>name</code>). Manage them in the <strong>Governance</strong> view (admins) or from the <strong>Tags</strong> column of the catalog explorer schema tab.</li>
           <li><strong>Masking policies:</strong> bind a tag (and optionally a value) to a mask, with exemptions by role or user. Built-in masks: <code>full</code>, <code>partial</code>, <code>email</code>, <code>null</code>, <code>hash</code> (keyed, so it cannot be reversed by a dictionary attack), <code>date_year</code>, <code>round</code> and a validated <code>custom</code> SQL expression. Each mask states what it does per column type.</li>
-          <li><strong>Enforcement at query time:</strong> a gateway rewrites the SQL of every governed execution path (SQL editor, dashboards, Genie, alerts, scheduled exports, jobs, time travel, Auto-Loader, compute nodes) with <code>SELECT * REPLACE (...)</code>, using scope analysis so that CTEs, joins, subqueries, aliases and <code>SELECT *</code> cannot bypass it. It fails closed: SQL it cannot analyse is refused, and users a policy applies to may only run allow-listed read statements.</li>
+          <li><strong>Row filter policies (row-level security):</strong> bind a tag on a catalog/schema/table (never a column, since a row filter restricts the whole table) to a column and a mode: <code>owner</code> (that column must equal the caller's username), <code>attribute</code> (that column must be one of the caller's assigned values for a key, from a built-in membership table you populate under <strong>Row Filters &rarr; User attributes</strong> &mdash; nothing assigned means nothing visible, never everything) or a validated <code>custom</code> boolean expression using <code>{col}</code>/<code>{user}</code>/<code>{role}</code>. Several applicable policies on one table combine with <code>AND</code>.</li>
+          <li><strong>Enforcement at query time:</strong> a gateway rewrites the SQL of every governed execution path (SQL editor, dashboards, Genie, alerts, scheduled exports, jobs, time travel, Auto-Loader, compute nodes) into <code>SELECT * [REPLACE (...)] FROM table [WHERE predicate AND ...]</code>, using scope analysis so that CTEs, joins, subqueries, aliases and <code>SELECT *</code> cannot bypass it. It fails closed: SQL it cannot analyse is refused, and users a policy applies to may only run allow-listed read statements.</li>
           <li><strong>Suggestions:</strong> the classifier proposes tags for untagged columns (emails, phone numbers, names) which an admin accepts in bulk.</li>
-          <li><strong>Preview as user:</strong> shows which columns another user sees masked and the rewritten SQL, without impersonating them.</li>
-          <li><strong>Tag propagation:</strong> when an exempt user runs <code>CREATE TABLE ... AS SELECT</code> over tagged columns, the tags follow onto the new table. Columns that are computed from tagged columns are marked <code>sensitivity=unclassified</code> for review, so a copy cannot become an unprotected leak.</li>
-          <li><strong>Audit & coverage:</strong> every tag and policy change is logged, and the coverage view shows which execution paths are governed and how many sensitive columns are still untagged.</li>
+          <li><strong>Preview as user:</strong> shows which columns another user sees masked, which tables have a row filter applied for them, and the rewritten SQL, without impersonating them.</li>
+          <li><strong>Tag propagation:</strong> when an exempt user runs <code>CREATE TABLE ... AS SELECT</code> over tagged columns, the tags follow onto the new table (computed columns are marked <code>sensitivity=unclassified</code> for review). A copy of a row-filtered table is tagged the same way as its source, so a copy cannot become a full unfiltered leak of the original.</li>
+          <li><strong>Audit & coverage:</strong> every tag and policy change is logged, and the coverage view shows which execution paths are governed, how many sensitive columns are still untagged, and which row filter policies match nothing or reference a missing column.</li>
         </ul>
 
         <div class="code-container">
@@ -648,15 +649,20 @@ WHERE curr.salary <> prev.salary;</code></pre>
           <pre><code class="language-sql">-- An analyst with a policy on pii=email sees masked values; an admin (exempt) sees raw values
 SELECT name, email FROM warehouse.hr.employees;
 -- name | email
--- Ada  | a***@example.com</code></pre>
+-- Ada  | a***@example.com
+
+-- With a row filter policy (attribute mode, column "region") the analyst also sees only their assigned regions:
+SELECT name, region FROM warehouse.hr.employees;
+-- name | region
+-- Ada  | EMEA</code></pre>
         </div>
 
         <div class="callout warning">
           <div class="callout-icon"><i class="ph ph-warning"></i></div>
           <div class="callout-body">
-            <div class="callout-title">Limits of masking</div>
+            <div class="callout-title">Limits of masking and row filtering</div>
             <p>
-              Masking is enforced in the studio's SQL layer. Notebook kernels run arbitrary Python and cannot be masked, so users a masking policy applies to run them in the isolated notebook sandbox, where data is only reachable through the masking gateway (see <a href="#security-settings">Security Settings</a>). Row-level filtering is not implemented yet. Direct file access to the warehouse is only possible for administrators.
+              Both are enforced in the studio's SQL layer. Notebook kernels run arbitrary Python and cannot be masked or row-filtered, so users either policy applies to run them in the isolated notebook sandbox, where data is only reachable through the governance gateway (see <a href="#security-settings">Security Settings</a>). Direct file access to the warehouse is only possible for administrators.
             </p>
           </div>
         </div>
@@ -1013,8 +1019,8 @@ WHERE active = true;</code></pre>
           <li><strong>LDAP / Active Directory:</strong> In-studio LDAP connection testing, credential validation, and automatic group-to-role mapping.</li>
           <li><strong>Change your own password:</strong> user menu &rarr; <em>Change password</em> (accounts whose password is kept in the studio's own database only). It needs the current password, and sessions signed in before the change are signed out. Administrators can still reset any password from Users &amp; IAM.</li>
           <li><strong>Multi-Factor Authentication (MFA):</strong> TOTP (RFC 6238) generation, QR code registration, and 10 self-service emergency backup recovery codes.</li>
-          <li><strong>Column masking:</strong> tag-driven masking policies with role and user exemptions (see <a href="#tags-masking-policies">Tags & Masking Policies</a>).</li>
-          <li><strong>Row-Level Security (RLS):</strong> <em>planned, not yet implemented.</em> Column masking is the only fine-grained data policy today.</li>
+          <li><strong>Column masking:</strong> tag-driven masking policies with role and user exemptions (see <a href="#tags-masking-policies">Tags, Masking Policies & Row-Level Security</a>).</li>
+          <li><strong>Row-Level Security (RLS):</strong> tag-driven row filter policies (owner, attribute, or custom expression modes), enforced by the same query-rewrite gateway as column masking, with role and user exemptions.</li>
         </ul>
       </section>
 
@@ -1397,6 +1403,30 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
                 <td><code>{"tag_key": "pii", "mask_type": "email", "except_roles": ["admin"]}</code></td>
               </tr>
               <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/row-policies</code></td>
+                <td>Lists row filter policies</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/governance/row-policies</code></td>
+                <td>Creates a row filter policy (PUT and DELETE on <code>/{policy_id}</code>, POST <code>/validate</code> for a custom expression)</td>
+                <td><code>{"tag_key": "region_scoped", "filter_column": "region", "filter_mode": "attribute", "attribute_key": "region"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/governance/attributes</code></td>
+                <td>Lists principal attribute assignments (the membership table 'attribute'-mode row policies read)</td>
+                <td>Query params: <code>principal_type</code>, <code>principal_value</code>, <code>attribute_key</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/governance/attributes</code></td>
+                <td>Assigns attribute values to a user or a role (DELETE with the same query params to remove)</td>
+                <td><code>{"principal_type": "user", "principal_value": "analyst_bob", "attribute_key": "region", "values": ["EMEA"]}</code></td>
+              </tr>
+              <tr>
                 <td><span class="badge green">POST</span></td>
                 <td><code>/api/governance/preview-as</code></td>
                 <td>Shows what another user would see, with the rewritten SQL</td>
@@ -1512,7 +1542,7 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
         <li class="toc-item"><a href="#delta-lake-time-travel" class="toc-link" style="padding-left: 1rem;">Delta Time Travel</a></li>
         <li class="toc-item"><a href="#unity-catalog-volumes" class="toc-link" style="padding-left: 1rem;">Volumes Explorer</a></li>
         <li class="toc-item"><a href="#interactive-data-lineage" class="toc-link" style="padding-left: 1rem;">Data Lineage DAG</a></li>
-        <li class="toc-item"><a href="#tags-masking-policies" class="toc-link" style="padding-left: 1rem;">Tags & Masking</a></li>
+        <li class="toc-item"><a href="#tags-masking-policies" class="toc-link" style="padding-left: 1rem;">Tags, Masking & Row Security</a></li>
         <li class="toc-item"><a href="#monaco-sql-editor" class="toc-link">SQL & Lakeview BI</a></li>
         <li class="toc-item"><a href="#lakeview-dashboards" class="toc-link" style="padding-left: 1rem;">Dashboards & Exports</a></li>
         <li class="toc-item"><a href="#genie-spaces-ai" class="toc-link" style="padding-left: 1rem;">Genie Space (AI)</a></li>
