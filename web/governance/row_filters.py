@@ -341,7 +341,7 @@ def list_attributes(principal_type: Optional[str] = None, principal_value: Optio
     try:
         rows = conn.execute(
             f"SELECT * FROM principal_attributes {where} "
-            "ORDER BY principal_type, principal_value, attribute_key, attribute_value").fetchall()
+            "ORDER BY principal_type, principal_value, attribute_key, attribute_value", params).fetchall()
     finally:
         conn.close()
     grouped: Dict[tuple, List[str]] = {}
