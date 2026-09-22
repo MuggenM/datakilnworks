@@ -32,8 +32,9 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from web.governance import catalog_meta, policies, store, tags
+from web.governance import catalog_meta, policies, row_filters, store, tags
 from web.governance.policies import MaskSpec, Principal
+from web.governance.row_filters import RowFilterSpec
 
 logging.getLogger("sqlglot").setLevel(logging.ERROR)
 logger = logging.getLogger("localspark.governance")
@@ -67,6 +68,15 @@ class MaskedColumn:
 
 
 @dataclass
+class RowFilterApplied:
+    table: str
+    policy_id: str
+    policy_name: str
+    filter_column: str
+    predicate_digest: str                       # non-reversible: distinguishes different resolved predicates for caching
+
+
+@dataclass
 class RewriteResult:
     sql: str                                   # SQL to execute (== the input when nothing changed)
     original_sql: str = ""
@@ -75,10 +85,16 @@ class RewriteResult:
     blocked: Optional[str] = None              # when set the statement must NOT be executed
     tables: List[str] = field(default_factory=list)
     exempt_reads: List[MaskedColumn] = field(default_factory=list)  # columns the principal is exempt from (audited)
+    row_filtered: List[RowFilterApplied] = field(default_factory=list)
+    row_filter_exempt_reads: List[RowFilterApplied] = field(default_factory=list)  # unfiltered reads (audited)
 
     @property
     def masked_tables(self) -> List[str]:
         return sorted({m.table for m in self.masked})
+
+    @property
+    def row_filtered_tables(self) -> List[str]:
+        return sorted({r.table for r in self.row_filtered})
 
 
 class _Block(Exception):
@@ -190,12 +206,13 @@ def resolve_path(path: str, home_catalog: str) -> PathInfo:
 class _Ctx:
     """Per-call state: metadata lookups (cached), current catalog/schema (tracks USE), accumulated results."""
 
-    def __init__(self, con, principal: Principal, subject: bool, sandbox: bool, default_catalog: Optional[str],
-                 default_schema: Optional[str], trusted: bool = False):
+    def __init__(self, con, principal: Principal, subject: bool, row_subject: bool, sandbox: bool,
+                 default_catalog: Optional[str], default_schema: Optional[str], trusted: bool = False):
         self.con = con
         self.trusted = trusted          # server-built SQL (previews, exports): masking applies, file sandbox/allowlists do not
         self.principal = principal
         self.subject = subject          # at least one masking policy applies -> allowlists + masking
+        self.row_subject = row_subject  # at least one row filter policy applies -> allowlists + row filtering
         self.sandbox = sandbox          # non-admin: file sandbox applies
         cur = con.execute("SELECT current_database(), current_schema()").fetchone()
         self.session_catalog = tags.norm(cur[0])
@@ -206,6 +223,8 @@ class _Ctx:
         self._views: Optional[Dict[Tuple[str, str, str], str]] = None
         self.masked: List[MaskedColumn] = []
         self.exempt_reads: List[MaskedColumn] = []
+        self.row_filtered: List[RowFilterApplied] = []
+        self.row_filter_exempt_reads: List[RowFilterApplied] = []
         self.tables: Set[str] = set()
         self.changed = False
         self.uses_file_scan = False
@@ -319,14 +338,44 @@ def _would_mask_for_exempt(ident: Tuple[str, str, str], ctx: _Ctx) -> List[MaskS
     return _masks_for(ident, ctx, ghost)
 
 
-def _build_masked_subquery(source: exp.Expression, specs: List[MaskSpec], alias: Optional[exp.Expression],
-                           default_alias: str) -> exp.Subquery:
-    """(SELECT * REPLACE (mask AS col, ...) FROM <source>) AS alias"""
-    replace_list = ", ".join(f"{s.expression} AS {_quote(s.column)}" for s in specs)
-    template = _cache_get(_TEMPLATE_CACHE, replace_list)
+def _row_filters_for(ident: Tuple[str, str, str], ctx: _Ctx, principal: Principal) -> List[RowFilterSpec]:
+    return row_filters.filters_for_table(ident[0], ident[1], ident[2], ctx.columns(*ident), principal)
+
+
+def _record_row_exempt_reads(ident: Tuple[str, str, str], ctx: _Ctx, specs: List[RowFilterSpec]) -> None:
+    """Row filters of `ident` a fully non-exempt principal would get but this principal does not (read raw/unfiltered)."""
+    still_filtered = {s.policy_id for s in specs}
+    for g in _would_filter_for_nonexempt(ident, ctx):
+        if g.policy_id not in still_filtered:
+            ctx.row_filter_exempt_reads.append(
+                RowFilterApplied(_label(ident), g.policy_id, g.policy_name, g.filter_column, _predicate_digest(g.predicate)))
+
+
+def _would_filter_for_nonexempt(ident: Tuple[str, str, str], ctx: _Ctx) -> List[RowFilterSpec]:
+    """Row filters a *non-exempt* principal would get here (used to audit exempt/raw reads such as admins)."""
+    ghost = Principal(username="\u0000audit", role="user")
+    return _row_filters_for(ident, ctx, ghost)
+
+
+def _predicate_digest(predicate: str) -> str:
+    return hashlib.sha1(predicate.encode()).hexdigest()[:12]
+
+
+def _build_governed_subquery(source: exp.Expression, specs: List[MaskSpec], row_specs: List[RowFilterSpec],
+                             alias: Optional[exp.Expression], default_alias: str) -> exp.Subquery:
+    """(SELECT * [REPLACE (mask AS col, ...)] FROM <source> [WHERE (row filter) AND ...]) AS alias"""
+    replace_list = ", ".join(f"{s.expression} AS {_quote(s.column)}" for s in specs) if specs else ""
+    where_sql = " AND ".join(f"({p.predicate})" for p in row_specs) if row_specs else ""
+    # Row filter predicates embed this principal's identity/attribute values as literals, so they are not reusable
+    # across principals: only the mask-only shape (principal-independent mask expressions) is worth caching.
+    cache_key = replace_list if not where_sql else None
+    template = _cache_get(_TEMPLATE_CACHE, cache_key) if cache_key is not None else None
     if template is None:
-        template = sqlglot.parse_one(f"SELECT * REPLACE ({replace_list}) FROM __src__", dialect="duckdb")
-        _cache_put(_TEMPLATE_CACHE, replace_list, template)
+        select = f"SELECT * REPLACE ({replace_list})" if replace_list else "SELECT *"
+        text = select + " FROM __src__" + (f" WHERE {where_sql}" if where_sql else "")
+        template = sqlglot.parse_one(text, dialect="duckdb")
+        if cache_key is not None:
+            _cache_put(_TEMPLATE_CACHE, cache_key, template)
     inner = template.copy()
     inner.find(exp.Table).replace(source)
     tbl_alias = alias if alias is not None else exp.TableAlias(this=exp.to_identifier(default_alias))
@@ -340,6 +389,12 @@ def _quote(name: str) -> str:
 def _record(ctx: _Ctx, ident: Tuple[str, str, str], specs: List[MaskSpec]) -> None:
     for s in specs:
         ctx.masked.append(MaskedColumn(_label(ident), s.column, s.policy_id, s.policy_name, s.mask_type))
+    ctx.changed = True
+
+
+def _record_row(ctx: _Ctx, ident: Tuple[str, str, str], specs: List[RowFilterSpec]) -> None:
+    for s in specs:
+        ctx.row_filtered.append(RowFilterApplied(_label(ident), s.policy_id, s.policy_name, s.filter_column, _predicate_digest(s.predicate)))
     ctx.changed = True
 
 
@@ -361,11 +416,11 @@ def _rewrite_table_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack: Tuple[Tuple
     if ident is None:
         # A name we cannot resolve might still resolve for the engine (its default catalog/schema can differ from ours).
         # Refuse when it could be tagged data: a tagged table's name, or any broad (catalog/schema) tag exists.
-        if ctx.subject and not ctx.trusted and (_name_is_sensitive(tags.norm(tbl.name), ctx) or _broad_tags_exist()):
-            raise _Block(f"Could not resolve table '{tbl.sql()}' while masking policies apply; qualify it as catalog.schema.table.")
+        if (ctx.subject or ctx.row_subject) and not ctx.trusted and (_name_is_sensitive(tags.norm(tbl.name), ctx) or _broad_tags_exist()):
+            raise _Block(f"Could not resolve table '{tbl.sql()}' while governance policies apply; qualify it as catalog.schema.table.")
         return set()
     ctx.tables.add(_label(ident))
-    if ctx.subject:
+    if ctx.subject or ctx.row_subject:
         # Execute exactly what was analysed: pin the reference to its resolved identity so the engine's own default
         # catalog/schema (which differs between the studio cursor, workers and Ray actors) cannot pick another table.
         tbl.set("catalog", exp.to_identifier(ident[0]))
@@ -378,9 +433,9 @@ def _rewrite_table_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack: Tuple[Tuple
     source: exp.Expression = tbl
     view_body_replaced = False
 
-    # -- views: mask through their definition ----------------------------------------------------------------------
+    # -- views: mask/filter through their definition -----------------------------------------------------------------
     body_sql = ctx.view_sql(*ident)
-    if body_sql is not None and ctx.subject:
+    if body_sql is not None and (ctx.subject or ctx.row_subject):
         if ident in stack or depth >= MAX_VIEW_DEPTH:
             raise _Block(f"View '{_label(ident)}' is too deeply nested or recursive to verify.")
         try:
@@ -390,36 +445,41 @@ def _rewrite_table_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack: Tuple[Tuple
                                                    and getattr(created.this, "expressions", None)):
                 raise ValueError("unsupported view definition")
         except Exception:
-            raise _Block(f"View '{_label(ident)}' has a definition that cannot be verified for masking.")
+            raise _Block(f"View '{_label(ident)}' has a definition that cannot be verified for governance.")
         saved = (ctx.catalog, ctx.schema)
         ctx.catalog, ctx.schema = ident[0], ident[1]
-        before = len(ctx.masked)
+        before_masked, before_rows = len(ctx.masked), len(ctx.row_filtered)
         try:
             body = body.copy()
             inner_masked = _rewrite_query(body, ctx, depth + 1, stack + (ident,))
         finally:
             ctx.catalog, ctx.schema = saved
-        if len(ctx.masked) > before:
+        if len(ctx.masked) > before_masked or len(ctx.row_filtered) > before_rows:
             plain = tbl.copy()
             plain.set("alias", None)
             source = exp.Subquery(this=body, alias=exp.TableAlias(this=exp.to_identifier(ident[2])))
             view_body_replaced = True
 
-    # -- masks on the object itself --------------------------------------------------------------------------------
+    # -- masks and row filters on the object itself --------------------------------------------------------------
     specs = _masks_for(ident, ctx, ctx.principal) if ident not in inner_masked else []
-    if ident not in inner_masked:            # (masked inside the view body already: nothing was read raw)
+    row_specs = _row_filters_for(ident, ctx, ctx.principal) if ident not in inner_masked else []
+    if ident not in inner_masked:            # (governed inside the view body already: nothing was read raw)
         _record_exempt_reads(ident, ctx, specs)
-    if not specs:
+        _record_row_exempt_reads(ident, ctx, row_specs)
+    if not specs and not row_specs:
         if view_body_replaced:
             tbl.replace(_with_alias(source, alias_node))
         return inner_masked | ({ident} if view_body_replaced else set())
 
-    _record(ctx, ident, specs)
+    if specs:
+        _record(ctx, ident, specs)
+    if row_specs:
+        _record_row(ctx, ident, row_specs)
     if source is tbl:
         stripped = tbl.copy()
         stripped.set("alias", None)
         source = stripped
-    tbl.replace(_build_masked_subquery(source, specs, alias_node, default_alias or tags.norm(tbl.name)))
+    tbl.replace(_build_governed_subquery(source, specs, row_specs, alias_node, default_alias or tags.norm(tbl.name)))
     return inner_masked | {ident}
 
 
@@ -466,12 +526,13 @@ def _first_arg(fn: exp.Expression) -> Optional[exp.Expression]:
 
 
 def _rewrite_function_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack) -> Set[Tuple[str, str, str]]:
-    """Table functions and file scans: sandbox the path, then map it back to a table so masks still apply."""
+    """Table functions and file scans: sandbox the path, then map it back to a table so masks/row filters still apply."""
     literal_name = _looks_like_path(tbl)
     fn_name = _function_name(tbl) if literal_name is None else "read_parquet" if literal_name.lower().endswith(".parquet") else "read_csv"
+    governed = ctx.subject or ctx.row_subject
     if literal_name is None and not isinstance(tbl.this, exp.Identifier) and fn_name not in FILE_SCAN_FUNCS:
-        if ctx.subject and not ctx.trusted and fn_name not in ALLOWED_TABLE_FUNCS:
-            raise _Block(f"The table function '{fn_name}' is not available while masking policies apply to you.")
+        if governed and not ctx.trusted and fn_name not in ALLOWED_TABLE_FUNCS:
+            raise _Block(f"The table function '{fn_name}' is not available while governance policies apply to you.")
         return set()
 
     ctx.uses_file_scan = True
@@ -481,44 +542,49 @@ def _rewrite_function_ref(tbl: exp.Table, ctx: _Ctx, depth: int, stack) -> Set[T
         arg = _first_arg(tbl.this)
         paths = _literal_paths(arg) if arg is not None else None
     if paths is None:
-        if (ctx.sandbox or ctx.subject) and not ctx.trusted:
+        if (ctx.sandbox or governed) and not ctx.trusted:
             raise _Block(f"'{fn_name}' needs a literal file path; computed paths are not allowed for your role.")
         return set()
 
     idents: Set[Tuple[str, str, str]] = set()
     for path in paths:
         info = resolve_path(path, ctx.home_catalog)
-        if info.kind == "metadata" and (ctx.sandbox or ctx.subject):
+        if info.kind == "metadata" and (ctx.sandbox or governed):
             raise _Block("Access to platform metadata files is not allowed.")
-        if info.kind in ("outside", "remote-unknown", "warehouse-other") and (ctx.sandbox or ctx.subject) and not ctx.trusted:
+        if info.kind in ("outside", "remote-unknown", "warehouse-other") and (ctx.sandbox or governed) and not ctx.trusted:
             raise _Block(f"Reading '{path}' is not allowed: only warehouse tables, volumes and exports can be scanned.")
         if info.kind == "table" and info.identity:
             idents.add(info.identity)
     if not idents:
         return set()
-    if len(idents) > 1 and ctx.subject and not ctx.trusted:
-        raise _Block("A single scan cannot mix files of several tables while masking policies apply.")
+    if len(idents) > 1 and governed and not ctx.trusted:
+        raise _Block("A single scan cannot mix files of several tables while governance policies apply.")
 
     ident = next(iter(idents))
     ctx.tables.add(_label(ident))
     cols = ctx.columns(*ident)
     if not cols:
         # Path looks like a table dir but the table is not registered: treat as sensitive only if it carries tags.
-        if ctx.subject and tags.table_has_any_tags(*ident):
-            raise _Block(f"Cannot verify the columns of '{_label(ident)}' for masking.")
+        if governed and tags.table_has_any_tags(*ident):
+            raise _Block(f"Cannot verify the columns of '{_label(ident)}' for governance.")
         return set()
     specs = _masks_for(ident, ctx, ctx.principal)
+    row_specs = _row_filters_for(ident, ctx, ctx.principal)
     _record_exempt_reads(ident, ctx, specs)
-    if not specs:
+    _record_row_exempt_reads(ident, ctx, row_specs)
+    if not specs and not row_specs:
         return set()
     if fn_name not in COLUMN_SCAN_FUNCS:
-        raise _Block(f"'{fn_name}' cannot read files of '{_label(ident)}': it has masked columns "
-                     f"({', '.join(s.column for s in specs)}).")
-    _record(ctx, ident, specs)
+        labels = ", ".join(s.column for s in specs) or "row filters"
+        raise _Block(f"'{fn_name}' cannot read files of '{_label(ident)}': it has masked columns or row filters ({labels}).")
+    if specs:
+        _record(ctx, ident, specs)
+    if row_specs:
+        _record_row(ctx, ident, row_specs)
     alias_node = tbl.args.get("alias")
     stripped = tbl.copy()
     stripped.set("alias", None)
-    tbl.replace(_build_masked_subquery(stripped, specs, alias_node, fn_name if literal_name is None else "scan"))
+    tbl.replace(_build_governed_subquery(stripped, specs, row_specs, alias_node, fn_name if literal_name is None else "scan"))
     return {ident}
 
 
@@ -593,26 +659,26 @@ _COMMAND_RISKY = re.compile(r"\b(query|query_table|read_text|read_blob|glob|read
 
 
 def _gate_statement(stmt: exp.Expression, ctx: _Ctx) -> None:
-    """Default-deny statement allowlist for principals subject to masking."""
+    """Default-deny statement allowlist for principals subject to masking or row filtering."""
     _gate_sandbox(stmt, ctx)
-    if not ctx.subject or ctx.trusted:
+    if not (ctx.subject or ctx.row_subject) or ctx.trusted:
         return
     kind = (stmt.args.get("kind") or "").upper() if isinstance(stmt, (exp.Create, exp.Drop, exp.Alter)) else ""
     if isinstance(stmt, exp.Command):
-        raise _Block("This statement type is not available while masking policies apply to you.")
+        raise _Block("This statement type is not available while governance policies apply to you.")
     if not isinstance(stmt, _ALLOWED_ROOTS_SUBJECT):
-        raise _Block(f"'{type(stmt).__name__.upper()}' statements are not available while masking policies apply to you.")
+        raise _Block(f"'{type(stmt).__name__.upper()}' statements are not available while governance policies apply to you.")
     if isinstance(stmt, exp.Create) and kind not in _CREATE_KINDS_OK:
-        raise _Block(f"CREATE {kind or 'this object'} is not available while masking policies apply to you "
-                     "(masks are defined by governance and cannot be redefined).")
+        raise _Block(f"CREATE {kind or 'this object'} is not available while governance policies apply to you "
+                     "(masks and row filters are defined by governance and cannot be redefined).")
     if isinstance(stmt, exp.Drop) and kind not in _DROP_KINDS_OK:
-        raise _Block(f"DROP {kind or 'this object'} is not available while masking policies apply to you.")
+        raise _Block(f"DROP {kind or 'this object'} is not available while governance policies apply to you.")
     if isinstance(stmt, exp.Set):
         text = stmt.sql(dialect="duckdb").lower()
         if not re.match(r"^set\s+(local\s+|session\s+)?(search_path|schema)\b", text):
-            raise _Block("Changing engine settings is not available while masking policies apply to you.")
+            raise _Block("Changing engine settings is not available while governance policies apply to you.")
     if isinstance(stmt, exp.Copy) and _copy_writes(stmt):
-        raise _Block("COPY ... TO is not available while masking policies apply to you; use the export feature instead.")
+        raise _Block("COPY ... TO is not available while governance policies apply to you; use the export feature instead.")
 
 
 def _copy_writes(stmt: exp.Copy) -> bool:
@@ -677,12 +743,26 @@ def _referenced_masked(stmt: exp.Expression, ctx: _Ctx) -> List[MaskedColumn]:
     return found
 
 
+def _referenced_row_filtered(stmt: exp.Expression, ctx: _Ctx) -> List[RowFilterApplied]:
+    """For statements we do not rewrite: which row-filtered tables would they touch? (over-approximation via find_all)"""
+    found: List[RowFilterApplied] = []
+    for t in stmt.find_all(exp.Table):
+        if not isinstance(t.this, exp.Identifier):
+            continue
+        ident = _resolve_identifier(t, ctx)
+        if ident is None:
+            continue
+        for s in _row_filters_for(ident, ctx, ctx.principal):
+            found.append(RowFilterApplied(_label(ident), s.policy_id, s.policy_name, s.filter_column, _predicate_digest(s.predicate)))
+    return found
+
+
 def _rewrite_statement(stmt: exp.Expression, ctx: _Ctx) -> exp.Expression:
     if isinstance(stmt, exp.Use):
         _apply_use(stmt, ctx)
         return stmt
     bad = _forbidden_function(stmt)
-    if bad and (ctx.subject or ctx.sandbox) and not ctx.trusted:
+    if bad and (ctx.subject or ctx.row_subject or ctx.sandbox) and not ctx.trusted:
         raise _Block(bad)
     _gate_statement(stmt, ctx)
 
@@ -690,18 +770,24 @@ def _rewrite_statement(stmt: exp.Expression, ctx: _Ctx) -> exp.Expression:
     if targets:
         for q in targets:
             _rewrite_query(q, ctx)
-        # CREATE VIEW over masked data would persist masked SQL that depends on internal functions
-        if isinstance(stmt, exp.Create) and (stmt.args.get("kind") or "").upper() == "VIEW" and ctx.masked:
-            raise _Block("Views over masked columns cannot be created while masking policies apply to you.")
+        # CREATE VIEW over governed data would persist masked/unfiltered SQL that depends on internal functions
+        if isinstance(stmt, exp.Create) and (stmt.args.get("kind") or "").upper() == "VIEW" and (ctx.masked or ctx.row_filtered):
+            raise _Block("Views over masked or row-filtered data cannot be created while governance policies apply to you.")
         return stmt
 
-    # Statements without a rewritable query: refuse when they reach masked columns.
+    # Statements without a rewritable query: refuse when they reach masked or row-filtered tables.
     if isinstance(stmt, exp.Describe):
         return stmt
-    touched = _referenced_masked(stmt, ctx) if (ctx.subject and not isinstance(stmt, (exp.Show, exp.Transaction, exp.Commit, exp.Rollback))) else []
-    if touched and isinstance(stmt, _READ_ONLY_ROOTS + (exp.Create, exp.Alter, exp.Drop, exp.TruncateTable)):
-        cols = ", ".join(sorted({f"{m.table}.{m.column}" for m in touched})[:6])
-        raise _Block(f"{type(stmt).__name__.upper()} cannot be used on tables with columns masked for you ({cols}).")
+    not_scoped = isinstance(stmt, (exp.Show, exp.Transaction, exp.Commit, exp.Rollback))
+    touched_masked = _referenced_masked(stmt, ctx) if (ctx.subject and not not_scoped) else []
+    touched_rows = _referenced_row_filtered(stmt, ctx) if (ctx.row_subject and not not_scoped) else []
+    if (touched_masked or touched_rows) and isinstance(stmt, _READ_ONLY_ROOTS + (exp.Create, exp.Alter, exp.Drop, exp.TruncateTable)):
+        parts = []
+        if touched_masked:
+            parts.append(f"columns masked for you ({', '.join(sorted({f'{m.table}.{m.column}' for m in touched_masked})[:6])})")
+        if touched_rows:
+            parts.append(f"row filters that apply to you ({', '.join(sorted({m.table for m in touched_rows})[:6])})")
+        raise _Block(f"{type(stmt).__name__.upper()} cannot be used on tables with {'; '.join(parts)}.")
     # file scans inside non-query statements (e.g. COPY (SELECT ... FROM read_parquet(...))) still need sandboxing
     for t in stmt.find_all(exp.Table):
         if not isinstance(t.this, exp.Identifier) or _looks_like_path(t):
@@ -742,8 +828,13 @@ def _split_statements(sql: str) -> List[exp.Expression]:
 
 
 def _subject_to_policies(principal: Principal) -> bool:
-    """True when at least one enabled policy applies to this principal (i.e. is not exempt)."""
+    """True when at least one enabled masking policy applies to this principal (i.e. is not exempt)."""
     return any(not policies.is_exempt(p, principal) for p in policies.enabled_policies())
+
+
+def _subject_to_row_policies(principal: Principal) -> bool:
+    """True when at least one enabled row filter policy applies to this principal (i.e. is not exempt)."""
+    return any(not policies.is_exempt(p, principal) for p in row_filters.enabled_row_policies())
 
 
 def rewrite_for_principal(sql: str, principal: Principal, con, *, default_catalog: Optional[str] = None,
@@ -757,13 +848,16 @@ def rewrite_for_principal(sql: str, principal: Principal, con, *, default_catalo
         return result
     sandbox = principal.role != "admin"
     tagged_data = tags.has_any_tags()
-    # With no tags anywhere nothing can be masked: skip every catalog lookup (masks themselves stay protected via sandbox rules).
+    # With no tags anywhere nothing can be masked or filtered: skip every catalog lookup (governance functions stay
+    # protected via sandbox rules regardless).
     subject = tagged_data and _subject_to_policies(principal)
+    row_subject = tagged_data and _subject_to_row_policies(principal)
     audit_exempt = tagged_data and bool(policies.enabled_policies())
-    if not (sandbox or subject or audit_exempt):
+    row_audit_exempt = tagged_data and bool(row_filters.enabled_row_policies())
+    if not (sandbox or subject or row_subject or audit_exempt or row_audit_exempt):
         return result
 
-    if (sandbox or subject) and ".metadata" in sql.lower() and not trusted:
+    if (sandbox or subject or row_subject) and ".metadata" in sql.lower() and not trusted:
         result.blocked = "Access to platform metadata files is not allowed."
         return result
 
@@ -776,9 +870,9 @@ def rewrite_for_principal(sql: str, principal: Principal, con, *, default_catalo
     try:
         statements = _split_statements(body)
     except Exception as exc:
-        return _on_parse_failure(sql, body, principal, subject, sandbox, result, exc)
+        return _on_parse_failure(sql, body, principal, subject, row_subject, sandbox, result, exc)
 
-    ctx = _Ctx(con, principal, subject, sandbox, default_catalog, default_schema, trusted)
+    ctx = _Ctx(con, principal, subject, row_subject, sandbox, default_catalog, default_schema, trusted)
     try:
         rewritten = [_rewrite_statement(s, ctx) for s in statements]
     except _Block as blocked:
@@ -787,28 +881,30 @@ def rewrite_for_principal(sql: str, principal: Principal, con, *, default_catalo
         return result
     except Exception as exc:                                   # any bug in the rewriter must fail closed for subjects
         logger.exception("Governance rewrite failed")
-        if subject:
-            result.blocked = f"The query could not be verified for column masking ({type(exc).__name__}); it was not run."
+        if subject or row_subject:
+            result.blocked = f"The query could not be verified for governance ({type(exc).__name__}); it was not run."
             return result
         return result
 
     result.tables = sorted(ctx.tables)
     result.masked = ctx.masked
     result.exempt_reads = ctx.exempt_reads
+    result.row_filtered = ctx.row_filtered
+    result.row_filter_exempt_reads = ctx.row_filter_exempt_reads
     if ctx.changed:
         result.changed = True
         result.sql = explain_prefix + "; ".join(ctx.use_texts.get(id(s)) or s.sql(dialect="duckdb") for s in rewritten)
     return result
 
 
-def _on_parse_failure(sql: str, body: str, principal: Principal, subject: bool, sandbox: bool, result: RewriteResult,
-                      exc: Exception) -> RewriteResult:
+def _on_parse_failure(sql: str, body: str, principal: Principal, subject: bool, row_subject: bool, sandbox: bool,
+                      result: RewriteResult, exc: Exception) -> RewriteResult:
     """Unparseable SQL: refuse when it might touch protected data, otherwise let the engine report the error."""
     lowered = body.lower()
-    if (sandbox or subject) and ".metadata" in lowered:
+    if (sandbox or subject or row_subject) and ".metadata" in lowered:
         result.blocked = "Access to platform metadata files is not allowed."
-    elif subject and _text_mentions_sensitive(lowered):
-        result.blocked = ("The query uses syntax that cannot be verified for column masking and mentions tagged data; "
+    elif (subject or row_subject) and _text_mentions_sensitive(lowered):
+        result.blocked = ("The query uses syntax that cannot be verified for governance and mentions tagged data; "
                           "it was not run. Rephrase it using standard SQL.")
     return result
 
@@ -827,8 +923,8 @@ def _text_mentions_sensitive(lowered_sql: str) -> bool:
 # ----------------------------------------------------------------------------
 
 def record_outcome(result: RewriteResult, principal: Principal, *, client: str = "sql") -> None:
-    """Writes one aggregated audit row per query that was masked, blocked, or read raw by an exempt principal."""
-    if not (result.masked or result.blocked or result.exempt_reads):
+    """Writes one aggregated audit row per query that was masked, filtered, blocked, or read raw by an exempt principal."""
+    if not (result.masked or result.blocked or result.exempt_reads or result.row_filtered or result.row_filter_exempt_reads):
         return
     digest = hashlib.sha1(result.original_sql.encode("utf-8", "ignore")).hexdigest()[:12]
     try:
@@ -847,6 +943,15 @@ def record_outcome(result: RewriteResult, principal: Principal, *, client: str =
                     "columns": sorted({f"{m.table}.{m.column}" for m in result.exempt_reads}),
                     "policies": sorted({m.policy_name for m in result.exempt_reads}), "query": digest, "client": client,
                     "role": principal.role})
+            if result.row_filtered:
+                store.write_audit(conn, principal.username, "ROW_FILTER_APPLIED", None, {
+                    "tables": result.row_filtered_tables, "policies": sorted({m.policy_name for m in result.row_filtered}),
+                    "query": digest, "client": client, "role": principal.role})
+            if result.row_filter_exempt_reads:
+                store.write_audit(conn, principal.username, "ROW_FILTER_EXEMPT_READ", None, {
+                    "tables": sorted({m.table for m in result.row_filter_exempt_reads}),
+                    "policies": sorted({m.policy_name for m in result.row_filter_exempt_reads}), "query": digest,
+                    "client": client, "role": principal.role})
             conn.commit()
         finally:
             conn.close()

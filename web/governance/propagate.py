@@ -10,6 +10,10 @@ statement succeeds the tags of the columns the principal read raw are copied ont
   * a destination column computed from tagged columns (expressions, joins, aggregates) cannot be classified
     automatically, so it is tagged `sensitivity=unclassified` for an admin to review;
   * nothing is propagated for masked principals: the values they write are already masked.
+
+The same problem exists at row granularity: an exempt principal who reads a row-filtered table unfiltered and copies it
+copies every row, so the destination table is tagged with the same table-level tag that triggered the row filter
+(no per-column tracing needed: a row filter restricts the whole table, not one column).
 """
 
 import logging
@@ -20,7 +24,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from web.governance import enforce, policies, tags
+from web.governance import enforce, policies, row_filters, tags
 from web.governance.enforce import RewriteResult
 from web.governance.policies import Principal
 
@@ -112,16 +116,26 @@ def _find_destination(name: exp.Table, ctx: "enforce._Ctx") -> Optional[Ident]:
 def propagate_after(sql: str, principal: Principal, result: RewriteResult, con, *, default_catalog: str = "warehouse") -> List[Dict[str, str]]:
     """
     Copies tags from the raw-read source columns of a successful CREATE TABLE AS / INSERT ... SELECT onto the
-    destination table. Returns what was tagged. Best effort: never raises into the caller.
+    destination table (column-level, from `result.exempt_reads`), and copies the *table-level* tag of any row-filtered
+    source table the principal read unfiltered onto the destination (from `result.row_filter_exempt_reads`): an exempt
+    read of a row-filtered table copies every row, so the copy needs the same filter or it becomes a full, unfiltered
+    leak of the original. Returns what was tagged. Best effort: never raises into the caller.
     """
     try:
-        if principal.is_system or not result.exempt_reads or not looks_like_derived_write(sql):
+        if principal.is_system or not looks_like_derived_write(sql) or not (result.exempt_reads or result.row_filter_exempt_reads):
             return []
         raw_read: Dict[str, Set[str]] = {}
         for m in result.exempt_reads:
             raw_read.setdefault(m.table, set()).add(m.column.lower())
+        row_tag_keys: Set[Tuple[str, str]] = set()          # (tag_key, tag_value) of every row filter read unfiltered
+        for r in result.row_filter_exempt_reads:
+            try:
+                pol = row_filters.get_row_policy(r.policy_id)
+            except Exception:
+                continue
+            row_tag_keys.add((pol["tag_key"], pol["tag_value"] or ""))
         applied: List[Dict[str, str]] = []
-        ctx = enforce._Ctx(con, principal, False, False, default_catalog, "main")
+        ctx = enforce._Ctx(con, principal, False, False, False, default_catalog, "main")
         for stmt in sqlglot.parse(sql, dialect="duckdb"):
             if stmt is None or not isinstance(stmt, (exp.Create, exp.Insert)):
                 continue
@@ -129,31 +143,39 @@ def propagate_after(sql: str, principal: Principal, result: RewriteResult, con, 
             target = stmt.this.this if isinstance(stmt.this, exp.Schema) else stmt.this
             if not isinstance(query, exp.Query) or not isinstance(target, exp.Table):
                 continue
-            plan = _projection_plan(query, ctx)
             dest = _find_destination(target, ctx)
-            if not dest or not plan:
+            if not dest:
                 continue
-            dest_cols = {c["column"].lower(): c["column"] for c in ctx.columns(*dest)}
-            for dst_col, (sources, direct) in plan.items():
-                real_col = dest_cols.get(dst_col.lower())
-                if real_col is None:
-                    continue
-                tainted = [(i, c) for i, c in sources if c.lower() in raw_read.get(".".join(i), set())]
-                if not tainted:
-                    continue
-                if direct and len(sources) == 1:
-                    ident, src_col = sources[0]
-                    eff = tags.effective_tags(ident[0], ident[1], ident[2], [src_col])[src_col]
-                    to_set = [(k, v["value"]) for k, v in eff.items()]
-                else:
-                    to_set = [UNCLASSIFIED]
-                for key, value in to_set:
-                    try:
-                        tags.set_tag(catalog=dest[0], schema_name=dest[1], table_name=dest[2], column_name=real_col, tag_key=key,
-                                     tag_value=value, actor=principal.username, source="propagated")
-                        applied.append({"object": ".".join(dest + (real_col,)), "tag": key, "value": value})
-                    except ValueError as exc:            # e.g. the 'sensitivity' definition was deleted
-                        logger.debug(f"Tag propagation skipped for {dest}.{real_col}: {exc}")
+            plan = _projection_plan(query, ctx) if raw_read else {}
+            if plan:
+                dest_cols = {c["column"].lower(): c["column"] for c in ctx.columns(*dest)}
+                for dst_col, (sources, direct) in plan.items():
+                    real_col = dest_cols.get(dst_col.lower())
+                    if real_col is None:
+                        continue
+                    tainted = [(i, c) for i, c in sources if c.lower() in raw_read.get(".".join(i), set())]
+                    if not tainted:
+                        continue
+                    if direct and len(sources) == 1:
+                        ident, src_col = sources[0]
+                        eff = tags.effective_tags(ident[0], ident[1], ident[2], [src_col])[src_col]
+                        to_set = [(k, v["value"]) for k, v in eff.items()]
+                    else:
+                        to_set = [UNCLASSIFIED]
+                    for key, value in to_set:
+                        try:
+                            tags.set_tag(catalog=dest[0], schema_name=dest[1], table_name=dest[2], column_name=real_col,
+                                         tag_key=key, tag_value=value, actor=principal.username, source="propagated")
+                            applied.append({"object": ".".join(dest + (real_col,)), "tag": key, "value": value})
+                        except ValueError as exc:            # e.g. the 'sensitivity' definition was deleted
+                            logger.debug(f"Tag propagation skipped for {dest}.{real_col}: {exc}")
+            for key, value in row_tag_keys:
+                try:
+                    tags.set_tag(catalog=dest[0], schema_name=dest[1], table_name=dest[2], column_name="",
+                                 tag_key=key, tag_value=value, actor=principal.username, source="propagated")
+                    applied.append({"object": ".".join(dest), "tag": key, "value": value})
+                except ValueError as exc:                     # e.g. the tag definition was deleted
+                    logger.debug(f"Row-filter tag propagation skipped for {dest}: {exc}")
         return applied
     except Exception as exc:
         logger.warning(f"Tag propagation failed: {exc}")

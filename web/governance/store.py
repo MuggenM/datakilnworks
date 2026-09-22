@@ -70,6 +70,37 @@ CREATE TABLE IF NOT EXISTS masking_policies (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS row_policies (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    tag_key TEXT NOT NULL REFERENCES tag_definitions(tag_key),
+    tag_value TEXT,
+    filter_column TEXT NOT NULL,
+    filter_mode TEXT NOT NULL CHECK (filter_mode IN ('owner','attribute','custom')),
+    attribute_key TEXT,
+    filter_expr TEXT,
+    except_roles TEXT NOT NULL DEFAULT '["admin"]',
+    except_users TEXT NOT NULL DEFAULT '[]',
+    priority INTEGER NOT NULL DEFAULT 100,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS principal_attributes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    principal_type TEXT NOT NULL CHECK (principal_type IN ('user','role')),
+    principal_value TEXT NOT NULL,
+    attribute_key TEXT NOT NULL,
+    attribute_value TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (principal_type, principal_value, attribute_key, attribute_value)
+);
+CREATE INDEX IF NOT EXISTS idx_principal_attributes ON principal_attributes(attribute_key, principal_type, principal_value);
+
 CREATE TABLE IF NOT EXISTS governance_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
