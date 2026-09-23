@@ -13968,6 +13968,12 @@
       </div>
 
       <!-- Users List Table -->
+      <div class="flex items-center justify-end shrink-0">
+        <label class="flex items-center space-x-1.5 text-[11px] text-slate-500 dark:text-slate-400 cursor-pointer select-none">
+          <input type="checkbox" x-model="showDeletedUsers" @change="fetchUsers()" class="w-3.5 h-3.5 text-indigo-600 rounded cursor-pointer">
+          <span>Show deleted users</span>
+        </label>
+      </div>
       <div class="flex-1 overflow-y-auto border border-slate-200 dark:border-dbx-border rounded-xl">
         <table class="w-full text-left text-xs">
           <thead class="bg-slate-100 dark:bg-slate-900/80 text-slate-600 dark:text-slate-400 border-b border-slate-200 dark:border-dbx-border font-semibold uppercase text-[10px] sticky top-0 backdrop-blur-md">
@@ -13975,6 +13981,7 @@
               <th class="py-2.5 px-4">User</th>
               <th class="py-2.5 px-4">Email</th>
               <th class="py-2.5 px-4">Role</th>
+              <th class="py-2.5 px-4">Source</th>
               <th class="py-2.5 px-4">Status</th>
               <th class="py-2.5 px-4">Created At</th>
               <th class="py-2.5 px-4 text-right">Actions</th>
@@ -13982,7 +13989,7 @@
           </thead>
           <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/50 text-slate-700 dark:text-slate-300">
             <template x-for="u in iamUsers" :key="u.id">
-              <tr class="hover:bg-slate-50 dark:hover:bg-dbx-hover/40 transition">
+              <tr class="hover:bg-slate-50 dark:hover:bg-dbx-hover/40 transition" :class="(!u.is_active || u.deleted_at) ? 'opacity-50' : ''">
                 <td class="py-3 px-4">
                   <div class="flex items-center space-x-2.5">
                     <div class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-[10px] text-white shadow-xs"
@@ -13990,7 +13997,7 @@
                       <span x-text="u.username.slice(0, 2).toUpperCase()"></span>
                     </div>
                     <div>
-                      <div class="font-bold text-slate-900 dark:text-white" x-text="u.full_name"></div>
+                      <div class="font-bold text-slate-900 dark:text-white" :class="u.deleted_at ? 'line-through' : ''" x-text="u.full_name"></div>
                       <div class="font-mono text-slate-400 text-[11px]" x-text="'@' + u.username"></div>
                     </div>
                   </div>
@@ -14005,20 +14012,37 @@
                   </select>
                 </td>
                 <td class="py-3 px-4">
+                  <span class="text-[10px] font-mono px-2 py-0.5 rounded font-semibold uppercase"
+                        :class="(u.auth_source || 'local') === 'local' ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300 border border-slate-300 dark:border-slate-700' : 'bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-300 border border-violet-300 dark:border-violet-800'"
+                        x-text="u.auth_source || 'local'"></span>
+                </td>
+                <td class="py-3 px-4">
                   <span class="text-[10px] font-mono px-2 py-0.5 rounded font-semibold"
-                        :class="u.is_active ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400 border border-slate-300 dark:border-slate-700'"
-                        x-text="u.is_active ? 'Active' : 'Disabled'"></span>
+                        :class="u.deleted_at ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 border border-rose-300 dark:border-rose-800' : (u.is_active ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400 border border-slate-300 dark:border-slate-700')"
+                        x-text="u.deleted_at ? 'Deleted' : (u.is_active ? 'Active' : 'Disabled')"></span>
                 </td>
                 <td class="py-3 px-4 font-mono text-slate-400 text-[11px]" x-text="u.created_at ? u.created_at.slice(0, 16).replace('T', ' ') : '-'"></td>
                 <td class="py-3 px-4 text-right space-x-1">
-                  <button @click="openResetPasswordModal(u)" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 rounded text-slate-700 dark:text-slate-200 transition text-[11px] font-medium" title="Reset Password">
-                    <i class="ph ph-key"></i>
-                  </button>
-                  <button x-show="u.username !== 'admin'" @click="toggleUserActive(u)" class="px-2 py-1 rounded transition text-[11px] font-medium border"
-                          :class="u.is_active ? 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-950/60 dark:hover:bg-amber-900 dark:text-amber-300 dark:border-amber-800' : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border-emerald-200 dark:bg-emerald-950/60 dark:hover:bg-emerald-900 dark:text-emerald-300 dark:border-emerald-800'"
-                          :title="u.is_active ? 'Deactivate User' : 'Activate User'">
-                    <i class="ph" :class="u.is_active ? 'ph-prohibit' : 'ph-check'"></i>
-                  </button>
+                  <template x-if="u.deleted_at">
+                    <button @click="restoreUser(u)" class="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:hover:bg-emerald-900 dark:text-emerald-300 dark:border-emerald-800 rounded transition text-[11px] font-medium" title="Restore User">
+                      <i class="ph ph-arrow-counter-clockwise"></i>
+                    </button>
+                  </template>
+                  <template x-if="!u.deleted_at">
+                    <span class="space-x-1">
+                      <button @click="openResetPasswordModal(u)" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 rounded text-slate-700 dark:text-slate-200 transition text-[11px] font-medium" title="Reset Password">
+                        <i class="ph ph-key"></i>
+                      </button>
+                      <button x-show="u.username !== 'admin'" @click="toggleUserActive(u)" class="px-2 py-1 rounded transition text-[11px] font-medium border"
+                              :class="u.is_active ? 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-950/60 dark:hover:bg-amber-900 dark:text-amber-300 dark:border-amber-800' : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border-emerald-200 dark:bg-emerald-950/60 dark:hover:bg-emerald-900 dark:text-emerald-300 dark:border-emerald-800'"
+                              :title="u.is_active ? 'Deactivate User' : 'Activate User'">
+                        <i class="ph" :class="u.is_active ? 'ph-prohibit' : 'ph-check'"></i>
+                      </button>
+                      <button x-show="u.username !== 'admin'" @click="deleteUser(u)" class="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900 dark:text-rose-300 dark:border-rose-800 rounded transition text-[11px] font-medium" title="Delete User">
+                        <i class="ph ph-trash"></i>
+                      </button>
+                    </span>
+                  </template>
                 </td>
               </tr>
             </template>
@@ -16308,6 +16332,7 @@
         showIamModal: false,
         showCreateUserCard: false,
         iamUsers: [],
+        showDeletedUsers: false,
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
@@ -17771,7 +17796,7 @@
         async fetchUsers() {
           this.iamLoading = true;
           try {
-            const res = await fetch('/api/users');
+            const res = await fetch('/api/users' + (this.showDeletedUsers ? '?include_deleted=true' : ''));
             if (res.ok) {
               const data = await res.json();
               this.iamUsers = data.users || [];
@@ -17845,6 +17870,43 @@
             this.showToast(`User ${user.username} is now ${user.is_active ? 'Active' : 'Disabled'}`, 'success');
           } catch (e) {
             this.showToast('Error updating status: ' + e.message, 'error');
+          }
+        },
+
+        async deleteUser(user) {
+          if (!confirm(`Delete '${user.username}'? They will disappear from this list (unless "Show deleted users" is checked) and can no longer sign in. An admin can restore them later.`)) return;
+          try {
+            const res = await fetch(`/api/users/${user.id}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (!res.ok) {
+              this.showToast(data.detail || 'Failed to delete user', 'error');
+              return;
+            }
+            this.showToast(`User ${user.username} deleted`, 'success');
+            if (this.showDeletedUsers) {
+              user.deleted_at = new Date().toISOString();
+              user.is_active = 0;
+            } else {
+              this.iamUsers = this.iamUsers.filter(u => u.id !== user.id);
+            }
+          } catch (e) {
+            this.showToast('Error deleting user: ' + e.message, 'error');
+          }
+        },
+
+        async restoreUser(user) {
+          try {
+            const res = await fetch(`/api/users/${user.id}/restore`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) {
+              this.showToast(data.detail || 'Failed to restore user', 'error');
+              return;
+            }
+            user.deleted_at = null;
+            user.is_active = 1;
+            this.showToast(`User ${user.username} restored`, 'success');
+          } catch (e) {
+            this.showToast('Error restoring user: ' + e.message, 'error');
           }
         },
 

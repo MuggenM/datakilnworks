@@ -225,8 +225,11 @@ def authenticate(username: str, password: str, cfg: Optional[Dict[str, Any]] = N
     role = _map_role(cfg, groups)
 
     from web.auth import upsert_external_user
-    record = upsert_external_user(username=entry["username"], display_name=entry["display_name"], role=role,
-                                  auth_source="ldap")
+    try:
+        record = upsert_external_user(username=entry["username"], display_name=entry["display_name"], role=role,
+                                      auth_source="ldap")
+    except ValueError as exc:                    # e.g. the account was deleted and needs an admin to restore it
+        return None, str(exc)
     return record, None
 
 
@@ -241,6 +244,8 @@ def sync_user(username: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, 
     local = get_user_by_username(username)
     if not local or (local.get("auth_source") or "local") != "ldap":
         return {"username": username, "status": "skipped", "reason": "not an LDAP-provisioned account"}
+    if local.get("deleted_at"):
+        return {"username": username, "status": "skipped", "reason": "deleted; an administrator must restore it first"}
     if not cfg.get("enabled"):
         return {"username": username, "status": "skipped", "reason": "LDAP is not enabled"}
     try:

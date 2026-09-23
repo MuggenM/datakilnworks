@@ -70,6 +70,12 @@ def init_auth_db():
                 conn.execute("ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'")
             if "password_changed_at" not in existing:
                 conn.execute("ALTER TABLE users ADD COLUMN password_changed_at INTEGER")
+            # `deleted_at` (nullable): soft-deleted, distinct from `is_active`. A deactivated user (is_active=0,
+            # deleted_at NULL) stays in the list, greyed out -- an admin paused them, or LDAP sync no longer found
+            # their directory entry. A deleted user (deleted_at set) is hidden from the list by default and always
+            # implicitly inactive; `list_users(include_deleted=True)` or the UI's "Show deleted users" reveals them.
+            if "deleted_at" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
 
             conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_permissions (
@@ -266,11 +272,14 @@ def get_user_by_username(username: str, include_password_hash: bool = False) -> 
         conn.close()
 
 
-def list_users() -> List[Dict[str, Any]]:
-    """Returns all registered users (excluding password hashes)."""
+def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
+    """Returns all registered users (excluding password hashes). Soft-deleted ones are omitted unless asked for."""
     conn = get_db_connection()
     try:
-        rows = conn.execute("SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source FROM users ORDER BY created_at ASC").fetchall()
+        where = "" if include_deleted else "WHERE deleted_at IS NULL"
+        rows = conn.execute(
+            f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at "
+            f"FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
@@ -377,6 +386,10 @@ def upsert_external_user(username: str, display_name: str, role: str, auth_sourc
         if existing:
             if (existing["auth_source"] or "local") == "local":
                 raise ValueError(f"'{clean_username}' is a local account; it cannot be taken over by {auth_source}.")
+            if existing["deleted_at"]:
+                # An admin's deletion is a deliberate decision; directory activity (a login, a sync) must never
+                # silently undo it. An admin has to restore_user() the account first.
+                raise ValueError(f"'{clean_username}' was deleted; an administrator must restore it before it can sign in again.")
             with conn:
                 conn.execute("UPDATE users SET display_name = ?, role = ?, is_active = 1, auth_source = ? WHERE id = ?",
                             (display_name.strip() or clean_username, role, auth_source, existing["id"]))
@@ -436,7 +449,10 @@ def change_own_password(user_id: str, current_password: str, new_password: str) 
 
 
 def delete_user(user_id: str) -> bool:
-    """Deactivates a user (soft delete). Prevents deleting the primary admin."""
+    """
+    Soft-deletes a user: deactivated and hidden from the list by default (distinct from a plain deactivation, which
+    stays visible, greyed out). Reversible with `restore_user`. Prevents deleting the primary admin.
+    """
     conn = get_db_connection()
     try:
         row = conn.execute("SELECT username, role FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -445,8 +461,22 @@ def delete_user(user_id: str) -> bool:
         if row["username"] == "admin":
             raise ValueError("The primary 'admin' account cannot be deactivated or deleted.")
 
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         with conn:
-            conn.execute("UPDATE users SET is_active = 0 WHERE id = ?", (user_id,))
+            conn.execute("UPDATE users SET is_active = 0, deleted_at = ? WHERE id = ?", (now_str, user_id))
+            return True
+    finally:
+        conn.close()
+
+
+def restore_user(user_id: str) -> bool:
+    """Undoes `delete_user`: clears deleted_at and reactivates the account."""
+    conn = get_db_connection()
+    try:
+        if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            return False
+        with conn:
+            conn.execute("UPDATE users SET is_active = 1, deleted_at = NULL WHERE id = ?", (user_id,))
             return True
     finally:
         conn.close()

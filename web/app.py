@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from web.auth import (
     get_current_user, resolve_principal, require_role, create_access_token, verify_password,
     get_user_by_username, list_users, create_user, update_user, reset_user_password,
-    delete_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db
+    delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db
 )
 from web import auth_frameworks, llm_settings
 from web.compute_auth import compute_headers
@@ -496,8 +496,8 @@ async def get_current_user_profile(request: Request):
 # ==============================================================================
 
 @app.get("/api/users")
-async def get_users_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    return {"users": list_users()}
+async def get_users_endpoint(include_deleted: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return {"users": list_users(include_deleted=include_deleted)}
 
 
 @app.post("/api/users")
@@ -567,9 +567,17 @@ async def delete_user_endpoint(
         ok = delete_user(user_id)
         if not ok:
             raise HTTPException(status_code=404, detail="User not found")
-        return {"success": True, "message": "User deactivated successfully"}
+        return {"success": True, "message": "User deleted (hidden from the list; restorable by an admin)"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/users/{user_id}/restore")
+async def restore_user_endpoint(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    ok = restore_user(user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"success": True, "message": "User restored"}
 
 
 # ==============================================================================
