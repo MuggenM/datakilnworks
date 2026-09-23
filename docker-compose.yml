@@ -13,6 +13,12 @@ services:
       - WH_STARTER_ENDPOINT=http://compute-node-01:8001
       - WH_ANALYTICS_ENDPOINT=http://compute-node-02:8002
       - WH_ETL_ENDPOINT=http://compute-node-03:8003
+      # Bootstrap-only: consulted once, only if the users table is empty (a brand-new warehouse volume).
+      # Generate INIT_ADMIN_PASSWORD_HASH with `docker compose exec datakilnworks-studio python -m web.auth hash-password`
+      # and set these in .env -- see web/auth.py::_init_admin_from_env. Never affects an already-seeded warehouse.
+      - INIT_ADMIN_USERNAME=${INIT_ADMIN_USERNAME:-}
+      - INIT_ADMIN_PASSWORD_HASH=${INIT_ADMIN_PASSWORD_HASH:-}
+      - INIT_ADMIN_DISPLAY_NAME=${INIT_ADMIN_DISPLAY_NAME:-}
     volumes:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse
