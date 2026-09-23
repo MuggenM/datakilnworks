@@ -90,6 +90,19 @@ def _search_base(cfg: Dict[str, Any], key: str) -> str:
     return _cfg_str(cfg, key) or _cfg_str(cfg, "base_dn")
 
 
+def _entry_to_dict(entry, fallback_username: str = "") -> Dict[str, Any]:
+    def attr(*names: str) -> str:
+        for name in names:
+            if name in entry and entry[name].value:
+                v = entry[name].value
+                return v[0] if isinstance(v, list) else str(v)
+        return ""
+
+    return {"dn": entry.entry_dn, "username": attr("uid", "sAMAccountName", "user_id") or fallback_username,
+            "display_name": attr("cn", "displayName", "display_name") or fallback_username,
+            "email": attr("mail", "email")}
+
+
 def find_user(conn: Connection, cfg: Dict[str, Any], username: str) -> Optional[Dict[str, Any]]:
     """The single directory entry matching `username`, or None. Raises LdapError on more than one match."""
     base = _search_base(cfg, "user_search_base")
@@ -109,18 +122,32 @@ def find_user(conn: Connection, cfg: Dict[str, Any], username: str) -> Optional[
         return None
     if len(conn.entries) > 1:
         raise LdapError(f"The user filter matched more than one entry for '{username}'; narrow user_search_filter.")
-    entry = conn.entries[0]
+    return _entry_to_dict(conn.entries[0], username)
 
-    def attr(*names: str) -> str:
-        for name in names:
-            if name in entry and entry[name].value:
-                v = entry[name].value
-                return v[0] if isinstance(v, list) else str(v)
-        return ""
 
-    return {"dn": entry.entry_dn, "username": attr("uid", "sAMAccountName", "user_id") or username,
-            "display_name": attr("cn", "displayName", "display_name") or username,
-            "email": attr("mail", "email")}
+# Presence of the username attribute AD (`sAMAccountName`) or OpenLDAP/lldap (`uid`) use, not an objectClass filter:
+# some directories (lldap included) validate objectClass values in a filter against their own schema and reject an
+# unrecognized one outright (e.g. "invalid class in objectClass attribute: user") rather than just matching nothing.
+# Used only to *enumerate* candidates for bulk sync; `user_search_filter` (with its {username} placeholder) is still
+# what a login checks a specific person against, and is unaffected by this.
+BULK_USER_FILTER = "(|(uid=*)(sAMAccountName=*))"
+
+
+def list_directory_users(conn: Connection, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every person entry under the user search base, for bulk discovery (see sync_all's `discover` option)."""
+    base = _search_base(cfg, "user_search_base")
+    if not base:
+        raise LdapError("No user search base / base DN is configured.")
+    try:
+        conn.search(base, BULK_USER_FILTER, search_scope=SUBTREE, attributes=["*"])
+    except Exception as exc:
+        raise LdapError(f"The directory could not be enumerated: {exc}") from exc
+    seen: Dict[str, Dict[str, Any]] = {}
+    for entry in conn.entries:
+        record = _entry_to_dict(entry)
+        if record["username"]:
+            seen[record["username"].lower()] = record       # de-duplicate: several matched objectClasses, one entry
+    return list(seen.values())
 
 
 def find_groups(conn: Connection, cfg: Dict[str, Any], user_dn: str) -> List[str]:
@@ -239,15 +266,65 @@ def sync_user(username: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, 
         _safe_unbind(svc)
 
 
-def sync_all(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Runs `sync_user` for every locally provisioned LDAP account. Best-effort: one failure never stops the rest."""
+def discover_and_provision(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Bulk-provisions every directory entry under the user search base that isn't already a local account (of any
+    kind -- an existing local *or* ldap account is left untouched). This is what makes "sync" actually pull users
+    in from the directory rather than only refreshing accounts someone has already logged into once: without it,
+    an LDAP-provisioned account exists locally only after its first successful login, so a fresh install has
+    nothing for `sync_user`/`sync_all` to refresh yet.
+    """
+    from web import auth_frameworks
+    from web.auth import get_user_by_username, upsert_external_user
+    cfg = cfg if cfg is not None else auth_frameworks.load_raw_config().get("ldap", {})
+    if not cfg.get("enabled"):
+        return {"discovered": [], "skipped": [], "error": "LDAP is not enabled."}
+    try:
+        svc = _service_connection(cfg)
+    except Exception as exc:
+        return {"discovered": [], "skipped": [], "error": str(exc)}
+    discovered: List[str] = []
+    skipped: List[str] = []
+    try:
+        try:
+            entries = list_directory_users(svc, cfg)
+        except Exception as exc:
+            return {"discovered": [], "skipped": [], "error": str(exc)}
+        for entry in entries:
+            username = entry["username"]
+            if not username or get_user_by_username(username) is not None:
+                if username:
+                    skipped.append(username)               # already local (local or ldap): never touched here
+                continue
+            groups = find_groups(svc, cfg, entry["dn"])
+            role = _map_role(cfg, groups)
+            try:
+                upsert_external_user(username=username, display_name=entry["display_name"], role=role, auth_source="ldap")
+                discovered.append(username)
+            except ValueError:
+                skipped.append(username)                    # a local account was created for this name meanwhile
+    finally:
+        _safe_unbind(svc)
+    return {"discovered": discovered, "skipped": skipped, "error": None}
+
+
+def sync_all(cfg: Optional[Dict[str, Any]] = None, discover: bool = True) -> Dict[str, Any]:
+    """
+    Full reconciliation against the directory: discovers and provisions new directory users (unless `discover` is
+    False), then runs `sync_user` for every locally provisioned LDAP account -- including the ones just discovered,
+    so their reported status is consistent -- to catch role changes and deactivate ones removed from the directory.
+    Best effort: one failure never stops the rest.
+    """
     from web import auth_frameworks
     from web.auth import list_users
     cfg = cfg if cfg is not None else auth_frameworks.load_raw_config().get("ldap", {})
+    discovery = discover_and_provision(cfg) if discover else {"discovered": [], "skipped": [], "error": None}
     results = [sync_user(u["username"], cfg) for u in list_users() if (u.get("auth_source") or "local") == "ldap"]
-    return {"checked": len(results), "updated": sum(1 for r in results if r["status"] == "updated"),
+    return {"checked": len(results), "discovered": len(discovery["discovered"]), "discovered_users": discovery["discovered"],
+            "updated": sum(1 for r in results if r["status"] == "updated"),
             "deactivated": sum(1 for r in results if r["status"] == "deactivated"),
-            "errors": [r for r in results if r["status"] == "error"], "results": results}
+            "errors": [r for r in results if r["status"] == "error"] + ([{"reason": discovery["error"]}] if discovery["error"] else []),
+            "results": results}
 
 
 def _safe_unbind(conn: Connection) -> None:

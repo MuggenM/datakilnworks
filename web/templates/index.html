@@ -14702,7 +14702,7 @@
                 <span>Test Bind &amp; Search</span>
               </button>
               <button type="button" @click="syncLdapUsers()" :disabled="isSyncingLdap"
-                      title="Re-checks every LDAP-provisioned user's role against the directory now, and deactivates any that were removed there"
+                      title="Provisions every new directory user under the user search base, re-checks existing LDAP users' roles, and deactivates any removed from the directory"
                       class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
                 <i class="ph" :class="isSyncingLdap ? 'ph-spinner animate-spin' : 'ph-arrows-clockwise'"></i>
                 <span>Sync LDAP Users Now</span>
@@ -14715,7 +14715,7 @@
               </div>
               <div x-show="ldapSyncResult" class="text-xs flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800">
                 <i class="ph ph-info"></i>
-                <span x-text="ldapSyncResult ? (ldapSyncResult.checked + ' checked, ' + ldapSyncResult.updated + ' updated, ' + ldapSyncResult.deactivated + ' deactivated' + (ldapSyncResult.errors.length ? (', ' + ldapSyncResult.errors.length + ' error(s)') : '')) : ''"></span>
+                <span x-text="ldapSyncResult ? (ldapSyncResult.discovered + ' discovered, ' + ldapSyncResult.checked + ' checked, ' + ldapSyncResult.updated + ' updated, ' + ldapSyncResult.deactivated + ' deactivated' + (ldapSyncResult.errors.length ? (', ' + ldapSyncResult.errors.length + ' error(s)') : '')) : ''"></span>
               </div>
             </div>
           </div>
@@ -18792,7 +18792,7 @@
             const data = await res.json();
             if (!res.ok) { this.showToast(data.detail || 'LDAP sync failed', 'error'); return; }
             this.ldapSyncResult = data;
-            this.showToast(`LDAP sync: ${data.checked} checked, ${data.updated} updated, ${data.deactivated} deactivated`, data.errors.length ? 'error' : 'success');
+            this.showToast(`LDAP sync: ${data.discovered} discovered, ${data.checked} checked, ${data.updated} updated, ${data.deactivated} deactivated`, data.errors.length ? 'error' : 'success');
           } catch (e) {
             this.showToast('Error syncing LDAP users: ' + e.message, 'error');
           } finally {
