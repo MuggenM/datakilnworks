@@ -1016,7 +1016,7 @@ WHERE active = true;</code></pre>
         <ul>
           <li><strong>Role-Based Access Control (RBAC):</strong> Three built-in roles: <code>admin</code> (full platform governance), <code>power_user</code> (pipeline/model authoring), and <code>user</code> (query execution & reporting).</li>
           <li><strong>OAuth 2.0 / OIDC:</strong> Native integration with 8 identity providers: Okta, Azure AD, Google Workspace, GitHub, GitLab, Auth0, Keycloak, and Generic Custom OIDC with PKCE.</li>
-          <li><strong>LDAP / Active Directory:</strong> real service-account bind, user search and bind-as-user credential verification (never a cached hash, so a directory password change or lock applies on the next login), group-to-role mapping, and automatic provisioning of a local account (<code>auth_source=ldap</code>) that only that directory can ever authenticate. <em>Sync</em> re-resolves every LDAP-provisioned account's role and deactivates it locally if the directory entry is gone. An existing local username is always refused, so an LDAP login can never take over a local account.</li>
+          <li><strong>LDAP / Active Directory:</strong> real service-account bind, user search and bind-as-user credential verification (never a cached hash, so a directory password change or lock applies on the next login), group-to-role mapping, and automatic provisioning of a local account (<code>auth_source=ldap</code>) that only that directory can ever authenticate. <em>Sync</em> provisions every not-yet-known directory user, re-resolves every already-known LDAP account's role, and deactivates one locally if its directory entry is gone. An existing local username is always refused, so an LDAP login (or sync) can never take over a local account.</li>
           <li><strong>Change your own password:</strong> user menu &rarr; <em>Change password</em> (accounts whose password is kept in the studio's own database only). It needs the current password, and sessions signed in before the change are signed out. Administrators can still reset any password from Users &amp; IAM.</li>
           <li><strong>Multi-Factor Authentication (MFA):</strong> TOTP (RFC 6238) generation, QR code registration, and 10 self-service emergency backup recovery codes.</li>
           <li><strong>Column masking:</strong> tag-driven masking policies with role and user exemptions (see <a href="#tags-masking-policies">Tags, Masking Policies & Row-Level Security</a>).</li>
@@ -1339,7 +1339,7 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
               <tr>
                 <td><span class="badge green">POST</span></td>
                 <td><code>/api/auth/frameworks/ldap/sync</code></td>
-                <td>Admin only: re-resolves every LDAP-provisioned account's role, deactivates ones removed from the directory</td>
+                <td>Admin only: provisions new directory users, re-resolves every LDAP-provisioned account's role, deactivates ones removed from the directory</td>
                 <td>&mdash;</td>
               </tr>
               <tr>
