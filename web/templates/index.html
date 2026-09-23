@@ -14019,9 +14019,6 @@
                           :title="u.is_active ? 'Deactivate User' : 'Activate User'">
                     <i class="ph" :class="u.is_active ? 'ph-prohibit' : 'ph-check'"></i>
                   </button>
-                  <button x-show="u.username !== 'admin'" @click="deleteUser(u)" class="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900 dark:text-rose-300 dark:border-rose-800 rounded transition text-[11px] font-medium" title="Delete User">
-                    <i class="ph ph-trash"></i>
-                  </button>
                 </td>
               </tr>
             </template>
@@ -17848,22 +17845,6 @@
             this.showToast(`User ${user.username} is now ${user.is_active ? 'Active' : 'Disabled'}`, 'success');
           } catch (e) {
             this.showToast('Error updating status: ' + e.message, 'error');
-          }
-        },
-
-        async deleteUser(user) {
-          if (!confirm(`Are you sure you want to delete user account '${user.username}'?`)) return;
-          try {
-            const res = await fetch(`/api/users/${user.id}`, { method: 'DELETE' });
-            const data = await res.json();
-            if (!res.ok) {
-              this.showToast(data.detail || 'Failed to delete user', 'error');
-              return;
-            }
-            this.showToast(`User ${user.username} deleted`, 'success');
-            await this.fetchUsers();
-          } catch (e) {
-            this.showToast('Error deleting user: ' + e.message, 'error');
           }
         },
 
