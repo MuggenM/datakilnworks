@@ -39,6 +39,8 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "group_search_base": "ou=Groups,dc=company,dc=internal",
         "admin_group": "cn=DataAdmins,ou=Groups,dc=company,dc=internal",
         "power_user_group": "cn=DataEngineers,ou=Groups,dc=company,dc=internal",
+        "user_group": "",       # optional: explicit group for the `user` role (else default_role applies)
+        "sync_group": "",       # optional: only members of this group may log in / be synced; empty = everyone
         "default_role": "user"
     },
     "oidc": {

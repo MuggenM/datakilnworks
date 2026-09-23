@@ -13,8 +13,9 @@ Flow for `authenticate(username, password)`:
   3. on exactly one match, re-bind *as that user's DN* with the password given -- this is the actual credential
      check, never a comparison against a cached hash, so a password change or account lock in the directory takes
      effect immediately;
-  4. search `group_search_base` for groups whose membership includes the user's DN, and map `admin_group`/
-     `power_user_group` to a role (first match wins; unmatched groups get `default_role`);
+  4. search `group_search_base` for groups whose membership includes the user's DN. If `sync_group` is set the user
+     must be a member, else login is refused (and bulk sync skips / re-sync deactivates them). Then map
+     `admin_group`/`power_user_group`/`user_group` to a role (first match wins; unmatched get `default_role`);
   5. create or update the local user row with `auth_source='ldap'` and a random, never-guessable password hash
      (so `verify_password` can never succeed against it -- an LDAP-sourced account can only ever authenticate
      through this module) via `web.auth.upsert_external_user`.
@@ -167,14 +168,26 @@ def find_groups(conn: Connection, cfg: Dict[str, Any], user_dn: str) -> List[str
     return [e.entry_dn for e in conn.entries]
 
 
+def _in_sync_group(cfg: Dict[str, Any], group_dns: List[str]) -> bool:
+    """True when no `sync_group` is configured (everyone under the user search base is in scope), else only
+    when the user is a member of it. Gates login, bulk discovery and re-sync alike, so the restriction can't be
+    bypassed by simply logging in directly."""
+    sync_group = _cfg_str(cfg, "sync_group").lower()
+    return not sync_group or sync_group in {g.lower() for g in group_dns}
+
+
 def _map_role(cfg: Dict[str, Any], group_dns: List[str]) -> str:
     admin_group = _cfg_str(cfg, "admin_group").lower()
     power_group = _cfg_str(cfg, "power_user_group").lower()
+    user_group = _cfg_str(cfg, "user_group").lower()
     lowered = {g.lower() for g in group_dns}
     if admin_group and admin_group in lowered:
         return "admin"
     if power_group and power_group in lowered:
         return "power_user"
+    if user_group and user_group in lowered:
+        return "user"
+    # In scope (sync_group, if any, already checked) but in no role group: default_role, never a silent skip.
     default = _cfg_str(cfg, "default_role", "user")
     return default if default in ("admin", "power_user", "user") else "user"
 
@@ -222,6 +235,8 @@ def authenticate(username: str, password: str, cfg: Optional[Dict[str, Any]] = N
         groups = find_groups(user_conn, cfg, entry["dn"])
     finally:
         _safe_unbind(user_conn)
+    if not _in_sync_group(cfg, groups):
+        return None, "You are not authorized to use this application (not a member of the required directory group)."
     role = _map_role(cfg, groups)
 
     from web.auth import upsert_external_user
@@ -259,6 +274,10 @@ def sync_user(username: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, 
                 update_user(local["id"], is_active=False)
             return {"username": username, "status": "deactivated", "reason": "no longer found in the directory"}
         groups = find_groups(svc, cfg, entry["dn"])
+        if not _in_sync_group(cfg, groups):
+            if local.get("is_active"):
+                update_user(local["id"], is_active=False)
+            return {"username": username, "status": "deactivated", "reason": "no longer a member of the sync group"}
         role = _map_role(cfg, groups)
         upsert_external_user(username=entry["username"], display_name=entry["display_name"], role=role, auth_source="ldap")
         if not local.get("is_active"):
@@ -302,6 +321,9 @@ def discover_and_provision(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, An
                     skipped.append(username)               # already local (local or ldap): never touched here
                 continue
             groups = find_groups(svc, cfg, entry["dn"])
+            if not _in_sync_group(cfg, groups):
+                skipped.append(username)                    # outside the configured sync group: never provisioned
+                continue
             role = _map_role(cfg, groups)
             try:
                 upsert_external_user(username=username, display_name=entry["display_name"], role=role, auth_source="ldap")

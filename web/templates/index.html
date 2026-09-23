@@ -14689,7 +14689,11 @@
             <!-- LDAP Role Mappings -->
             <div class="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-dbx-border rounded-xl space-y-2">
               <span class="font-bold text-slate-800 dark:text-white block text-[11px] uppercase tracking-wider text-slate-500">Directory Group to Studio Role Mappings</span>
-              <div class="grid grid-cols-3 gap-2 text-xs">
+              <div>
+                <label class="block text-[10px] text-slate-500 mb-0.5 font-semibold">Sync Group DN <span class="font-normal">(optional: only members may log in or be synced; empty = everyone under the user search base)</span></label>
+                <input type="text" x-model="authConfig.ldap.sync_group" placeholder="cn=datakilnworks,ou=Groups,dc=..." class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-indigo-500">
+              </div>
+              <div class="grid grid-cols-4 gap-2 text-xs">
                 <div>
                   <label class="block text-[10px] text-slate-500 mb-0.5 font-semibold">Admin Group DN</label>
                   <input type="text" x-model="authConfig.ldap.admin_group" placeholder="cn=DataAdmins,ou=Groups,dc=..." class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-indigo-500">
@@ -14697,6 +14701,10 @@
                 <div>
                   <label class="block text-[10px] text-slate-500 mb-0.5 font-semibold">Power User Group DN</label>
                   <input type="text" x-model="authConfig.ldap.power_user_group" placeholder="cn=DataEngineers,ou=Groups,dc=..." class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-indigo-500">
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-500 mb-0.5 font-semibold">User Group DN <span class="font-normal">(optional)</span></label>
+                  <input type="text" x-model="authConfig.ldap.user_group" placeholder="cn=DataAnalysts,ou=Groups,dc=..." class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-indigo-500">
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-500 mb-0.5 font-semibold">Default Fallback Role</label>
@@ -16420,6 +16428,8 @@
             group_search_base: 'ou=Groups,dc=company,dc=internal',
             admin_group: 'cn=DataAdmins,ou=Groups,dc=company,dc=internal',
             power_user_group: 'cn=DataEngineers,ou=Groups,dc=company,dc=internal',
+            user_group: '',
+            sync_group: '',
             default_role: 'user'
           },
           oidc: {
