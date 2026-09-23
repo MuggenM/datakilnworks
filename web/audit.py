@@ -38,7 +38,7 @@ def init_history_db():
                     error_message TEXT,
                     client TEXT NOT NULL DEFAULT 'SQL_EDITOR',
                     is_mutation INTEGER NOT NULL DEFAULT 0,
-                    user TEXT NOT NULL DEFAULT 'martin',
+                    user TEXT NOT NULL DEFAULT 'admin',
                     warehouse_id TEXT DEFAULT 'wh_starter',
                     catalog TEXT DEFAULT 'warehouse'
                 );
@@ -81,7 +81,7 @@ def log_query(
     error_message: Optional[str] = None,
     client: str = "SQL_EDITOR",
     is_mutation: bool = False,
-    user: str = "martin",
+    user: str = "admin",
     warehouse_id: str = "wh_starter",
     catalog: str = "warehouse",
     profile_json: Optional[str] = None,

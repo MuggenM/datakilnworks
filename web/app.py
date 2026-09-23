@@ -4892,7 +4892,7 @@ class ManualLogPayload(BaseModel):
     error_message: Optional[str] = None
     client: Optional[str] = "NOTEBOOK"
     is_mutation: Optional[bool] = False
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 @app.post("/api/history/log")
 async def manual_log_query(payload: ManualLogPayload):
@@ -4904,7 +4904,7 @@ async def manual_log_query(payload: ManualLogPayload):
         error_message=payload.error_message,
         client=payload.client or "NOTEBOOK",
         is_mutation=payload.is_mutation or False,
-        user=payload.user or "martin"
+        user=payload.user or "admin"
     )
     return {"success": True, "query_id": qid}
 
@@ -5591,7 +5591,7 @@ class RecentRecordPayload(BaseModel):
     title: str
     subtitle: Optional[str] = ""
     metadata: Optional[Dict[str, Any]] = None
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 @app.post("/api/recents")
 async def record_recent_endpoint(payload: RecentRecordPayload, request: Request):
@@ -5699,7 +5699,7 @@ class AlertCreatePayload(BaseModel):
     is_enabled: Optional[bool] = True
     is_muted: Optional[bool] = False
     is_shared: Optional[bool] = True
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 
 class AlertUpdatePayload(BaseModel):
@@ -5715,13 +5715,13 @@ class AlertUpdatePayload(BaseModel):
     is_enabled: Optional[bool] = None
     is_muted: Optional[bool] = None
     is_shared: Optional[bool] = None
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 
 @app.get("/api/alerts/summary")
-async def get_alerts_summary_endpoint(request: Request, user: Optional[str] = "martin"):
+async def get_alerts_summary_endpoint(request: Request, user: Optional[str] = "admin"):
     from web.alerts import get_alerts_summary
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     try:
         return get_alerts_summary(user_id=user_id)
     except Exception as e:
@@ -5734,10 +5734,10 @@ async def get_alerts_endpoint(
     request: Request,
     state: Optional[str] = None,
     search: Optional[str] = None,
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 ):
     from web.alerts import get_alerts
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     try:
         return get_alerts(user_id=user_id, state_filter=state, search=search)
     except Exception as e:
@@ -5749,7 +5749,7 @@ async def get_alerts_endpoint(
 async def create_alert_endpoint(payload: AlertCreatePayload, request: Request):
     from web.alerts import create_alert
     from web.recents import record_recent
-    user_id = request.headers.get("X-User") or payload.user or "martin"
+    user_id = request.headers.get("X-User") or payload.user or "admin"
     try:
         alert = create_alert(payload.dict(), user_id=user_id)
         try:
@@ -5770,10 +5770,10 @@ async def create_alert_endpoint(payload: AlertCreatePayload, request: Request):
 
 
 @app.get("/api/alerts/{alert_id}")
-async def get_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def get_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import get_alert
     from web.recents import record_recent
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     alert = get_alert(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -5794,7 +5794,7 @@ async def get_alert_endpoint(alert_id: str, request: Request, user: Optional[str
 @app.put("/api/alerts/{alert_id}")
 async def update_alert_endpoint(alert_id: str, payload: AlertUpdatePayload, request: Request):
     from web.alerts import update_alert
-    user_id = request.headers.get("X-User") or payload.user or "martin"
+    user_id = request.headers.get("X-User") or payload.user or "admin"
     data = payload.dict(exclude_unset=True)
     alert = update_alert(alert_id, data, user_id=user_id)
     if not alert:
@@ -5803,10 +5803,10 @@ async def update_alert_endpoint(alert_id: str, payload: AlertUpdatePayload, requ
 
 
 @app.delete("/api/alerts/{alert_id}")
-async def delete_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def delete_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import delete_alert
     from web.recents import delete_recent
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     success = delete_alert(alert_id, user_id=user_id)
     if not success:
         raise HTTPException(status_code=404, detail="Alert not found or already deleted")
@@ -5818,9 +5818,9 @@ async def delete_alert_endpoint(alert_id: str, request: Request, user: Optional[
 
 
 @app.post("/api/alerts/{alert_id}/run")
-async def run_alert_check_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def run_alert_check_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import execute_alert_check
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     try:
         result = execute_alert_check(alert_id, triggered_by="manual", user_id=user_id)
         return result
@@ -5830,9 +5830,9 @@ async def run_alert_check_endpoint(alert_id: str, request: Request, user: Option
 
 
 @app.post("/api/alerts/{alert_id}/mute")
-async def toggle_mute_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def toggle_mute_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import toggle_mute_alert
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     alert = toggle_mute_alert(alert_id, user_id=user_id)
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -5840,9 +5840,9 @@ async def toggle_mute_alert_endpoint(alert_id: str, request: Request, user: Opti
 
 
 @app.post("/api/alerts/{alert_id}/toggle")
-async def toggle_enable_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def toggle_enable_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import toggle_enable_alert
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     alert = toggle_enable_alert(alert_id, user_id=user_id)
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -6281,7 +6281,7 @@ async def list_studio_experiments():
 async def create_studio_experiment(request: Request):
     from web.experiments import mlflow_create_experiment
     body = await request.json()
-    user_id = request.headers.get("X-User", "martin")
+    user_id = request.headers.get("X-User", "admin")
     try:
         res = mlflow_create_experiment(body.get("name", ""), body.get("artifact_location"), user_id=user_id)
         return res
@@ -6516,7 +6516,7 @@ async def restore_table_endpoint(
     request: Request
 ):
     from web.time_travel import resolve_table_path, restore_table_to_version
-    user = request.headers.get("X-User") or "martin"
+    user = request.headers.get("X-User") or "admin"
     path, cat_id = resolve_table_path(schema_name, table_name, payload.catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")

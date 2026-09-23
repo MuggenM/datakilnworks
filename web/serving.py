@@ -39,7 +39,7 @@ def init_serving_db():
                 catalog_name TEXT NOT NULL DEFAULT 'warehouse',
                 schema_name TEXT NOT NULL DEFAULT 'dbo',
                 description TEXT DEFAULT '',
-                user_id TEXT DEFAULT 'martin',
+                user_id TEXT DEFAULT 'admin',
                 tags TEXT DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -134,7 +134,7 @@ def seed_default_models(conn: sqlite3.Connection):
         (
             "employee_turnover_predictor",
             "Predicts probability of employee attrition and voluntary turnover risk based on tenure, salary, and satisfaction telemetry.",
-            "martin",
+            "admin",
             json.dumps({"domain": "people_analytics", "framework": "xgboost", "task": "binary_classification"}),
             now_str,
             now_str
@@ -215,7 +215,7 @@ def seed_default_models(conn: sqlite3.Connection):
         (
             "equipment_failure_forecaster",
             "Real-time industrial IoT telemetry failure forecasting and predictive maintenance time-to-failure scoring.",
-            "martin",
+            "admin",
             json.dumps({"domain": "iot_manufacturing", "framework": "lightgbm", "task": "anomaly_detection"}),
             now_str,
             now_str
@@ -460,7 +460,7 @@ def create_registered_model(
                 cat,
                 sch,
                 description.strip(),
-                "martin",
+                "admin",
                 json.dumps(tags or {}),
                 now_str,
                 now_str
@@ -635,7 +635,7 @@ def create_model_version(
                 cat,
                 sch,
                 description or f"Registered model {cat}.{sch}.{clean_name}",
-                "martin",
+                "admin",
                 "{}",
                 now_str,
                 now_str

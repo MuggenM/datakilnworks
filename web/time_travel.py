@@ -248,7 +248,7 @@ def compare_table_versions(
 def restore_table_to_version(
     target_path: str,
     target_version: int,
-    user: str = "martin"
+    user: str = "admin"
 ) -> Dict[str, Any]:
     """
     Restores the Delta table to target_version using native Delta Lake rollback.

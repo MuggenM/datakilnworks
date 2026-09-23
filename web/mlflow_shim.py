@@ -73,7 +73,7 @@ def _call_api(path: str, data: Optional[Dict[str, Any]] = None, method: str = "P
                 experiment_id=payload.get("experiment_id", "0"),
                 run_name=payload.get("run_name"),
                 start_time=payload.get("start_time"),
-                user_id=payload.get("user_id", "martin"),
+                user_id=payload.get("user_id", "admin"),
                 tags=payload.get("tags")
             )
             return {"run": r}
