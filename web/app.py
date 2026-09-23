@@ -410,7 +410,7 @@ async def login_endpoint(payload: LoginRequest):
         # cached here. See ldap_auth._LOCAL_ACCOUNT_CONFLICT for why an existing *local* username is never reached
         # by this branch's auto-provisioning path.
         from web import ldap_auth
-        ldap_user, reason = ldap_auth.authenticate(payload.username, payload.password)
+        ldap_user, reason = await asyncio.to_thread(ldap_auth.authenticate, payload.username, payload.password)
         if ldap_user is None:
             logger.info(f"LDAP login failed for '{payload.username}': {reason}")
             raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -723,14 +723,14 @@ async def test_ldap_bind_endpoint(
     cfg = dict(payload)
     if cfg.get("bind_password") == "••••••••":
         cfg["bind_password"] = auth_frameworks.load_raw_config().get("ldap", {}).get("bind_password", "")
-    return ldap_auth.test_bind_and_search(cfg)
+    return await asyncio.to_thread(ldap_auth.test_bind_and_search, cfg)
 
 
 @app.post("/api/auth/frameworks/ldap/sync")
 async def sync_ldap_users_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     """Re-resolves every LDAP-provisioned account's role and active status against the directory now."""
     from web import ldap_auth
-    return ldap_auth.sync_all()
+    return await asyncio.to_thread(ldap_auth.sync_all)
 
 
 @app.post("/api/auth/frameworks/oidc/test")

@@ -48,7 +48,7 @@ def _cfg_str(cfg: Dict[str, Any], key: str, default: str = "") -> str:
 
 
 def _connect(cfg: Dict[str, Any], user: Optional[str] = None, password: Optional[str] = None,
-            timeout: float = 5.0) -> Connection:
+            timeout: int = 5) -> Connection:
     host = _cfg_str(cfg, "server_host")
     if not host:
         raise LdapError("LDAP server host is not configured.")
@@ -57,13 +57,24 @@ def _connect(cfg: Dict[str, Any], user: Optional[str] = None, password: Optional
     use_ssl = encryption == "ssl" or port == 636
     server = Server(host, port=port, use_ssl=use_ssl, get_info=ALL, connect_timeout=timeout)
     try:
-        conn = Connection(server, user=user, password=password, authentication=SIMPLE if user else None, auto_bind=False)
+        # receive_timeout must be an int: ldap3 struct.packs it, and a float raises struct.error deep inside the
+        # library. Without it, a host:port that accepts the TCP connection but never speaks LDAP (a typo'd port
+        # that happens to hit some other service) hangs the calling thread until the OS's own TCP timeout, which
+        # can be minutes -- every caller of this module (login included) needs bounded, predictable failure.
+        conn = Connection(server, user=user, password=password, authentication=SIMPLE if user else None,
+                          auto_bind=False, receive_timeout=timeout)
         if not conn.bind():
             raise LDAPException(conn.result.get("description") or conn.result.get("message") or "bind failed")
         if encryption == "starttls":
             conn.start_tls()
         return conn
-    except LDAPException as exc:
+    except LdapError:
+        raise
+    except Exception as exc:
+        # Not just LDAPException: a server that answers on the port but doesn't actually speak LDAP (wrong port,
+        # an HTTP service, ...) can make ldap3's BER decoder raise a raw KeyError/struct.error/etc. on the garbage
+        # response, not one of its own exception types. Every failure mode here must become a clean LdapError, or
+        # it reaches a FastAPI endpoint as an unhandled exception and comes back as a non-JSON 500.
         raise LdapError(f"Could not bind to {host}:{port}: {exc}") from exc
 
 
@@ -88,7 +99,12 @@ def find_user(conn: Connection, cfg: Dict[str, Any], username: str) -> Optional[
     if "{username}" not in filt:
         raise LdapError("user_search_filter must contain the {username} placeholder.")
     filt = filt.replace("{username}", escape_filter_chars(username))
-    conn.search(base, filt, search_scope=SUBTREE, attributes=["*"])
+    try:
+        conn.search(base, filt, search_scope=SUBTREE, attributes=["*"])
+    except LdapError:
+        raise
+    except Exception as exc:
+        raise LdapError(f"The user search failed: {exc}") from exc
     if not conn.entries:
         return None
     if len(conn.entries) > 1:
@@ -118,7 +134,7 @@ def find_groups(conn: Connection, cfg: Dict[str, Any], user_dn: str) -> List[str
     filt = filt.replace("{user_dn}", escape_filter_chars(user_dn))
     try:
         conn.search(base, filt, search_scope=SUBTREE, attributes=["cn"])
-    except LDAPException as exc:
+    except Exception as exc:
         logger.warning(f"LDAP group search failed: {exc}")
         return []
     return [e.entry_dn for e in conn.entries]
@@ -157,28 +173,28 @@ def authenticate(username: str, password: str, cfg: Optional[Dict[str, Any]] = N
 
     try:
         svc = _service_connection(cfg)
-    except LdapError as exc:
+    except Exception as exc:
         logger.warning(f"LDAP service bind failed: {exc}")
         return None, "The directory is not reachable right now."
     try:
         entry = find_user(svc, cfg, username)
-    except LdapError as exc:
+    except Exception as exc:
         logger.warning(f"LDAP user search failed: {exc}")
         return None, "The directory could not be searched."
     finally:
-        svc.unbind()
+        _safe_unbind(svc)
     if entry is None:
         return None, "Invalid username or password."
 
     try:
         user_conn = _connect(cfg, user=entry["dn"], password=password)
-    except LdapError:
+    except Exception:
         return None, "Invalid username or password."          # bad password, locked/disabled account, etc.
 
     try:
         groups = find_groups(user_conn, cfg, entry["dn"])
     finally:
-        user_conn.unbind()
+        _safe_unbind(user_conn)
     role = _map_role(cfg, groups)
 
     from web.auth import upsert_external_user
@@ -202,7 +218,7 @@ def sync_user(username: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, 
         return {"username": username, "status": "skipped", "reason": "LDAP is not enabled"}
     try:
         svc = _service_connection(cfg)
-    except LdapError as exc:
+    except Exception as exc:
         return {"username": username, "status": "error", "reason": str(exc)}
     try:
         entry = find_user(svc, cfg, username)
@@ -217,10 +233,10 @@ def sync_user(username: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, 
             update_user(local["id"], is_active=True)
         changed = role != local.get("role") or entry["display_name"] != local.get("display_name") or not local.get("is_active")
         return {"username": username, "status": "updated" if changed else "unchanged", "role": role}
-    except LdapError as exc:
+    except Exception as exc:
         return {"username": username, "status": "error", "reason": str(exc)}
     finally:
-        svc.unbind()
+        _safe_unbind(svc)
 
 
 def sync_all(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -234,11 +250,18 @@ def sync_all(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             "errors": [r for r in results if r["status"] == "error"], "results": results}
 
 
+def _safe_unbind(conn: Connection) -> None:
+    try:
+        conn.unbind()
+    except Exception:
+        pass
+
+
 def test_bind_and_search(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Deeper diagnostic than auth_frameworks.test_ldap_connection: service bind + a bounded user search."""
     try:
         svc = _service_connection(cfg)
-    except LdapError as exc:
+    except Exception as exc:
         return {"success": False, "message": str(exc)}
     try:
         base = _search_base(cfg, "user_search_base")
@@ -246,8 +269,8 @@ def test_bind_and_search(cfg: Dict[str, Any]) -> Dict[str, Any]:
         if base:
             svc.search(base, "(objectClass=*)", search_scope=SUBTREE, attributes=["1.1"], paged_size=50)
             count = len(svc.entries)
-        return {"success": True, "message": f"Service bind succeeded" + (f"; {count} entr{'y' if count == 1 else 'ies'} visible under the user search base" if count is not None else "")}
-    except LDAPException as exc:
+        return {"success": True, "message": "Service bind succeeded" + (f"; {count} entr{'y' if count == 1 else 'ies'} visible under the user search base" if count is not None else "")}
+    except Exception as exc:
         return {"success": False, "message": f"Bind succeeded but the search failed: {exc}"}
     finally:
-        svc.unbind()
+        _safe_unbind(svc)
