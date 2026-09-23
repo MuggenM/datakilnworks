@@ -18785,9 +18785,18 @@
         },
 
         async syncLdapUsers() {
+          // Unlike Test Bind & Search (which tests whatever is currently typed in the form), Sync acts on the
+          // saved server-side config, since it changes real accounts -- catch the most common mismatch client-side
+          // with a specific message, rather than a bare "LDAP is not enabled" buried in the sync result.
+          if (!this.authConfig.ldap.enabled) {
+            this.showToast('Check "Enable LDAP / Active Directory Integration" and click Save Settings before syncing.', 'error');
+            return;
+          }
           this.isSyncingLdap = true;
           this.ldapSyncResult = null;
           try {
+            const saveOk = await this.saveAuthConfig();
+            if (!saveOk) { this.showToast('Could not save the LDAP settings; sync was not run.', 'error'); return; }
             const res = await fetch('/api/auth/frameworks/ldap/sync', { method: 'POST' });
             const data = await res.json();
             if (!res.ok) { this.showToast(data.detail || 'LDAP sync failed', 'error'); return; }
