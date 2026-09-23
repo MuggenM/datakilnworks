@@ -135,15 +135,6 @@ def init_auth_db():
                         "user",
                         1,
                         now_str
-                    ),
-                    (
-                        "u_admin_martin",
-                        "martin",
-                        hash_password("adminpassword123"),
-                        "Martin (Admin)",
-                        "admin",
-                        1,
-                        now_str
                     )
                 ]
 
@@ -151,15 +142,6 @@ def init_auth_db():
                 INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, seed_users)
-
-            # Ensure martin exists if db was already created
-            cur.execute("SELECT COUNT(*) FROM users WHERE username = 'martin'")
-            if cur.fetchone()[0] == 0:
-                now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                cur.execute("""
-                    INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at)
-                    VALUES ('u_admin_martin', 'martin', ?, 'Martin (Admin)', 'admin', 1, ?)
-                """, (hash_password("adminpassword123"), now_str))
 
             # Seed initial default settings
             conn.execute("""
