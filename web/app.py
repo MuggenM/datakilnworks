@@ -24,8 +24,8 @@ from pydantic import BaseModel
 
 from web.auth import (
     get_current_user, resolve_principal, require_role, create_access_token, verify_password,
-    get_user_by_username, list_users, create_user, update_user, reset_user_password,
-    delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db
+    get_user_by_username, get_user_by_id, list_users, create_user, update_user, reset_user_password,
+    delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db, decode_access_token
 )
 from web import auth_frameworks, llm_settings
 from web.compute_auth import compute_headers
@@ -166,6 +166,37 @@ async def _sandbox_isolation(request: Request, call_next):
     """
     if not request.url.path.startswith("/api/sandbox/") and sandbox_client.is_sandbox_peer(request.client.host if request.client else None):
         return JSONResponse(status_code=403, content={"detail": "Notebook sandboxes may only use /api/sandbox/*."})
+    return await call_next(request)
+
+
+_MUST_CHANGE_PASSWORD_ALLOWED = {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me", "/api/auth/login"}
+
+
+@app.middleware("http")
+async def _must_change_password_gate(request: Request, call_next):
+    """
+    A password an account holder didn't choose themselves (the INIT_ADMIN_* bootstrap, or an admin's reset) must be
+    changed before that session can do anything else -- enforced here, not just in the UI, so a direct API call
+    can't skip it. Only touches /api/*; the SPA shell and static assets stay reachable so the browser can load and
+    show the "change your password" screen in the first place.
+    """
+    path = request.url.path
+    if not path.startswith("/api/") or path in _MUST_CHANGE_PASSWORD_ALLOWED or path.startswith("/api/sandbox/"):
+        return await call_next(request)
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        payload = decode_access_token(token)
+        if payload and "sub" in payload:
+            user = get_user_by_id(payload["sub"])
+            # Mirror resolve_principal's own staleness check: a session issued before the account's last
+            # password change is not this user's live session, so leave it to the normal auth layer to
+            # reject (401) instead of misreading it as "the current user, who must change their password".
+            changed = user.get("password_changed_at") if user else None
+            stale = bool(changed and int(payload.get("iat", 0)) < int(changed))
+            if user and user.get("is_active", 1) == 1 and not stale and user.get("must_change_password"):
+                return JSONResponse(status_code=403, content={
+                    "detail": "This account's password must be changed before continuing.",
+                    "must_change_password": True})
     return await call_next(request)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -428,7 +459,8 @@ async def login_endpoint(payload: LoginRequest):
         "email": f"{u['username']}@localspark.lakehouse",
         "role": u["role"],
         "created_at": u["created_at"],
-        "last_login_at": u["last_login_at"]
+        "last_login_at": u["last_login_at"],
+        "must_change_password": bool(u.get("must_change_password"))
     }
     resp = JSONResponse(content={"success": True, "token": token, "user": safe_user})
     resp.set_cookie(

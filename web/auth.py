@@ -43,6 +43,39 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 
+def _init_admin_from_env() -> "tuple[str, str, str]":
+    """
+    Reads the bootstrap admin from INIT_ADMIN_USERNAME / INIT_ADMIN_PASSWORD_HASH / INIT_ADMIN_DISPLAY_NAME.
+    Raises SystemExit(1) (logged, not a traceback) if the studio is starting with no accounts at all and no
+    admin is configured -- a fresh deployment with nobody able to log in is a misconfiguration, not something to
+    paper over with a hardcoded default password. Generate the hash with:
+        docker compose exec datakilnworks-studio python -m web.auth hash-password
+    """
+    import re
+    username = (os.getenv("INIT_ADMIN_USERNAME") or "admin").strip().lower()
+    pw_hash = (os.getenv("INIT_ADMIN_PASSWORD_HASH") or "").strip()
+    display_name = (os.getenv("INIT_ADMIN_DISPLAY_NAME") or "Administrator").strip()
+    if not pw_hash:
+        logger.critical(
+            "No admin account exists yet and INIT_ADMIN_PASSWORD_HASH is not set. Generate one with "
+            "`docker compose exec datakilnworks-studio python -m web.auth hash-password`, then set "
+            "INIT_ADMIN_USERNAME (default 'admin') and INIT_ADMIN_PASSWORD_HASH in the environment (e.g. .env) "
+            "and restart. Refusing to start with no way to log in."
+        )
+        raise SystemExit(1)
+    if not re.fullmatch(r"pbkdf2_sha256\$\d+\$[0-9a-f]+\$[0-9a-f]+", pw_hash):
+        logger.critical(
+            "INIT_ADMIN_PASSWORD_HASH is not a hash this build recognises (expected the output of "
+            "`python -m web.auth hash-password`). Refusing to store it as-is: if this is meant to be the plain "
+            "password rather than its hash, every login would then compare against it in the clear."
+        )
+        raise SystemExit(1)
+    if not username or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", username):
+        logger.critical(f"INIT_ADMIN_USERNAME '{username}' is not a usable username.")
+        raise SystemExit(1)
+    return username, pw_hash, display_name or "Administrator"
+
+
 def init_auth_db():
     """Initializes auth.db tables and seeds default users if empty."""
     os.makedirs(METADATA_DIR, exist_ok=True)
@@ -76,6 +109,11 @@ def init_auth_db():
             # implicitly inactive; `list_users(include_deleted=True)` or the UI's "Show deleted users" reveals them.
             if "deleted_at" not in existing:
                 conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+            # `must_change_password`: set when a password was provided by someone other than the account holder
+            # (the INIT_ADMIN_* bootstrap, or an admin's reset) rather than chosen by them -- cleared the moment
+            # they successfully change it themselves (see reset_user_password).
+            if "must_change_password" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
 
             conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_permissions (
@@ -100,48 +138,23 @@ def init_auth_db():
 
             now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            # Seed default users if users table is empty
+            # Bootstrap the first admin from INIT_ADMIN_* environment variables. Only ever considered when the
+            # users table is genuinely empty (bootstrap-only: once any account exists, these variables are never
+            # consulted again, so they can be removed from the environment after the first start without effect,
+            # and an admin who changes their password will never have it silently reverted on the next restart).
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) FROM users")
             count = cur.fetchone()[0]
 
             if count == 0:
-                logger.info("Seeding default multi-user accounts in auth.db...")
-
-                seed_users = [
-                    (
-                        "u_admin_01",
-                        "admin",
-                        hash_password("adminpassword123"),
-                        "System Administrator",
-                        "admin",
-                        1,
-                        now_str
-                    ),
-                    (
-                        "u_power_02",
-                        "lead_engineer",
-                        hash_password("powerpassword123"),
-                        "Lead Data Engineer",
-                        "power_user",
-                        1,
-                        now_str
-                    ),
-                    (
-                        "u_user_03",
-                        "analyst_bob",
-                        hash_password("userpassword123"),
-                        "Bob the Analyst",
-                        "user",
-                        1,
-                        now_str
-                    )
-                ]
-
-                cur.executemany("""
-                INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, seed_users)
+                username, pw_hash, display_name = _init_admin_from_env()
+                user_id = f"u_{username}_{secrets.token_hex(4)}"
+                cur.execute("""
+                    INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at, must_change_password)
+                    VALUES (?, ?, ?, ?, 'admin', 1, ?, 1)
+                """, (user_id, username, pw_hash, display_name, now_str))
+                logger.info(f"Bootstrapped admin account '{username}' from INIT_ADMIN_* environment variables "
+                           "(must_change_password set: it will be required to change it on first login).")
 
             # Seed initial default settings
             conn.execute("""
@@ -260,8 +273,8 @@ def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
     try:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         rows = conn.execute(
-            f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at "
-            f"FROM users {where} ORDER BY created_at ASC").fetchall()
+            f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at, "
+            f"must_change_password FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
@@ -388,16 +401,21 @@ def upsert_external_user(username: str, display_name: str, role: str, auth_sourc
         conn.close()
 
 
-def reset_user_password(user_id: str, new_password: str) -> bool:
-    """Updates password hash for the specified user."""
+def reset_user_password(user_id: str, new_password: str, chosen_by_self: bool = False) -> bool:
+    """
+    Updates the password hash for the specified user. `chosen_by_self` distinguishes who picked the password:
+    False (the default: an admin's reset) sets `must_change_password`, since the account holder didn't choose it
+    themselves; True (only change_own_password should pass this) clears it, since they just did.
+    """
     if len(new_password) < 4:
         raise ValueError("Password must be at least 4 characters long")
     conn = get_db_connection()
     try:
         pw_hash = hash_password(new_password)
         with conn:
-            res = conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
-                               (pw_hash, int(time.time()), user_id))
+            res = conn.execute(
+                "UPDATE users SET password_hash = ?, password_changed_at = ?, must_change_password = ? WHERE id = ?",
+                (pw_hash, int(time.time()), 0 if chosen_by_self else 1, user_id))
             return res.rowcount > 0
     finally:
         conn.close()
@@ -427,7 +445,7 @@ def change_own_password(user_id: str, current_password: str, new_password: str) 
         raise ValueError(f"The new password must be at least {MIN_SELF_PASSWORD_LENGTH} characters long.")
     if new_password == current_password:
         raise ValueError("The new password must differ from the current one.")
-    reset_user_password(user_id, new_password)
+    reset_user_password(user_id, new_password, chosen_by_self=True)
 
 
 def delete_user(user_id: str) -> bool:
@@ -577,5 +595,29 @@ def require_role(allowed_roles: List[str]):
     return role_checker
 
 
-# Auto-initialize database tables on module load
-init_auth_db()
+def _cli() -> None:
+    """`python -m web.auth hash-password`: prints a PBKDF2 hash for INIT_ADMIN_PASSWORD_HASH without ever writing
+    the plaintext to a file or the database. Deliberately does not import/touch the rest of the app or open
+    auth.db, so it works before any bootstrap configuration exists yet (the exact situation it's for)."""
+    import getpass
+    import sys
+    if len(sys.argv) < 2 or sys.argv[1] != "hash-password":
+        print("Usage: python -m web.auth hash-password", file=sys.stderr)
+        raise SystemExit(2)
+    pw = getpass.getpass("New admin password: ")
+    if len(pw) < 8:
+        print("Use at least 8 characters.", file=sys.stderr)
+        raise SystemExit(1)
+    if getpass.getpass("Confirm: ") != pw:
+        print("Passwords did not match.", file=sys.stderr)
+        raise SystemExit(1)
+    print("\nSet this as INIT_ADMIN_PASSWORD_HASH (e.g. in .env):\n")
+    print(hash_password(pw))
+
+
+if __name__ == "__main__":
+    _cli()
+else:
+    # Auto-initialize database tables on module load (skipped for `python -m web.auth hash-password`, above:
+    # that must work before any bootstrap configuration exists, so it never touches auth.db at all).
+    init_auth_db()
