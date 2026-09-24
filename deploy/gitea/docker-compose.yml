@@ -1,0 +1,66 @@
+# Gitea for Data Kiln Works' git integration (self-hosted, rootless, SQLite). Run it yourself:
+#
+#   docker compose -f deploy/gitea/docker-compose.yml up -d
+#
+# It joins the studio's compose network so the studio reaches it as http://gitea:3000 (no port has to be published for that).
+# Start the platform first (`docker compose up -d` in the repo root) so the network exists, or override the network name:
+#   DKW_NETWORK=<your studio network>   (default: datakilnworks_default = "<project directory>_default")
+#
+# First-time setup (Gitea has no default admin; registration is disabled):
+#   docker exec gitea gitea admin user create --admin --username gitea-admin --password '<a strong password>' \
+#       --email admin@example.internal --must-change-password=false
+#   then sign in at http://localhost:3000, create the bot user `dkw-bot`, the repository for your dbt project, give the bot write
+#   access, and create an access token for the bot with scope `write:repository` (add `write:issue` for pull requests later).
+#
+# Settings live in .env next to this file or in the environment (all optional):
+#   GITEA_HTTP_BIND   127.0.0.1   address the web UI is published on. Use 0.0.0.0 ONLY behind a firewall or a TLS proxy.
+#   GITEA_HTTP_PORT   3000        host port of the web UI
+#   GITEA_ROOT_URL    http://localhost:3000/   what Gitea prints in clone URLs (the address people use; the studio does not care)
+#   GITEA_SSH_PORT    (unset)     set (e.g. 2222) to also publish SSH for people who push over SSH; the studio uses HTTPS + token
+#   GITEA_IMAGE       gitea/gitea:1.22-rootless
+
+services:
+  gitea:
+    image: ${GITEA_IMAGE:-gitea/gitea:1.22-rootless}
+    container_name: gitea
+    restart: unless-stopped
+    environment:
+      - GITEA__server__ROOT_URL=${GITEA_ROOT_URL:-http://localhost:3000/}
+      - GITEA__server__DOMAIN=${GITEA_DOMAIN:-localhost}
+      - GITEA__server__SSH_DOMAIN=${GITEA_DOMAIN:-localhost}
+      - GITEA__server__DISABLE_SSH=${GITEA_DISABLE_SSH:-true}
+      - GITEA__database__DB_TYPE=sqlite3
+      - GITEA__security__INSTALL_LOCK=true            # skip the web installer; the admin is created with the command above
+      - GITEA__service__DISABLE_REGISTRATION=true      # accounts are created by an administrator, never self-service
+      - GITEA__service__REQUIRE_SIGNIN_VIEW=true
+      - GITEA__repository__DEFAULT_BRANCH=main
+      - GITEA__webhook__ALLOWED_HOST_LIST=${GITEA_WEBHOOK_ALLOWED_HOSTS:-}   # e.g. the studio's host, only if you use webhooks
+      - GITEA__log__LEVEL=Info
+    volumes:
+      - gitea-data:/var/lib/gitea         # repositories, SQLite database, attachments: BACK THIS UP
+      - gitea-config:/etc/gitea
+    ports:
+      - "${GITEA_HTTP_BIND:-127.0.0.1}:${GITEA_HTTP_PORT:-3000}:3000"
+      # SSH is off by default (DISABLE_SSH). To use it: GITEA_DISABLE_SSH=false, and publish it by adding a line such as
+      #   - "${GITEA_SSH_PORT:-2222}:2222"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - default
+
+networks:
+  default:
+    name: ${DKW_NETWORK:-datakilnworks_default}
+    external: true
+
+volumes:
+  gitea-data:
+  gitea-config:

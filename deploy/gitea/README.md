@@ -23,26 +23,21 @@ Publish ports only for **people**:
   need it. Bind `0.0.0.0` only behind a firewall or a proxy, never plain-HTTP on an open network (tokens and passwords cross it).
 * SSH: `2222:22` only if people push over SSH.
 
-## Development with Docker Compose (you run it yourself)
+## Development with Docker Compose
 
-```yaml
-services:
-  gitea:
-    image: gitea/gitea:1.22-rootless
-    restart: unless-stopped
-    environment:
-      - GITEA__server__ROOT_URL=http://localhost:3000/     # what browsers use; the studio does not care
-      - GITEA__service__DISABLE_REGISTRATION=true
-    volumes:
-      - gitea-data:/var/lib/gitea
-      - gitea-config:/etc/gitea
-    ports:
-      - "127.0.0.1:3000:3000"
-    networks: [default]          # put it on the same network as the studio (or use the studio's project network)
-volumes: {gitea-data: {}, gitea-config: {}}
+`docker-compose.yml` in this directory runs a rootless Gitea with SQLite that joins the studio's compose network:
+
+```bash
+docker compose up -d                                   # in the repo root: creates the studio network (datakilnworks_default)
+docker compose -f deploy/gitea/docker-compose.yml up -d
+docker exec gitea gitea admin user create --admin --username gitea-admin --password '<strong password>' \
+    --email admin@example.internal --must-change-password=false
 ```
 
-The studio then uses `http://gitea:3000/<owner>/<repo>.git` when both are on the same Docker network.
+The studio then uses `http://gitea:3000/<owner>/<repo>.git` (no port needs publishing for that). The web UI is published on
+`127.0.0.1:3000` only; the header of the file lists the settings (bind address, port, root URL, optional SSH). The file was
+verified end to end: healthy, sign-in required, an access token creates a repository, and a second container on the network
+cloned and pushed over HTTP with the token.
 
 ## Kubernetes
 
