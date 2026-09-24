@@ -26,6 +26,10 @@ services:
       - GIT_REMOTE_URL=${GIT_REMOTE_URL:-}
       - GIT_BRANCH=${GIT_BRANCH:-main}
       - GIT_TOKEN=${GIT_TOKEN:-}
+      # Git sync of the shared notebooks (Workspace > Git; only notebooks/Shared). The token falls back to GIT_TOKEN.
+      - NOTEBOOKS_GIT_REMOTE_URL=${NOTEBOOKS_GIT_REMOTE_URL:-}
+      - NOTEBOOKS_GIT_BRANCH=${NOTEBOOKS_GIT_BRANCH:-main}
+      - NOTEBOOKS_GIT_TOKEN=${NOTEBOOKS_GIT_TOKEN:-}
     volumes:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse

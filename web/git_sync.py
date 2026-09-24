@@ -1,23 +1,26 @@
-"""Git sync for the dbt project (phase 1: status, connect, pull, commit, push).
+"""Git sync (phase 1: status, connect, pull, commit, push) for two directories, each through its own `Repo`:
+the dbt project (`DBT`) and the shared notebooks (`NOTEBOOKS`, only `notebooks/Shared`, never the private `Users/` folders).
 
-The project directory (`DBT_PROJECT_DIR`) is synchronised with a remote repository (a self-hosted Gitea in the reference
+A directory (`DBT_PROJECT_DIR`, `NOTEBOOKS_DIR/Shared`) is synchronised with a remote repository (a self-hosted Gitea in the reference
 deployment, but this is plain git over HTTP(S), so any server works). Rules that keep this safe:
 
 * The project directory must be **its own repository**. In development it sits inside the platform repository, and running
   git there would commit the platform's files; every operation refuses unless the directory is the top level of its own repo.
 * Configuration is environment only (a Kubernetes Secret in production): `GIT_REMOTE_URL` (http/https, no credentials in it),
-  `GIT_TOKEN`, `GIT_BRANCH` (default `main`). The token is handed to git through `GIT_CONFIG_*` environment variables (never
+  `GIT_TOKEN`, `GIT_BRANCH` (default `main`); for the notebooks the same names prefixed `NOTEBOOKS_` (the token falls back to `GIT_TOKEN`). The token is handed to git through `GIT_CONFIG_*` environment variables (never
   argv, never the URL, never written to `.git/config`) and is scrubbed from every message returned or logged.
 * Pulls are fast-forward only and refused on a dirty tree, so nothing is merged or overwritten. The pulled project is then checked
   with `dbt parse`; if dbt rejects it the pull is rolled back to the previous commit.
 * Commits are refused while a project file holds a plaintext credential, are authored as the acting user, and are audited.
 * One lock serialises every operation (the project is a single working tree, so run a single replica).
 """
-import datetime
+import json
+import shutil
 import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -31,297 +34,342 @@ _EXCLUDES = ["target/", "logs/", "dbt_packages/", ".duckrun_spill/", "*.duckdb",
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$")
 
 
+
+
 class GitError(Exception):
     """A refusal or failure with a message that is safe to show (the token is scrubbed)."""
 
 
-def _project_dir() -> str:
-    return os.getenv("DBT_PROJECT_DIR", "/workspace/dbt_project")
+MAX_FILE_BYTES = 5 * 1024 * 1024
 
 
-def remote_url() -> str:
-    return (os.getenv("GIT_REMOTE_URL") or "").strip()
+class Repo:
+    def __init__(self, kind: str):
+        self.kind = kind
+        if kind == "dbt":
+            self.prefix, self.audit_object, self.excludes = "GIT_", "dbt_project", _EXCLUDES
+        else:
+            self.prefix, self.audit_object, self.excludes = "NB_GIT_", "notebooks_shared", [".ipynb_checkpoints/", "__pycache__/", "*.pyc"]
 
+    # ---- configuration (read on every call: the environment can change under a running process)
+    def dir(self) -> str:
+        if self.kind == "dbt":
+            return os.getenv("DBT_PROJECT_DIR", "/workspace/dbt_project")
+        return os.path.join(os.getenv("NOTEBOOKS_DIR", "/workspace/notebooks"), "Shared")
 
-def branch() -> str:
-    b = (os.getenv("GIT_BRANCH") or "main").strip()
-    if not _BRANCH.match(b) or ".." in b:
-        raise GitError("GIT_BRANCH is not a valid branch name.")
-    return b
+    def _var(self, name: str, default: str = "") -> str:
+        if self.kind == "dbt":
+            return (os.getenv(f"GIT_{name}") or default).strip()
+        return (os.getenv(f"NOTEBOOKS_GIT_{name}") or (os.getenv(f"GIT_{name}") if name == "TOKEN" else "") or default).strip()
 
+    def remote_url(self) -> str:
+        return self._var("REMOTE_URL")
 
-def configured() -> bool:
-    return bool(remote_url())
+    def token(self) -> str:
+        return self._var("TOKEN")
 
+    def branch(self) -> str:
+        b = self._var("BRANCH", "main")
+        if not _BRANCH.match(b) or ".." in b:
+            raise GitError("The branch name is not valid.")
+        return b
 
-def _check_url(url: str) -> None:
-    u = urlparse(url)
-    if u.scheme not in ("http", "https") or not u.hostname:
-        raise GitError("GIT_REMOTE_URL must be an http(s) URL.")
-    if u.username or u.password:
-        raise GitError("GIT_REMOTE_URL must not contain credentials; put the token in GIT_TOKEN.")
+    def configured(self) -> bool:
+        return bool(self.remote_url())
 
+    def _check_url(self) -> None:
+        u = urlparse(self.remote_url())
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise GitError("The remote URL must be an http(s) URL.")
+        if u.username or u.password:
+            raise GitError("The remote URL must not contain credentials; put the token in its own variable.")
 
-def _scrub(text: str) -> str:
-    tok = os.getenv("GIT_TOKEN") or ""
-    if tok:
-        text = text.replace(tok, "***")
-    return text
+    def _scrub(self, text: str) -> str:
+        tok = self.token()
+        return text.replace(tok, "***") if tok else text
 
+    def _env(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        env = {k: v for k, v in os.environ.items()
+               if (not k.startswith("GIT_") or k in ("GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY")) and "GIT_TOKEN" not in k}
+        env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "http:https", "GIT_CONFIG_NOSYSTEM": "1", "GIT_ASKPASS": "true",
+                    "HOME": os.getenv("GIT_HOME", "/tmp"), "LC_ALL": "C"})
+        if self.token() and self.remote_url():
+            host = urlparse(self.remote_url())
+            env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{host.scheme}://{host.netloc}/.extraHeader",
+                        "GIT_CONFIG_VALUE_0": f"Authorization: token {self.token()}"})
+        if extra:
+            env.update(extra)
+        return env
 
-def _env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k in ("GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY")}
-    env.update({
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ALLOW_PROTOCOL": "http:https",          # no file:, ext:, ssh: transports
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_ASKPASS": "true",
-        "HOME": os.getenv("GIT_HOME", "/tmp"),
-        "LC_ALL": "C",
-    })
-    tok = os.getenv("GIT_TOKEN") or ""
-    if tok and remote_url():
-        host = urlparse(remote_url())
-        env.update({
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": f"http.{host.scheme}://{host.netloc}/.extraHeader",
-            "GIT_CONFIG_VALUE_0": f"Authorization: token {tok}",
-        })
-    if extra:
-        env.update(extra)
-    return env
+    def _git(self, args: List[str], check: bool = True, extra_env: Optional[Dict[str, str]] = None) -> str:
+        try:
+            r = subprocess.run(["git", *args], cwd=self.dir(), capture_output=True, text=True, timeout=_TIMEOUT, env=self._env(extra_env))
+        except subprocess.TimeoutExpired:
+            raise GitError(f"git {args[0]} timed out after {_TIMEOUT}s.")
+        except FileNotFoundError:
+            raise GitError("git is not installed in this image.")
+        out = self._scrub((r.stdout or "") + (r.stderr or "")).strip()
+        if check and r.returncode != 0:
+            raise GitError(out[-800:] or f"git {args[0]} failed.")
+        return out if check else f"{r.returncode}\n{out}"
 
+    def own_repo(self) -> bool:
+        d = self.dir()
+        if not os.path.isdir(os.path.join(d, ".git")):
+            return False
+        try:
+            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=d, capture_output=True, text=True, timeout=10, env=self._env()).stdout.strip()
+        except Exception:
+            return False
+        return bool(top) and os.path.realpath(top) == os.path.realpath(d)
 
-def _git(args: List[str], check: bool = True, extra_env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None) -> str:
-    try:
-        r = subprocess.run(["git", *args], cwd=cwd or _project_dir(), capture_output=True, text=True, timeout=_TIMEOUT, env=_env(extra_env))
-    except subprocess.TimeoutExpired:
-        raise GitError(f"git {args[0]} timed out after {_TIMEOUT}s.")
-    except FileNotFoundError:
-        raise GitError("git is not installed in this image.")
-    out = _scrub((r.stdout or "") + (r.stderr or "")).strip()
-    if check and r.returncode != 0:
-        raise GitError(out[-800:] or f"git {args[0]} failed.")
-    return out if check else f"{r.returncode}\n{out}"
+    def _require_repo(self) -> None:
+        if not self.configured():
+            raise GitError("Git sync is not configured (set the remote URL).")
+        self._check_url()
+        if not self.own_repo():
+            raise GitError("This folder is not connected to its repository yet. Connect it first.")
 
+    def _head(self) -> Optional[str]:
+        code, _, sha = self._git(["rev-parse", "--verify", "-q", "HEAD"], check=False).partition("\n")
+        return sha.strip() if code == "0" else None
 
-def _own_repo() -> bool:
-    d = _project_dir()
-    if not os.path.isdir(os.path.join(d, ".git")):
-        return False
-    try:
-        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=d, capture_output=True, text=True, timeout=10, env=_env()).stdout.strip()
-    except Exception:
-        return False
-    return bool(top) and os.path.realpath(top) == os.path.realpath(d)
+    def head_sha(self) -> Optional[str]:
+        try:
+            return self._head() if self.own_repo() else None
+        except Exception:
+            return None
 
+    def _audit(self, actor: str, action: str, detail: Dict[str, Any]) -> None:
+        try:
+            from web.governance import store
+            store.init_governance_db()
+            conn = store.get_db()
+            try:
+                store.write_audit(conn, actor, self.prefix + action, self.audit_object, detail)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(f"could not audit {action}: {exc}")
 
-def _require_repo() -> None:
-    if not configured():
-        raise GitError("Git sync is not configured (set GIT_REMOTE_URL).")
-    _check_url(remote_url())
-    if not _own_repo():
-        raise GitError("The dbt project is not connected to its repository yet. Connect it first.")
+    def _changes(self) -> List[Dict[str, str]]:
+        out = self._git(["status", "--porcelain=v1", "-uall"])
+        return [{"status": l[:2].strip() or "?", "path": l[3:]} for l in out.splitlines() if l.strip()]
 
-
-def _head() -> Optional[str]:
-    out = _git(["rev-parse", "--verify", "-q", "HEAD"], check=False)
-    code, _, sha = out.partition("\n")
-    return sha.strip() if code == "0" else None
-
-
-def head_sha() -> Optional[str]:
-    """The commit the project is at (None if it is not its own repository); recorded on every dbt run."""
-    try:
-        return _head() if _own_repo() else None
-    except Exception:
+    # ---- validation of what is about to be shared / was just received
+    def _problem_with_tree(self) -> Optional[str]:
+        """dbt: `dbt parse`. Notebooks: every .ipynb must be a notebook JSON (a pulled half-file would break the runner)."""
+        d = self.dir()
+        if self.kind == "dbt":
+            from web import dbt_config
+            p = os.path.join(d, "dbt_project.yml")
+            if not os.path.isfile(p):
+                return "The pulled project has no dbt_project.yml."
+            return dbt_config._dbt_parse("dbt_project.yml", open(p, encoding="utf-8").read())
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x != ".git"]
+            for fn in files:
+                if fn.endswith(".ipynb"):
+                    try:
+                        with open(os.path.join(root, fn), encoding="utf-8") as f:
+                            if not isinstance(json.load(f).get("cells"), list):
+                                raise ValueError("no cells")
+                    except Exception:
+                        return f"{os.path.relpath(os.path.join(root, fn), d)} is not a valid notebook."
         return None
 
+    def _problems_before_commit(self) -> List[str]:
+        found: List[str] = []
+        d = self.dir()
+        if self.kind == "dbt":
+            from web import dbt_config
+            for name in dbt_config.FILES:
+                p = os.path.join(d, name)
+                if os.path.isfile(p):
+                    with open(p, encoding="utf-8") as f:
+                        found += [f"{name}: {w}" for w in dbt_config.secret_warnings(f.read())]
+        for c in self._changes():
+            p = os.path.join(d, c["path"].split(" -> ")[-1])
+            if os.path.isfile(p) and os.path.getsize(p) > MAX_FILE_BYTES:
+                found.append(f"{c['path']} is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB (data does not belong in git)")
+        return found
 
-def _audit(actor: str, action: str, detail: Dict[str, Any]) -> None:
-    try:
-        from web.governance import store
-        store.init_governance_db()
-        conn = store.get_db()
-        try:
-            store.write_audit(conn, actor, action, "dbt_project", detail)
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning(f"could not audit {action}: {exc}")
-
-
-def _changes() -> List[Dict[str, str]]:
-    out = _git(["status", "--porcelain=v1", "-uall"])
-    return [{"status": l[:2].strip() or "?", "path": l[3:]} for l in out.splitlines() if l.strip()]
-
-
-# ---------------------------------------------------------------- operations
-
-def status(fetch: bool = False) -> Dict[str, Any]:
-    with _LOCK:
-        info: Dict[str, Any] = {"configured": configured(), "remote": remote_url() or None, "branch": None, "connected": False,
-                                "token_set": bool(os.getenv("GIT_TOKEN")),
-                                "head": None, "changes": [], "dirty": False, "ahead": 0, "behind": 0, "log": []}
-        if not configured():
-            return info
-        try:
-            info["branch"] = branch()
-            _check_url(remote_url())
-        except GitError as exc:
-            info["error"] = str(exc)
-            return info
-        if not _own_repo():
-            info["reason"] = "The dbt project directory is not its own git repository yet."
-            return info
-        info["connected"] = True
-        if fetch:
+    # ---- operations
+    def status(self, fetch: bool = False) -> Dict[str, Any]:
+        with _LOCK:
+            info: Dict[str, Any] = {"configured": self.configured(), "remote": self.remote_url() or None, "branch": None, "connected": False,
+                                    "token_set": bool(self.token()), "head": None, "changes": [], "dirty": False, "ahead": 0, "behind": 0, "log": []}
+            if not self.configured():
+                return info
             try:
-                _git(["fetch", "origin", branch()])
+                info["branch"] = self.branch()
+                self._check_url()
             except GitError as exc:
-                info["fetch_error"] = str(exc)
-        info["head"] = _head()
-        info["changes"] = _changes()
-        info["dirty"] = bool(info["changes"])
-        info["ahead"] = info["behind"] = 0
-        ref = f"refs/remotes/origin/{branch()}"
-        if _git(["rev-parse", "--verify", "-q", ref], check=False).startswith("0"):
-            counts = _git(["rev-list", "--left-right", "--count", f"HEAD...{ref}"], check=False).split("\n", 1)[-1].split()
-            if len(counts) == 2 and _head():
-                info["ahead"], info["behind"] = int(counts[0]), int(counts[1])
-            elif not _head():
-                info["behind"] = int(_git(["rev-list", "--count", ref]))
-            info["remote_head"] = _git(["rev-parse", ref])
-        elif _head():
-            info["ahead"] = int(_git(["rev-list", "--count", "HEAD"]))     # the remote has no such branch yet: everything is unpushed
-        log = _git(["log", "-n", "10", "--format=%H%x1f%an%x1f%aI%x1f%s"], check=False).split("\n", 1)[-1]
-        info["log"] = [dict(zip(("sha", "author", "date", "subject"), l.split("\x1f"))) for l in log.splitlines() if "\x1f" in l]
-        return info
+                info["error"] = str(exc)
+                return info
+            if not self.own_repo():
+                info["reason"] = "This folder is not its own git repository yet."
+                return info
+            info["connected"] = True
+            b = self.branch()
+            if fetch:
+                try:
+                    self._git(["fetch", "origin", b])
+                except GitError as exc:
+                    info["fetch_error"] = str(exc)
+            info["head"] = self._head()
+            info["changes"] = self._changes()
+            info["dirty"] = bool(info["changes"])
+            ref = f"refs/remotes/origin/{b}"
+            if self._git(["rev-parse", "--verify", "-q", ref], check=False).startswith("0"):
+                counts = self._git(["rev-list", "--left-right", "--count", f"HEAD...{ref}"], check=False).split("\n", 1)[-1].split()
+                if len(counts) == 2 and info["head"]:
+                    info["ahead"], info["behind"] = int(counts[0]), int(counts[1])
+                elif not info["head"]:
+                    info["behind"] = int(self._git(["rev-list", "--count", ref]))
+                info["remote_head"] = self._git(["rev-parse", ref])
+            elif info["head"]:
+                info["ahead"] = int(self._git(["rev-list", "--count", "HEAD"]))     # the remote has no such branch yet
+            log = self._git(["log", "-n", "10", "--format=%H%x1f%an%x1f%aI%x1f%s"], check=False).split("\n", 1)[-1]
+            info["log"] = [dict(zip(("sha", "author", "date", "subject"), l.split("\x1f"))) for l in log.splitlines() if "\x1f" in l]
+            return info
 
+    def connect(self, actor: str) -> Dict[str, Any]:
+        """Makes the folder a checkout of the remote branch. Existing files stay (they show as local changes); nothing is overwritten."""
+        with _LOCK:
+            if not self.configured():
+                raise GitError("Git sync is not configured (set the remote URL).")
+            self._check_url()
+            b, d = self.branch(), self.dir()
+            if not os.path.isdir(d):
+                if self.kind == "dbt":
+                    raise GitError("The project directory does not exist.")
+                os.makedirs(d, exist_ok=True)
+            if self.own_repo():
+                self._git(["remote", "set-url", "origin", self.remote_url()])
+                return self.status(fetch=True)
+            if os.path.exists(os.path.join(d, ".git")):
+                raise GitError("A .git entry exists but it is not a usable repository of its own.")
+            self._git(["init", "-q", "-b", b])
+            self._git(["remote", "add", "origin", self.remote_url()])
+            with open(os.path.join(d, ".git", "info", "exclude"), "a", encoding="utf-8") as f:
+                f.write("\n# build artefacts (added by the studio)\n" + "\n".join(self.excludes) + "\n")
+            if self.kind == "notebooks":
+                # Outputs never reach the repository: the clean filter runs at `git add`/`git status`, the files on disk are untouched.
+                strip = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nb_strip.py")
+                with open(os.path.join(d, ".git", "info", "attributes"), "a", encoding="utf-8") as f:
+                    f.write("*.ipynb filter=dkwstrip\n")
+                self._git(["config", "filter.dkwstrip.clean", f"{sys.executable} {strip}"])
+                self._git(["config", "filter.dkwstrip.smudge", "cat"])
+            self._git(["config", "user.name", "Data Kiln Works"])
+            self._git(["config", "user.email", "dkw@localhost"])
+            self._git(["config", "pull.ff", "only"])
+            try:
+                self._git(["fetch", "origin", b])
+                remote_has_branch = True
+            except GitError as exc:
+                if "couldn't find remote ref" in str(exc).lower():
+                    remote_has_branch = False                     # empty remote: the first commit will create the branch
+                else:
+                    shutil.rmtree(os.path.join(d, ".git"), ignore_errors=True)   # leave no half-connected state
+                    raise
+            if remote_has_branch:
+                self._git(["reset", "-q", "--mixed", f"origin/{b}"])   # adopt the remote history, keep every local file as a change
+                self._git(["branch", "--set-upstream-to", f"origin/{b}"], check=False)
+            self._audit(actor, "CONNECT", {"remote": self.remote_url(), "branch": b})
+            return self.status()
 
-def connect(actor: str) -> Dict[str, Any]:
-    """Makes the project directory a checkout of the remote branch. Existing files stay as they are (they show up as local
-    changes against the remote); nothing is overwritten, so this is safe to run on a seeded project."""
-    with _LOCK:
-        if not configured():
-            raise GitError("Git sync is not configured (set GIT_REMOTE_URL).")
-        _check_url(remote_url())
-        b = branch()
-        d = _project_dir()
-        if not os.path.isdir(d):
-            raise GitError("The dbt project directory does not exist.")
-        if _own_repo():
-            _git(["remote", "set-url", "origin", remote_url()])
-            return status(fetch=True)
-        if os.path.exists(os.path.join(d, ".git")):
-            raise GitError("A .git entry exists but it is not a usable repository of its own.")
-        # A directory that lives inside another repository (development) would make git use that one; `git init` here creates our own.
-        _git(["init", "-q", "-b", b])
-        _git(["remote", "add", "origin", remote_url()])
-        with open(os.path.join(d, ".git", "info", "exclude"), "a", encoding="utf-8") as f:
-            f.write("\n# dbt build artefacts (added by the studio)\n" + "\n".join(_EXCLUDES) + "\n")
-        _git(["config", "user.name", "Data Kiln Works"])
-        _git(["config", "user.email", "dkw@localhost"])
-        _git(["config", "pull.ff", "only"])
-        try:
-            _git(["fetch", "origin", b])
-            remote_has_branch = True
-        except GitError as exc:
-            if "couldn't find remote ref" in str(exc).lower():
-                remote_has_branch = False                     # empty remote: the first commit will create the branch
+    def pull(self, actor: str) -> Dict[str, Any]:
+        with _LOCK:
+            self._require_repo()
+            b = self.branch()
+            if self._changes():
+                raise GitError("There are uncommitted local changes. Commit them (or discard them) before pulling.")
+            before = self._head()
+            self._git(["fetch", "origin", b])
+            ref = f"origin/{b}"
+            if before is None:
+                self._git(["reset", "-q", "--hard", ref])
             else:
-                import shutil
-                shutil.rmtree(os.path.join(d, ".git"), ignore_errors=True)   # nothing useful was created: leave no half-connected state
+                if self._git(["merge-base", "--is-ancestor", ref, "HEAD"], check=False).startswith("0"):
+                    return {**self.status(), "pulled": False, "message": "Already up to date."}
+                if not self._git(["merge-base", "--is-ancestor", "HEAD", ref], check=False).startswith("0"):
+                    raise GitError("Local and remote history have diverged; pulling would need a merge, which is not done automatically. "
+                                   "Resolve it in the repository.")
+                self._git(["merge", "--ff-only", ref])
+            after = self._head()
+            problem = self._problem_with_tree()
+            if problem:
+                if before:
+                    self._git(["reset", "-q", "--hard", before])
+                else:
+                    self._git(["update-ref", "-d", "HEAD"], check=False)
+                self._audit(actor, "PULL_REJECTED", {"to": after, "reason": problem[:300]})
+                raise GitError("The pulled content was rejected, so the pull was rolled back:\n" + problem)
+            self._audit(actor, "PULL", {"from": before, "to": after})
+            return {**self.status(), "pulled": True, "message": f"Updated to {after[:8]}."}
+
+    def commit(self, actor: str, message: str) -> Dict[str, Any]:
+        with _LOCK:
+            self._require_repo()
+            message = (message or "").strip()
+            if not message:
+                raise GitError("A commit message is required.")
+            if len(message) > 2000:
+                raise GitError("The commit message is too long.")
+            if not self._changes():
+                raise GitError("Nothing to commit.")
+            problems = self._problems_before_commit()
+            if problems:
+                raise GitError("Refusing to commit:\n" + "\n".join(problems))
+            author = re.sub(r"[^A-Za-z0-9._-]", "_", actor or "unknown")[:60] or "unknown"
+            ident = {"GIT_AUTHOR_NAME": author, "GIT_AUTHOR_EMAIL": f"{author}@datakilnworks.local",
+                     "GIT_COMMITTER_NAME": "Data Kiln Works", "GIT_COMMITTER_EMAIL": "dkw@localhost"}
+            self._git(["add", "-A"])
+            self._git(["commit", "-q", "-m", message], extra_env=ident)
+            sha = self._head()
+            self._audit(actor, "COMMIT", {"sha": sha, "message": message[:200]})
+            return {**self.status(), "committed": sha}
+
+    def push(self, actor: str) -> Dict[str, Any]:
+        with _LOCK:
+            self._require_repo()
+            b = self.branch()
+            if not self._head():
+                raise GitError("Nothing to push: there are no commits yet.")
+            try:
+                self._git(["push", "origin", f"HEAD:refs/heads/{b}"])
+            except GitError as exc:
+                if any(w in str(exc) for w in ("rejected", "non-fast-forward", "fetch first")):
+                    raise GitError("The remote has commits you do not have. Pull first (history is never force-pushed).")
                 raise
-        if remote_has_branch:
-            _git(["reset", "-q", "--mixed", f"origin/{b}"])   # adopt the remote history, keep every local file as a change
-            _git(["branch", "--set-upstream-to", f"origin/{b}"], check=False)
-        _audit(actor, "GIT_CONNECT", {"remote": remote_url(), "branch": b})
-        return status()
+            self._git(["fetch", "origin", b], check=False)
+            self._git(["branch", "--set-upstream-to", f"origin/{b}"], check=False)
+            self._audit(actor, "PUSH", {"sha": self._head(), "branch": b})
+            return {**self.status(), "pushed": True}
 
 
-def pull(actor: str) -> Dict[str, Any]:
-    with _LOCK:
-        _require_repo()
-        b = branch()
-        if _changes():
-            raise GitError("There are uncommitted local changes. Commit them (or discard them) before pulling.")
-        before = _head()
-        _git(["fetch", "origin", b])
-        ref = f"origin/{b}"
-        if before is None:
-            _git(["reset", "-q", "--hard", ref])
-        else:
-            if _git(["merge-base", "--is-ancestor", ref, "HEAD"], check=False).startswith("0"):
-                return {**status(), "pulled": False, "message": "Already up to date."}
-            if not _git(["merge-base", "--is-ancestor", "HEAD", ref], check=False).startswith("0"):
-                raise GitError("Local and remote history have diverged; pulling would need a merge, which is not done automatically. "
-                               "Resolve it in the repository.")
-            _git(["merge", "--ff-only", ref])
-        after = _head()
-        from web import dbt_config
-        problem = dbt_config._dbt_parse("dbt_project.yml", open(os.path.join(_project_dir(), "dbt_project.yml"), encoding="utf-8").read()) \
-            if os.path.isfile(os.path.join(_project_dir(), "dbt_project.yml")) else "The pulled project has no dbt_project.yml."
-        if problem:
-            if before:
-                _git(["reset", "-q", "--hard", before])
-            else:
-                _git(["update-ref", "-d", "HEAD"], check=False)
-            _audit(actor, "GIT_PULL_REJECTED", {"to": after, "reason": problem[:300]})
-            raise GitError("dbt rejected the pulled project, so the pull was rolled back:\n" + problem)
-        _audit(actor, "GIT_PULL", {"from": before, "to": after})
-        return {**status(), "pulled": True, "message": f"Updated to {after[:8]}."}
+DBT = Repo("dbt")
+NOTEBOOKS = Repo("notebooks")
 
 
-def _plaintext_secrets() -> List[str]:
-    from web import dbt_config
-    found: List[str] = []
-    for name in dbt_config.FILES:
-        p = os.path.join(_project_dir(), name)
-        if os.path.isfile(p):
-            with open(p, encoding="utf-8") as f:
-                found += [f"{name}: {w}" for w in dbt_config.secret_warnings(f.read())]
-    return found
+def get(kind: str) -> Repo:
+    if kind == "dbt":
+        return DBT
+    if kind == "notebooks":
+        return NOTEBOOKS
+    raise GitError("Unknown repository.")
 
 
-def commit(actor: str, message: str) -> Dict[str, Any]:
-    with _LOCK:
-        _require_repo()
-        message = (message or "").strip()
-        if not message:
-            raise GitError("A commit message is required.")
-        if len(message) > 2000:
-            raise GitError("The commit message is too long.")
-        if not _changes():
-            raise GitError("Nothing to commit.")
-        secrets = _plaintext_secrets()
-        if secrets:
-            raise GitError("Refusing to commit: a credential is in plain text (use env_var() instead):\n" + "\n".join(secrets))
-        author = re.sub(r"[^A-Za-z0-9._-]", "_", actor or "unknown")[:60] or "unknown"
-        ident = {"GIT_AUTHOR_NAME": author, "GIT_AUTHOR_EMAIL": f"{author}@datakilnworks.local",
-                 "GIT_COMMITTER_NAME": "Data Kiln Works", "GIT_COMMITTER_EMAIL": "dkw@localhost"}
-        _git(["add", "-A"])
-        _git(["commit", "-q", "-m", message], extra_env=ident)
-        sha = _head()
-        _audit(actor, "GIT_COMMIT", {"sha": sha, "message": message[:200]})
-        return {**status(), "committed": sha}
+# dbt is the original user; these keep its module-level API.
+def head_sha() -> Optional[str]:
+    """The commit the dbt project is at (None if it is not its own repository); recorded on every dbt run."""
+    return DBT.head_sha()
 
 
-def push(actor: str) -> Dict[str, Any]:
-    with _LOCK:
-        _require_repo()
-        b = branch()
-        if not _head():
-            raise GitError("Nothing to push: there are no commits yet.")
-        try:
-            _git(["push", "origin", f"HEAD:refs/heads/{b}"])
-        except GitError as exc:
-            msg = str(exc)
-            if "rejected" in msg or "non-fast-forward" in msg or "fetch first" in msg:
-                raise GitError("The remote has commits you do not have. Pull first (history is never force-pushed).")
-            raise
-        _git(["fetch", "origin", b], check=False)
-        _git(["branch", "--set-upstream-to", f"origin/{b}"], check=False)
-        _audit(actor, "GIT_PUSH", {"sha": _head(), "branch": b})
-        return {**status(), "pushed": True}
+def status(fetch: bool = False): return DBT.status(fetch)
+def connect(actor: str): return DBT.connect(actor)
+def pull(actor: str): return DBT.pull(actor)
+def commit(actor: str, message: str): return DBT.commit(actor, message)
+def push(actor: str): return DBT.push(actor)

@@ -624,11 +624,18 @@ def _cli() -> None:
     if len(sys.argv) < 2 or sys.argv[1] != "hash-password":
         print("Usage: python -m web.auth hash-password", file=sys.stderr)
         raise SystemExit(2)
-    pw = getpass.getpass("New admin password: ")
+    if sys.stdin.isatty():
+        pw = getpass.getpass("New admin password: ")
+        confirm = None if len(pw) < 8 else getpass.getpass("Confirm: ")
+    else:
+        # No terminal (`docker exec` without -it, or a pipe): read the password from the first line of stdin, e.g.
+        #   printf '%s\n' "$PW" | docker exec -i <container> python -m web.auth hash-password
+        pw = sys.stdin.readline().rstrip("\r\n")
+        confirm = pw
     if len(pw) < 8:
         print("Use at least 8 characters.", file=sys.stderr)
         raise SystemExit(1)
-    if getpass.getpass("Confirm: ") != pw:
+    if confirm != pw:
         print("Passwords did not match.", file=sys.stderr)
         raise SystemExit(1)
     print("\nPaste this line into .env (the single quotes matter: Docker Compose would otherwise treat each $ in the hash as a variable):\n")

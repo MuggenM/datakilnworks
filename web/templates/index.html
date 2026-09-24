@@ -4169,6 +4169,11 @@
               <i class="ph ph-folder-plus text-xs"></i>
               <span>New Folder</span>
             </button>
+            <!-- Git sync of Shared (admins, only when configured) -->
+            <button x-show="currentUser && currentUser.role === 'admin'" @click="openNbGit()" class="text-xs px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded font-medium flex items-center space-x-1 transition" title="Sync the Shared folder with its Git repository" data-testid="nb-git-open">
+              <i class="ph ph-git-branch text-xs"></i>
+              <span>Git</span>
+            </button>
             <!-- Upload button -->
             <button @click="$refs.workspaceFileInput.click()" class="text-xs px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded font-medium flex items-center space-x-1 transition" title="Upload Notebook or Script">
               <i class="ph ph-upload-simple text-xs"></i>
@@ -15779,6 +15784,47 @@
     </div>
   </div>
 
+  <!-- Modal: Git sync of notebooks/Shared, admins only -->
+  <div x-show="nbGit.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="nbGit.open = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-lg shadow-2xl p-5 space-y-3 text-xs" @click.outside="nbGit.open = false" data-testid="nb-git-modal">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
+        <div>
+          <h4 class="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-1.5"><i class="ph ph-git-branch text-teal-500"></i><span>Git: shared notebooks</span></h4>
+          <p class="text-[11px] text-slate-500 mt-0.5">Syncs the <span class="font-mono">Shared</span> folder only; private <span class="font-mono">Users/</span> folders are never sent. Outputs are stripped from committed notebooks.</p>
+        </div>
+        <button type="button" @click="nbGit.open = false" class="text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+      <div x-show="!nbGit.git.configured" class="text-slate-500">Git sync is not configured. Set <span class="font-mono">NOTEBOOKS_GIT_REMOTE_URL</span> (and <span class="font-mono">NOTEBOOKS_GIT_TOKEN</span>, or <span class="font-mono">GIT_TOKEN</span>) and restart the studio.</div>
+      <div x-show="nbGit.git.configured" class="space-y-2">
+        <div class="flex items-center justify-between">
+          <span class="font-mono text-slate-500" x-text="nbGit.git.branch + ' · ' + (nbGit.git.remote || '')"></span>
+          <button type="button" x-show="!nbGit.git.connected && !nbGit.git.error" @click="nbGitAction('connect')" :disabled="nbGit.busy" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="nb-git-connect">Connect to repository</button>
+        </div>
+        <p x-show="!nbGit.git.connected" class="text-[11px] text-slate-500" x-text="nbGit.git.error || nbGit.git.reason || ''"></p>
+        <div x-show="nbGit.git.connected" class="space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-[11px] text-slate-500" x-text="'ahead ' + nbGit.git.ahead + ' · behind ' + nbGit.git.behind + ' · ' + (nbGit.git.head ? nbGit.git.head.slice(0, 8) : 'no commits')"></span>
+            <div class="space-x-1.5">
+              <button type="button" @click="nbGitAction('status?fetch=true', 'GET')" :disabled="nbGit.busy" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="nb-git-refresh">Refresh</button>
+              <button type="button" @click="nbGitAction('pull')" :disabled="nbGit.busy || nbGit.git.dirty || !nbGit.git.behind" :title="nbGit.git.dirty ? 'Commit or discard local changes first' : 'Fast-forward pull'" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-pull">Pull</button>
+              <button type="button" @click="nbGitAction('push')" :disabled="nbGit.busy || !nbGit.git.ahead" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-push">Push</button>
+            </div>
+          </div>
+          <div x-show="nbGit.git.dirty" class="space-y-1.5">
+            <div class="text-[11px] text-slate-500"><span x-text="nbGit.git.changes.length + ' uncommitted change(s): '"></span>
+              <span class="font-mono" x-text="nbGit.git.changes.slice(0, 6).map(c => c.status + ' ' + c.path).join(', ') + (nbGit.git.changes.length > 6 ? ', …' : '')"></span></div>
+            <div class="flex space-x-2">
+              <input type="text" x-model="nbGit.msg" placeholder="Commit message" maxlength="200" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="nb-git-message">
+              <button type="button" @click="nbGitAction('commit', 'POST', { message: nbGit.msg })" :disabled="nbGit.busy || !nbGit.msg.trim()" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="nb-git-commit">Commit</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div x-show="nbGit.note" class="text-[11px] text-emerald-600 dark:text-emerald-400" x-text="nbGit.note"></div>
+      <pre x-show="nbGit.error" class="whitespace-pre-wrap font-mono text-[11px] text-rose-600 dark:text-rose-400" x-text="nbGit.error" data-testid="nb-git-error"></pre>
+    </div>
+  </div>
+
   <!-- Modal: Delta shallow clone -->
   <div x-show="cloneModal.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="cloneModal.open = false">
     <form @submit.prevent="submitClone()" class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-md shadow-2xl p-5 space-y-4 text-xs" @click.outside="cloneModal.open = false">
@@ -16657,6 +16703,7 @@
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
+        nbGit: { open: false, busy: false, msg: '', note: '', error: '', git: { configured: false, connected: false, ahead: 0, behind: 0, dirty: false, changes: [], head: null } },
         dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', git: { configured: false, connected: false, ahead: 0, behind: 0, dirty: false, changes: [], head: null }, gitMsg: '', gitBusy: false, gitNote: '', gitError: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
         cloneModal: { open: false, source: '', schema: '', name: '', catalog: 'warehouse', srcSchema: '', srcTable: '', version: '', replace: false, busy: false, error: '' },
         changePasswordOpen: false,
@@ -23924,6 +23971,36 @@
             }
           } catch (e) {
             console.error('Error fetching dbt models:', e);
+          }
+        },
+
+        async openNbGit() {
+          this.nbGit.open = true; this.nbGit.error = ''; this.nbGit.note = '';
+          try {
+            const res = await fetch('/api/git/repos/notebooks/status');
+            if (res.ok) this.nbGit.git = await res.json();
+          } catch (e) { this.nbGit.error = 'Error: ' + e.message; }
+        },
+
+        async nbGitAction(path, method = 'POST', body = null) {
+          this.nbGit.busy = true; this.nbGit.error = ''; this.nbGit.note = '';
+          try {
+            const res = await fetch('/api/git/repos/notebooks/' + path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+            const data = await res.json();
+            if (!res.ok) {
+              this.nbGit.error = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+              const st = await fetch('/api/git/repos/notebooks/status'); if (st.ok) this.nbGit.git = await st.json();
+              return;
+            }
+            this.nbGit.git = data;
+            if (data.committed) { this.nbGit.msg = ''; this.nbGit.note = 'Committed ' + data.committed.slice(0, 8) + '.'; }
+            else if (data.pushed) this.nbGit.note = 'Pushed.';
+            else if (data.message) this.nbGit.note = data.message;
+            if (data.pulled || path === 'connect') await this.fetchWorkspaceTree();
+          } catch (e) {
+            this.nbGit.error = 'Error: ' + e.message;
+          } finally {
+            this.nbGit.busy = false;
           }
         },
 

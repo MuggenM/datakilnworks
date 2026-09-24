@@ -5497,31 +5497,56 @@ async def _git_call(fn, *args):
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+def _git_repo(kind: str):
+    from web import git_sync
+    try:
+        return git_sync.get(kind)
+    except git_sync.GitError:
+        raise HTTPException(status_code=404, detail="Unknown repository.")
+
+
+# Two repositories share these routes: `dbt` (the dbt project) and `notebooks` (notebooks/Shared only, never the private Users/ folders).
+# The original un-prefixed paths keep meaning `dbt`.
 @app.get("/api/git/status")
 async def git_status_endpoint(fetch: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     """Sync state of the dbt project with its remote repository (admins only). `fetch=true` asks the remote first."""
-    from web import git_sync
-    return await _git_call(git_sync.status, fetch)
+    return await _git_call(_git_repo("dbt").status, fetch)
 
 @app.post("/api/git/connect")
 async def git_connect_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    from web import git_sync
-    return await _git_call(git_sync.connect, current_user.get("username", "admin"))
+    return await _git_call(_git_repo("dbt").connect, current_user.get("username", "admin"))
 
 @app.post("/api/git/pull")
 async def git_pull_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    from web import git_sync
-    return await _git_call(git_sync.pull, current_user.get("username", "admin"))
+    return await _git_call(_git_repo("dbt").pull, current_user.get("username", "admin"))
 
 @app.post("/api/git/commit")
 async def git_commit_endpoint(payload: GitCommitPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    from web import git_sync
-    return await _git_call(git_sync.commit, current_user.get("username", "admin"), payload.message)
+    return await _git_call(_git_repo("dbt").commit, current_user.get("username", "admin"), payload.message)
 
 @app.post("/api/git/push")
 async def git_push_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    from web import git_sync
-    return await _git_call(git_sync.push, current_user.get("username", "admin"))
+    return await _git_call(_git_repo("dbt").push, current_user.get("username", "admin"))
+
+@app.get("/api/git/repos/{kind}/status")
+async def git_repo_status_endpoint(kind: str, fetch: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).status, fetch)
+
+@app.post("/api/git/repos/{kind}/connect")
+async def git_repo_connect_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).connect, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/pull")
+async def git_repo_pull_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).pull, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/commit")
+async def git_repo_commit_endpoint(kind: str, payload: GitCommitPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).commit, current_user.get("username", "admin"), payload.message)
+
+@app.post("/api/git/repos/{kind}/push")
+async def git_repo_push_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).push, current_user.get("username", "admin"))
 
 @app.post("/api/dbt/models/{model_name}/open")
 async def open_dbt_model_endpoint(model_name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
