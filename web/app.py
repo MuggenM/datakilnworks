@@ -330,6 +330,7 @@ def scan_delta_tables() -> List[Dict[str, Any]]:
         return tables
 
     for root, dirs, files in os.walk(WAREHOUSE_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]     # .metadata, .dbt (private dbt output), ...: never catalog schemas
         if "_delta_log" in dirs:
             rel = os.path.relpath(root, WAREHOUSE_DIR)
             parts = rel.split(os.sep)

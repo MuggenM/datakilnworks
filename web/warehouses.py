@@ -625,6 +625,7 @@ def scan_all_catalogs_and_tables(conn=None) -> Dict[str, Any]:
 
         if os.path.exists(cat_path):
             for root, dirs, files in os.walk(cat_path):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]     # .metadata, .dbt (private dbt output), ...
                 # For default primary warehouse, skip catalogs/ subfolder and .metadata/
                 if cat_id == "warehouse":
                     rel_from_main = os.path.relpath(root, cat_path)

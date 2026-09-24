@@ -975,6 +975,7 @@ def get_schema_tables_summary() -> List[Dict[str, Any]]:
 
     try:
         for root, dirs, files in os.walk(WAREHOUSE_DIR):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]     # .metadata, .dbt (private dbt output), ...
             if "_delta_log" in dirs:
                 rel = os.path.relpath(root, WAREHOUSE_DIR)
                 parts = rel.split(os.sep)

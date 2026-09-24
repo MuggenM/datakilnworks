@@ -6388,7 +6388,7 @@
             <div>
               <h2 class="text-sm font-bold text-slate-900 dark:text-white flex items-center space-x-2">
                 <span>Transformations</span>
-                <span class="text-[10px] px-1.5 py-0.5 bg-teal-100 dark:bg-teal-950 text-teal-800 dark:text-teal-300 rounded border border-teal-300/80 dark:border-teal-800/80 font-mono font-semibold" x-text="'dbt Core ' + (dbtStatus?.dbt_version || '1.12') + ' + duckrun'"></span>
+                <span class="text-[10px] px-1.5 py-0.5 bg-teal-100 dark:bg-teal-950 text-teal-800 dark:text-teal-300 rounded border border-teal-300/80 dark:border-teal-800/80 font-mono font-semibold" x-text="'dbt Core ' + (dbtStatus?.dbt_version || '?') + (dbtStatus?.uses_duckrun ? ' + duckrun' : ' (adapter: ' + (dbtStatus?.adapter_type || '?') + ')')"></span>
               </h2>
               <p class="text-[11px] text-slate-500 dark:text-slate-400">Modular SQL modeling, Jinja DAG transformations & Delta Lakehouse tests</p>
             </div>

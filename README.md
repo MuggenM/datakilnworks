@@ -460,7 +460,9 @@ spec:
 ### 25. 🧱 dbt Core Workbench & Interactive CTE Stepper
 * **Native dbt-core Integration**:
   - Full dbt project management inside Data Kiln Works (`./dbt_project`).
-  - Compiles and materializes Jinja SQL models to local Delta Lake tables.
+  - **Runs on the duckrun dbt adapter** (`type: duckrun` in `dbt_project/profiles.yml`; duckrun is a dbt adapter built on dbt-duckdb): SQL executes in DuckDB, and `table` / `incremental` models are written as real **Delta Lake tables** under `warehouse/.dbt/<schema>/<model>` while `view` models stay views in `dbt_analytics.duckdb`. `dbt-core`, `jinja2` and `duckrun` are pinned in `requirements.txt`.
+  - The dbt output is deliberately a private dot-directory: it is derived from governed tables, so it is not a catalog schema (the catalog scans skip dot-directories) and is previewed through the dbt views only. Making dbt output visible in the catalog needs governance tags carried over first.
+  - **Upgrading from the plain dbt-duckdb adapter**: a project that already ran on it holds real tables in the DuckDB file, which duckrun cannot replace with views. The project's `on-run-start` macro (`drop_legacy_duckdb_tables`) drops only those legacy tables, once; the run rebuilds them as Delta. It is a no-op afterwards and on fresh installs.
 * **Interactive CTE Step Debugger**:
   - Inspect intermediate Common Table Expressions (`WITH cte AS (...)`) step-by-step.
   - View row count, column schemas, and live tabular output for each CTE before compiling the final model.

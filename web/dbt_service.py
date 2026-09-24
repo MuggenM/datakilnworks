@@ -46,22 +46,54 @@ def _save_run_record(record: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning(f"Failed to persist dbt run record: {e}")
 
+def _package_version(name: str) -> Optional[str]:
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        return None
+
+
+def _profile_adapter_type() -> Optional[str]:
+    """The adapter `type` of the active target in profiles.yml (what dbt will load), or None if it cannot be read."""
+    try:
+        import yaml
+        with open(os.path.join(DBT_PROJECT_DIR, "profiles.yml"), "r", encoding="utf-8") as f:
+            profiles = yaml.safe_load(f) or {}
+        for profile in profiles.values():
+            if isinstance(profile, dict) and isinstance(profile.get("outputs"), dict):
+                target = os.getenv("DBT_TARGET") or profile.get("target")
+                out = profile["outputs"].get(target) or next(iter(profile["outputs"].values()), {})
+                return out.get("type")
+    except Exception as exc:
+        logger.debug(f"Could not read the dbt profile: {exc}")
+    return None
+
+
 def get_dbt_status(user: Optional[str] = None, is_admin: bool = True) -> Dict[str, Any]:
     project_exists = os.path.exists(os.path.join(DBT_PROJECT_DIR, "dbt_project.yml"))
     profiles_exists = os.path.exists(os.path.join(DBT_PROJECT_DIR, "profiles.yml"))
 
-    # Check dbt executable
-    dbt_bin = "/usr/local/bin/dbt" if os.path.exists("/usr/local/bin/dbt") else "dbt"
-    version_str = "1.12.4"
-    
+    dbt_version = _package_version("dbt-core")
+    adapter_type = _profile_adapter_type()
+    adapter_version = _package_version("duckrun" if adapter_type == "duckrun" else "dbt-duckdb")
+    if adapter_type == "duckrun":
+        adapter_label = f"duckrun {adapter_version or ''} (DuckDB SQL, Delta Lake tables)".replace("  ", " ")
+    elif adapter_type:
+        adapter_label = f"{adapter_type} {adapter_version or ''}".strip() + " (not duckrun: models are not written as Delta tables)"
+    else:
+        adapter_label = "unknown (profiles.yml unreadable)"
+
     models = list_dbt_models()
     runs = _load_runs_history(user=user, is_admin=is_admin)
     last_run = runs[0] if runs else None
 
     return {
-        "installed": True,
-        "dbt_version": version_str,
-        "adapter": "duckdb (duckrun enabled)",
+        "installed": dbt_version is not None,
+        "dbt_version": dbt_version or "not installed",
+        "adapter": adapter_label,
+        "adapter_type": adapter_type,
+        "uses_duckrun": adapter_type == "duckrun",
         "project_dir": DBT_PROJECT_DIR,
         "project_valid": project_exists and profiles_exists,
         "project_name": "localspark_lakehouse",

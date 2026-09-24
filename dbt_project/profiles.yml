@@ -2,8 +2,14 @@ localspark_dbt:
   target: dev
   outputs:
     dev:
-      type: duckdb
+      # duckrun is a dbt adapter (built on dbt-duckdb): SQL runs in DuckDB, `table` / `incremental` models are written as
+      # Delta tables under `root_path`, and `view` models stay views in the DuckDB file below.
+      type: duckrun
       path: '/workspace/warehouse/dbt_analytics.duckdb'
+      # Private on purpose (a dot-directory is not a catalog schema): dbt output is derived from governed tables, so it must
+      # not appear in the catalog / SQL editor until its governance tags are carried over. Previews read it through the
+      # views in the DuckDB file.
+      root_path: '/workspace/warehouse/.dbt'
       extensions:
         - httpfs
         - delta

@@ -854,6 +854,9 @@ SELECT name, region FROM warehouse.hr.employees;
           <li><strong>Live Execution Stream:</strong> ANSI-color-decoded stdout and stderr stream live to the browser interface.</li>
           <li><strong>Model Dependency Graph:</strong> Interactive visualization of dbt model dependencies (e.g. <code>stg_trips</code> &rarr; <code>fact_taxi_trips</code>).</li>
           <li><strong>Per-User Run History:</strong> Execution logs and test outcomes are archived and scoped per user.</li>
+          <li><strong>The duckrun adapter:</strong> the project's profile uses <code>type: duckrun</code>, a dbt adapter built on dbt-duckdb. SQL runs in DuckDB, and <code>table</code> / <code>incremental</code> models are written as real Delta Lake tables under <code>warehouse/.dbt/&lt;schema&gt;/&lt;model&gt;</code>; <code>view</code> models stay views in <code>dbt_analytics.duckdb</code>. <code>dbt-core</code>, <code>jinja2</code> and <code>duckrun</code> are pinned in <code>requirements.txt</code>.</li>
+          <li><strong>Private output:</strong> dbt output is derived from governed tables, so it is kept in a dot-directory that the catalog does not list; it is previewed in the Transformations view. Exposing it in the catalog would first require carrying the source tags over.</li>
+          <li><strong>Upgrading a project that ran on the plain dbt-duckdb adapter:</strong> the project's <code>on-run-start</code> macro <code>drop_legacy_duckdb_tables</code> drops only the old real tables once (DuckDB cannot replace a table with a view); the run rebuilds them as Delta. It does nothing on later runs or fresh installs.</li>
         </ul>
 
         <div class="code-container">
