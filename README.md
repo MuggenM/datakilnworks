@@ -425,9 +425,11 @@ spec:
   - **Sync group & role groups**: set `sync_group` (a group DN, e.g. `cn=datakilnworks,...`) and only its members can log in, get discovered by sync, or stay active — login is refused for other directory users, bulk sync skips them, and a re-sync deactivates an account that left the group. Empty means everyone under the user search base. `admin_group` / `power_user_group` / `user_group` map directory groups to the local roles (first match wins); a member of `sync_group` in none of them gets `default_role`, never a silent skip.
   - **Sync**: `POST /api/auth/frameworks/ldap/sync` (or the *Sync LDAP Users Now* button) provisions every directory user under the user search base who has never logged in yet, re-resolves every already-known LDAP account's role against the directory, and deactivates one locally if its directory entry is gone. An existing local (or already-provisioned LDAP) username is always left untouched, never overwritten.
   - **Test Bind & Search** (beyond the existing TCP/TLS-only *Test Connection*) does the real service bind and a bounded search, for a config that is actually usable, not just reachable.
-* **OIDC & OAuth 2.0 Providers**:
-  - Federate logins with Azure AD, Okta, Keycloak, or Google Identity.
-  - Auto-discovery via `.well-known/openid-configuration`.
+* **OIDC & OAuth 2.0 Providers** (`web/oidc_auth.py`; a real authorization-code flow, not a stub):
+  - Federate logins with Azure AD, Okta, Keycloak, or Google Identity. A **Sign in with <provider>** button appears on the login screen once OIDC is enabled with an issuer and client ID; register `redirect_uri` (default `http://localhost:8891/api/auth/oidc/callback`, editable) with the provider.
+  - Auto-discovery via `.well-known/openid-configuration` (the document's `issuer` must equal the configured one). PKCE (S256) always, plus `state` and `nonce`; the attempt is remembered only in a short-lived signed HttpOnly cookie. Public clients (no secret) work.
+  - The ID token is verified against the provider's JWKS with an asymmetric-algorithm allow-list (never `none`/HS256), and `iss`, `aud`/`azp`, `exp` and `nonce` are checked. Username comes from `username_claim` (default `preferred_username`, else a *verified* email); role from `admin_claim` with `admin_value` / `power_user_value` (userinfo is consulted if the claim isn't in the ID token), else `default_role`.
+  - Accounts are created with `auth_source='oidc'` and no usable password. An existing local or LDAP username, a deleted account, or one an administrator deactivated is always refused: an OIDC login can never take over or reactivate an account. Roles are refreshed on each login (there is no background sync for OIDC).
 * **SAML 2.0 Enterprise Federation**:
   - Corporate SSO support for PingIdentity, Shibboleth, and enterprise IdPs.
 * **Granular Role-Based Access Control (RBAC)**:

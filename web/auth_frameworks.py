@@ -51,6 +51,7 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "client_secret": "",
         "scopes": "openid email profile groups",
         "redirect_uri": "http://localhost:8891/api/auth/oidc/callback",
+        "username_claim": "preferred_username",   # falls back to a verified `email` claim
         "admin_claim": "groups",
         "admin_value": "LakehouseAdmins",
         "power_user_value": "DataEngineers",

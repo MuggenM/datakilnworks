@@ -474,6 +474,67 @@ async def login_endpoint(payload: LoginRequest):
     return resp
 
 
+def _oidc_redirect_uri(cfg: Dict[str, Any], request: Request) -> str:
+    """The registered redirect URI is authoritative (it must match the IdP's registration exactly); only when it
+    is blank do we derive one from the request."""
+    return (cfg.get("redirect_uri") or "").strip() or str(request.url_for("oidc_callback"))
+
+
+@app.get("/api/auth/sso")
+async def sso_providers():
+    """Public: which single sign-on buttons the login screen should show (no secrets, no config detail)."""
+    from web import oidc_auth
+    cfg = auth_frameworks.load_raw_config().get("oidc", {})
+    return {"oidc": {"enabled": oidc_auth.is_configured(cfg), "provider_name": (cfg.get("provider_name") or "SSO").strip()}}
+
+
+def _sso_failure(message: str) -> RedirectResponse:
+    from urllib.parse import quote
+    resp = RedirectResponse(url=f"/?sso_error={quote(message)}", status_code=302)
+    resp.delete_cookie("dkw_oidc", path="/api/auth/oidc")
+    return resp
+
+
+@app.get("/api/auth/oidc/login")
+async def oidc_login(request: Request):
+    """Starts the OpenID Connect authorization-code (PKCE) flow: redirects the browser to the identity provider."""
+    from web import oidc_auth
+    cfg = auth_frameworks.load_raw_config().get("oidc", {})
+    if not oidc_auth.is_configured(cfg):
+        return _sso_failure("OpenID Connect sign-in is not enabled.")
+    redirect_uri = _oidc_redirect_uri(cfg, request)
+    try:
+        url, state_cookie = await asyncio.to_thread(oidc_auth.begin_login, cfg, redirect_uri)
+    except oidc_auth.OidcError as exc:
+        return _sso_failure(str(exc))
+    resp = RedirectResponse(url=url, status_code=302)
+    resp.set_cookie(oidc_auth.STATE_COOKIE, state_cookie, max_age=oidc_auth.STATE_TTL_SECONDS, httponly=True,
+                    samesite="lax", secure=redirect_uri.startswith("https://"), path="/api/auth/oidc")
+    return resp
+
+
+@app.get("/api/auth/oidc/callback", name="oidc_callback")
+async def oidc_callback(request: Request, code: str = "", state: str = "", error: str = "", error_description: str = ""):
+    """The identity provider sends the browser back here: validate, provision the local account, start a session."""
+    from web import oidc_auth
+    cfg = auth_frameworks.load_raw_config().get("oidc", {})
+    if error:
+        logger.info(f"OIDC provider returned an error: {error} {error_description}")
+        return _sso_failure("The identity provider did not complete the sign-in.")
+    redirect_uri = _oidc_redirect_uri(cfg, request)
+    try:
+        u = await asyncio.to_thread(oidc_auth.complete_login, cfg, code, state,
+                                    request.cookies.get(oidc_auth.STATE_COOKIE), redirect_uri)
+    except oidc_auth.OidcError as exc:
+        return _sso_failure(str(exc))
+    record_user_login(u["id"])
+    resp = RedirectResponse(url="/", status_code=302)
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u), max_age=86400, httponly=True, samesite="lax",
+                    secure=redirect_uri.startswith("https://"))
+    resp.delete_cookie(oidc_auth.STATE_COOKIE, path="/api/auth/oidc")
+    return resp
+
+
 @app.post("/api/auth/change-password")
 async def change_password_endpoint(payload: PasswordChangeRequest, request: Request):
     """A signed-in user changes their own password (local accounts only; needs the current password)."""
