@@ -13929,7 +13929,7 @@
 
   <!-- Modal: Identity & Access Management (Admin Only) -->
   <div x-show="showIamModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showIamModal = false">
-    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-4xl shadow-2xl p-6 space-y-5 max-h-[90vh] flex flex-col" @click.outside="showIamModal = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-7xl shadow-2xl p-6 space-y-5 max-h-[90vh] flex flex-col" @click.outside="showIamModal = false">
       <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-3 shrink-0">
         <div class="flex items-center space-x-3">
           <div class="w-9 h-9 rounded-lg bg-indigo-50 dark:bg-indigo-950/80 border border-indigo-200 dark:border-indigo-800/80 flex items-center justify-center text-indigo-600 dark:text-indigo-400 text-lg">
@@ -14004,7 +14004,7 @@
           <thead class="bg-slate-100 dark:bg-slate-900/80 text-slate-600 dark:text-slate-400 border-b border-slate-200 dark:border-dbx-border font-semibold uppercase text-[10px] sticky top-0 backdrop-blur-md">
             <tr>
               <th class="py-2.5 px-4">User</th>
-              <th class="py-2.5 px-4">Email</th>
+              <th class="py-2.5 px-4 hidden xl:table-cell">Email</th>
               <th class="py-2.5 px-4">Role</th>
               <th class="py-2.5 px-4">Source</th>
               <th class="py-2.5 px-4">Status</th>
@@ -14027,7 +14027,7 @@
                     </div>
                   </div>
                 </td>
-                <td class="py-3 px-4 text-slate-500 font-mono text-[11px]" x-text="u.email || '-'"></td>
+                <td class="py-3 px-4 hidden xl:table-cell text-slate-500 font-mono text-[11px]" x-text="u.email || '-'"></td>
                 <td class="py-3 px-4">
                   <select :value="u.role" @change="updateUserRole(u, $event.target.value)" :disabled="u.username === 'admin'" class="bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-2 py-1 text-[11px] font-semibold cursor-pointer focus:outline-none focus:border-indigo-500"
                           :class="u.role === 'admin' ? 'text-rose-600 dark:text-rose-400' : (u.role === 'power_user' ? 'text-amber-600 dark:text-amber-400' : 'text-sky-600 dark:text-sky-400')">
@@ -14046,8 +14046,8 @@
                         :class="u.deleted_at ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 border border-rose-300 dark:border-rose-800' : (u.is_active ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400 border border-slate-300 dark:border-slate-700')"
                         x-text="u.deleted_at ? 'Deleted' : (u.is_active ? 'Active' : 'Disabled')"></span>
                 </td>
-                <td class="py-3 px-4 font-mono text-slate-400 text-[11px]" x-text="u.created_at ? u.created_at.slice(0, 16).replace('T', ' ') : '-'"></td>
-                <td class="py-3 px-4 text-right space-x-1">
+                <td class="py-3 px-4 font-mono text-slate-400 text-[11px] whitespace-nowrap" x-text="u.created_at ? u.created_at.slice(0, 16).replace('T', ' ') : '-'"></td>
+                <td class="py-3 px-4 text-right space-x-1 whitespace-nowrap">
                   <template x-if="u.deleted_at">
                     <button @click="restoreUser(u)" class="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:hover:bg-emerald-900 dark:text-emerald-300 dark:border-emerald-800 rounded transition text-[11px] font-medium" title="Restore User">
                       <i class="ph ph-arrow-counter-clockwise"></i>
