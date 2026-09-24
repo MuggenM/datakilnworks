@@ -241,7 +241,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | Feature | Real Databricks | Snowflake | DataKilnWorks Studio | Winner |
 | :--- | :---: | :---: | :---: | :--- |
 | **User Authentication** | OAuth 2.0 / SAML 2.0 | SAML 2.0 / Key-pair | **JWT + OAuth 2.0 + LDAP + PBKDF2 Hashing** | 🏆 **Data Kiln Works** |
-| **OAuth Providers Supported** | Major enterprise (Okta, Azure, Google) | Major enterprise | **8 Native Providers (Okta, Azure AD, Google, GitHub, GitLab, Auth0, Keycloak, Custom OIDC with PKCE)** | 🏆 **Data Kiln Works** |
+| **OAuth Providers Supported** | Major enterprise (Okta, Azure, Google) | Major enterprise | **Generic OpenID Connect (authorization code + PKCE): any standards-compliant provider (Okta, Entra ID, Keycloak, Google, Auth0); no provider-specific integrations** | 🤝 **Parity** |
 | **Multi-Factor Authentication (MFA)**| ✅ Duo / Cloud MFA | ✅ Duo Push / TOTP | ✅ **Native TOTP (Google/MS/Authy) + 10 Backup Codes** | 🏆 **Data Kiln Works** |
 | **MFA Configuration & Stats** | ⚠️ Admin console only | ⚠️ SQL commands | ✅ **Full GUI: Policy enforcement, grace period, reset, stats** | 🏆 **Data Kiln Works** |
 | **LDAP / Active Directory Sync** | ✅ SCIM / Enterprise only | ✅ SCIM / Enterprise only | ✅ **Real bind-as-user auth, group-to-role mapping, auto-provisioning, and a sync that deactivates accounts removed from the directory (all tiers)** | 🏆 **Data Kiln Works** |
@@ -250,7 +250,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Network Policies / IP Allowlists**| ✅ Yes | ✅ Yes | ⚠️ Kubernetes / Ingress level | 🏆 **Databricks / Snowflake** |
 | **Compliance Certifications** | ✅ SOC 2, HIPAA, FedRAMP | ✅ SOC 2, HIPAA, PCI-DSS | ⚠️ Inherited from host / customer infrastructure | 🏆 **Databricks / Snowflake** |
 
-**Domain Verdict:** **DataKilnWorks Studio** democratizes enterprise security by providing OAuth 2.0 (8 providers), LDAP sync, and TOTP MFA with backup codes at all tiers without requiring enterprise SaaS surcharges.
+**Domain Verdict:** **DataKilnWorks Studio** democratizes enterprise security by providing generic OpenID Connect login (PKCE), LDAP sync, and TOTP MFA with backup codes at all tiers without requiring enterprise SaaS surcharges.
 
 ---
 

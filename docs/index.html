@@ -1327,6 +1327,24 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
                 <td><code>{"username": "...", "password": "..."}</code></td>
               </tr>
               <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/auth/sso</code></td>
+                <td>Public: whether OpenID Connect sign-in is enabled and its display name (drives the login screen's button)</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/auth/oidc/login</code></td>
+                <td>Starts the OpenID Connect authorization-code (PKCE) flow: redirects the browser to the identity provider</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/auth/oidc/callback</code></td>
+                <td>The provider's redirect target: verifies state and the ID token, provisions the account, sets the session cookie, redirects to <code>/</code> (or to <code>/?sso_error=&hellip;</code>)</td>
+                <td><code>?code=...&amp;state=...</code></td>
+              </tr>
+              <tr>
                 <td><span class="badge green">POST</span></td>
                 <td><code>/api/auth/change-password</code></td>
                 <td>Changes the caller's own password (local accounts only); ends other sessions</td>
