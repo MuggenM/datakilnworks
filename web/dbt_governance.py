@@ -35,7 +35,7 @@ logger = logging.getLogger("localspark.dbt_governance")
 TAG_KEY = "access"
 CLOSED, OPEN = "closed", "open"
 POLICY_NAME = "dbt output closed by default"
-CATALOG = "warehouse"
+SOURCE_CATALOG = "warehouse"                   # dbt sources read the local lakehouse (external_location: delta_scan(...))
 PROPAGATED_SOURCE = "dbt"                      # `source` of tag assignments this module derives (and may refresh / remove)
 _MISSING_COLUMN = "__dbt_output_closed__"      # never exists, so the row filter fails closed (1 = 0) on every table it matches
 OUTPUT_MATERIALIZATIONS = ("table", "incremental", "delta")
@@ -43,6 +43,11 @@ OUTPUT_MATERIALIZATIONS = ("table", "incremental", "delta")
 
 def enabled() -> bool:
     return os.getenv("DBT_CLOSED_BY_DEFAULT", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env() -> Dict[str, str]:
+    from web.dbt_config import dbt_env
+    return dbt_env()
 
 
 def _project_dir() -> str:
@@ -53,13 +58,53 @@ def _warehouse_dir() -> str:
     return os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 
 
+# ---------------------------------------------------------------- where dbt lands its tables
+
+def target() -> Dict[str, Any]:
+    """Where the profile's `root_path` points and which catalog that is: the local warehouse ('warehouse'), an S3 mount's bucket (the
+    mount's catalog) or somewhere no catalog reads (catalog None: nobody can read those tables through a governed path)."""
+    from web.dbt_service import _profile_output
+    root = str(_profile_output().get("root_path") or "").strip()
+    if root.lower().startswith("s3://"):
+        from web.autoloader_s3 import parse_s3_path
+        from web.dbt_config import s3_mounts
+        from web.mounts import get_s3_storage_options
+        bucket, prefix = parse_s3_path(root)
+        mount = next((m for m in s3_mounts() if (m.get("config") or {}).get("bucket") == bucket), None)
+        if not mount:
+            return {"kind": "s3", "catalog": None, "root": root, "note": f"no S3 storage mount is configured for bucket '{bucket}', so the "
+                                                                          "tables are not visible in any catalog"}
+        return {"kind": "s3", "catalog": mount.get("catalog_name") or mount["id"], "root": f"s3://{bucket}/{prefix}".rstrip("/"),
+                "storage_options": get_s3_storage_options(mount.get("config") or {})}
+    if not root or os.path.abspath(root) == os.path.abspath(_warehouse_dir()):
+        return {"kind": "local", "catalog": "warehouse", "root": _warehouse_dir()}
+    return {"kind": "local", "catalog": None, "root": root, "note": "the profile's root_path is outside the warehouse, so the tables are not in any catalog"}
+
+
+def _dest_catalog() -> Optional[str]:
+    return target()["catalog"]
+
+
+def _delta_table(schema: str, alias: str):
+    """The output table as a DeltaTable (local or S3), or None if it has not been built."""
+    from deltalake import DeltaTable
+    t = target()
+    try:
+        if t["kind"] == "s3":
+            return DeltaTable(f'{t["root"]}/{schema}/{alias}', storage_options=t.get("storage_options"))
+        path = os.path.join(t["root"], schema, alias)
+        return DeltaTable(path) if os.path.isdir(os.path.join(path, "_delta_log")) else None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- what dbt will build
 
 def list_models() -> List[Dict[str, Any]]:
     """Every model dbt knows (`dbt ls`): name, alias, schema, materialization, upstream node ids, compiled-file location."""
     r = subprocess.run(["dbt", "ls", "--resource-type", "model", "--output", "json", "--output-keys",
                         "name alias schema database config depends_on original_file_path package_name", "--profiles-dir", "."],
-                       cwd=_project_dir(), capture_output=True, text=True, timeout=90)
+                       cwd=_project_dir(), capture_output=True, text=True, timeout=90, env=_env())
     models = []
     for line in (r.stdout or "").splitlines():
         line = line.strip()
@@ -89,6 +134,10 @@ def ensure_closed_by_default(schemas: Set[str], actor: str = "dbt") -> Dict[str,
     from web.governance import row_filters, store, tags
     store.init_governance_db()
     done: Dict[str, Any] = {"schemas_closed": [], "policy_created": False, "tag_created": False}
+    catalog = _dest_catalog()
+    if catalog is None:
+        return {**done, "skipped": target().get("note", "the output is not in a catalog")}
+    done["catalog"] = catalog
     try:
         tags.get_definition(TAG_KEY)
     except tags.NotFound:
@@ -103,8 +152,8 @@ def ensure_closed_by_default(schemas: Set[str], actor: str = "dbt") -> Dict[str,
             "filter_column": _MISSING_COLUMN, "filter_expr": "{col} IS NULL", "except_roles": ["admin", "power_user"], "priority": 10}, actor=actor)
         done["policy_created"] = True
     for schema in sorted(schemas):
-        if TAG_KEY not in tags.effective_table_tags(CATALOG, schema, "_"):
-            tags.set_tag(catalog=CATALOG, schema_name=schema, tag_key=TAG_KEY, tag_value=CLOSED, actor=actor, source=PROPAGATED_SOURCE)
+        if TAG_KEY not in tags.effective_table_tags(catalog, schema, "_"):
+            tags.set_tag(catalog=catalog, schema_name=schema, tag_key=TAG_KEY, tag_value=CLOSED, actor=actor, source=PROPAGATED_SOURCE)
             done["schemas_closed"].append(schema)
     return done
 
@@ -112,7 +161,10 @@ def ensure_closed_by_default(schemas: Set[str], actor: str = "dbt") -> Dict[str,
 def access_state(schema: str, table: str) -> Dict[str, Any]:
     """{'access': 'closed'|'open'|None, 'level': 'schema'|'table'|...} for one output table."""
     from web.governance import tags
-    info = tags.effective_table_tags(CATALOG, schema, table).get(TAG_KEY)
+    catalog = _dest_catalog()
+    if catalog is None:
+        return {"access": None, "level": None}
+    info = tags.effective_table_tags(catalog, schema, table).get(TAG_KEY)
     return {"access": info["value"] if info else None, "level": info["level"] if info else None}
 
 
@@ -136,7 +188,7 @@ def _normalise(sql: str, models: List[Dict[str, Any]]) -> str:
         if path.startswith(root):
             parts = path[len(root):].strip("/").split("/")
             if len(parts) == 2:
-                return f"{CATALOG}.{parts[0]}.{parts[1]}"
+                return f"{SOURCE_CATALOG}.{parts[0]}.{parts[1]}"
         return match.group(0)
     return re.sub(r"delta_scan\(\s*'([^']+)'\s*\)", scan, sql)
 
@@ -156,15 +208,17 @@ def _leaf_sources(column: str, sql: str, upstream: Dict[str, str]) -> Optional[L
             continue
         src = n.source
         if isinstance(src, exp.Table) and src.db:
-            out.append((src.catalog or CATALOG, src.db, src.name, n.name.split(".")[-1]))
+            out.append((src.catalog or SOURCE_CATALOG, src.db, src.name, n.name.split(".")[-1]))
     return out
 
 
 def propagate_tags(models: List[Dict[str, Any]], actor: str = "dbt") -> Dict[str, Any]:
     """Copies source tags onto every output table (see rule 3). Returns per-table counts and any columns handled by the
     conservative fallback."""
-    from deltalake import DeltaTable
     from web.governance import tags
+    dest = _dest_catalog()
+    if dest is None:
+        return {"tables": {}, "fallback_columns": [], "skipped": [m["alias"] for m in models], "note": target().get("note")}
     sql_by_alias = {}
     for m in models:
         raw = _compiled_sql(m)
@@ -174,16 +228,16 @@ def propagate_tags(models: List[Dict[str, Any]], actor: str = "dbt") -> Dict[str
     for m in models:
         if m["materialized"] not in OUTPUT_MATERIALIZATIONS:
             continue
-        table_dir = os.path.join(_warehouse_dir(), m["schema"], m["alias"])
-        if not os.path.isdir(os.path.join(table_dir, "_delta_log")) or m["alias"] not in sql_by_alias:
+        table = _delta_table(m["schema"], m["alias"])
+        if table is None or m["alias"] not in sql_by_alias:
             result["skipped"].append(m["alias"])
             continue
-        columns = [f.name for f in DeltaTable(table_dir).schema().fields]
+        columns = [f.name for f in table.schema().fields]
         upstream = {a: s for a, s in sql_by_alias.items() if a != m["alias"]}
         # refresh what this module derived earlier: an upstream tag that was removed must not linger on the output
-        for a in tags.list_assignments(catalog=CATALOG, limit=5000):
+        for a in tags.list_assignments(catalog=dest, limit=5000):
             if a["schema_name"] == m["schema"] and a["table_name"] == m["alias"] and a.get("source") == PROPAGATED_SOURCE:
-                tags.unset_tag(catalog=CATALOG, schema_name=m["schema"], table_name=m["alias"], column_name=a.get("column_name") or "",
+                tags.unset_tag(catalog=dest, schema_name=m["schema"], table_name=m["alias"], column_name=a.get("column_name") or "",
                                tag_key=a["tag_key"], actor=actor)
         col_tags: Dict[str, Dict[str, str]] = {}
         table_tags: Dict[str, str] = {}
@@ -216,7 +270,7 @@ def propagate_tags(models: List[Dict[str, Any]], actor: str = "dbt") -> Dict[str
 def _set(m: Dict[str, Any], column: str, key: str, value: str, actor: str) -> int:
     from web.governance import tags
     try:
-        tags.set_tag(catalog=CATALOG, schema_name=m["schema"], table_name=m["alias"], column_name=column, tag_key=key, tag_value=value,
+        tags.set_tag(catalog=_dest_catalog(), schema_name=m["schema"], table_name=m["alias"], column_name=column, tag_key=key, tag_value=value,
                      actor=actor, source=PROPAGATED_SOURCE)
         return 1
     except ValueError as exc:                                              # e.g. a value the tag's allowed list rejects
@@ -236,7 +290,7 @@ def _base_tables(sql: str, upstream: Dict[str, str]) -> Set[Tuple[str, str, str]
             continue
         for t in tree.find_all(exp.Table):
             if t.db:
-                out.add((t.catalog or CATALOG, t.db, t.name))
+                out.add((t.catalog or SOURCE_CATALOG, t.db, t.name))
             elif t.name in upstream and t.name not in seen:
                 seen.add(t.name)
                 todo.append(upstream[t.name])
@@ -246,7 +300,7 @@ def _base_tables(sql: str, upstream: Dict[str, str]) -> Set[Tuple[str, str, str]
 def _table_columns(cat: str, schema: str, table: str):
     from deltalake import DeltaTable
     try:
-        return DeltaTable(os.path.join(_warehouse_dir(), schema, table)).schema().fields if cat == CATALOG else []
+        return DeltaTable(os.path.join(_warehouse_dir(), schema, table)).schema().fields if cat == SOURCE_CATALOG else []
     except Exception:
         return []
 
@@ -268,22 +322,28 @@ def open_model(model_name: str, actor: str) -> Dict[str, Any]:
     from web.governance import tags
     models = list_models()
     m = _find_output(model_name, models)
-    if not os.path.isdir(os.path.join(_warehouse_dir(), m["schema"], m["alias"], "_delta_log")):
+    catalog = _dest_catalog()
+    if catalog is None:
+        raise ValueError("dbt's output is not in a catalog, so there is nothing to open: " + target().get("note", ""))
+    if _delta_table(m["schema"], m["alias"]) is None:
         raise ValueError(f"'{model_name}' has not been built yet (run dbt first).")
     ensure_closed_by_default({m["schema"]}, actor=actor)
     carried = propagate_tags(models, actor=actor)
     info = carried["tables"].get(f'{m["schema"]}.{m["alias"]}', {"tags_set": 0, "tagged_columns": []})
-    tags.set_tag(catalog=CATALOG, schema_name=m["schema"], table_name=m["alias"], tag_key=TAG_KEY, tag_value=OPEN, actor=actor, source="manual")
-    return {"table": f'{CATALOG}.{m["schema"]}.{m["alias"]}', "access": OPEN, "carried_tags": info["tags_set"],
+    tags.set_tag(catalog=catalog, schema_name=m["schema"], table_name=m["alias"], tag_key=TAG_KEY, tag_value=OPEN, actor=actor, source="manual")
+    return {"table": f'{catalog}.{m["schema"]}.{m["alias"]}', "access": OPEN, "carried_tags": info["tags_set"],
             "columns_with_source_tags": info["tagged_columns"], "fallback_columns": [c for c in carried["fallback_columns"] if c.startswith(m["alias"] + ".")]}
 
 
 def close_model(model_name: str, actor: str) -> Dict[str, Any]:
     from web.governance import tags
     m = _find_output(model_name, list_models())
+    catalog = _dest_catalog()
+    if catalog is None:
+        raise ValueError("dbt's output is not in a catalog: " + target().get("note", ""))
     ensure_closed_by_default({m["schema"]}, actor=actor)
-    tags.set_tag(catalog=CATALOG, schema_name=m["schema"], table_name=m["alias"], tag_key=TAG_KEY, tag_value=CLOSED, actor=actor, source="manual")
-    return {"table": f'{CATALOG}.{m["schema"]}.{m["alias"]}', "access": CLOSED}
+    tags.set_tag(catalog=catalog, schema_name=m["schema"], table_name=m["alias"], tag_key=TAG_KEY, tag_value=CLOSED, actor=actor, source="manual")
+    return {"table": f'{catalog}.{m["schema"]}.{m["alias"]}', "access": CLOSED}
 
 
 # ---------------------------------------------------------------- around a dbt run

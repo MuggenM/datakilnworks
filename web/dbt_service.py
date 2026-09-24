@@ -247,7 +247,8 @@ def get_dbt_model_detail(model_name: str) -> Optional[Dict[str, Any]]:
                 cwd=DBT_PROJECT_DIR,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=30
+                timeout=30,
+                env=__import__("web.dbt_config", fromlist=["dbt_env"]).dbt_env()
             )
             if compiled_path and os.path.exists(compiled_path):
                 with open(compiled_path, "r", encoding="utf-8") as f:
@@ -297,13 +298,15 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
     logger.info(f"Executing dbt command in {DBT_PROJECT_DIR}: {' '.join(cmd)}")
     
     try:
+        from web.dbt_config import dbt_env
         proc = subprocess.run(
             cmd,
             cwd=DBT_PROJECT_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=180
+            timeout=180,
+            env=dbt_env()                       # S3 mounts as DKW_MOUNT_<ID>_* variables, for profiles that land models in a mount
         )
         output = proc.stdout
         exit_code = proc.returncode
@@ -359,6 +362,19 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
     _save_run_record(record)
     return record
 
+def _configure_preview_storage(con) -> None:
+    """Views over Delta tables that dbt landed in an S3 mount need that mount's credentials on the preview connection."""
+    root = str(_profile_output().get("root_path") or "")
+    if not root.lower().startswith("s3://"):
+        return
+    try:
+        from web import autoloader_s3
+        conn = autoloader_s3.resolve_connection({"source_volume_path": root, "source_mount_id": None})
+        autoloader_s3.configure_duckdb(con, conn)
+    except Exception as exc:
+        logger.warning(f"Could not configure S3 access for the dbt preview: {exc}")
+
+
 def preview_dbt_model_data(model_name: str, limit: int = 50) -> Dict[str, Any]:
     """Queries the materialized table/view in dbt_analytics.duckdb."""
     import duckdb
@@ -368,6 +384,7 @@ def preview_dbt_model_data(model_name: str, limit: int = 50) -> Dict[str, Any]:
     con = None
     try:
         con = duckdb.connect(DBT_DB_PATH, read_only=True)
+        _configure_preview_storage(con)
         rel = f'"{_profile_schema()}"."{model_name}"'          # qualified: an old run may have left a same-named table in `main`
         df = con.execute(f"SELECT * FROM {rel} LIMIT {limit}").df()
         columns = list(df.columns)
@@ -412,6 +429,7 @@ def preview_cte_step(model_name: str, cte_name: str, limit: int = 50) -> Dict[st
 
         con = duckdb.connect(DBT_DB_PATH, read_only=True)
         con.execute("INSTALL delta; LOAD delta;")
+        _configure_preview_storage(con)
         df = con.execute(test_sql).df()
         import numpy as np
         df_clean = df.replace({np.nan: None})

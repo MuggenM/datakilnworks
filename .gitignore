@@ -50,3 +50,4 @@ scratch/verify_*.py
 
 # Claude Code project guidance
 CLAUDE.md
+dbt_project/.config_history/

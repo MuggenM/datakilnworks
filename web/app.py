@@ -5393,14 +5393,65 @@ async def list_dbt_models_endpoint():
     from web import dbt_governance
     data = list_dbt_models()
     if dbt_governance.enabled():
+        catalog = dbt_governance._dest_catalog()
         for m in data.get("models", []):
-            if m.get("materialization") in dbt_governance.OUTPUT_MATERIALIZATIONS:
+            if catalog and m.get("materialization") in dbt_governance.OUTPUT_MATERIALIZATIONS:
                 try:
-                    m["lakehouse_table"] = f'{dbt_governance.CATALOG}.{m["schema"]}.{m.get("alias") or m["name"]}'
+                    m["lakehouse_table"] = f'{catalog}.{m["schema"]}.{m.get("alias") or m["name"]}'
                     m["access"] = dbt_governance.access_state(m["schema"], m.get("alias") or m["name"])
                 except Exception as exc:
                     logger.debug(f"access state of dbt model {m.get('name')} unavailable: {exc}")
     return data
+
+class DbtConfigPayload(BaseModel):
+    content: str
+
+
+@app.get("/api/dbt/config")
+async def list_dbt_config_files(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The dbt project's editable configuration files (admins only: they decide what dbt does as the system)."""
+    from web import dbt_config
+    return {"files": [dbt_config.read(n) for n in dbt_config.FILES],
+            "s3_mounts": [{"id": m["id"], "name": m.get("name") or m["id"], "bucket": (m.get("config") or {}).get("bucket"),
+                           "catalog": m.get("catalog_name")} for m in dbt_config.s3_mounts()]}
+
+@app.post("/api/dbt/config/s3-profile/{mount_id}")
+async def dbt_s3_profile_endpoint(mount_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """profiles.yml with its target pointed at an S3 mount (returned for review, not saved)."""
+    from web import dbt_config
+    try:
+        return {"name": "profiles.yml", "content": dbt_config.s3_profile(mount_id)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.get("/api/dbt/config/{name}/versions/{version_id}")
+async def get_dbt_config_version(name: str, version_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import dbt_config
+    try:
+        return dbt_config.read_version(name, version_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+@app.post("/api/dbt/config/{name}/validate")
+async def validate_dbt_config(name: str, payload: DbtConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import dbt_config
+    try:
+        return await asyncio.to_thread(dbt_config.validate, name, payload.content)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+@app.put("/api/dbt/config/{name}")
+async def save_dbt_config(name: str, payload: DbtConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Validates (YAML, cross-checks, and `dbt parse` on a scratch copy), keeps the previous version and audits. Invalid = nothing written."""
+    from web import dbt_config
+    try:
+        return await asyncio.to_thread(dbt_config.save, name, payload.content, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except dbt_config.ConfigError as exc:
+        raise HTTPException(status_code=422, detail={"message": "The configuration was not saved.", "errors": exc.errors})
 
 @app.post("/api/dbt/models/{model_name}/open")
 async def open_dbt_model_endpoint(model_name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
