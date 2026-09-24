@@ -22,6 +22,10 @@ services:
       # Idle SQL warehouses are really suspended (their compute-node container stopped) after `auto_stop_mins`, and resumed
       # by the next query. `pause` freezes the container instead of stopping it (instant resume, memory stays allocated).
       - WAREHOUSE_SUSPEND_MODE=${WAREHOUSE_SUSPEND_MODE:-stop}
+      # Git sync of the dbt project (Transformations > Project files > Git). Off unless GIT_REMOTE_URL is set. See .env.example.
+      - GIT_REMOTE_URL=${GIT_REMOTE_URL:-}
+      - GIT_BRANCH=${GIT_BRANCH:-main}
+      - GIT_TOKEN=${GIT_TOKEN:-}
     volumes:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse

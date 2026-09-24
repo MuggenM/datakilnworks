@@ -15687,6 +15687,32 @@
         </div>
       </div>
 
+      <!-- Git sync: the project directory against its remote repository (see web/git_sync.py) -->
+      <div x-show="dbtCfg.git && dbtCfg.git.configured" class="p-3 rounded-lg bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border space-y-2 shrink-0" data-testid="git-panel">
+        <div class="flex items-center justify-between">
+          <span class="font-semibold text-slate-800 dark:text-slate-200"><i class="ph ph-git-branch text-teal-500"></i> Git
+            <span class="font-mono font-normal text-slate-500" x-text="dbtCfg.git ? (dbtCfg.git.branch + ' · ' + (dbtCfg.git.remote || '')) : ''"></span></span>
+          <div class="flex items-center space-x-1.5" x-show="dbtCfg.git && dbtCfg.git.connected">
+            <span class="text-[11px] text-slate-500" x-text="'ahead ' + dbtCfg.git.ahead + ' · behind ' + dbtCfg.git.behind + ' · ' + (dbtCfg.git.head ? dbtCfg.git.head.slice(0, 8) : 'no commits')"></span>
+            <button type="button" @click="gitAction('status?fetch=true', 'GET')" :disabled="dbtCfg.gitBusy" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="git-refresh">Refresh</button>
+            <button type="button" @click="gitAction('pull')" :disabled="dbtCfg.gitBusy || dbtCfg.git.dirty || !dbtCfg.git.behind" :title="dbtCfg.git.dirty ? 'Commit or discard local changes first' : 'Fast-forward pull, checked with dbt parse'" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="git-pull">Pull</button>
+            <button type="button" @click="gitAction('push')" :disabled="dbtCfg.gitBusy || !dbtCfg.git.ahead" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="git-push">Push</button>
+          </div>
+          <button type="button" x-show="dbtCfg.git && !dbtCfg.git.connected && !dbtCfg.git.error" @click="gitAction('connect')" :disabled="dbtCfg.gitBusy" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="git-connect">Connect to repository</button>
+        </div>
+        <p x-show="dbtCfg.git && !dbtCfg.git.connected" class="text-[11px] text-slate-500" x-text="(dbtCfg.git && (dbtCfg.git.error || dbtCfg.git.reason)) || ''"></p>
+        <div x-show="dbtCfg.git && dbtCfg.git.connected && dbtCfg.git.dirty" class="space-y-1.5">
+          <div class="text-[11px] text-slate-500"><span x-text="(dbtCfg.git ? dbtCfg.git.changes.length : 0) + ' uncommitted change(s): '"></span>
+            <span class="font-mono" x-text="dbtCfg.git ? dbtCfg.git.changes.slice(0, 6).map(c => c.status + ' ' + c.path).join(', ') + (dbtCfg.git.changes.length > 6 ? ', …' : '') : ''"></span></div>
+          <div class="flex space-x-2">
+            <input type="text" x-model="dbtCfg.gitMsg" placeholder="Commit message" maxlength="200" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="git-message">
+            <button type="button" @click="gitAction('commit', 'POST', { message: dbtCfg.gitMsg })" :disabled="dbtCfg.gitBusy || !dbtCfg.gitMsg.trim()" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="git-commit">Commit</button>
+          </div>
+        </div>
+        <div x-show="dbtCfg.gitNote" class="text-[11px] text-emerald-600 dark:text-emerald-400" x-text="dbtCfg.gitNote"></div>
+        <pre x-show="dbtCfg.gitError" class="whitespace-pre-wrap font-mono text-[11px] text-rose-600 dark:text-rose-400" x-text="dbtCfg.gitError" data-testid="git-error"></pre>
+      </div>
+
       <!-- Guided settings: the few things people change; they edit the text below and leave everything else (and the comments) alone -->
       <div x-show="dbtCfg.settings" class="p-3 rounded-lg bg-teal-50 dark:bg-teal-950/30 border border-teal-200 dark:border-teal-900 space-y-2.5 shrink-0">
         <div class="flex items-center justify-between">
@@ -16631,7 +16657,7 @@
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
-        dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
+        dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', git: { configured: false, connected: false, ahead: 0, behind: 0, dirty: false, changes: [], head: null }, gitMsg: '', gitBusy: false, gitNote: '', gitError: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
         cloneModal: { open: false, source: '', schema: '', name: '', catalog: 'warehouse', srcSchema: '', srcTable: '', version: '', replace: false, busy: false, error: '' },
         changePasswordOpen: false,
         changePasswordForced: false,
@@ -23901,6 +23927,31 @@
           }
         },
 
+        async loadDbtGit() {
+          try {
+            const res = await fetch('/api/git/status');
+            if (res.ok) this.dbtCfg.git = await res.json();
+          } catch (e) { /* git sync is optional */ }
+        },
+
+        async gitAction(path, method = 'POST', body = null) {
+          this.dbtCfg.gitBusy = true; this.dbtCfg.gitError = ''; this.dbtCfg.gitNote = '';
+          try {
+            const res = await fetch('/api/git/' + path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+            const data = await res.json();
+            if (!res.ok) { this.dbtCfg.gitError = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail); await this.loadDbtGit(); return; }
+            this.dbtCfg.git = data;
+            if (data.committed) { this.dbtCfg.gitMsg = ''; this.dbtCfg.gitNote = 'Committed ' + data.committed.slice(0, 8) + '.'; }
+            else if (data.pushed) this.dbtCfg.gitNote = 'Pushed.';
+            else if (data.message) this.dbtCfg.gitNote = data.message;
+            if (data.pulled) await this.openDbtConfig();     // the files on disk changed: reload the editors
+          } catch (e) {
+            this.dbtCfg.gitError = 'Error: ' + e.message;
+          } finally {
+            this.dbtCfg.gitBusy = false;
+          }
+        },
+
         async openDbtConfig() {
           this.dbtCfg = { ...this.dbtCfg, open: true, errors: [], warnings: [], ok: null, busy: true };
           try {
@@ -23913,6 +23964,7 @@
             this.dbtCfg.s3Mounts = data.s3_mounts || [];
             this.dbtCfg.warnings = (data.files.find(f => f.name === this.dbtCfg.tab) || {}).warnings || [];
             await this.refreshDbtSettings();
+            this.loadDbtGit();
           } catch (e) {
             this.dbtCfg.errors = ['Error: ' + e.message];
           } finally {

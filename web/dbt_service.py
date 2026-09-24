@@ -301,6 +301,15 @@ def get_dbt_model_detail(model_name: str) -> Optional[Dict[str, Any]]:
         "metadata": meta
     }
 
+def _project_sha():
+    """The project's git commit at run time (None when the project is not its own repository), so a run can be traced to code."""
+    try:
+        from web import git_sync
+        return git_sync.head_sha()
+    except Exception:
+        return None
+
+
 def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh: bool = False, target: str = "dev", user: str = "admin") -> Dict[str, Any]:
     run_id = f"run_{uuid.uuid4().hex[:8]}"
     start_time = datetime.datetime.now()
@@ -381,7 +390,8 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
             "warn": warn_count,
             "error": error_count
         },
-        "governance": governance
+        "governance": governance,
+        "git_sha": _project_sha()
     }
     
     _save_run_record(record)
