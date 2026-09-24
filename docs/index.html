@@ -782,6 +782,14 @@ SELECT name, region FROM warehouse.hr.employees;
 &lt;/iframe&gt;</code></pre>
         </div>
 
+        <h3 id="query-history-audit">Query History: reuse and fix old queries</h3>
+        <p>
+          <em>Query History</em> is an audit trail: what ran is never rewritten. Opening an entry (<em>Inspect</em>) shows its SQL in an editable
+          <strong>working copy</strong>. <em>Qualify table names</em> completes every table name to <code>catalog.schema.table</code> by inserting the missing prefix in place
+          (your formatting and comments stay). A name is only completed when it resolves to exactly one table; unknown or ambiguous names are listed and left alone, as are CTE names and table functions.
+          From there use <em>Open in SQL editor</em> or <em>Save as query</em> to keep the corrected version under <em>Saved Queries</em>.
+        </p>
+
         <h3 id="genie-spaces-ai">Genie Space: Conversational Text-to-SQL AI Analyst</h3>
         <p>
           <strong>Genie Space</strong> enables conversational data analysis in plain English. Similar to Databricks Genie and Snowflake Cortex Analyst, Genie converts natural language questions into executable DuckDB SQL.

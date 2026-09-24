@@ -10083,17 +10083,31 @@
           <pre class="text-xs text-red-300 font-mono whitespace-pre-wrap break-all" x-text="selectedQueryDetail ? selectedQueryDetail.error_message : ''"></pre>
         </div>
 
-        <!-- Full SQL Query Box -->
+        <!-- SQL: an editable working copy. The history record itself is an audit trail and is never changed. -->
         <div class="space-y-1.5">
           <div class="flex items-center justify-between">
-            <label class="text-xs font-semibold text-slate-700 dark:text-slate-300">SQL Statement</label>
-            <button @click="copyQueryText(selectedQueryDetail.query_text)" class="text-[11px] px-2.5 py-1 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-200 dark:border-dbx-border rounded text-slate-700 dark:text-slate-300 flex items-center space-x-1 transition">
-              <i class="ph ph-copy text-xs"></i>
-              <span>Copy SQL</span>
-            </button>
+            <label class="text-xs font-semibold text-slate-700 dark:text-slate-300">SQL Statement <span class="font-normal text-slate-500">(working copy: edit freely, the history record stays as it was run)</span></label>
+            <div class="flex items-center space-x-1.5">
+              <button @click="qualifyHistorySql()" :disabled="historyEdit.busy" data-testid="hist-qualify" class="text-[11px] px-2.5 py-1 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-200 dark:border-dbx-border rounded text-slate-700 dark:text-slate-300 flex items-center space-x-1 disabled:opacity-50" title="Complete table names to catalog.schema.table">
+                <i class="ph ph-tree-structure text-xs"></i><span>Qualify table names</span>
+              </button>
+              <button @click="historyEdit.sql = selectedQueryDetail.query_text; historyEdit.notes = null" :disabled="!selectedQueryDetail || historyEdit.sql === selectedQueryDetail.query_text" class="text-[11px] px-2.5 py-1 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-200 dark:border-dbx-border rounded text-slate-700 dark:text-slate-300 disabled:opacity-40">Reset</button>
+              <button @click="copyQueryText(historyEdit.sql)" class="text-[11px] px-2.5 py-1 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-200 dark:border-dbx-border rounded text-slate-700 dark:text-slate-300 flex items-center space-x-1">
+                <i class="ph ph-copy text-xs"></i><span>Copy</span>
+              </button>
+            </div>
           </div>
-          <div class="bg-slate-100/90 dark:bg-slate-950 border border-slate-200 dark:border-dbx-border rounded-lg p-3 max-h-60 overflow-y-auto">
-            <pre class="text-xs font-mono text-slate-900 dark:text-amber-200/90 whitespace-pre-wrap break-all select-all leading-relaxed" x-text="selectedQueryDetail ? selectedQueryDetail.query_text : ''"></pre>
+          <textarea x-model="historyEdit.sql" rows="9" spellcheck="false" wrap="off" data-testid="hist-sql"
+                    class="w-full bg-slate-100/90 dark:bg-slate-950 border border-slate-200 dark:border-dbx-border rounded-lg p-3 text-xs font-mono text-slate-900 dark:text-amber-200/90 leading-relaxed focus:outline-none focus:border-amber-500 resize-y"></textarea>
+          <div x-show="historyEdit.notes" class="text-[11px] space-y-0.5" data-testid="hist-notes">
+            <div x-show="historyEdit.notes && historyEdit.notes.changes.length" class="text-emerald-600 dark:text-emerald-400" x-text="historyEdit.notes ? 'Completed: ' + historyEdit.notes.changes.map(c => c.from + ' → ' + c.to).join('; ') : ''"></div>
+            <div x-show="historyEdit.notes && historyEdit.notes.unresolved.length" class="text-amber-600 dark:text-amber-400" x-text="historyEdit.notes ? 'Left as is: ' + historyEdit.notes.unresolved.map(u => u.name + ' (' + u.reason + ')').join('; ') : ''"></div>
+            <div x-show="historyEdit.notes && !historyEdit.notes.changes.length && !historyEdit.notes.unresolved.length" class="text-slate-500">Every table name is already fully qualified.</div>
+          </div>
+          <div x-show="historyEdit.error" class="text-[11px] text-rose-600 dark:text-rose-400" x-text="historyEdit.error"></div>
+          <div class="flex items-center justify-end space-x-2 pt-1">
+            <button @click="showQueryDetailModal = false; openInSqlEditor(historyEdit.sql)" data-testid="hist-open" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-200 dark:border-dbx-border rounded text-xs text-slate-700 dark:text-slate-200 flex items-center space-x-1.5"><i class="ph ph-terminal-window"></i><span>Open in SQL editor</span></button>
+            <button @click="saveHistorySqlAsQuery()" data-testid="hist-save" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-semibold flex items-center space-x-1.5"><i class="ph ph-floppy-disk"></i><span>Save as query</span></button>
           </div>
         </div>
       </div>
@@ -16703,6 +16717,7 @@
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
+        historyEdit: { sql: '', notes: null, busy: false, error: '' },
         nbGit: { open: false, busy: false, msg: '', note: '', error: '', git: { configured: false, connected: false, ahead: 0, behind: 0, dirty: false, changes: [], head: null } },
         dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', git: { configured: false, connected: false, ahead: 0, behind: 0, dirty: false, changes: [], head: null }, gitMsg: '', gitBusy: false, gitNote: '', gitError: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
         cloneModal: { open: false, source: '', schema: '', name: '', catalog: 'warehouse', srcSchema: '', srcTable: '', version: '', replace: false, busy: false, error: '' },
@@ -23834,12 +23849,40 @@
 
         openQueryDetails(item, initialTab = 'overview') {
           this.selectedQueryDetail = item;
+          this.historyEdit = { sql: (item && item.query_text) || '', notes: null, busy: false, error: '' };
           this.queryDetailActiveTab = initialTab;
           this.showQueryDetailModal = true;
           this.historyProfileData = null;
           if (initialTab === 'profile' && item && item.query_id) {
             this.fetchHistoryQueryProfile(item.query_id);
           }
+        },
+
+        async qualifyHistorySql() {
+          this.historyEdit.busy = true; this.historyEdit.error = '';
+          try {
+            const res = await fetch('/api/sql/qualify', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sql: this.historyEdit.sql, catalog: (this.selectedQueryDetail && this.selectedQueryDetail.catalog) || null }) });
+            const data = await res.json();
+            if (!res.ok) { this.historyEdit.error = typeof data.detail === 'string' ? data.detail : 'Could not qualify the table names.'; return; }
+            this.historyEdit.sql = data.sql;
+            this.historyEdit.notes = { changes: data.changes, unresolved: data.unresolved };
+          } catch (e) {
+            this.historyEdit.error = 'Error: ' + e.message;
+          } finally {
+            this.historyEdit.busy = false;
+          }
+        },
+
+        saveHistorySqlAsQuery() {
+          const q = this.selectedQueryDetail || {};
+          this.saveQueryModalMode = 'save_as';
+          this.queryForm = {
+            id: '', name: '', description: q.query_id ? `From query history ${q.query_id}` : '', query_text: this.historyEdit.sql,
+            warehouse_id: q.warehouse_id || this.selectedSqlWarehouseId || 'wh_starter', catalog: q.catalog || 'warehouse', schema_name: 'dbo', tags: ''
+          };
+          this.showQueryDetailModal = false;
+          this.showSaveQueryModal = true;
         },
 
         openQueryProfile(item) {

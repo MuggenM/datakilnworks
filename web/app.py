@@ -5251,6 +5251,22 @@ async def list_query_history(
     res["active_user_filter"] = target_user or "ALL"
     return res
 
+class QualifySqlPayload(BaseModel):
+    sql: str
+    catalog: Optional[str] = None
+
+
+@app.post("/api/sql/qualify")
+async def qualify_sql_endpoint(payload: QualifySqlPayload, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Completes table names to catalog.schema.table by editing the text in place (formatting and comments stay). Nothing is executed."""
+    from web import sql_qualify
+    if len(payload.sql) > 200_000:
+        raise HTTPException(status_code=413, detail="The SQL is too large.")
+    try:
+        return await asyncio.to_thread(sql_qualify.qualify, payload.sql, payload.catalog)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
 @app.get("/api/history/{query_id}")
 async def get_single_query_history(query_id: str):
     record = get_query_by_id(query_id)
