@@ -26,7 +26,9 @@ services:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
-      - ./dbt_project:/workspace/dbt_project
+      # The dbt project (models + profiles.yml + dbt_project.yml). In production point DBT_PROJECT_HOST_DIR at a checkout of your OWN
+      # project repository; an empty directory is seeded from web/dbt_template on first start. See .env.example.
+      - ${DBT_PROJECT_HOST_DIR:-./dbt_project}:/workspace/dbt_project
       - ./docs:/workspace/docs
       - sandbox-secret:/run/sandbox:ro
       - controller-secret:/run/controller:ro

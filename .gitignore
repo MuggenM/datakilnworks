@@ -50,4 +50,5 @@ scratch/verify_*.py
 
 # Claude Code project guidance
 CLAUDE.md
+# legacy location of the dbt config history (it now lives in warehouse/.metadata)
 dbt_project/.config_history/

@@ -15687,16 +15687,48 @@
         </div>
       </div>
 
-      <!-- Land the models in an S3 mount -->
-      <div x-show="dbtCfg.tab === 'profiles.yml' && dbtCfg.s3Mounts.length" class="p-2.5 rounded-lg bg-teal-50 dark:bg-teal-950/30 border border-teal-200 dark:border-teal-900 flex flex-wrap items-center gap-2 shrink-0">
-        <i class="ph ph-cloud-arrow-up text-teal-500 text-sm"></i>
-        <span class="text-slate-700 dark:text-slate-300">Land dbt's tables in an S3 mount instead of local storage:</span>
-        <select x-model="dbtCfg.s3Mount" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-slate-800 dark:text-slate-200">
-          <option value="">Choose a mount…</option>
-          <template x-for="m in dbtCfg.s3Mounts" :key="m.id"><option :value="m.id" x-text="m.name + ' (s3://' + m.bucket + ')'"></option></template>
-        </select>
-        <button type="button" @click="generateDbtS3Profile()" :disabled="!dbtCfg.s3Mount || dbtCfg.busy" class="px-2.5 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold">Fill in the profile</button>
-        <span class="text-[10px] text-slate-500 basis-full">Writes <code>s3://&lt;bucket&gt;/&lt;schema&gt;/&lt;model&gt;</code>; the mount's endpoint and keys are referenced as environment variables (never written into the file). Comments in the file are not kept. Review, then Save.</span>
+      <!-- Guided settings: the few things people change; they edit the text below and leave everything else (and the comments) alone -->
+      <div x-show="dbtCfg.settings" class="p-3 rounded-lg bg-teal-50 dark:bg-teal-950/30 border border-teal-200 dark:border-teal-900 space-y-2.5 shrink-0">
+        <div class="flex items-center justify-between">
+          <span class="font-semibold text-slate-800 dark:text-slate-200"><i class="ph ph-sliders-horizontal text-teal-500"></i> Settings</span>
+          <span class="text-[10px] text-slate-500">Edits the YAML below (unsaved until you press Save); comments and everything not listed here stay as they are.</span>
+        </div>
+        <div class="grid grid-cols-12 gap-3">
+          <div class="col-span-5">
+            <label class="block text-[10px] uppercase font-semibold text-slate-500 mb-1">Where dbt writes its tables</label>
+            <select x-model="dbtCfg.form.storage" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-800 dark:text-slate-200">
+              <option value="local">Local warehouse (storage on this server)</option>
+              <template x-for="m in dbtCfg.s3Mounts" :key="m.id"><option :value="m.id" x-text="'S3 mount: ' + m.name + ' (s3://' + m.bucket + ')'"></option></template>
+            </select>
+            <p class="text-[10px] text-slate-500 mt-1" x-show="dbtCfg.form.storage !== 'local'">Written to s3://&lt;bucket&gt;/&lt;schema&gt;/&lt;model&gt;. The mount's keys are passed as environment variables, never stored in the file.</p>
+          </div>
+          <div class="col-span-4">
+            <label class="block text-[10px] uppercase font-semibold text-slate-500 mb-1">Schema</label>
+            <input type="text" x-model="dbtCfg.form.schema" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-800 dark:text-slate-200">
+            <p class="text-[10px] text-slate-500 mt-1">dbt tables land in <span class="font-mono" x-text="(dbtCfg.form.storage === 'local' ? 'warehouse' : 's3') + '/' + (dbtCfg.form.schema || '…') + '/<model>'"></span>, closed to users until an admin opens them.</p>
+          </div>
+          <div class="col-span-3">
+            <label class="block text-[10px] uppercase font-semibold text-slate-500 mb-1">Threads</label>
+            <input type="number" min="1" max="64" x-model.number="dbtCfg.form.threads" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-800 dark:text-slate-200">
+          </div>
+        </div>
+        <div x-show="dbtCfg.form.folders.length">
+          <label class="block text-[10px] uppercase font-semibold text-slate-500 mb-1">Default materialization per model folder</label>
+          <div class="flex flex-wrap gap-x-4 gap-y-1.5">
+            <template x-for="f in dbtCfg.form.folders" :key="f.path">
+              <label class="flex items-center space-x-1.5"><span class="font-mono text-slate-700 dark:text-slate-300" x-text="'models/' + f.path"></span>
+                <select x-model="f.materialized" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-1.5 py-1 text-slate-800 dark:text-slate-200">
+                  <option value="">(not set)</option>
+                  <template x-for="m in ['view', 'table', 'incremental', 'ephemeral']" :key="m"><option :value="m" x-text="m"></option></template>
+                </select>
+              </label>
+            </template>
+          </div>
+        </div>
+        <div class="flex items-center justify-end space-x-2">
+          <span x-show="dbtCfg.applied.length" class="text-[11px] text-teal-700 dark:text-teal-300" x-text="'Applied to the files below: ' + dbtCfg.applied.join('; ')"></span>
+          <button type="button" @click="applyDbtSettings()" :disabled="dbtCfg.busy" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold">Apply to the files</button>
+        </div>
       </div>
 
       <textarea x-model="dbtCfg.files[dbtCfg.tab].content" spellcheck="false" wrap="off"
@@ -16599,7 +16631,7 @@
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
-        dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', busy: false, errors: [], warnings: [], ok: null, message: '' },
+        dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
         cloneModal: { open: false, source: '', schema: '', name: '', catalog: 'warehouse', srcSchema: '', srcTable: '', version: '', replace: false, busy: false, error: '' },
         changePasswordOpen: false,
         changePasswordForced: false,
@@ -23880,6 +23912,7 @@
             this.dbtCfg.files = files;
             this.dbtCfg.s3Mounts = data.s3_mounts || [];
             this.dbtCfg.warnings = (data.files.find(f => f.name === this.dbtCfg.tab) || {}).warnings || [];
+            await this.refreshDbtSettings();
           } catch (e) {
             this.dbtCfg.errors = ['Error: ' + e.message];
           } finally {
@@ -23920,6 +23953,8 @@
             this.dbtCfg.ok = true;
             this.dbtCfg.message = data.changed ? 'Saved. The previous version was kept.' : 'No changes.';
             this.showToast(`${this.dbtCfg.tab} saved`, 'success');
+            this.dbtCfg.applied = [];
+            await this.refreshDbtSettings();
             await this.fetchDbtAll();
           } catch (e) {
             this.dbtCfg.errors = ['Error: ' + e.message];
@@ -23935,13 +23970,31 @@
           if (res.ok) { this.dbtCfg.files[this.dbtCfg.tab].content = data.content; this.dbtCfg.errors = []; this.dbtCfg.ok = null; }
         },
 
-        async generateDbtS3Profile() {
-          this.dbtCfg.busy = true; this.dbtCfg.errors = []; this.dbtCfg.ok = null;
+        async refreshDbtSettings() {
           try {
-            const res = await fetch(`/api/dbt/config/s3-profile/${encodeURIComponent(this.dbtCfg.s3Mount)}`, { method: 'POST' });
+            const res = await fetch('/api/dbt/config/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ profiles: this.dbtCfg.files['profiles.yml'].content, project: this.dbtCfg.files['dbt_project.yml'].content }) });
+            if (!res.ok) { this.dbtCfg.settings = null; return; }   // the text is not valid enough for the form: the editor still works
+            const st = await res.json();
+            this.dbtCfg.settings = st;
+            this.dbtCfg.form = { storage: st.storage.kind === 's3' ? (st.storage.mount_id || 'local') : 'local', schema: st.schema || '', threads: st.threads || 2,
+                                 folders: st.folders.map(f => ({ path: f.path, materialized: f.materialized || '' })) };
+          } catch (e) { this.dbtCfg.settings = null; }
+        },
+
+        async applyDbtSettings() {
+          this.dbtCfg.busy = true; this.dbtCfg.errors = []; this.dbtCfg.ok = null; this.dbtCfg.applied = [];
+          try {
+            const f = this.dbtCfg.form;
+            const settings = { schema: f.schema, threads: f.threads, folders: f.folders.filter(x => x.materialized),
+                               storage: f.storage === 'local' ? { kind: 'local' } : { kind: 's3', mount_id: f.storage } };
+            const res = await fetch('/api/dbt/config/settings/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ profiles: this.dbtCfg.files['profiles.yml'].content, project: this.dbtCfg.files['dbt_project.yml'].content, settings }) });
             const data = await res.json();
-            if (!res.ok) { this.dbtCfg.errors = [data.detail || 'Could not generate the profile.']; return; }
-            this.dbtCfg.files['profiles.yml'].content = data.content;
+            if (!res.ok) { this.dbtCfg.errors = [data.detail || 'Could not apply the settings.']; return; }
+            this.dbtCfg.files['profiles.yml'].content = data['profiles.yml'];
+            this.dbtCfg.files['dbt_project.yml'].content = data['dbt_project.yml'];
+            this.dbtCfg.applied = data.changed.length ? data.changed : ['nothing to change'];
           } catch (e) {
             this.dbtCfg.errors = ['Error: ' + e.message];
           } finally {

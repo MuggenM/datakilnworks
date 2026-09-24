@@ -3,17 +3,42 @@ import json
 import uuid
 import datetime
 import subprocess
+import shutil
 import logging
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger("localspark.dbt")
 
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/workspace/dbt_project")
+DBT_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbt_template")
 DBT_RUNS_LOG = os.path.join(DBT_PROJECT_DIR, "logs", "dbt_runs_history.json")
 DBT_DB_PATH = os.path.join(os.getenv("WAREHOUSE_DIR", "/workspace/warehouse"), "dbt_analytics.duckdb")
 
 # In-memory runs cache
 _RUNS_HISTORY: List[Dict[str, Any]] = []
+
+def ensure_project() -> Dict[str, Any]:
+    """A fresh deployment mounts an empty directory (or its own project repo without a profile): seed it from the shipped template.
+    Only files that are missing are created, nothing that exists is ever overwritten, and a directory that already has a
+    dbt_project.yml is left completely alone (it is the deployment's own project)."""
+    if os.path.exists(os.path.join(DBT_PROJECT_DIR, "dbt_project.yml")):
+        return {"seeded": []}
+    seeded = []
+    try:
+        for base, _dirs, files in os.walk(DBT_TEMPLATE_DIR):
+            rel = os.path.relpath(base, DBT_TEMPLATE_DIR)
+            for f in files:
+                dst = os.path.normpath(os.path.join(DBT_PROJECT_DIR, rel, f))
+                if not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy(os.path.join(base, f), dst)
+                    seeded.append(os.path.relpath(dst, DBT_PROJECT_DIR))
+        if seeded:
+            logger.info(f"Seeded the empty dbt project at {DBT_PROJECT_DIR} from the template ({len(seeded)} files).")
+    except Exception as exc:
+        logger.warning(f"Could not seed the dbt project: {exc}")
+    return {"seeded": seeded}
+
 
 def _load_runs_history(user: Optional[str] = None, is_admin: bool = True) -> List[Dict[str, Any]]:
     global _RUNS_HISTORY

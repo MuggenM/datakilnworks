@@ -120,6 +120,11 @@ async def startup_event():
     asyncio.create_task(cron_scheduler_loop())
     from web import warehouse_lifecycle
     asyncio.create_task(warehouse_lifecycle.autosuspend_loop(_warehouse_has_active_queries))
+    try:
+        from web.dbt_service import ensure_project
+        ensure_project()
+    except Exception as e_dbt:
+        logger.warning(f"dbt project check failed: {e_dbt}")
     init_auth_db()
     from web.alerts import alerts_scheduler_loop, init_alerts_db
     init_alerts_db()
@@ -5414,6 +5419,33 @@ async def list_dbt_config_files(current_user: Dict[str, Any] = Depends(require_r
     return {"files": [dbt_config.read(n) for n in dbt_config.FILES],
             "s3_mounts": [{"id": m["id"], "name": m.get("name") or m["id"], "bucket": (m.get("config") or {}).get("bucket"),
                            "catalog": m.get("catalog_name")} for m in dbt_config.s3_mounts()]}
+
+class DbtSettingsPayload(BaseModel):
+    profiles: str
+    project: str
+    settings: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/dbt/config/settings")
+async def read_dbt_settings(payload: DbtSettingsPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The few settings the guided form edits, read from the given (possibly unsaved) file texts."""
+    from web import dbt_config
+    try:
+        return dbt_config.read_settings(payload.profiles, payload.project)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read the settings from these files: {exc}")
+
+@app.post("/api/dbt/config/settings/apply")
+async def apply_dbt_settings(payload: DbtSettingsPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Applies the form's settings to the given file texts as minimal text edits (comments kept). Returns the proposed files;
+    nothing is saved until they go through the normal validated save."""
+    from web import dbt_config
+    try:
+        return dbt_config.apply_settings(payload.profiles, payload.project, payload.settings or {})
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 @app.post("/api/dbt/config/s3-profile/{mount_id}")
 async def dbt_s3_profile_endpoint(mount_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):

@@ -6,7 +6,7 @@ the system principal: a hook in dbt_project.yml is arbitrary SQL, and profiles.y
   * Every save is validated first, and never half-applied: the candidate is parsed as YAML, cross-checked (the project's
     `profile:` must exist in profiles.yml), and then run through `dbt parse` on a scratch copy of the project, so what dbt itself
     would refuse (a bad adapter setting, an unknown key, a broken Jinja expression) is refused here, with dbt's message.
-  * Every save keeps the previous version (last 20 per file, `dbt_project/.config_history/`) and is written to the governance
+  * Every save keeps the previous version (last 20 per file, in the studio's metadata, not in the project) and is written to the governance
     audit log (who, which file, a line-level summary; never the content, which may hold credentials).
   * Credentials do not belong in these files. Every configured S3 mount is exported to dbt as DKW_MOUNT_<ID>_* environment
     variables (`mount_env`), so a profile can say `{{ env_var('DKW_MOUNT_<ID>_SECRET') }}` and keep working when the mount's key
@@ -45,7 +45,9 @@ def _project_dir() -> str:
 
 
 def _history_dir() -> str:
-    return os.path.join(_project_dir(), ".config_history")
+    """Config history is application data, kept next to the studio's other metadata, so it never lands in the dbt project's own
+    git repository (a production project lives in its own repo)."""
+    return os.getenv("DBT_CONFIG_HISTORY_DIR") or os.path.join(os.getenv("WAREHOUSE_DIR", "/workspace/warehouse"), ".metadata", "dbt_config_history")
 
 
 def _path(name: str) -> str:
@@ -300,36 +302,215 @@ def save(name: str, content: str, actor: str) -> Dict[str, Any]:
     return {**read(name), "changed": True}
 
 
-# ---------------------------------------------------------------- landing models in an S3 mount
+# ---------------------------------------------------------------- guided settings (line-level edits: comments survive)
+#
+# The few settings people actually change are offered as a form, but the YAML stays the source of truth: every change is a
+# surgical edit of the text (a value replaced, a block inserted or removed), so comments, ordering and everything the form
+# does not know about are untouched. The result is only *proposed* (returned as text); saving goes through the same validation.
+
+MATERIALIZATIONS = ("view", "table", "incremental", "ephemeral")
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _is_content(line: str) -> bool:
+    st = line.strip()
+    return bool(st) and not st.startswith("#")
+
+
+def _locate(lines: List[str], path: List[str]):
+    """(start, end, indent) of the mapping node at `path` (its key line, one past its last line, the key line's indent), or None."""
+    idx, indent, end = -1, -1, len(lines)
+    for key in path:
+        child, found, i = None, None, idx + 1
+        while i < end:
+            if _is_content(lines[i]):
+                ind = _indent(lines[i])
+                if ind <= indent:
+                    break
+                child = ind if child is None else child
+                if ind == child and re.match(rf"^\s*['\"]?{re.escape(key)}['\"]?\s*:", lines[i]):
+                    found = i
+                    break
+            i += 1
+        if found is None:
+            return None
+        j = found + 1
+        while j < end and (not _is_content(lines[j]) or _indent(lines[j]) > child
+                           or (_indent(lines[j]) == child and lines[j].lstrip().startswith("- "))):     # indentless sequence items belong to their key
+            j += 1
+        while j > found + 1 and not _is_content(lines[j - 1]):
+            j -= 1                                            # trailing blank / comment lines belong to what follows
+        idx, indent, end = found, child, j
+    return idx, end, indent
+
+
+def _child_indent(lines: List[str], start: int, end: int, parent_indent: int) -> int:
+    for i in range(start + 1, end):
+        if _is_content(lines[i]):
+            return _indent(lines[i])
+    return parent_indent + 2
+
+
+def _set_key(lines: List[str], path: List[str], key: str, value: Any) -> bool:
+    """Sets `key: value` inside the mapping at `path` (replacing the line, or appending it). False if `path` does not exist."""
+    node = _locate(lines, path)
+    if node is None:
+        return False
+    start, end, indent = node
+    ci = _child_indent(lines, start, end, indent)
+    rendered = yaml.safe_dump({key: value}, default_flow_style=True, width=10_000).strip()
+    rendered = rendered[1:-1].strip() if rendered.startswith("{") else rendered      # `key: value` without flow braces
+    for i in range(start + 1, end):
+        if _is_content(lines[i]) and _indent(lines[i]) == ci and re.match(rf"^\s*['\"]?{re.escape(key)}['\"]?\s*:", lines[i]):
+            lines[i] = " " * ci + rendered
+            return True
+    lines.insert(end, " " * ci + rendered)
+    return True
+
+
+def _remove_key(lines: List[str], path: List[str]) -> bool:
+    node = _locate(lines, path)
+    if node is None:
+        return False
+    del lines[node[0]:node[1]]
+    return True
+
+
+def _put_block(lines: List[str], path: List[str], key: str, value: Any) -> bool:
+    """Replaces (or appends) a nested value (mapping / list) under `path` as block YAML."""
+    node = _locate(lines, path)
+    if node is None:
+        return False
+    _remove_key(lines, path + [key])
+    node = _locate(lines, path)
+    start, end, indent = node
+    ci = _child_indent(lines, start, end, indent)
+    text = yaml.safe_dump({key: value}, default_flow_style=False, sort_keys=False, width=10_000)
+    lines[end:end] = [" " * ci + l if l.strip() else l for l in text.rstrip("\n").split("\n")]
+    return True
+
+
+def _active(profiles_text: str):
+    data = yaml.safe_load(profiles_text) or {}
+    name = next((k for k, v in data.items() if isinstance(v, dict) and isinstance(v.get("outputs"), dict)), None)
+    if not name:
+        raise ValueError("profiles.yml has no profile with outputs.")
+    target = os.getenv("DBT_TARGET") or data[name].get("target") or next(iter(data[name]["outputs"]))
+    if target not in data[name]["outputs"]:
+        raise ValueError(f"target '{target}' is not one of the profile's outputs.")
+    return data, name, target
+
+
+def read_settings(profiles_text: str, project_text: str) -> Dict[str, Any]:
+    data, profile, target = _active(profiles_text)
+    out = data[profile]["outputs"][target]
+    root = str(out.get("root_path") or "")
+    kind, mount_id = "local", None
+    if root.lower().startswith("s3://"):
+        kind = "s3"
+        bucket = root[5:].split("/", 1)[0]
+        mount_id = next((m["id"] for m in s3_mounts() if (m.get("config") or {}).get("bucket") == bucket), None)
+    project = yaml.safe_load(project_text) or {}
+    pname = project.get("name")
+    configured = ((project.get("models") or {}).get(pname) or {}) if pname else {}
+    folders = []
+    models_dir = os.path.join(_project_dir(), "models")
+    on_disk = sorted(d for d in os.listdir(models_dir) if os.path.isdir(os.path.join(models_dir, d))) if os.path.isdir(models_dir) else []
+    for name in list(dict.fromkeys([k for k, v in configured.items() if isinstance(v, dict)] + on_disk)):
+        cfg = configured.get(name) if isinstance(configured.get(name), dict) else {}
+        folders.append({"path": name, "materialized": cfg.get("+materialized") or cfg.get("materialized")})
+    return {"profile": profile, "target_name": target, "adapter": out.get("type"), "storage": {"kind": kind, "mount_id": mount_id, "root_path": root},
+            "schema": out.get("schema"), "threads": out.get("threads"), "project": pname, "folders": folders}
+
+
+def apply_settings(profiles_text: str, project_text: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns the two files with `settings` applied as minimal text edits, plus what changed. Nothing is saved."""
+    data, profile, target = _active(profiles_text)
+    plines, jlines = profiles_text.replace("\r\n", "\n").split("\n"), project_text.replace("\r\n", "\n").split("\n")
+    base = [profile, "outputs", target]
+    changed: List[str] = []
+    cur = data[profile]["outputs"][target]
+
+    if "schema" in settings and settings["schema"] not in (None, "") and settings["schema"] != cur.get("schema"):
+        if not _IDENT.match(str(settings["schema"])):
+            raise ValueError("The schema must be letters, digits and underscores (starting with a letter or underscore).")
+        _set_key(plines, base, "schema", str(settings["schema"]))
+        changed.append(f"schema: {settings['schema']}")
+    if "threads" in settings and settings["threads"] not in (None, "") and int(settings["threads"]) != cur.get("threads"):
+        threads = int(settings["threads"])
+        if not 1 <= threads <= 64:
+            raise ValueError("Threads must be between 1 and 64.")
+        _set_key(plines, base, "threads", threads)
+        changed.append(f"threads: {threads}")
+
+    storage = settings.get("storage")
+    if storage:
+        want_s3 = storage.get("kind") == "s3"
+        cur_root = str(cur.get("root_path") or "")
+        if want_s3:
+            mount = next((m for m in s3_mounts() if m["id"] == storage.get("mount_id")), None)
+            if not mount:
+                raise LookupError(f"'{storage.get('mount_id')}' is not a configured S3 mount.")
+            bucket = ((mount.get("config") or {}).get("bucket") or "").strip()
+            if not bucket:
+                raise ValueError("This mount has no bucket configured.")
+            snippet = _s3_output_snippet(mount, bucket)
+            if cur_root != f"s3://{bucket}" or cur.get("storage_options") != snippet["storage_options"] or cur.get("secrets") != snippet["secrets"]:
+                _set_key(plines, base, "root_path", f"s3://{bucket}")
+                _put_block(plines, base, "storage_options", snippet["storage_options"])
+                _put_block(plines, base, "secrets", snippet["secrets"])
+                if not {"httpfs", "delta"} <= set(cur.get("extensions") or []):
+                    _put_block(plines, base, "extensions", sorted(set((cur.get("extensions") or []) + ["httpfs", "delta"])))
+                changed.append(f"storage: S3 mount {mount.get('name') or mount['id']} (s3://{bucket})")
+        elif cur_root.lower().startswith("s3://") or cur.get("storage_options") or cur.get("secrets"):
+            _set_key(plines, base, "root_path", os.getenv("WAREHOUSE_DIR", "/workspace/warehouse"))
+            _remove_key(plines, base + ["storage_options"])
+            _remove_key(plines, base + ["secrets"])
+            changed.append("storage: local warehouse")
+
+    project = yaml.safe_load(project_text) or {}
+    pname = project.get("name")
+    for f in settings.get("folders") or []:
+        mat = f.get("materialized")
+        if not mat:
+            continue
+        if mat not in MATERIALIZATIONS:
+            raise ValueError(f"Materialization must be one of: {', '.join(MATERIALIZATIONS)}.")
+        if not _IDENT.match(str(f.get("path"))):
+            raise ValueError("Folder names are letters, digits and underscores.")
+        cfg = (((project.get("models") or {}).get(pname) or {}).get(f["path"]) or {}) if pname else {}
+        if isinstance(cfg, dict) and (cfg.get("+materialized") == mat):
+            continue
+        if not _set_key(jlines, ["models", pname, f["path"]], "+materialized", mat):     # the folder is not configured yet: create what is missing
+            if _locate(jlines, ["models"]) is None:
+                jlines.extend(["", "models:"])
+            if _locate(jlines, ["models", pname]) is None:
+                _put_block(jlines, ["models"], pname, {f["path"]: {"+materialized": mat}})
+            else:
+                _put_block(jlines, ["models", pname], f["path"], {"+materialized": mat})
+        changed.append(f"models/{f['path']}: +materialized: {mat}")
+    return {"profiles.yml": "\n".join(plines), "dbt_project.yml": "\n".join(jlines), "changed": changed}
+
+
+def _s3_output_snippet(mount: Dict[str, Any], bucket: str) -> Dict[str, Any]:
+    cfg = mount.get("config") or {}
+    p = f"DKW_MOUNT_{_env_id(mount)}_"
+    ev = lambda suffix: '{{ env_var("' + p + suffix + '") }}'         # double quotes inside: the YAML stays single-quoted and readable
+    use_ssl = str(cfg.get("use_ssl", False)).lower() in ("true", "1") or str(cfg.get("endpoint", "")).lower().startswith("https://")
+    return {"storage_options": {"AWS_ENDPOINT_URL": ev("ENDPOINT_URL"), "AWS_ACCESS_KEY_ID": ev("KEY_ID"), "AWS_SECRET_ACCESS_KEY": ev("SECRET"),
+                                "AWS_REGION": ev("REGION"), "AWS_ALLOW_HTTP": "false" if use_ssl else "true", "AWS_S3_ALLOW_UNSAFE_RENAME": "true"},
+            "secrets": [{"type": "s3", "key_id": ev("KEY_ID"), "secret": ev("SECRET"), "endpoint": ev("ENDPOINT"), "url_style": ev("URL_STYLE"),
+                         "use_ssl": '{{ env_var("' + p + 'USE_SSL") | as_bool }}', "region": ev("REGION")}]}
+
 
 def s3_profile(mount_id: str) -> str:
-    """The current profiles.yml with its active target pointed at an S3 mount: models are written to s3://<bucket>/<schema>/<model>,
-    with the mount's endpoint and keys referenced through env_var() so no secret is written into the file. (Comments in the
-    file are not kept.)"""
-    mount = next((m for m in s3_mounts() if m["id"] == mount_id), None)
-    if not mount:
-        raise LookupError(f"'{mount_id}' is not a configured S3 mount.")
-    cfg = mount.get("config") or {}
-    bucket = (cfg.get("bucket") or "").strip()
-    if not bucket:
-        raise ValueError("This mount has no bucket configured.")
+    """profiles.yml with its active target pointed at an S3 mount (comments and everything else kept; see apply_settings)."""
     with open(_path("profiles.yml"), encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    profile_name = next((k for k, v in data.items() if isinstance(v, dict) and "outputs" in v), None)
-    if not profile_name:
-        raise ValueError("profiles.yml has no profile with outputs.")
-    prof = data[profile_name]
-    target = os.getenv("DBT_TARGET") or prof.get("target") or next(iter(prof["outputs"]))
-    out = prof["outputs"].setdefault(target, {})
-    p = f"DKW_MOUNT_{_env_id(mount)}_"
-    ev = lambda suffix: '{{ env_var("' + p + suffix + '") }}'     # double quotes inside: the YAML stays single-quoted and readable
-    use_ssl = str(cfg.get("use_ssl", False)).lower() in ("true", "1") or str(cfg.get("endpoint", "")).lower().startswith("https://")
-    out.update({"type": "duckrun", "root_path": f"s3://{bucket}", "schema": out.get("schema") or "dbt",
-                "storage_options": {"AWS_ENDPOINT_URL": ev("ENDPOINT_URL"), "AWS_ACCESS_KEY_ID": ev("KEY_ID"), "AWS_SECRET_ACCESS_KEY": ev("SECRET"),
-                                    "AWS_REGION": ev("REGION"), "AWS_ALLOW_HTTP": "false" if use_ssl else "true", "AWS_S3_ALLOW_UNSAFE_RENAME": "true"},
-                "secrets": [{"type": "s3", "key_id": ev("KEY_ID"), "secret": ev("SECRET"), "endpoint": ev("ENDPOINT"), "url_style": ev("URL_STYLE"),
-                             "use_ssl": '{{ env_var("' + p + 'USE_SSL") | as_bool }}', "region": ev("REGION")}]})
-    out["extensions"] = out.get("extensions") or ["httpfs", "delta"]
-    return ("# Models land in the S3 mount '%s' (s3://%s/<schema>/<model>). Endpoint and keys come from the mount through\n"
-            "# environment variables (see DKW_MOUNT_* in web/dbt_config.py), so no secret is stored in this file.\n" % (mount.get("name") or mount_id, bucket)) \
-        + yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+        text = f.read()
+    with open(_path("dbt_project.yml"), encoding="utf-8") as f:
+        project = f.read()
+    return apply_settings(text, project, {"storage": {"kind": "s3", "mount_id": mount_id}})["profiles.yml"]
