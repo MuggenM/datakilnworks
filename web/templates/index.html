@@ -4815,6 +4815,10 @@
             </button>
           </div>
 
+          <div x-show="!containerControl.available" class="px-5 py-2 text-[11px] bg-amber-950/40 border-b border-amber-800/50 text-amber-300 flex items-center space-x-2">
+            <i class="ph ph-warning"></i>
+            <span>Container control is unavailable, so <strong>auto-stop is not enforced</strong> and Start / Stop only change a flag. Run the <code>container-controller</code> service (see docker-compose.yml) to suspend and resume the compute-node containers for real.</span>
+          </div>
           <table class="w-full text-left text-xs border-collapse">
             <thead>
               <tr class="border-b border-dbx-border/80 bg-slate-900/60 text-slate-400 text-[11px] uppercase tracking-wider font-semibold">
@@ -4848,8 +4852,12 @@
                   <td class="py-3.5 px-4 font-sans">
                     <span class="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded text-[11px] font-medium" :class="wh.state === 'RUNNING' ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' : 'bg-slate-900 text-slate-400 border border-slate-700'">
                       <span class="h-1.5 w-1.5 rounded-full" :class="wh.state === 'RUNNING' ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
-                      <span x-text="wh.state"></span>
+                      <span x-text="warehouseBusyId === wh.id ? (wh.state === 'RUNNING' ? 'STOPPING…' : 'STARTING…') : wh.state"></span>
                     </span>
+                    <div x-show="wh.state !== 'RUNNING' && wh.suspend_reason" class="text-[10px] text-slate-500 mt-1" :title="wh.suspended_at">
+                      suspended (<span x-text="wh.suspend_reason"></span>)<span x-show="wh.container && wh.container.container_state" x-text="' · container ' + (wh.container ? wh.container.container_state : '')"></span>
+                    </div>
+                    <div x-show="wh.state === 'RUNNING' && wh.last_resume_ms" class="text-[10px] text-slate-500 mt-1" x-text="'last resume ' + ((wh.last_resume_ms || 0) / 1000).toFixed(1) + ' s'"></div>
                   </td>
                   <td class="py-3.5 px-4 font-sans font-medium text-slate-300" x-text="wh.cluster_size"></td>
                   <td class="py-3.5 px-4 font-sans">
@@ -4888,7 +4896,11 @@
                   <td class="py-3.5 px-4 font-mono text-slate-300">
                     <span class="text-cyan-400" x-text="wh.threads + ' vCPU'"></span> / <span class="text-amber-300" x-text="wh.max_memory"></span>
                   </td>
-                  <td class="py-3.5 px-4 font-sans text-slate-400" x-text="wh.auto_stop_mins ? wh.auto_stop_mins + ' mins' : 'Never'"></td>
+                  <td class="py-3.5 px-4 font-sans text-slate-400">
+                    <span x-text="wh.auto_stop_mins ? wh.auto_stop_mins + ' mins' : 'Never'"></span>
+                    <span x-show="wh.auto_stop_mins && wh.container && wh.container.controllable" class="ml-1 text-emerald-400 text-[10px] whitespace-nowrap" title="Idle warehouses really stop their compute-node container and resume on the next query"><i class="ph ph-power"></i> enforced</span>
+                    <span x-show="wh.auto_stop_mins && !(wh.container && wh.container.controllable)" class="ml-1 text-amber-400 text-[10px] whitespace-nowrap" title="No managed container behind this warehouse's endpoint: the timeout is only a setting"><i class="ph ph-warning"></i> not enforced</span>
+                  </td>
                   <td class="py-3.5 px-4 text-slate-300 font-mono" x-text="wh.query_count || 0"></td>
                   <td class="py-3.5 px-4 text-[11px] text-slate-400" x-text="wh.last_active_at"></td>
                   <td class="py-3.5 px-4 text-right">
@@ -17278,6 +17290,8 @@
 
         // SQL Warehouses & Multi-Catalog State
         sqlWarehouses: [],
+        containerControl: { available: false, configured: false, mode: 'stop' },
+        warehouseBusyId: null,
         clusterSizes: {},
         clusterNodes: [],
         loadingClusterNodes: false,
@@ -20452,6 +20466,7 @@
             const data = await res.json();
             this.sqlWarehouses = data.warehouses || [];
             this.clusterSizes = data.cluster_sizes || {};
+            this.containerControl = data.container_control || this.containerControl;
             if (this.sqlWarehouses.length > 0) {
               const exists = this.sqlWarehouses.find(w => w.id === this.selectedSqlWarehouseId);
               if (!exists) {
@@ -20673,30 +20688,37 @@
         },
 
         async startWarehouse(id) {
+          this.warehouseBusyId = id;
           try {
             const res = await fetch(`/api/sql-warehouses/${id}/start`, { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
             if (res.ok) {
+              this.showToast(data.container ? `Warehouse resumed in ${((data.resume_ms || 0) / 1000).toFixed(1)} s` : 'Warehouse started', data.warning ? 'error' : 'success');
               await this.fetchSqlWarehouses();
             } else {
-              const err = await res.json();
-              alert('Failed to start warehouse: ' + (err.detail || 'Unknown error'));
+              alert('Failed to start warehouse: ' + (data.detail || 'Unknown error'));
             }
           } catch (e) {
             alert('Failed to start warehouse: ' + e.message);
+          } finally {
+            this.warehouseBusyId = null;
           }
         },
 
         async stopWarehouse(id) {
+          this.warehouseBusyId = id;
           try {
             const res = await fetch(`/api/sql-warehouses/${id}/stop`, { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
             if (res.ok) {
               await this.fetchSqlWarehouses();
             } else {
-              const err = await res.json();
-              alert('Failed to stop warehouse: ' + (err.detail || 'Unknown error'));
+              alert('Failed to stop warehouse: ' + (data.detail || 'Unknown error'));
             }
           } catch (e) {
             alert('Failed to stop warehouse: ' + e.message);
+          } finally {
+            this.warehouseBusyId = null;
           }
         },
 

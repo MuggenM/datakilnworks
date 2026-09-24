@@ -631,8 +631,8 @@ def _cli() -> None:
     if getpass.getpass("Confirm: ") != pw:
         print("Passwords did not match.", file=sys.stderr)
         raise SystemExit(1)
-    print("\nSet this as INIT_ADMIN_PASSWORD_HASH (e.g. in .env):\n")
-    print(hash_password(pw))
+    print("\nPaste this line into .env (the single quotes matter: Docker Compose would otherwise treat each $ in the hash as a variable):\n")
+    print(f"INIT_ADMIN_PASSWORD_HASH='{hash_password(pw)}'")
 
 
 if __name__ == "__main__":

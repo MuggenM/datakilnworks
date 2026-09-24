@@ -118,6 +118,8 @@ async def startup_event():
     init_governance_db()
     asyncio.create_task(_governance_reconcile_loop())
     asyncio.create_task(cron_scheduler_loop())
+    from web import warehouse_lifecycle
+    asyncio.create_task(warehouse_lifecycle.autosuspend_loop(_warehouse_has_active_queries))
     init_auth_db()
     from web.alerts import alerts_scheduler_loop, init_alerts_db
     init_alerts_db()
@@ -1361,8 +1363,10 @@ async def list_cluster_nodes():
 
 @app.get("/api/sql-warehouses")
 async def list_sql_warehouses():
+    from web import container_control, warehouse_lifecycle
     warehouses = load_sql_warehouses()
     ray_status = ray_manager.get_status() if RAY_INSTALLED else {"available": False}
+    control_ok = await asyncio.to_thread(container_control.available)
     for w in warehouses:
         wh_id = w.get("id")
         active_pool = ray_manager.actor_pools.get(wh_id, []) if RAY_INSTALLED else []
@@ -1371,10 +1375,12 @@ async def list_sql_warehouses():
             w["ray_status"] = "RUNNING"
         else:
             w["ray_status"] = "IDLE" if w.get("state") == "RUNNING" else "STOPPED"
+        w["container"] = await asyncio.to_thread(warehouse_lifecycle.describe, w) if control_ok else {"controllable": False}
     return {
         "warehouses": warehouses,
         "cluster_sizes": CLUSTER_SIZES,
-        "ray_telemetry": ray_status
+        "ray_telemetry": ray_status,
+        "container_control": {"available": control_ok, "configured": container_control.configured(), "mode": container_control.suspend_mode()}
     }
 
 @app.post("/api/sql-warehouses")
@@ -1419,10 +1425,13 @@ async def update_sql_warehouse_endpoint(wh_id: str, payload: Dict[str, Any]):
     return wh
 
 @app.post("/api/sql-warehouses/{wh_id}/start")
-async def start_sql_warehouse_endpoint(wh_id: str):
-    wh = start_sql_warehouse(wh_id)
-    if not wh:
-        raise HTTPException(status_code=404, detail="Warehouse not found")
+async def start_sql_warehouse_endpoint(wh_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """Resumes a warehouse: for a managed one this really starts (or unpauses) its compute-node container and waits for it."""
+    from web import warehouse_lifecycle
+    res = await asyncio.to_thread(warehouse_lifecycle.resume, wh_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404 if res.get("error") == "Warehouse not found" else 502, detail=res.get("error"))
+    wh = res["warehouse"]
     if RAY_INSTALLED and wh.get("ray_workers", 0) > 0:
         try:
             ray_manager.scale_warehouse(wh_id, wh.get("ray_workers", 1))
@@ -1430,20 +1439,18 @@ async def start_sql_warehouse_endpoint(wh_id: str):
             logger.warning(f"Could not autoscale Ray pool for {wh_id}: {e}")
     active_pool = ray_manager.actor_pools.get(wh_id, []) if RAY_INSTALLED else []
     wh["active_ray_workers"] = len(active_pool)
-    return {"success": True, "warehouse": wh}
+    return {"success": True, "warehouse": wh, "container": res.get("container", False), "resume_ms": res.get("resume_ms"), "warning": res.get("warning")}
 
 @app.post("/api/sql-warehouses/{wh_id}/stop")
-async def stop_sql_warehouse_endpoint(wh_id: str):
-    wh = stop_sql_warehouse(wh_id)
-    if not wh:
-        raise HTTPException(status_code=404, detail="Warehouse not found")
-    if RAY_INSTALLED:
-        try:
-            ray_manager.scale_warehouse(wh_id, 0)
-        except Exception as e:
-            logger.warning(f"Could not scale down Ray pool for {wh_id}: {e}")
+async def stop_sql_warehouse_endpoint(wh_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """Suspends a warehouse: for a managed one this really stops (or pauses) its compute-node container."""
+    from web import warehouse_lifecycle
+    res = await asyncio.to_thread(warehouse_lifecycle.suspend, wh_id, "manual")
+    if not res.get("ok"):
+        raise HTTPException(status_code=404 if res.get("error") == "Warehouse not found" else 502, detail=res.get("error"))
+    wh = res["warehouse"]
     wh["active_ray_workers"] = 0
-    return {"success": True, "warehouse": wh}
+    return {"success": True, "warehouse": wh, "container": res.get("container", False)}
 
 @app.delete("/api/sql-warehouses/{wh_id}")
 async def delete_sql_warehouse_endpoint(wh_id: str):
@@ -2139,6 +2146,11 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
 # Active SQL query registry for query cancellation
 ACTIVE_QUERIES: Dict[str, Dict[str, Any]] = {}
 
+
+def _warehouse_has_active_queries(wh_id: str) -> bool:
+    """True while any SQL-editor query registered for this warehouse is still running (the auto-suspend guard)."""
+    return any(q.get("warehouse_id") == wh_id for q in list(ACTIVE_QUERIES.values()))
+
 class QueryRequest(BaseModel):
     query: str
     warehouse_id: Optional[str] = None
@@ -2171,6 +2183,10 @@ async def execute_sql(payload: QueryRequest, request: Request):
         }
 
     conn = get_duckrun_conn()
+    from web import warehouse_lifecycle
+    # A suspended warehouse (its container stopped by auto-suspend, a manual stop or by hand) is brought back first; concurrent
+    # queries wait for that one resume. If it cannot be resumed the query still runs (the studio executes it locally).
+    resume_info = await asyncio.to_thread(warehouse_lifecycle.ensure_running, payload.warehouse_id)
     wh = apply_warehouse_compute(conn, payload.warehouse_id)
     start_time = time.perf_counter()
 
@@ -2354,6 +2370,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 )
                 res_data["query_id"] = qid
                 res_data["execution_id"] = execution_id
+                res_data.update(_resume_fields(resume_info))
                 res_data["warehouse_name"] = wh["name"] if wh else "Starter"
                 res_data["cluster_size"] = wh.get("cluster_size", "Small") if wh else "Small"
                 return res_data
@@ -2389,6 +2406,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 masked_columns=len(masked_info)
             )
             return {
+                **_resume_fields(resume_info),
                 "success": True,
                 "masked_columns": masked_info,
                 "query_id": qid,
@@ -2421,6 +2439,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 executed_by=fallback_note
             )
             return {
+                **_resume_fields(resume_info),
                 "success": True,
                 "query_id": qid,
                 "execution_id": execution_id,
@@ -2488,6 +2507,21 @@ async def execute_sql(payload: QueryRequest, request: Request):
             }
     finally:
         ACTIVE_QUERIES.pop(execution_id, None)
+        if wh and wh.get("id"):
+            from web.warehouses import mark_sql_warehouse_active
+            mark_sql_warehouse_active(wh["id"])         # the auto-suspend idle clock starts when work ends, not when it began
+
+
+def _resume_fields(info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Tells the client why a query was slow (its warehouse was suspended and resumed for it) or that resuming failed."""
+    if not info:
+        return {}
+    if info.get("error"):
+        return {"warehouse_resume_error": info["error"]}
+    out = {"warehouse_resumed_ms": info["resume_ms"]}
+    if info.get("warning"):
+        out["warehouse_resume_warning"] = info["warning"]
+    return out
 
 
 @app.post("/api/sql/cancel/{execution_id}")

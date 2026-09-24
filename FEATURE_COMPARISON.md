@@ -86,7 +86,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Cache Management & Stats** | ❌ Opaque | ⚠️ Limited API | ✅ **Full REST API + Manual Cache Eviction** | 🏆 **Data Kiln Works** |
 | **Compute Warehouse Tiers** | Serverless / Classic SQL | XS, S, M, L, XL, 2XL..6XL | **Starter, Analytics, ETL / Heavy Workers** | ✅ Tie |
 | **Multi-Warehouse Isolation** | ✅ Yes | ✅ Yes | ✅ **Yes (Container / Process Isolation)** | ✅ Tie |
-| **Auto-Suspend & Auto-Resume** | ✅ Yes | ✅ Yes | ✅ **Yes (Immediate zero-cost idle)** | ✅ Tie |
+| **Auto-Suspend & Auto-Resume** | ✅ Yes | ✅ Yes | ✅ **Yes: idle warehouses really stop (or pause) their compute-node container and the next query resumes it (a few seconds); needs the container-controller service and applies to the managed compute nodes only** | ⚠️ **Databricks / Snowflake** resume in seconds on managed infrastructure; Data Kiln's cold start is a container start |
 | **Petabyte Distributed Scale** | ✅ Yes (Clusters > 1000 nodes) | ✅ Yes (Multi-cluster warehouses) | ⚠️ Up to 16 Ray nodes (~10-50TB optimal) | 🏆 **Databricks / Snowflake** |
 | **Operational Query Cost** | $$$ (Per DBU / VM hour) | $$$ (Per credit / second) | **$0 (Zero incremental query cost)** | 🏆 **Data Kiln Works** |
 

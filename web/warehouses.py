@@ -4,6 +4,7 @@ import time
 import uuid
 import datetime
 import logging
+import threading
 from typing import Optional, Dict, Any, List, Tuple
 from deltalake import DeltaTable
 
@@ -145,6 +146,23 @@ def load_sql_warehouses() -> List[Dict[str, Any]]:
         logger.error(f"Failed to load sql_warehouses.json: {e}")
         return get_default_sql_warehouses()
 
+# Every read-modify-write of sql_warehouses.json takes this lock: request handlers, the auto-suspend loop and the lifecycle
+# code change it from different threads, and an unlocked writer silently reverts another's state change.
+_WH_LOCK = threading.RLock()
+
+
+def mutate_sql_warehouse(wh_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Sets `fields` on one warehouse atomically; returns the updated record (None if it does not exist)."""
+    with _WH_LOCK:
+        warehouses = load_sql_warehouses()
+        for w in warehouses:
+            if w["id"] == wh_id:
+                w.update(fields)
+                save_sql_warehouses(warehouses)
+                return w
+    return None
+
+
 def save_sql_warehouses(warehouses: List[Dict[str, Any]]):
     os.makedirs(METADATA_DIR, exist_ok=True)
     try:
@@ -204,43 +222,44 @@ def create_sql_warehouse(
     return new_wh
 
 def update_sql_warehouse(wh_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    warehouses = load_sql_warehouses()
-    target = None
-    for w in warehouses:
-        if w["id"] == wh_id:
-            target = w
-            break
-    if not target:
-        return None
-
-    if "name" in updates and updates["name"]:
-        target["name"] = updates["name"].strip()
-    if "cluster_size" in updates:
-        cs = updates["cluster_size"]
-        target["cluster_size"] = cs
-        if cs in CLUSTER_SIZES and cs != "Custom":
-            target["threads"] = CLUSTER_SIZES[cs]["threads"]
-            target["max_memory"] = CLUSTER_SIZES[cs]["max_memory"]
-    if "threads" in updates and updates["threads"] is not None:
-        target["threads"] = int(updates["threads"])
-    if "max_memory" in updates and updates["max_memory"]:
-        target["max_memory"] = str(updates["max_memory"])
-    if "auto_stop_mins" in updates:
-        target["auto_stop_mins"] = int(updates["auto_stop_mins"])
-    if "endpoint" in updates:
-        target["endpoint"] = str(updates["endpoint"]).strip() if updates["endpoint"] else ""
-    if "ray_workers" in updates and updates["ray_workers"] is not None:
-        target["ray_workers"] = int(updates["ray_workers"])
-    if "min_workers" in updates and updates["min_workers"] is not None:
-        target["min_workers"] = int(updates["min_workers"])
-    if "max_workers" in updates and updates["max_workers"] is not None:
-        target["max_workers"] = int(updates["max_workers"])
-    if "is_default" in updates and updates["is_default"]:
+    with _WH_LOCK:
+        warehouses = load_sql_warehouses()
+        target = None
         for w in warehouses:
-            w["is_default"] = (w["id"] == wh_id)
+            if w["id"] == wh_id:
+                target = w
+                break
+        if not target:
+            return None
 
-    save_sql_warehouses(warehouses)
-    return target
+        if "name" in updates and updates["name"]:
+            target["name"] = updates["name"].strip()
+        if "cluster_size" in updates:
+            cs = updates["cluster_size"]
+            target["cluster_size"] = cs
+            if cs in CLUSTER_SIZES and cs != "Custom":
+                target["threads"] = CLUSTER_SIZES[cs]["threads"]
+                target["max_memory"] = CLUSTER_SIZES[cs]["max_memory"]
+        if "threads" in updates and updates["threads"] is not None:
+            target["threads"] = int(updates["threads"])
+        if "max_memory" in updates and updates["max_memory"]:
+            target["max_memory"] = str(updates["max_memory"])
+        if "auto_stop_mins" in updates:
+            target["auto_stop_mins"] = int(updates["auto_stop_mins"])
+        if "endpoint" in updates:
+            target["endpoint"] = str(updates["endpoint"]).strip() if updates["endpoint"] else ""
+        if "ray_workers" in updates and updates["ray_workers"] is not None:
+            target["ray_workers"] = int(updates["ray_workers"])
+        if "min_workers" in updates and updates["min_workers"] is not None:
+            target["min_workers"] = int(updates["min_workers"])
+        if "max_workers" in updates and updates["max_workers"] is not None:
+            target["max_workers"] = int(updates["max_workers"])
+        if "is_default" in updates and updates["is_default"]:
+            for w in warehouses:
+                w["is_default"] = (w["id"] == wh_id)
+
+        save_sql_warehouses(warehouses)
+        return target
 
 def get_compute_nodes_status() -> List[Dict[str, Any]]:
     """Polls real-time telemetry from all clustered Docker compute worker nodes."""
@@ -303,44 +322,62 @@ def get_compute_nodes_status() -> List[Dict[str, Any]]:
     return results
 
 def start_sql_warehouse(wh_id: str) -> Optional[Dict[str, Any]]:
-    warehouses = load_sql_warehouses()
-    for w in warehouses:
-        if w["id"] == wh_id:
-            w["state"] = "RUNNING"
-            w["last_active_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_sql_warehouses(warehouses)
-            return w
-    return None
-
-def stop_sql_warehouse(wh_id: str) -> Optional[Dict[str, Any]]:
-    warehouses = load_sql_warehouses()
-    for w in warehouses:
-        if w["id"] == wh_id:
-            w["state"] = "STOPPED"
-            save_sql_warehouses(warehouses)
-            return w
-    return None
-
-def delete_sql_warehouse(wh_id: str) -> bool:
-    warehouses = load_sql_warehouses()
-    target = next((w for w in warehouses if w["id"] == wh_id), None)
-    if not target or target.get("is_default"):
-        return False
-    warehouses = [w for w in warehouses if w["id"] != wh_id]
-    save_sql_warehouses(warehouses)
-    return True
-
-def touch_sql_warehouse(wh_id: str):
-    try:
+    with _WH_LOCK:
         warehouses = load_sql_warehouses()
         for w in warehouses:
             if w["id"] == wh_id:
-                w["query_count"] = w.get("query_count", 0) + 1
+                w["state"] = "RUNNING"
                 w["last_active_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 save_sql_warehouses(warehouses)
-                break
+                return w
+        return None
+
+def stop_sql_warehouse(wh_id: str) -> Optional[Dict[str, Any]]:
+    with _WH_LOCK:
+        warehouses = load_sql_warehouses()
+        for w in warehouses:
+            if w["id"] == wh_id:
+                w["state"] = "STOPPED"
+                save_sql_warehouses(warehouses)
+                return w
+        return None
+
+def delete_sql_warehouse(wh_id: str) -> bool:
+    with _WH_LOCK:
+        warehouses = load_sql_warehouses()
+        target = next((w for w in warehouses if w["id"] == wh_id), None)
+        if not target or target.get("is_default"):
+            return False
+        warehouses = [w for w in warehouses if w["id"] != wh_id]
+        save_sql_warehouses(warehouses)
+        return True
+
+def touch_sql_warehouse(wh_id: str):
+    with _WH_LOCK:
+        try:
+            warehouses = load_sql_warehouses()
+            for w in warehouses:
+                if w["id"] == wh_id:
+                    w["query_count"] = w.get("query_count", 0) + 1
+                    w["last_active_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    save_sql_warehouses(warehouses)
+                    break
+        except Exception:
+            pass
+
+def mark_sql_warehouse_active(wh_id: str):
+    """Refreshes `last_active_at` only (a query just finished): the auto-suspend idle clock starts from the *end* of work."""
+    try:
+        mutate_sql_warehouse(wh_id, {"last_active_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
     except Exception:
         pass
+
+
+def resolve_sql_warehouse(warehouse_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    warehouses = load_sql_warehouses()
+    wh = next((w for w in warehouses if w["id"] == warehouse_id), None) if warehouse_id else None
+    return wh or next((w for w in warehouses if w.get("is_default")), warehouses[0] if warehouses else None)
+
 
 def apply_warehouse_compute(conn, warehouse_id: Optional[str] = None) -> Dict[str, Any]:
     """Applies threads and max_memory from the active/requested SQL Warehouse onto the DuckDB connection."""
