@@ -242,8 +242,8 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | :--- | :---: | :---: | :---: | :--- |
 | **User Authentication** | OAuth 2.0 / SAML 2.0 | SAML 2.0 / Key-pair | **JWT + OAuth 2.0 + LDAP + PBKDF2 Hashing** | 🏆 **Data Kiln Works** |
 | **OAuth Providers Supported** | Major enterprise (Okta, Azure, Google) | Major enterprise | **Generic OpenID Connect (authorization code + PKCE): any standards-compliant provider (Okta, Entra ID, Keycloak, Google, Auth0); no provider-specific integrations** | 🤝 **Parity** |
-| **Multi-Factor Authentication (MFA)**| ✅ Duo / Cloud MFA | ✅ Duo Push / TOTP | ✅ **Native TOTP (Google/MS/Authy) + 10 Backup Codes** | 🏆 **Data Kiln Works** |
-| **MFA Configuration & Stats** | ⚠️ Admin console only | ⚠️ SQL commands | ✅ **Full GUI: Policy enforcement, grace period, reset, stats** | 🏆 **Data Kiln Works** |
+| **Multi-Factor Authentication (MFA)**| ✅ Duo / Cloud MFA | ✅ Duo Push / TOTP | ✅ **Native TOTP (any authenticator app), 10 single-use backup codes, per-user opt-in** | 🤝 **Parity** |
+| **MFA Configuration & Stats** | ⚠️ Admin console only | ⚠️ SQL commands | ⚠️ **Self-service enrolment and admin reset only; no org-wide "require MFA" policy, grace period or stats yet** | **Snowflake / Databricks** (admin tooling) |
 | **LDAP / Active Directory Sync** | ✅ SCIM / Enterprise only | ✅ SCIM / Enterprise only | ✅ **Real bind-as-user auth, group-to-role mapping, auto-provisioning, and a sync that deactivates accounts removed from the directory (all tiers)** | 🏆 **Data Kiln Works** |
 | **Multi-User Workspace Isolation**| ✅ Personal folders | ⚠️ Worksheets list | ✅ **Personal home directories (`Users/<username>/`) with 403 enforcement** | 🏆 **Databricks / Data Kiln** |
 | **Role-Based Access Control (RBAC)**| ✅ Full RBAC | ✅ Hierarchical RBAC | ✅ **Admin, Power User, User roles with UI & API enforcement** | ✅ Tie |

@@ -1019,7 +1019,7 @@ WHERE active = true;</code></pre>
           <li><strong>OAuth 2.0 / OIDC:</strong> Real authorization-code sign-in with PKCE, <code>state</code> and <code>nonce</code> for any standards-compliant OpenID Connect provider (Okta, Entra ID, Keycloak, Google, Auth0, ...). Enable it under Platform Settings &rarr; Authentication, register the shown Redirect URI with the provider, and a <em>Sign in with &hellip;</em> button appears on the login screen. ID tokens are verified against the provider's keys (issuer, audience, expiry, nonce); the role comes from the configured group claim, refreshed at each login. An existing local or LDAP username, or an account an administrator deactivated or deleted, is never taken over or reactivated by an OIDC login.</li>
           <li><strong>LDAP / Active Directory:</strong> real service-account bind, user search and bind-as-user credential verification (never a cached hash, so a directory password change or lock applies on the next login), group-to-role mapping, and automatic provisioning of a local account (<code>auth_source=ldap</code>) that only that directory can ever authenticate. <em>Sync</em> provisions every not-yet-known directory user, re-resolves every already-known LDAP account's role, and deactivates one locally if its directory entry is gone. An existing local username is always refused, so an LDAP login (or sync) can never take over a local account. <strong>Sync group:</strong> set <code>sync_group</code> to restrict LDAP access to one directory group &mdash; non-members are refused at login, skipped by sync, and deactivated on re-sync if they leave. <code>admin_group</code>, <code>power_user_group</code> and <code>user_group</code> map directory groups to local roles; a sync-group member in none of them gets the <em>Default Fallback Role</em>.</li>
           <li><strong>Change your own password:</strong> user menu &rarr; <em>Change password</em> (accounts whose password is kept in the studio's own database only). It needs the current password, and sessions signed in before the change are signed out. Administrators can still reset any password from Users &amp; IAM.</li>
-          <li><strong>Multi-Factor Authentication (MFA):</strong> TOTP (RFC 6238) generation, QR code registration, and 10 self-service emergency backup recovery codes.</li>
+          <li><strong>Multi-Factor Authentication (MFA):</strong> opt-in TOTP (RFC 6238) for any authenticator app. User menu &rarr; <em>Two-factor authentication</em> shows a QR code, asks for a first code to confirm, then displays 10 single-use backup codes once. Password sign-ins (local and LDAP) then take two steps; OIDC accounts use their identity provider's own second factor. A code works once, wrong codes are rate-limited (5 failures lock the second factor for 5 minutes), and turning MFA off or regenerating backup codes needs a current code (plus your password for local accounts). Administrators can reset a user's MFA from Users &amp; IAM if a device is lost. There is no organisation-wide &ldquo;require MFA&rdquo; policy yet.</li>
           <li><strong>Column masking:</strong> tag-driven masking policies with role and user exemptions (see <a href="#tags-masking-policies">Tags, Masking Policies & Row-Level Security</a>).</li>
           <li><strong>Row-Level Security (RLS):</strong> tag-driven row filter policies (owner, attribute, or custom expression modes), enforced by the same query-rewrite gateway as column masking, with role and user exemptions.</li>
         </ul>
@@ -1323,7 +1323,7 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
               <tr>
                 <td><span class="badge green">POST</span></td>
                 <td><code>/api/auth/login</code></td>
-                <td>Signs in: local password check, or a real LDAP bind-as-user for an unknown or LDAP-provisioned username</td>
+                <td>Signs in: local password check, or a real LDAP bind-as-user for an unknown or LDAP-provisioned username. For an account with MFA it returns <code>{"mfa_required": true, "mfa_token": ...}</code> instead of a session</td>
                 <td><code>{"username": "...", "password": "..."}</code></td>
               </tr>
               <tr>
@@ -1343,6 +1343,48 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
                 <td><code>/api/auth/oidc/callback</code></td>
                 <td>The provider's redirect target: verifies state and the ID token, provisions the account, sets the session cookie, redirects to <code>/</code> (or to <code>/?sso_error=&hellip;</code>)</td>
                 <td><code>?code=...&amp;state=...</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/auth/login/mfa</code></td>
+                <td>Second sign-in step for an account with MFA: the <code>mfa_token</code> from <code>/api/auth/login</code> plus a code; issues the session</td>
+                <td><code>{"mfa_token": "...", "code": "123456"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge blue">GET</span></td>
+                <td><code>/api/auth/mfa/status</code></td>
+                <td>Whether MFA is on for the caller and how many backup codes remain</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/auth/mfa/setup</code></td>
+                <td>Starts enrolment: returns the secret and <code>otpauth://</code> URI (nothing is enabled yet)</td>
+                <td>&mdash;</td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/auth/mfa/enable</code></td>
+                <td>Confirms enrolment with a code from the app; returns the backup codes once</td>
+                <td><code>{"code": "123456"}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/auth/mfa/disable</code></td>
+                <td>Turns MFA off; needs a current code and, for local accounts, the password</td>
+                <td><code>{"code": "...", "password": "..."}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/auth/mfa/backup-codes</code></td>
+                <td>Replaces all backup codes; same confirmation as disable</td>
+                <td><code>{"code": "...", "password": "..."}</code></td>
+              </tr>
+              <tr>
+                <td><span class="badge green">POST</span></td>
+                <td><code>/api/users/{id}/mfa/reset</code></td>
+                <td>Admin only: turns off another user's MFA (lost device)</td>
+                <td>&mdash;</td>
               </tr>
               <tr>
                 <td><span class="badge green">POST</span></td>

@@ -107,6 +107,12 @@ def init_auth_db():
             # deleted_at NULL) stays in the list, greyed out -- an admin paused them, or LDAP sync no longer found
             # their directory entry. A deleted user (deleted_at set) is hidden from the list by default and always
             # implicitly inactive; `list_users(include_deleted=True)` or the UI's "Show deleted users" reveals them.
+            # Two-factor (TOTP) state, owned by web/mfa.py. Never returned by the user getters below.
+            for col, ddl in (("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                             ("totp_last_step", "INTEGER NOT NULL DEFAULT 0"), ("totp_backup", "TEXT"),
+                             ("totp_failures", "INTEGER NOT NULL DEFAULT 0"), ("totp_locked_until", "INTEGER NOT NULL DEFAULT 0")):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             if "deleted_at" not in existing:
                 conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
             # `must_change_password`: set when a password was provided by someone other than the account holder
@@ -229,6 +235,8 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
     """Decodes and validates a JWT token, returning payload dict or None if invalid/expired."""
     try:
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        if "purpose" in payload:
+            return None           # single-purpose tokens (MFA step, OIDC state) are never sessions, whatever they are signed with
         return payload
     except Exception:
         return None
@@ -238,15 +246,26 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
 # USER CRUD OPERATIONS
 # ==============================================================================
 
+_MFA_SECRET_COLUMNS = ("totp_secret", "totp_pending", "totp_last_step", "totp_backup", "totp_failures", "totp_locked_until")
+
+
+def _public_user(u: Dict[str, Any]) -> Dict[str, Any]:
+    """A user row without credentials: no password hash and none of the TOTP secret material (the getters feed
+    /api/auth/me and friends). Exposes only whether MFA is on."""
+    u.pop("password_hash", None)
+    for col in _MFA_SECRET_COLUMNS:
+        u.pop(col, None)
+    u["mfa_enabled"] = bool(u.pop("totp_enabled", 0))
+    return u
+
+
 def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     """Fetches user record by ID."""
     conn = get_db_connection()
     try:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if row:
-            u = dict(row)
-            u.pop("password_hash", None)
-            return u
+            return _public_user(dict(row))
         return None
     finally:
         conn.close()
@@ -258,9 +277,9 @@ def get_user_by_username(username: str, include_password_hash: bool = False) -> 
     try:
         row = conn.execute("SELECT * FROM users WHERE username = ?", (username.strip().lower(),)).fetchone()
         if row:
-            u = dict(row)
-            if not include_password_hash:
-                u.pop("password_hash", None)
+            u = _public_user(dict(row))
+            if include_password_hash:
+                u["password_hash"] = row["password_hash"]
             return u
         return None
     finally:
@@ -274,10 +293,11 @@ def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         rows = conn.execute(
             f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at, "
-            f"must_change_password FROM users {where} ORDER BY created_at ASC").fetchall()
+            f"must_change_password, totp_enabled FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
+            d["mfa_enabled"] = bool(d.pop("totp_enabled", 0))
             d["full_name"] = d.get("display_name") or d["username"]
             d["email"] = f"{d['username']}@localspark.lakehouse"
             result.append(d)

@@ -449,6 +449,16 @@ async def login_endpoint(payload: LoginRequest):
     if u.get("is_active", 1) != 1:
         raise HTTPException(status_code=403, detail="Account is deactivated. Contact an administrator.")
 
+    from web import mfa
+    if mfa.is_enabled(u["id"]):
+        # Password was right, but a second factor is required: no session yet, only a short-lived token that is
+        # good for nothing except POST /api/auth/login/mfa.
+        return JSONResponse(content={"success": False, "mfa_required": True, "mfa_token": mfa.create_mfa_token(u)})
+    return _session_response(u)
+
+
+def _session_response(u: Dict[str, Any]) -> JSONResponse:
+    """Records the login and returns the session (cookie + user), shared by every password-based sign-in path."""
     record_user_login(u["id"])
     token = create_access_token(u)
     safe_user = {
@@ -460,7 +470,9 @@ async def login_endpoint(payload: LoginRequest):
         "role": u["role"],
         "created_at": u["created_at"],
         "last_login_at": u["last_login_at"],
-        "must_change_password": bool(u.get("must_change_password"))
+        "must_change_password": bool(u.get("must_change_password")),
+        "auth_source": u.get("auth_source") or "local",
+        "mfa_enabled": bool(u.get("mfa_enabled"))
     }
     resp = JSONResponse(content={"success": True, "token": token, "user": safe_user})
     resp.set_cookie(
@@ -472,6 +484,106 @@ async def login_endpoint(payload: LoginRequest):
         secure=False
     )
     return resp
+
+
+class MfaLoginRequest(BaseModel):
+    mfa_token: str
+    code: str
+
+
+class MfaCodeRequest(BaseModel):
+    code: str
+    password: Optional[str] = None
+
+
+@app.post("/api/auth/login/mfa")
+async def login_mfa_endpoint(payload: MfaLoginRequest):
+    """Second step of a two-step sign-in: the mfa_token from /api/auth/login plus a TOTP or backup code."""
+    from web import mfa
+    u = mfa.user_from_mfa_token(payload.mfa_token)
+    if u is None:
+        raise HTTPException(status_code=401, detail="This sign-in expired. Please sign in again.")
+    ok, reason = mfa.verify_login(u["id"], payload.code)
+    if not ok:
+        raise HTTPException(status_code=401 if "not valid" in reason else 429, detail=reason)
+    return _session_response(u)
+
+
+@app.get("/api/auth/mfa/status")
+async def mfa_status(request: Request):
+    from web import mfa
+    user = await get_current_user(request)
+    return mfa.status(user["id"])
+
+
+@app.post("/api/auth/mfa/setup")
+async def mfa_setup(request: Request):
+    """Starts enrolment: returns the secret and otpauth:// URI for the authenticator app (nothing is enabled yet)."""
+    from web import mfa
+    user = await get_current_user(request)
+    if (user.get("auth_source") or "local") == "oidc":
+        raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
+    try:
+        return mfa.begin_setup(user["id"], user["username"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/auth/mfa/enable")
+async def mfa_enable(payload: MfaCodeRequest, request: Request):
+    """Confirms enrolment with a code from the app; returns the backup codes, shown only this once."""
+    from web import mfa
+    user = await get_current_user(request)
+    try:
+        return {"success": True, "backup_codes": mfa.confirm_setup(user["id"], payload.code)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+async def _require_second_factor(request: Request, payload: MfaCodeRequest) -> Dict[str, Any]:
+    """For sensitive MFA changes: a stolen session alone is not enough -- a current code (or backup code) is needed,
+    plus the password for a local account."""
+    from web import mfa
+    from web.auth import verify_password
+    user = await get_current_user(request)
+    if not mfa.is_enabled(user["id"]):
+        raise HTTPException(status_code=400, detail="Two-factor authentication is not enabled.")
+    if (user.get("auth_source") or "local") == "local":
+        full = get_user_by_username(user["username"], include_password_hash=True)
+        if not payload.password or not verify_password(payload.password, full["password_hash"]):
+            raise HTTPException(status_code=403, detail="The password is incorrect.")
+    ok, reason = mfa.verify_login(user["id"], payload.code)
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
+    return user
+
+
+@app.post("/api/auth/mfa/disable")
+async def mfa_disable(payload: MfaCodeRequest, request: Request):
+    from web import mfa
+    user = await _require_second_factor(request, payload)
+    mfa.disable(user["id"])
+    return {"success": True}
+
+
+@app.post("/api/auth/mfa/backup-codes")
+async def mfa_regenerate_backup_codes(payload: MfaCodeRequest, request: Request):
+    """Replaces all backup codes with a fresh set (the old ones stop working)."""
+    from web import mfa
+    user = await _require_second_factor(request, payload)
+    return {"success": True, "backup_codes": mfa.regenerate_backup_codes(user["id"])}
+
+
+@app.post("/api/users/{user_id}/mfa/reset")
+async def admin_reset_mfa(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """A lost device: an administrator switches another user's two-factor authentication off so they can re-enrol."""
+    from web import mfa
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Use 'Disable' in your own two-factor settings.")
+    if not mfa.disable(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    logger.warning(f"MFA reset for user {user_id} by admin {current_user['username']}")
+    return {"success": True}
 
 
 def _oidc_redirect_uri(cfg: Dict[str, Any], request: Request) -> str:
