@@ -5300,10 +5300,42 @@ async def get_history_query_profile(query_id: str, request: Request):
     else:
         return {"success": False, "error": res.get("error", "Profiling unavailable for this query")}
 
+def _audit_history_deletion(actor: str, action: str, detail: Dict[str, Any]) -> None:
+    """The query history is an audit trail, so removing from it is itself recorded (who, how many, which ids; never the SQL)."""
+    from web.governance import store
+    store.init_governance_db()
+    conn = store.get_db()
+    try:
+        store.write_audit(conn, actor, action, "query_history", detail)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class HistoryDeletePayload(BaseModel):
+    query_ids: List[str]
+
+
 @app.delete("/api/history")
-async def clear_history():
+async def clear_history(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Removes the entire history (admins only)."""
+    from web.audit import get_query_history
+    total = get_query_history(limit=1).get("total_count")
     clear_query_history()
+    _audit_history_deletion(current_user.get("username", "admin"), "HISTORY_CLEAR", {"records": total})
     return {"success": True, "message": "Query history cleared"}
+
+@app.post("/api/history/delete")
+async def delete_history_entries(payload: HistoryDeletePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Removes the selected history entries (admins only). Everyone else's history is append-only."""
+    from web.audit import delete_queries
+    if not payload.query_ids:
+        raise HTTPException(status_code=400, detail="No queries selected.")
+    if len(payload.query_ids) > 5000:
+        raise HTTPException(status_code=413, detail="Too many queries in one request (max 5000).")
+    deleted = await asyncio.to_thread(delete_queries, payload.query_ids)
+    _audit_history_deletion(current_user.get("username", "admin"), "HISTORY_DELETE", {"deleted": deleted, "query_ids": payload.query_ids[:200]})
+    return {"success": True, "deleted": deleted}
 
 class ManualLogPayload(BaseModel):
     query_text: str

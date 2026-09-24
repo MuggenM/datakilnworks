@@ -228,3 +228,17 @@ def clear_query_history() -> bool:
     with get_db_connection() as conn:
         conn.execute("DELETE FROM query_history;")
     return True
+
+
+def delete_queries(query_ids) -> int:
+    """Deletes the given history rows; returns how many existed. (Callers restrict this to admins and audit it.)"""
+    ids = [q for q in dict.fromkeys(query_ids) if isinstance(q, str) and q]
+    if not ids:
+        return 0
+    init_history_db()
+    deleted = 0
+    with get_db_connection() as conn:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            deleted += conn.execute(f"DELETE FROM query_history WHERE query_id IN ({','.join('?' * len(chunk))})", chunk).rowcount
+    return deleted

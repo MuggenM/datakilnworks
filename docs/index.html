@@ -789,6 +789,10 @@ SELECT name, region FROM warehouse.hr.employees;
           (your formatting and comments stay). A name is only completed when it resolves to exactly one table; unknown or ambiguous names are listed and left alone, as are CTE names and table functions.
           From there use <em>Open in SQL editor</em> or <em>Save as query</em> to keep the corrected version under <em>Saved Queries</em>.
         </p>
+        <p>
+          The history is append-only for everyone except administrators: only an admin sees the checkboxes and <em>Delete selected</em> (and <em>Clear History</em>). Every deletion is written to the governance audit log
+          (<code>HISTORY_DELETE</code> / <code>HISTORY_CLEAR</code>: who, how many, which query ids; never the SQL text). Saved queries are not affected.
+        </p>
 
         <h3 id="genie-spaces-ai">Genie Space: Conversational Text-to-SQL AI Analyst</h3>
         <p>

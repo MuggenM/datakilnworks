@@ -6172,7 +6172,11 @@
               <i class="ph ph-arrows-clockwise text-xs" :class="{'animate-spin': historyLoading}"></i>
               <span>Refresh</span>
             </button>
-            <button @click="confirmClearHistory()" class="px-3 py-1.5 bg-white hover:bg-red-50 dark:bg-dbx-panel dark:hover:bg-red-950/40 border border-slate-200 dark:border-dbx-border hover:border-red-300 dark:hover:border-red-800 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-300 rounded text-xs flex items-center space-x-1.5 transition shadow-xs" title="Clear All History">
+            <button x-show="currentUser && currentUser.role === 'admin' && historySelected.length" @click="deleteSelectedHistory()" data-testid="hist-delete-selected" class="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs" title="Delete the selected entries (recorded in the audit log)">
+              <i class="ph ph-trash text-xs"></i>
+              <span x-text="'Delete selected (' + historySelected.length + ')'"></span>
+            </button>
+            <button x-show="currentUser && currentUser.role === 'admin'" @click="confirmClearHistory()" class="px-3 py-1.5 bg-white hover:bg-red-50 dark:bg-dbx-panel dark:hover:bg-red-950/40 border border-slate-200 dark:border-dbx-border hover:border-red-300 dark:hover:border-red-800 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-300 rounded text-xs flex items-center space-x-1.5 transition shadow-xs" title="Clear All History">
               <i class="ph ph-trash text-xs"></i>
               <span>Clear History</span>
             </button>
@@ -6286,6 +6290,10 @@
               <table class="w-full text-left text-xs border-collapse">
                 <thead class="bg-slate-900/90 text-slate-400 text-[10px] uppercase font-mono sticky top-0 border-b border-dbx-border select-none z-10">
                   <tr>
+                    <th class="px-3 py-2.5 w-8" x-show="currentUser && currentUser.role === 'admin'">
+                      <input type="checkbox" data-testid="hist-select-all" :checked="queryHistory.length && historySelected.length === queryHistory.length"
+                             @change="historySelected = $event.target.checked ? queryHistory.map(q => q.query_id) : []" title="Select all on this page">
+                    </th>
                     <th class="px-4 py-2.5 w-24">Status</th>
                     <th class="px-4 py-2.5">SQL Statement</th>
                     <th class="px-4 py-2.5 w-32">Source</th>
@@ -6298,7 +6306,11 @@
                 </thead>
                 <tbody class="divide-y divide-dbx-border/40">
                   <template x-for="item in queryHistory" :key="item.query_id">
-                    <tr class="hover:bg-dbx-hover/60 transition group font-mono text-[11px]">
+                    <tr class="hover:bg-dbx-hover/60 transition group font-mono text-[11px]" :class="historySelected.includes(item.query_id) ? 'bg-red-950/20' : ''">
+                      <td class="px-3 py-2" x-show="currentUser && currentUser.role === 'admin'">
+                        <input type="checkbox" data-testid="hist-row-select" :checked="historySelected.includes(item.query_id)"
+                               @change="historySelected = $event.target.checked ? [...historySelected, item.query_id] : historySelected.filter(x => x !== item.query_id)">
+                      </td>
                       <!-- Status -->
                       <td class="px-4 py-2 whitespace-nowrap">
                         <span x-show="item.status === 'SUCCESS'" class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-800/80 inline-flex items-center space-x-1">
@@ -17822,6 +17834,7 @@
           total_rows_produced: 0
         },
         historyTotalCount: 0,
+        historySelected: [],
         historyLoading: false,
         historyFilter: {
           search: '',
@@ -23822,6 +23835,7 @@
         // ==================== QUERY HISTORY METHODS ====================
         async fetchHistory() {
           this.historyLoading = true;
+          this.historySelected = [];
           try {
             const params = new URLSearchParams({
               limit: '100',
@@ -23912,6 +23926,21 @@
           this.$nextTick(() => {
             this.setEditorValue(sqlText);
           });
+        },
+
+        async deleteSelectedHistory() {
+          const n = this.historySelected.length;
+          if (!n || !confirm(`Delete ${n} query history entr${n === 1 ? 'y' : 'ies'}? This cannot be undone (the deletion itself is recorded in the audit log).`)) return;
+          try {
+            const res = await fetch('/api/history/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query_ids: this.historySelected }) });
+            const data = await res.json();
+            if (!res.ok) { this.showToast(typeof data.detail === 'string' ? data.detail : 'Could not delete the entries.', 'error'); return; }
+            this.historySelected = [];
+            this.showToast(`Deleted ${data.deleted} entr${data.deleted === 1 ? 'y' : 'ies'}.`, 'success');
+            await this.fetchHistory();
+          } catch (e) {
+            this.showToast('Failed to delete: ' + e.message, 'error');
+          }
         },
 
         async confirmClearHistory() {
