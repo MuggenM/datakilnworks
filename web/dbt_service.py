@@ -54,8 +54,8 @@ def _package_version(name: str) -> Optional[str]:
         return None
 
 
-def _profile_adapter_type() -> Optional[str]:
-    """The adapter `type` of the active target in profiles.yml (what dbt will load), or None if it cannot be read."""
+def _profile_output() -> Dict[str, Any]:
+    """The active target's settings from profiles.yml (what dbt will load); {} if it cannot be read."""
     try:
         import yaml
         with open(os.path.join(DBT_PROJECT_DIR, "profiles.yml"), "r", encoding="utf-8") as f:
@@ -63,11 +63,19 @@ def _profile_adapter_type() -> Optional[str]:
         for profile in profiles.values():
             if isinstance(profile, dict) and isinstance(profile.get("outputs"), dict):
                 target = os.getenv("DBT_TARGET") or profile.get("target")
-                out = profile["outputs"].get(target) or next(iter(profile["outputs"].values()), {})
-                return out.get("type")
+                return profile["outputs"].get(target) or next(iter(profile["outputs"].values()), {})
     except Exception as exc:
         logger.debug(f"Could not read the dbt profile: {exc}")
-    return None
+    return {}
+
+
+def _profile_adapter_type() -> Optional[str]:
+    return _profile_output().get("type")
+
+
+def _profile_schema() -> str:
+    """The schema dbt writes to by default (the profile's `schema`; dbt's own default is `main`)."""
+    return str(_profile_output().get("schema") or "main")
 
 
 def get_dbt_status(user: Optional[str] = None, is_admin: bool = True) -> Dict[str, Any]:
@@ -123,6 +131,7 @@ def list_dbt_models() -> Dict[str, Any]:
                     model_list.append({
                         "name": node.get("name"),
                         "unique_id": node_id,
+                        "alias": node.get("alias") or node.get("name"),
                         "path": node.get("original_file_path"),
                         "materialization": config.get("materialized", "view"),
                         "schema": node.get("schema", "main"),
@@ -278,6 +287,13 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
     if target and target.strip():
         cmd.extend(["--target", target.strip()])
 
+    writes_data = action in ("run", "build", "seed", "snapshot")
+    governance = {}
+    if writes_data:
+        # Close the schemas dbt is about to write to *before* the first table exists (see web/dbt_governance.py).
+        from web import dbt_governance
+        governance["before"] = dbt_governance.before_run(actor=user or "dbt")
+
     logger.info(f"Executing dbt command in {DBT_PROJECT_DIR}: {' '.join(cmd)}")
     
     try:
@@ -300,6 +316,10 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
         output = f"Execution error: {str(e)}"
         exit_code = 1
         status = "FAILED"
+
+    if writes_data:
+        from web import dbt_governance
+        governance["after"] = dbt_governance.after_run(actor=user or "dbt")
 
     end_time = datetime.datetime.now()
     duration_s = round((end_time - start_time).total_seconds(), 2)
@@ -332,7 +352,8 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
             "pass": pass_count,
             "warn": warn_count,
             "error": error_count
-        }
+        },
+        "governance": governance
     }
     
     _save_run_record(record)
@@ -347,12 +368,13 @@ def preview_dbt_model_data(model_name: str, limit: int = 50) -> Dict[str, Any]:
     con = None
     try:
         con = duckdb.connect(DBT_DB_PATH, read_only=True)
-        df = con.execute(f"SELECT * FROM {model_name} LIMIT {limit}").df()
+        rel = f'"{_profile_schema()}"."{model_name}"'          # qualified: an old run may have left a same-named table in `main`
+        df = con.execute(f"SELECT * FROM {rel} LIMIT {limit}").df()
         columns = list(df.columns)
         import numpy as np
         df_clean = df.replace({np.nan: None})
         rows = df_clean.to_dict(orient="records")
-        total_count = con.execute(f"SELECT COUNT(*) FROM {model_name}").fetchone()[0]
+        total_count = con.execute(f"SELECT COUNT(*) FROM {rel}").fetchone()[0]
         return {
             "columns": columns,
             "rows": rows,

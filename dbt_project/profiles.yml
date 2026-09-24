@@ -6,10 +6,12 @@ localspark_dbt:
       # Delta tables under `root_path`, and `view` models stay views in the DuckDB file below.
       type: duckrun
       path: '/workspace/warehouse/dbt_analytics.duckdb'
-      # Private on purpose (a dot-directory is not a catalog schema): dbt output is derived from governed tables, so it must
-      # not appear in the catalog / SQL editor until its governance tags are carried over. Previews read it through the
-      # views in the DuckDB file.
-      root_path: '/workspace/warehouse/.dbt'
+      # Models are written to <root_path>/<schema>/<model> -- i.e. into the lakehouse as ordinary Delta tables of the `dbt`
+      # schema (models with `+schema: marts` land in `dbt_marts`, dbt's default naming; keep it: it cannot collide with
+      # your source schemas). They are CLOSED BY DEFAULT: the studio tags each output schema `access=closed` before a run,
+      # so users see the tables but no rows until an admin opens one (see web/dbt_governance.py).
+      root_path: '/workspace/warehouse'
+      schema: dbt
       extensions:
         - httpfs
         - delta

@@ -5390,7 +5390,38 @@ async def get_dbt_status_endpoint(request: Request):
 @app.get("/api/dbt/models")
 async def list_dbt_models_endpoint():
     from web.dbt_service import list_dbt_models
-    return list_dbt_models()
+    from web import dbt_governance
+    data = list_dbt_models()
+    if dbt_governance.enabled():
+        for m in data.get("models", []):
+            if m.get("materialization") in dbt_governance.OUTPUT_MATERIALIZATIONS:
+                try:
+                    m["lakehouse_table"] = f'{dbt_governance.CATALOG}.{m["schema"]}.{m.get("alias") or m["name"]}'
+                    m["access"] = dbt_governance.access_state(m["schema"], m.get("alias") or m["name"])
+                except Exception as exc:
+                    logger.debug(f"access state of dbt model {m.get('name')} unavailable: {exc}")
+    return data
+
+@app.post("/api/dbt/models/{model_name}/open")
+async def open_dbt_model_endpoint(model_name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """An administrator deliberately opens one dbt table to users (refreshes its carried-over source tags first)."""
+    from web import dbt_governance
+    try:
+        return await asyncio.to_thread(dbt_governance.open_model, model_name, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/dbt/models/{model_name}/close")
+async def close_dbt_model_endpoint(model_name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import dbt_governance
+    try:
+        return await asyncio.to_thread(dbt_governance.close_model, model_name, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 @app.get("/api/dbt/models/{model_name}")
 async def get_dbt_model_endpoint(model_name: str):

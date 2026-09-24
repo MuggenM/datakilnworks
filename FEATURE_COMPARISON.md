@@ -203,7 +203,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 
 | Feature | Real Databricks | Snowflake | DataKilnWorks Studio | Winner |
 | :--- | :---: | :---: | :---: | :--- |
-| **dbt Core Integration** | ⚠️ External (dbt Cloud/CLI) | ⚠️ External (dbt Cloud/CLI) | ✅ **Integrated Native dbt Service (Run, Test, Docs, Compile) on the duckrun adapter: table models are Delta tables** | 🏆 **Data Kiln Works** |
+| **dbt Core Integration** | ⚠️ External (dbt Cloud/CLI) | ⚠️ External (dbt Cloud/CLI) | ✅ **Integrated Native dbt Service (Run, Test, Docs, Compile) on the duckrun adapter: table models are Delta tables in the lakehouse, closed to users until an admin opens them, source masking carried over** | 🏆 **Data Kiln Works** |
 | **In-Studio Transformation Logs** | ❌ Via external runner | ❌ Via external runner | ✅ **Real-time execution streaming in UI** | 🏆 **Data Kiln Works** |
 | **Pipeline Lineage Visualization** | ✅ Delta Live Tables (DLT) | ⚠️ Snowpark DAGs | ✅ **Interactive dbt model dependency graph & lineage** | 🏆 **Databricks / Data Kiln** |
 | **Per-User Execution History** | ⚠️ Job run history | ⚠️ Query history | ✅ **dbt Run History partitioned by user** | 🏆 **Data Kiln Works** |

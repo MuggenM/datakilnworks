@@ -6661,10 +6661,24 @@
                         <span class="text-[10px] px-2 py-0.5 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded font-mono" x-text="'schema: ' + (selectedDbtModel.schema || 'main')"></span>
                       </div>
                       <div class="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono text-[11px]" x-text="selectedDbtModel.path"></div>
+                      <div x-show="selectedDbtModel.access" class="mt-1.5 flex items-center space-x-2 text-[11px]">
+                        <span class="px-2 py-0.5 rounded font-semibold border"
+                              :class="selectedDbtModel.access && selectedDbtModel.access.access === 'open' ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border-emerald-300 dark:border-emerald-800' : 'bg-rose-100 dark:bg-rose-950 text-rose-800 dark:text-rose-300 border-rose-300 dark:border-rose-800'">
+                          <i class="ph" :class="selectedDbtModel.access && selectedDbtModel.access.access === 'open' ? 'ph-lock-open' : 'ph-lock'"></i>
+                          <span x-text="selectedDbtModel.access && selectedDbtModel.access.access === 'open' ? 'Open to users' : 'Closed: only admins and power users can read rows'"></span>
+                        </span>
+                        <span class="text-slate-500 font-mono" x-text="selectedDbtModel.lakehouse_table"></span>
+                      </div>
                     </div>
 
                     <!-- Model Actions -->
                     <div class="flex items-center space-x-2">
+                      <button x-show="selectedDbtModel.access && currentUser && currentUser.role === 'admin'" @click="toggleDbtModelAccess(selectedDbtModel)"
+                              class="px-3 py-1.5 border rounded text-xs flex items-center space-x-1.5 transition shadow-xs"
+                              :class="selectedDbtModel.access && selectedDbtModel.access.access === 'open' ? 'bg-white dark:bg-dbx-panel border-rose-300 dark:border-rose-800 text-rose-700 dark:text-rose-300' : 'bg-emerald-600 hover:bg-emerald-700 border-emerald-700 text-white'">
+                        <i class="ph" :class="selectedDbtModel.access && selectedDbtModel.access.access === 'open' ? 'ph-lock' : 'ph-lock-open'"></i>
+                        <span x-text="selectedDbtModel.access && selectedDbtModel.access.access === 'open' ? 'Close' : 'Open to users'"></span>
+                      </button>
                       <button @click="previewDbtModelData(selectedDbtModel.name)" class="px-3 py-1.5 bg-white hover:bg-slate-50 dark:bg-dbx-panel dark:hover:bg-dbx-hover border border-slate-200 dark:border-dbx-border rounded text-xs text-slate-700 dark:text-slate-200 flex items-center space-x-1.5 transition shadow-xs">
                         <i class="ph ph-table text-xs text-blue-500"></i>
                         <span>Preview Data</span>
@@ -23784,6 +23798,21 @@
             }
           } catch (e) {
             console.error('Error fetching dbt models:', e);
+          }
+        },
+
+        async toggleDbtModelAccess(model) {
+          const opening = !(model.access && model.access.access === 'open');
+          if (opening && !confirm(`Open ${model.lakehouse_table} to users?\n\nEveryone will be able to read its rows. Masking and row filters from its source tags keep applying, and dbt keeps carrying those tags over on every run.`)) return;
+          try {
+            const res = await fetch(`/api/dbt/models/${encodeURIComponent(model.name)}/${opening ? 'open' : 'close'}`, { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { this.showToast(data.detail || 'Could not change access', 'error'); return; }
+            const extra = opening && data.columns_with_source_tags && data.columns_with_source_tags.length ? ` (masking follows: ${data.columns_with_source_tags.join(', ')})` : '';
+            this.showToast(opening ? `${model.lakehouse_table} is now open${extra}` : `${model.lakehouse_table} is closed`, 'success');
+            await this.fetchDbtModels();
+          } catch (e) {
+            this.showToast('Error: ' + e.message, 'error');
           }
         },
 
