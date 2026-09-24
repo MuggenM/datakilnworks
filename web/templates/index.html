@@ -11032,7 +11032,18 @@
         <div>
           <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Source Volume Path</label>
           <input type="text" x-model="newPipelineForm.source_volume_path" placeholder="/Volumes/warehouse/raw/iot_stream" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
-          <p class="text-[10px] text-slate-500 mt-1">Directory watched by daemon. Must start with <code class="text-sky-400">/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume&gt;</code></p>
+          <p class="text-[10px] text-slate-500 mt-1">A volume folder (<code class="text-sky-400">/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume&gt;</code>) or an S3 / S3-compatible location (<code class="text-sky-400">s3://bucket/prefix/</code>).</p>
+        </div>
+
+        <div x-show="(newPipelineForm.source_volume_path || '').trim().toLowerCase().startsWith('s3://')" class="space-y-1.5">
+          <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Storage Mount (endpoint &amp; credentials)</label>
+          <select x-model="newPipelineForm.source_mount_id" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-medium focus:outline-none focus:border-dbx-orange">
+            <option value="">Automatic (an S3 mount for this bucket, else the first S3 mount)</option>
+            <template x-for="m in mountsList.filter(x => (x.type || '').toLowerCase() === 's3')" :key="m.id">
+              <option :value="m.id" x-text="(m.name || m.catalog_name || m.id) + ' (' + ((m.config && m.config.endpoint) || 'S3') + ')'"></option>
+            </template>
+          </select>
+          <p class="text-[10px] text-slate-500">S3 sources are polled: pick an interval of 30 seconds or more (each poll lists the prefix) or a cron schedule. New objects are read in place, without downloading them; a malformed object is copied under <code>_quarantine/</code> and removed if the key may delete it.</p>
         </div>
 
         <div class="grid grid-cols-2 gap-3">
@@ -16453,6 +16464,7 @@
           schema_evolution: 'addNewColumns',
           poll_interval_seconds: 10,
           cron_schedule: '',
+          source_mount_id: '',
           watch_sweep_seconds: 300,
           enabled: true
         },
@@ -25074,7 +25086,8 @@
           await Promise.all([
             this.fetchAutoloaderPipelines(),
             this.fetchAutoloaderStats(),
-            this.fetchVolumes()
+            this.fetchVolumes(),
+            this.fetchMounts()
           ]);
         },
 
@@ -25189,6 +25202,11 @@
         async createAutoloaderPipelineSubmit() {
           if (!this.newPipelineForm.name || !this.newPipelineForm.source_volume_path || !this.newPipelineForm.target_table) {
             this.showToast('Please fill in pipeline name, source volume, and target table.', 'error');
+            return;
+          }
+          const isS3 = this.newPipelineForm.source_volume_path.trim().toLowerCase().startsWith('s3://');
+          if (isS3 && this.newPipelineForm.poll_interval_seconds === 'watch') {
+            this.showToast('File events watch local volumes only. Pick a poll interval or a cron schedule for an S3 source.', 'error');
             return;
           }
           try {

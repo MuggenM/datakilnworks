@@ -267,7 +267,7 @@ class WatchManager:
         wanted: Dict[str, tuple] = {}
         invalid: Dict[str, str] = {}
         for p in pipelines:
-            if p.get("enabled", 1) and p.get("watch_enabled") and not p.get("cron_schedule"):
+            if p.get("enabled", 1) and p.get("watch_enabled") and not p.get("cron_schedule") and not (p.get("source_volume_path") or "").lower().startswith("s3://"):
                 try:
                     wanted[p["id"]] = (self._resolve_dir(p["source_volume_path"]), p.get("file_pattern") or "*")
                 except Exception as exc:

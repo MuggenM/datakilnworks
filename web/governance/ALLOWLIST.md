@@ -10,6 +10,7 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | :--- | :--- | :--- |
 | alerts.py::* | sqlite | SQLite alert store; the alert query itself runs in `execute_alert_check`, which is governed as the alert's owner |
 | autoloader.py::* | sqlite | SQLite checkpoint store |
+| autoloader_s3.py::configure_duckdb | system | Only installs httpfs and an S3 secret on the ingestion's private in-memory connection; runs no data query |
 | autoloader.py::_open_source_reader | system | Reads volume files it was told to ingest; writes tables, never reads tagged tables |
 | experiments.py::* | sqlite | MLflow tracking store |
 | lineage.py::* | sqlite | Lineage graph store (`parse_sql_lineage` only renders SQL text with sqlglot) |

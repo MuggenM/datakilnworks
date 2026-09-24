@@ -21,6 +21,7 @@ except ImportError:  # requirements.txt ships croniter; guard like web/workflow.
 from deltalake import DeltaTable, write_deltalake
 
 from web.volumes import resolve_volume_posix_path, get_volume_physical_path
+from web import autoloader_s3
 
 logger = logging.getLogger("localspark.autoloader")
 
@@ -87,6 +88,8 @@ def init_autoloader_db():
         cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN cron_schedule TEXT")
     # File-watch triggering (web/autoloader_watch.py): woken by filesystem events instead of a timer; the sweep is the
     # low-frequency safety-net rescan that still runs because events can be missed.
+    if "source_mount_id" not in existing_cols:              # S3 sources: which storage mount supplies endpoint + credentials
+        cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN source_mount_id TEXT")
     if "watch_enabled" not in existing_cols:
         cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN watch_enabled INTEGER DEFAULT 0")
     if "watch_sweep_seconds" not in existing_cols:
@@ -213,6 +216,20 @@ def _normalize_sweep(value) -> int:
         raise ValueError("watch_sweep_seconds must be a number of seconds.")
 
 
+def _validate_source(source_vol: str, watch_enabled: int, source_mount_id: Optional[str]) -> str:
+    """Validates and normalises a pipeline source. S3 sources are polled: inotify has nothing to watch there."""
+    if not autoloader_s3.is_s3_path(source_vol):
+        if source_mount_id:
+            raise ValueError("A storage mount only applies to s3:// sources.")
+        return source_vol
+    if watch_enabled:
+        raise ValueError("File events watch local volumes only. An S3 source is polled: use a poll interval or a cron schedule.")
+    try:
+        return autoloader_s3.normalize_path(source_vol)
+    except autoloader_s3.S3SourceError as exc:
+        raise ValueError(str(exc))
+
+
 def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str, Any]:
     """Creates a new Auto-Loader pipeline."""
     init_autoloader_db()
@@ -237,7 +254,9 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     if watch_enabled and cron_schedule:
         raise ValueError("File watching and a cron schedule are alternatives; choose one trigger.")
     if not source_vol:
-        raise ValueError("Source volume path is required (e.g. /Volumes/warehouse/raw/iot_stream).")
+        raise ValueError("Source volume path is required (e.g. /Volumes/warehouse/raw/iot_stream or s3://bucket/prefix/).")
+    source_mount_id = (data.get("source_mount_id") or "").strip() or None
+    source_vol = _validate_source(source_vol, watch_enabled, source_mount_id)
     if not target_tbl:
         raise ValueError("Target Delta table name is required.")
 
@@ -250,13 +269,13 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
             target_catalog, target_schema, target_table, ingest_mode,
             merge_keys, schema_evolution, poll_interval_seconds, enabled,
             status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested, cron_schedule,
-            watch_enabled, watch_sweep_seconds
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?, ?, ?)
+            watch_enabled, watch_sweep_seconds, source_mount_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?, ?, ?, ?)
     """, (
         pipeline_id, name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        created_by, now_iso, cron_schedule, watch_enabled, watch_sweep
+        created_by, now_iso, cron_schedule, watch_enabled, watch_sweep, source_mount_id
     ))
     conn.commit()
     conn.close()
@@ -295,6 +314,8 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
         watch_enabled = 0                    # choosing a schedule switches file watching off (they are alternatives)
     if watch_enabled and cron_schedule:
         raise ValueError("File watching and a cron schedule are alternatives; choose one trigger.")
+    source_mount_id = ((data.get("source_mount_id") or "").strip() or None) if "source_mount_id" in data else pipe.get("source_mount_id")
+    source_vol = _validate_source(source_vol, watch_enabled, source_mount_id)
 
     conn = get_db()
     conn.execute("""
@@ -302,13 +323,13 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
             name = ?, description = ?, source_volume_path = ?, file_pattern = ?,
             target_catalog = ?, target_schema = ?, target_table = ?, ingest_mode = ?,
             merge_keys = ?, schema_evolution = ?, poll_interval_seconds = ?, enabled = ?,
-            cron_schedule = ?, watch_enabled = ?, watch_sweep_seconds = ?
+            cron_schedule = ?, watch_enabled = ?, watch_sweep_seconds = ?, source_mount_id = ?
         WHERE id = ?
     """, (
         name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        cron_schedule, watch_enabled, watch_sweep, pipeline_id
+        cron_schedule, watch_enabled, watch_sweep, source_mount_id, pipeline_id
     ))
     conn.commit()
     conn.close()
@@ -507,17 +528,27 @@ def _open_source_reader(duck_conn, file_path: str, ext_lower: str) -> pa.RecordB
     return duck_conn.sql(query).fetch_arrow_reader(batch_size=BATCH_ROWS)
 
 
+def _looks_like_remote_io_error(err: Exception) -> bool:
+    """True for errors that say "could not reach or read the storage" rather than "this file is malformed"."""
+    text = str(err).lower()
+    return any(k in text for k in ("io error", "http", "connection", "timed out", "timeout", "access denied", "forbidden",
+                                   "ssl", "secret", "could not resolve", "no such bucket", "extension"))
+
+
 def _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash, file_size,
-                     elapsed_ms, now_iso, err) -> Dict[str, Any]:
-    """Moves a malformed file into `_quarantine/`, records it in the checkpoint DB and returns the result."""
-    quarantine_dir = os.path.join(base_source_dir, "_quarantine")
-    os.makedirs(quarantine_dir, exist_ok=True)
-    quarantine_file_dest = os.path.join(quarantine_dir, f"{os.path.basename(file_path)}.{int(time.time())}.bad")
-    try:
-        shutil.move(file_path, quarantine_file_dest)
-        logger.warning(f"Quarantined corrupt file '{file_path}' -> '{quarantine_file_dest}': {err}")
-    except Exception as q_err:
-        logger.error(f"Failed to move file to quarantine: {q_err}")
+                     elapsed_ms, now_iso, err, remote=None, pipeline=None) -> Dict[str, Any]:
+    """Moves a malformed file (or copies an S3 object) into `_quarantine/`, records it in the checkpoint DB and returns the result."""
+    if remote is not None:
+        autoloader_s3.quarantine(pipeline, remote)
+    else:
+        quarantine_dir = os.path.join(base_source_dir, "_quarantine")
+        os.makedirs(quarantine_dir, exist_ok=True)
+        quarantine_file_dest = os.path.join(quarantine_dir, f"{os.path.basename(file_path)}.{int(time.time())}.bad")
+        try:
+            shutil.move(file_path, quarantine_file_dest)
+            logger.warning(f"Quarantined corrupt file '{file_path}' -> '{quarantine_file_dest}': {err}")
+        except Exception as q_err:
+            logger.error(f"Failed to move file to quarantine: {q_err}")
 
     db = get_db()
     db.execute("""
@@ -555,6 +586,8 @@ def _remove_pipeline_lineage(pipeline: Dict[str, Any]):
 
 def _volume_lineage_id(source_volume_path: str) -> str:
     """Lineage node id for the volume behind a pipeline (`volume:/Volumes/cat/schema/vol`)."""
+    if autoloader_s3.is_s3_path(source_volume_path):
+        return "volume:" + autoloader_s3.normalize_path(source_volume_path).rstrip("/")
     parts = [p for p in (source_volume_path or "").strip().replace("\\", "/").split("/") if p]
     if parts and parts[0].lower() == "volumes":
         parts = parts[1:]
@@ -571,10 +604,14 @@ def sync_pipeline_lineage(pipeline: Dict[str, Any], last_file: Optional[str] = N
         from web.lineage import upsert_node, upsert_edge, make_table_id
         vol_id = _volume_lineage_id(pipeline["source_volume_path"])
         vol_path = vol_id[len("volume:"):]
-        vol_parts = vol_path.split("/")  # ['', 'Volumes', catalog, schema, volume]
-        vol_catalog = vol_parts[2] if len(vol_parts) > 2 else "warehouse"
-        vol_schema = vol_parts[3] if len(vol_parts) > 3 else "dbo"
-        vol_name = vol_parts[-1] or vol_path
+        if autoloader_s3.is_s3_path(vol_path):
+            bucket, _prefix = autoloader_s3.parse_s3_path(vol_path)
+            vol_catalog, vol_schema, vol_name = "s3", bucket, vol_path[len("s3://"):]
+        else:
+            vol_parts = vol_path.split("/")  # ['', 'Volumes', catalog, schema, volume]
+            vol_catalog = vol_parts[2] if len(vol_parts) > 2 else "warehouse"
+            vol_schema = vol_parts[3] if len(vol_parts) > 3 else "dbo"
+            vol_name = vol_parts[-1] or vol_path
         table_id = make_table_id(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
 
         # layer RAW_FILE + type VOLUME puts the node in the "Raw Files / Ingestion" column of the lineage graph
@@ -598,17 +635,23 @@ def purge_legacy_lineage_nodes():
         logger.debug(f"Legacy lineage purge skipped: {err}")
 
 
-def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_dir: str) -> Dict[str, Any]:
+def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_dir: str,
+                        remote: Optional["autoloader_s3.RemoteObject"] = None,
+                        s3_conn: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Ingests a single file into the pipeline's target Delta Lake table.
+    Ingests a single file (or, with `remote`, one S3 object read in place) into the pipeline's target Delta Lake table.
     Enforces schema evolution and moves corrupt files into _quarantine.
     """
     start_time = time.perf_counter()
     pipeline_id = pipeline["id"]
-    stat = os.stat(file_path)
-    file_size = stat.st_size
-    file_hash = compute_file_fingerprint(file_path)
-    rel_path = os.path.relpath(file_path, base_source_dir).replace("\\", "/")
+    if remote is not None:
+        file_size, file_hash, rel_path = remote.size, autoloader_s3.fingerprint(remote), remote.rel_key
+        file_path = remote.url
+    else:
+        stat = os.stat(file_path)
+        file_size = stat.st_size
+        file_hash = compute_file_fingerprint(file_path)
+        rel_path = os.path.relpath(file_path, base_source_dir).replace("\\", "/")
 
     _, ext = os.path.splitext(file_path)
     ext_lower = ext.lower().lstrip(".")
@@ -628,6 +671,8 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
     duck_conn = duckdb.connect(":memory:")
     read_state = {"opened": False, "error": None, "rows": 0}
     try:
+        if remote is not None:
+            autoloader_s3.configure_duckdb(duck_conn, s3_conn)
         reader = _open_source_reader(duck_conn, file_path, ext_lower)
         read_state["opened"] = True
 
@@ -727,10 +772,14 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
 
     except Exception as write_err:
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        if not read_state["opened"] or read_state["error"] is not None:
+        source_err = read_state["error"] or write_err
+        remote_io = remote is not None and _looks_like_remote_io_error(source_err)
+        if (not read_state["opened"] or read_state["error"] is not None) and not remote_io:
             # The source itself is unreadable/corrupt (not a Delta problem): quarantine it and keep going.
+            # (An S3 access / network / endpoint problem is not the object's fault: it is FAILED and retried instead.)
             return _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash,
-                                    file_size, elapsed_ms, now_iso, read_state["error"] or write_err)
+                                    file_size, elapsed_ms, now_iso, read_state["error"] or write_err,
+                                    remote=remote, pipeline=pipeline)
         db = get_db()
         db.execute("""
             INSERT OR REPLACE INTO autoloader_file_history (
@@ -775,6 +824,60 @@ def run_pipeline_cycle(pipeline_id: str) -> Dict[str, Any]:
         lock.release()
 
 
+def _run_s3_cycle(pipe: Dict[str, Any]) -> Dict[str, Any]:
+    """One polling cycle over an S3 prefix: list, skip checkpointed objects, stream each new one into Delta."""
+    pipeline_id = pipe["id"]
+    now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    db = get_db()
+    db.execute("UPDATE autoloader_pipelines SET status = 'RUNNING', last_run_at = ? WHERE id = ?", (now_iso, pipeline_id))
+    # A QUARANTINED object may still be in the bucket (the credentials could not delete it): never retry it.
+    known_rows = db.execute("SELECT file_hash FROM autoloader_file_history WHERE pipeline_id = ? AND status IN ('SUCCESS', 'QUARANTINED')",
+                            (pipeline_id,)).fetchall()
+    known_hashes = {r[0] for r in known_rows}
+    db.commit()
+    db.close()
+
+    def finish(status: str, error: Optional[str] = None, clear_error: bool = False):
+        d = get_db()
+        if error is not None or clear_error:
+            d.execute("UPDATE autoloader_pipelines SET status = ?, last_error = ? WHERE id = ?", (status, error, pipeline_id))
+        else:
+            d.execute("UPDATE autoloader_pipelines SET status = ? WHERE id = ?", (status, pipeline_id))
+        d.commit()
+        d.close()
+
+    try:
+        conn = autoloader_s3.resolve_connection(pipe)
+        client = autoloader_s3.make_client(conn)
+        objects = autoloader_s3.list_objects(pipe, client)
+    except autoloader_s3.S3SourceError as exc:
+        logger.error(f"Auto-Loader pipeline {pipeline_id}: {exc}")
+        finish("ERROR", str(exc))
+        return {"error": str(exc), "pipeline_id": pipeline_id, "files_found": 0, "files_ingested": 0, "rows_ingested": 0}
+
+    files_ingested = total_rows = files_quarantined = 0
+    results = []
+    for obj in objects:
+        try:
+            if autoloader_s3.fingerprint(obj) in known_hashes:
+                continue
+            res = process_single_file(pipe, obj.url, "", remote=obj, s3_conn=conn)
+            results.append(res)
+            if res["status"] == "SUCCESS":
+                files_ingested += 1
+                total_rows += res.get("rows", 0)
+                known_hashes.add(autoloader_s3.fingerprint(obj))
+            elif res["status"] == "QUARANTINED":
+                files_quarantined += 1
+        except Exception as exc:
+            logger.error(f"Unexpected error processing '{obj.url}': {exc}")
+
+    failed = any(r["status"] == "FAILED" for r in results)
+    finish("ERROR" if failed else ("IDLE" if pipe.get("enabled", 1) else "PAUSED"), clear_error=not failed)
+    return {"pipeline_id": pipeline_id, "name": pipe["name"], "files_found": len(objects), "files_ingested": files_ingested,
+            "files_quarantined": files_quarantined, "rows_ingested": total_rows, "details": results}
+
+
 def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
     """
     Scans the watched volume directory for new uningested files and loads them.
@@ -782,6 +885,8 @@ def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
     pipe = get_pipeline(pipeline_id)
     if not pipe:
         return {"error": "Pipeline not found"}
+    if autoloader_s3.is_s3_path(pipe["source_volume_path"]):
+        return _run_s3_cycle(pipe)
 
     try:
         source_dir = resolve_volume_posix_path(pipe["source_volume_path"])
