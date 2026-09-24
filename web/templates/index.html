@@ -2076,7 +2076,9 @@
                     <div class="text-purple-600 dark:text-purple-400 truncate font-medium">
                       <span x-text="p.file_pattern"></span>
                       <span class="text-slate-400"> • </span>
-                      <span x-text="p.cron_schedule ? ('cron ' + p.cron_schedule + ' UTC') : (p.poll_interval_seconds + 's interval')"></span>
+                      <span x-show="p.watch && p.watch.mode === 'watching'" class="text-emerald-500" :title="'inotify: ' + p.watch.directories + ' folder(s), ' + p.watch.events + ' event(s) seen; rescan every ' + p.watch.sweep_seconds + 's'"><i class="ph ph-eye"></i> watching</span>
+                      <span x-show="p.watch && p.watch.mode === 'fallback'" class="text-amber-500" :title="p.watch.detail"><i class="ph ph-warning"></i> watch unavailable, polling <span x-text="p.poll_interval_seconds + 's'"></span></span>
+                      <span x-show="!p.watch_enabled" x-text="p.cron_schedule ? ('cron ' + p.cron_schedule + ' UTC') : (p.poll_interval_seconds + 's interval')"></span>
                     </div>
                   </div>
                 </div>
@@ -11045,9 +11047,21 @@
               <option value="10">Standard (10 seconds)</option>
               <option value="30">30 seconds</option>
               <option value="60">1 minute</option>
+              <option value="watch">File events (instant, watches the folder)</option>
               <option value="cron">Scheduled (Cron, UTC)</option>
             </select>
           </div>
+        </div>
+
+        <div x-show="newPipelineForm.poll_interval_seconds === 'watch'" class="space-y-1.5">
+          <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Safety-net rescan</label>
+          <select x-model="newPipelineForm.watch_sweep_seconds" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-medium focus:outline-none focus:border-dbx-orange">
+            <option value="60">Every minute</option>
+            <option value="300">Every 5 minutes</option>
+            <option value="900">Every 15 minutes</option>
+            <option value="3600">Every hour</option>
+          </select>
+          <p class="text-[10px] text-slate-500">The pipeline starts the moment a file is fully written or renamed into the folder (a half-written file is never loaded). The rescan only catches what events can miss, such as network filesystems. Without Linux inotify it falls back to polling automatically.</p>
         </div>
 
         <div x-show="newPipelineForm.poll_interval_seconds === 'cron'" class="space-y-1.5">
@@ -16439,6 +16453,7 @@
           schema_evolution: 'addNewColumns',
           poll_interval_seconds: 10,
           cron_schedule: '',
+          watch_sweep_seconds: 300,
           enabled: true
         },
         pipelineHistoryModalOpen: false,
@@ -25181,8 +25196,10 @@
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(this.newPipelineForm.poll_interval_seconds === 'cron'
-                ? { ...this.newPipelineForm, poll_interval_seconds: 10 }
-                : { ...this.newPipelineForm, cron_schedule: '' })
+                ? { ...this.newPipelineForm, poll_interval_seconds: 10, watch_enabled: false }
+                : this.newPipelineForm.poll_interval_seconds === 'watch'
+                  ? { ...this.newPipelineForm, poll_interval_seconds: 10, cron_schedule: '', watch_enabled: true, watch_sweep_seconds: Number(this.newPipelineForm.watch_sweep_seconds) }
+                  : { ...this.newPipelineForm, cron_schedule: '', watch_enabled: false })
             });
             const data = await res.json();
             if (res.ok) {

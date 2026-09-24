@@ -891,7 +891,7 @@ WHERE trip_distance > 0 AND total_amount > 0</code></pre>
           <li><strong>Write modes:</strong> append or merge on one or more keys (key values are escaped, so odd column names are safe).</li>
           <li><strong>Rescued data:</strong> values that do not fit the schema land in a rescued-data column instead of failing the run.</li>
           <li><strong>Streaming-style batches:</strong> large loads are processed in batches (<code>AUTOLOADER_BATCH_ROWS</code>) with per-run history.</li>
-          <li><strong>Scheduling:</strong> run on demand or on a cron schedule.</li>
+          <li><strong>Triggers:</strong> a poll interval (5 s and up), a cron schedule, on demand, or <strong>File events</strong>: the pipeline starts as soon as a file is completely written or renamed into the folder (Linux inotify; typically about a second). A file that is still being written is never loaded; hidden, <code>.tmp</code>, <code>.part</code> and non-matching files are ignored, and a burst of files becomes a few runs. A low-frequency <em>safety-net rescan</em> (default every 5 minutes) still runs, because filesystem events can be missed on network drives or while the studio is down, and a catch-up run starts whenever watching starts. If inotify is unavailable the card shows <em>watch unavailable</em> and the pipeline keeps polling. File events and a cron schedule are alternatives.</li>
           <li><strong>Lineage:</strong> the source Volume appears as a node in the lineage graph.</li>
           <li><strong>Governance:</strong> ingestion runs as the pipeline owner, and tags propagate to the target table.</li>
         </ul>

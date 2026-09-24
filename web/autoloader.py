@@ -8,6 +8,7 @@ import hashlib
 import shutil
 import logging
 import asyncio
+import threading
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -84,6 +85,12 @@ def init_autoloader_db():
     existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(autoloader_pipelines)").fetchall()}
     if "cron_schedule" not in existing_cols:
         cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN cron_schedule TEXT")
+    # File-watch triggering (web/autoloader_watch.py): woken by filesystem events instead of a timer; the sweep is the
+    # low-frequency safety-net rescan that still runs because events can be missed.
+    if "watch_enabled" not in existing_cols:
+        cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN watch_enabled INTEGER DEFAULT 0")
+    if "watch_sweep_seconds" not in existing_cols:
+        cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN watch_sweep_seconds INTEGER DEFAULT 300")
 
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_file_history_pipeline ON autoloader_file_history(pipeline_id);
@@ -115,7 +122,7 @@ def list_pipelines() -> List[Dict[str, Any]]:
     conn = get_db()
     rows = conn.execute("SELECT * FROM autoloader_pipelines ORDER BY created_at DESC").fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [_with_watch_status(dict(r)) for r in rows]
 
 
 def get_pipeline(pipeline_id: str) -> Optional[Dict[str, Any]]:
@@ -124,7 +131,47 @@ def get_pipeline(pipeline_id: str) -> Optional[Dict[str, Any]]:
     conn = get_db()
     row = conn.execute("SELECT * FROM autoloader_pipelines WHERE id = ?", (pipeline_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _with_watch_status(dict(row)) if row else None
+
+
+_watch_manager = None
+_watch_manager_lock = threading.Lock()
+
+
+def get_watch_manager():
+    """The process-wide file-watch manager (created on first use)."""
+    global _watch_manager
+    with _watch_manager_lock:
+        if _watch_manager is None:
+            from web.autoloader_watch import WatchManager
+            _watch_manager = WatchManager(run_pipeline_cycle, resolve_volume_posix_path)
+        return _watch_manager
+
+
+def _with_watch_status(pipe: Dict[str, Any]) -> Dict[str, Any]:
+    pipe["watch_enabled"] = bool(pipe.get("watch_enabled"))
+    if _watch_manager is not None or pipe["watch_enabled"]:
+        try:
+            pipe["watch"] = get_watch_manager().status(pipe)
+        except Exception as exc:
+            pipe["watch"] = {"mode": "fallback", "detail": str(exc)}
+    else:
+        pipe["watch"] = {"mode": "off"}
+    return pipe
+
+
+def sync_watchers():
+    """Reconcile inotify watchers with the pipeline table (called after any pipeline change and by the daemon)."""
+    try:
+        init_autoloader_db()
+        conn = get_db()
+        rows = [dict(r) for r in conn.execute("SELECT * FROM autoloader_pipelines").fetchall()]
+        conn.close()
+        if _watch_manager is None and not any(r.get("watch_enabled") for r in rows):
+            return
+        get_watch_manager().sync(rows)
+    except Exception as exc:
+        logger.warning(f"Could not sync Auto-Loader file watchers: {exc}")
 
 
 def normalize_cron(expr: Optional[str]) -> Optional[str]:
@@ -157,6 +204,15 @@ def _validate_pipeline_mode(ingest_mode: str, merge_keys: str):
         raise ValueError("Merge mode requires at least one merge key (comma-separated column names).")
 
 
+def _normalize_sweep(value) -> int:
+    """Safety-net rescan interval (seconds) for file-watch pipelines; never below 30 s."""
+    from web.autoloader_watch import DEFAULT_SWEEP_SECONDS, MIN_SWEEP_SECONDS
+    try:
+        return max(MIN_SWEEP_SECONDS, int(value)) if value not in (None, "") else DEFAULT_SWEEP_SECONDS
+    except (TypeError, ValueError):
+        raise ValueError("watch_sweep_seconds must be a number of seconds.")
+
+
 def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str, Any]:
     """Creates a new Auto-Loader pipeline."""
     init_autoloader_db()
@@ -176,6 +232,10 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
 
     _validate_pipeline_mode(ingest_mode, merge_keys)
     cron_schedule = normalize_cron(data.get("cron_schedule"))
+    watch_enabled = 1 if data.get("watch_enabled") else 0
+    watch_sweep = _normalize_sweep(data.get("watch_sweep_seconds"))
+    if watch_enabled and cron_schedule:
+        raise ValueError("File watching and a cron schedule are alternatives; choose one trigger.")
     if not source_vol:
         raise ValueError("Source volume path is required (e.g. /Volumes/warehouse/raw/iot_stream).")
     if not target_tbl:
@@ -189,18 +249,20 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
             id, name, description, source_volume_path, file_pattern,
             target_catalog, target_schema, target_table, ingest_mode,
             merge_keys, schema_evolution, poll_interval_seconds, enabled,
-            status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested, cron_schedule
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?)
+            status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested, cron_schedule,
+            watch_enabled, watch_sweep_seconds
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?, ?, ?)
     """, (
         pipeline_id, name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        created_by, now_iso, cron_schedule
+        created_by, now_iso, cron_schedule, watch_enabled, watch_sweep
     ))
     conn.commit()
     conn.close()
 
     logger.info(f"Created Auto-Loader pipeline '{name}' ({pipeline_id}): {source_vol} -> {target_cat}.{target_sch}.{target_tbl}")
+    sync_watchers()
     created = get_pipeline(pipeline_id)
     sync_pipeline_lineage(created)
     return created
@@ -227,6 +289,12 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     ingest_mode = (ingest_mode or "append").strip().lower()
     _validate_pipeline_mode(ingest_mode, merge_keys)
     cron_schedule = normalize_cron(data["cron_schedule"]) if "cron_schedule" in data else pipe.get("cron_schedule")
+    watch_enabled = (1 if data["watch_enabled"] else 0) if "watch_enabled" in data else (1 if pipe.get("watch_enabled") else 0)
+    watch_sweep = _normalize_sweep(data.get("watch_sweep_seconds", pipe.get("watch_sweep_seconds")))
+    if "cron_schedule" in data and cron_schedule and "watch_enabled" not in data:
+        watch_enabled = 0                    # choosing a schedule switches file watching off (they are alternatives)
+    if watch_enabled and cron_schedule:
+        raise ValueError("File watching and a cron schedule are alternatives; choose one trigger.")
 
     conn = get_db()
     conn.execute("""
@@ -234,17 +302,18 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
             name = ?, description = ?, source_volume_path = ?, file_pattern = ?,
             target_catalog = ?, target_schema = ?, target_table = ?, ingest_mode = ?,
             merge_keys = ?, schema_evolution = ?, poll_interval_seconds = ?, enabled = ?,
-            cron_schedule = ?
+            cron_schedule = ?, watch_enabled = ?, watch_sweep_seconds = ?
         WHERE id = ?
     """, (
         name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
-        cron_schedule, pipeline_id
+        cron_schedule, watch_enabled, watch_sweep, pipeline_id
     ))
     conn.commit()
     conn.close()
 
+    sync_watchers()
     updated = get_pipeline(pipeline_id)
     sync_pipeline_lineage(updated)
     return updated
@@ -261,6 +330,7 @@ def delete_pipeline(pipeline_id: str) -> bool:
     rows_deleted = cur.rowcount
     conn.commit()
     conn.close()
+    sync_watchers()
     return rows_deleted > 0
 
 
@@ -684,9 +754,29 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
         duck_conn.close()
 
 
+_cycle_locks: Dict[str, threading.Lock] = {}
+_cycle_locks_guard = threading.Lock()
+
+
 def run_pipeline_cycle(pipeline_id: str) -> Dict[str, Any]:
     """
-    Executes one ingestion cycle for a pipeline.
+    Executes one ingestion cycle for a pipeline (a poll tick, a cron tick, a file event or "Run now"). A pipeline never
+    runs two cycles at once: a second trigger while one is running returns {"skipped": ...} immediately, and the file
+    watcher re-arms itself so a file that landed mid-scan is picked up by the next cycle.
+    """
+    with _cycle_locks_guard:
+        lock = _cycle_locks.setdefault(pipeline_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return {"pipeline_id": pipeline_id, "skipped": "a cycle is already running", "files_found": 0, "files_ingested": 0,
+                "files_quarantined": 0, "rows_ingested": 0, "details": []}
+    try:
+        return _run_pipeline_cycle_impl(pipeline_id)
+    finally:
+        lock.release()
+
+
+def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
+    """
     Scans the watched volume directory for new uningested files and loads them.
     """
     pipe = get_pipeline(pipeline_id)
@@ -783,6 +873,7 @@ async def autoloader_daemon_loop():
 
     while True:
         try:
+            await asyncio.to_thread(sync_watchers)
             pipelines = list_pipelines()
             now = time.time()
 
@@ -792,7 +883,12 @@ async def autoloader_daemon_loop():
                     continue
 
                 cron_expr = p.get("cron_schedule")
-                if cron_expr:
+                if p.get("watch_enabled") and not cron_expr and get_watch_manager().is_watching(p_id):
+                    # Events start cycles; this is only the low-frequency safety-net rescan (missed events, hard links,
+                    # filesystems that emit none).
+                    from web.autoloader_watch import sweep_seconds
+                    due = (now - last_run_map.setdefault(p_id, now)) >= sweep_seconds(p)
+                elif cron_expr:
                     # Scheduled pipelines run when a cron tick (UTC) has elapsed since the last run in the DB.
                     try:
                         due = cron_is_due(cron_expr, p.get("last_run_at") or p.get("created_at"), datetime.utcnow())
