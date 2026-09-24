@@ -397,8 +397,24 @@ class CatalogPermissionRequest(BaseModel):
 @app.post("/api/auth/login")
 async def login_endpoint(payload: LoginRequest):
     u = get_user_by_username(payload.username, include_password_hash=True)
-    if not u or not verify_password(payload.password, u["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    source = (u.get("auth_source") or "local") if u else None
+    if u and source != "ldap":
+        # Every account except an LDAP-provisioned one authenticates against its own stored hash (unchanged from
+        # before LDAP support existed). LDAP accounts never have a usable hash by design (see
+        # auth.upsert_external_user), so they always fall to the branch below instead.
+        if not verify_password(payload.password, u["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+    else:
+        # No local account at all, or one already provisioned from LDAP: the only way in is a fresh directory
+        # bind-as-user, so credential changes and account locks in LDAP take effect immediately rather than being
+        # cached here. See ldap_auth._LOCAL_ACCOUNT_CONFLICT for why an existing *local* username is never reached
+        # by this branch's auto-provisioning path.
+        from web import ldap_auth
+        ldap_user, reason = ldap_auth.authenticate(payload.username, payload.password)
+        if ldap_user is None:
+            logger.info(f"LDAP login failed for '{payload.username}': {reason}")
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        u = ldap_user
     if u.get("is_active", 1) != 1:
         raise HTTPException(status_code=403, detail="Account is deactivated. Contact an administrator.")
 
@@ -694,6 +710,27 @@ async def test_ldap_endpoint(
     """Tests LDAP server connectivity and TLS handshake."""
     result = auth_frameworks.test_ldap_connection(payload)
     return result
+
+
+@app.post("/api/auth/frameworks/ldap/test-bind")
+async def test_ldap_bind_endpoint(
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(require_role(["admin"]))
+):
+    """Beyond TCP/TLS: binds as the configured service account and runs one bounded search."""
+    from web import ldap_auth
+    # A masked bind_password ("••••••••") from the settings form means "unchanged": use what's saved.
+    cfg = dict(payload)
+    if cfg.get("bind_password") == "••••••••":
+        cfg["bind_password"] = auth_frameworks.load_raw_config().get("ldap", {}).get("bind_password", "")
+    return ldap_auth.test_bind_and_search(cfg)
+
+
+@app.post("/api/auth/frameworks/ldap/sync")
+async def sync_ldap_users_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Re-resolves every LDAP-provisioned account's role and active status against the directory now."""
+    from web import ldap_auth
+    return ldap_auth.sync_all()
 
 
 @app.post("/api/auth/frameworks/oidc/test")

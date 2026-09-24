@@ -5,9 +5,10 @@ Glue between the application and the enforcement engine: one small API every dat
     govern_sql(sql, user, ...)          rewrite + audit; returns a RewriteResult
     governed_sql_or_raise(sql, user)    the SQL to run, or raises GovernanceBlocked
     masked_columns_payload(result)      what the UI shows next to a result
-    fingerprint(result)                 cache-key component: results are only shareable between equal mask sets
-    mask_arrow(table, catalog, ...)     masks an Arrow table that Python code already holds (version diffs, previews)
-    deny_if_subject(user, what)         for features that cannot be masked (they are refused for masked principals)
+    row_filter_payload(result)          which tables had row filters applied, for the same banner
+    fingerprint(result)                 cache-key component: results are only shareable between equal mask/filter sets
+    mask_arrow(table, catalog, ...)     masks + row-filters an Arrow table Python code already holds (version diffs, previews)
+    deny_if_subject(user, what)         for features that cannot be masked or row-filtered (refused for governed principals)
 """
 
 import hashlib
@@ -16,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 import pyarrow as pa
 
-from web.governance import enforce, policies, tags
+from web.governance import enforce, policies, row_filters, tags
 from web.governance.enforce import GovernanceBlocked, RewriteResult
 from web.governance.policies import Principal
 
@@ -116,27 +117,42 @@ def masked_columns_payload(result: RewriteResult) -> List[Dict[str, str]]:
     return out
 
 
+def row_filter_payload(result: RewriteResult) -> List[Dict[str, str]]:
+    """Which tables had a row filter applied, for the same UI banner masked_columns_payload feeds."""
+    seen, out = set(), []
+    for r in result.row_filtered:
+        if r.table not in seen:
+            seen.add(r.table)
+            out.append({"table": r.table, "column": r.filter_column, "policy": r.policy_name})
+    return out
+
+
 def fingerprint(result: RewriteResult) -> str:
-    """Stable id of the set of masks a result was computed under; part of every result-cache key."""
-    if not result.masked:
+    """Stable id of the masks and row filters a result was computed under; part of every result-cache key."""
+    if not result.masked and not result.row_filtered:
         return ""
     parts = sorted(f"{m.table}.{m.column}:{m.policy_id}:{m.mask_type}" for m in result.masked)
+    # predicate_digest, not the policy id alone: two users under the same policy can resolve to different predicates
+    # (different username, different assigned attribute values), and must never share a cached result.
+    parts += sorted(f"{r.table}:{r.policy_id}:{r.predicate_digest}" for r in result.row_filtered)
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
 def is_subject(user) -> bool:
-    """True when at least one masking policy applies to this user (and tagged data exists)."""
+    """True when at least one masking or row filter policy applies to this user (and tagged data exists)."""
     principal = user if isinstance(user, Principal) else principal_for(user)
     if principal.is_system or not tags.has_any_tags():
         return False
-    return any(not policies.is_exempt(p, principal) for p in policies.enabled_policies())
+    if any(not policies.is_exempt(p, principal) for p in policies.enabled_policies()):
+        return True
+    return any(not policies.is_exempt(p, principal) for p in row_filters.enabled_row_policies())
 
 
 def deny_if_subject(user, what: str) -> None:
-    """Refuses features that read data outside the governed catalogs (they cannot be masked)."""
+    """Refuses features that read data outside the governed catalogs (they cannot be masked or row-filtered)."""
     if is_subject(user):
-        raise GovernanceBlocked(f"{what} is not available while masking policies apply to you, because it reads data "
-                                "that cannot be masked. Use the SQL editor instead.")
+        raise GovernanceBlocked(f"{what} is not available while governance policies apply to you, because it reads "
+                                "data that cannot be masked or row-filtered. Use the SQL editor instead.")
 
 
 _provisioned: "weakref.WeakSet" = None
@@ -175,7 +191,10 @@ def _tester():
 
 
 def mask_arrow(table: pa.Table, catalog: str, schema_name: str, table_name: str, user) -> pa.Table:
-    """Applies the masks that `user` is subject to for (catalog.schema.table) to an Arrow table Python code already holds."""
+    """
+    Applies the masks and row filters that `user` is subject to for (catalog.schema.table) to an Arrow table Python
+    code already holds (there is no SQL to rewrite here, so this runs the same specs directly against the table).
+    """
     principal = user if isinstance(user, Principal) else principal_for(user)
     if principal.is_system or not tags.has_any_tags() or table.num_columns == 0:
         return table
@@ -185,10 +204,14 @@ def mask_arrow(table: pa.Table, catalog: str, schema_name: str, table_name: str,
         described = cur.execute("DESCRIBE SELECT * FROM __gov_in").fetchall()
         columns = [{"column": r[0], "type": r[1]} for r in described]
         specs = policies.masks_for_table(catalog, schema_name, table_name, columns, principal)
-        if not specs:
+        row_specs = row_filters.filters_for_table(catalog, schema_name, table_name, columns, principal)
+        if not specs and not row_specs:
             return table
         replace = ", ".join(f'{s.expression} AS "{s.column}"' for s in specs)
-        return cur.execute(f"SELECT * REPLACE ({replace}) FROM __gov_in").arrow().read_all()
+        select = f"SELECT * REPLACE ({replace})" if specs else "SELECT *"
+        where = " AND ".join(f"({p.predicate})" for p in row_specs)
+        sql = select + " FROM __gov_in" + (f" WHERE {where}" if where else "")
+        return cur.execute(sql).arrow().read_all()
     finally:
         try:
             cur.unregister("__gov_in")

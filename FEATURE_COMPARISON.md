@@ -63,7 +63,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Interactive File Explorer for Volumes**| ⚠️ Basic | ⚠️ Snowsight Stage UI | ✅ **Full File Tree + Presigned Upload/Download** | 🏆 **Data Kiln Works** |
 | **Interactive Data Lineage** | ✅ System Lineage Table | ✅ Object Dependencies | ✅ **Interactive 22-node visual graph + Column Lineage** | 🏆 **Data Kiln Works** |
 | **Catalog-Scoped Lineage Filtering** | ✅ Yes | ⚠️ Global only | ✅ **Yes (`allowed_catalogs` RBAC scoping)** | ✅ Tie |
-| **Row-Level Security (RLS)** | ✅ Row Filters | ✅ Row Access Policies | ❌ **Not implemented** (catalog-level ACLs only). The governance gateway already resolves every table scan, so a row filter is a planned extension | 🏆 **Databricks / Snowflake** |
+| **Row-Level Security (RLS)** | ✅ Row Filters | ✅ Row Access Policies | ✅ **Tag-driven row filter policies (owner/attribute/custom modes), enforced by the same query-rewrite gateway as column masking, combined with `AND` when several apply** | ✅ Tie |
 | **Dynamic Column Masking** | ✅ Column Masking | ✅ Dynamic Masking | ✅ **Tag-driven masking evaluated at query time (redact, hash, partial, email, null, generalize, custom)** | ✅ Tie |
 | **Data Retention & Time Travel** | ✅ `TIMESTAMP / VERSION AS OF` | ✅ Time Travel (up to 90d) | ✅ **Delta Time Travel (`VERSION AS OF` / `RESTORE`)** | ✅ Tie |
 | **Zero-Copy Cloning** | ✅ Shallow Clone | ✅ Zero-Copy Clone | ✅ **Delta Shallow Clone** | ✅ Tie |
@@ -244,7 +244,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **OAuth Providers Supported** | Major enterprise (Okta, Azure, Google) | Major enterprise | **8 Native Providers (Okta, Azure AD, Google, GitHub, GitLab, Auth0, Keycloak, Custom OIDC with PKCE)** | 🏆 **Data Kiln Works** |
 | **Multi-Factor Authentication (MFA)**| ✅ Duo / Cloud MFA | ✅ Duo Push / TOTP | ✅ **Native TOTP (Google/MS/Authy) + 10 Backup Codes** | 🏆 **Data Kiln Works** |
 | **MFA Configuration & Stats** | ⚠️ Admin console only | ⚠️ SQL commands | ✅ **Full GUI: Policy enforcement, grace period, reset, stats** | 🏆 **Data Kiln Works** |
-| **LDAP / Active Directory Sync** | ✅ SCIM / Enterprise only | ✅ SCIM / Enterprise only | ✅ **Built-in LDAP auth, connection test & user sync (All tiers)**| 🏆 **Data Kiln Works** |
+| **LDAP / Active Directory Sync** | ✅ SCIM / Enterprise only | ✅ SCIM / Enterprise only | ✅ **Real bind-as-user auth, group-to-role mapping, auto-provisioning, and a sync that deactivates accounts removed from the directory (all tiers)** | 🏆 **Data Kiln Works** |
 | **Multi-User Workspace Isolation**| ✅ Personal folders | ⚠️ Worksheets list | ✅ **Personal home directories (`Users/<username>/`) with 403 enforcement** | 🏆 **Databricks / Data Kiln** |
 | **Role-Based Access Control (RBAC)**| ✅ Full RBAC | ✅ Hierarchical RBAC | ✅ **Admin, Power User, User roles with UI & API enforcement** | ✅ Tie |
 | **Network Policies / IP Allowlists**| ✅ Yes | ✅ Yes | ⚠️ Kubernetes / Ingress level | 🏆 **Databricks / Snowflake** |
@@ -346,7 +346,7 @@ flowchart TD
 
 | Domain Category | Evaluated Categories | DataKilnWorks Studio | Real Databricks | Snowflake Data Cloud | Leader |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **1. Data Catalog & Governance** | 11 | **9 / 11** | 10 / 11 | 9 / 11 | 🏆 **Databricks / Data Kiln** |
+| **1. Data Catalog & Governance** | 11 | **10 / 11** | 10 / 11 | 9 / 11 | 🏆 **Databricks / Data Kiln** |
 | **2. Query Engine & Performance** | 10 | **8 / 10** | 7 / 10 | 7 / 10 | 🏆 **Data Kiln Works (Local) / Cloud (Scale)** |
 | **3. BI & Lakeview Visualization** | 11 | **11 / 11** | 6 / 11 | 6 / 11 | 🏆 **Data Kiln Works** |
 | **4. Developer IDE & PySpark** | 7 | **7 / 7** | 6 / 7 | 4 / 7 | 🏆 **Data Kiln Works** |
@@ -358,7 +358,7 @@ flowchart TD
 | **10. Compute Scaling & Infrastructure**| 8 | **7 / 8** | 7 / 8 | 6 / 8 | 🏆 **Data Kiln Works (Speed) / Cloud (Scale)**|
 | **11. Security & Authentication** | 9 | **8 / 9** | 8 / 9 | 8 / 9 | 🏆 **Data Kiln Works** |
 | **12. Alerting & Webhook Integrations**| 6 | **6 / 6** | 3 / 6 | 2 / 6 | 🏆 **Data Kiln Works** |
-| **TOTALS** | **98 Dimensions** | **94 / 98 (96%)** | **81 / 98 (83%)** | **67 / 98 (68%)** | 🏆 **Data Kiln Works: 1st in Local/On-Prem Lakehouse** |
+| **TOTALS** | **98 Dimensions** | **95 / 98 (97%)** | **81 / 98 (83%)** | **67 / 98 (68%)** | 🏆 **Data Kiln Works: 1st in Local/On-Prem Lakehouse** |
 
 ---
 
@@ -366,4 +366,4 @@ flowchart TD
 
 The updated 2026 re-evaluation confirms that **DataKilnWorks Studio has crossed the threshold from a dashboarding emulator to a true, self-contained Data Lakehouse and AI Operating System**. 
 
-For organizations running in private clouds, on-premises data centers, air-gapped environments, or engineers seeking an uncompromised local development sandbox, **DataKilnWorks Studio delivers 96% overall feature coverage of Databricks and Snowflake while maintaining a 100% cost and sovereignty advantage**.
+For organizations running in private clouds, on-premises data centers, air-gapped environments, or engineers seeking an uncompromised local development sandbox, **DataKilnWorks Studio delivers 97% overall feature coverage of Databricks and Snowflake while maintaining a 100% cost and sovereignty advantage**.

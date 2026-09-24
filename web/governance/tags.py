@@ -274,6 +274,23 @@ def get_index() -> Dict[str, Any]:
         return _index["data"]
 
 
+def effective_table_tags(catalog: str, schema_name: str, table_name: str) -> Dict[str, Dict[str, str]]:
+    """
+    {tag_key: {"value": v, "level": "catalog|schema|table"}} inherited at the table itself, with no column overlay.
+    What a table-level policy (a row filter) resolves against: masking's `effective_tags` layers column tags on top
+    of this same inheritance for a per-column result.
+    """
+    catalog, schema_name, table_name = norm(catalog), norm(schema_name), norm(table_name)
+    idx = get_index()
+    inherited: Dict[str, Dict[str, str]] = {}
+    for level, level_tags in (("catalog", idx["catalogs"].get(catalog, {})),
+                              ("schema", idx["schemas"].get((catalog, schema_name), {})),
+                              ("table", idx["tables"].get((catalog, schema_name, table_name), {}))):
+        for key, value in level_tags.items():
+            inherited[key] = {"value": value, "level": level}
+    return inherited
+
+
 def effective_tags(catalog: str, schema_name: str, table_name: str, columns: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
     """
     {column: {tag_key: {"value": v, "level": "column|table|schema|catalog"}}} for the given columns.
@@ -281,12 +298,7 @@ def effective_tags(catalog: str, schema_name: str, table_name: str, columns: Lis
     """
     catalog, schema_name, table_name = norm(catalog), norm(schema_name), norm(table_name)
     idx = get_index()
-    inherited: Dict[str, Dict[str, str]] = {}
-    for level, tags in (("catalog", idx["catalogs"].get(catalog, {})),
-                        ("schema", idx["schemas"].get((catalog, schema_name), {})),
-                        ("table", idx["tables"].get((catalog, schema_name, table_name), {}))):
-        for key, value in tags.items():
-            inherited[key] = {"value": value, "level": level}
+    inherited = effective_table_tags(catalog, schema_name, table_name)
     col_tags = idx["columns"].get((catalog, schema_name, table_name), {})
     out: Dict[str, Dict[str, Dict[str, str]]] = {}
     for col in columns:

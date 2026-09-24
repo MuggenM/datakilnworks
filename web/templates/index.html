@@ -1669,6 +1669,7 @@
         <div class="flex flex-wrap gap-2 text-xs font-medium">
           <button @click="govTab = 'tags'" :class="govTab === 'tags' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-tag"></i><span>Tags</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govTags.length"></span></button>
           <button x-show="currentUser?.role === 'admin'" @click="govTab = 'policies'" :class="govTab === 'policies' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-eye-slash"></i><span>Masking Policies</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govPolicies.length"></span></button>
+          <button x-show="currentUser?.role === 'admin'" @click="govTab = 'rowpolicies'; if (!govAttributes.length) fetchGovAttributes();" :class="govTab === 'rowpolicies' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-rows"></i><span>Row Filters</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govRowPolicies.length"></span></button>
           <button @click="govTab = 'suggestions'" :class="govTab === 'suggestions' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-magic-wand"></i><span>Suggestions</span></button>
           <button x-show="currentUser?.role === 'admin'" @click="govTab = 'preview'; if (!govUsers.length) fetchGovUsers();" :class="govTab === 'preview' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-user-focus"></i><span>Preview as user</span></button>
           <button x-show="currentUser?.role === 'admin'" @click="govTab = 'audit'; fetchGovAudit(); fetchGovCoverage();" :class="govTab === 'audit' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-list-checks"></i><span>Audit &amp; Coverage</span></button>
@@ -1745,6 +1746,65 @@
           </template>
         </div>
 
+        <!-- TAB: Row filter policies (row-level security) -->
+        <div x-show="govTab === 'rowpolicies' && currentUser?.role === 'admin'" class="space-y-5">
+          <div class="flex items-center justify-between">
+            <p class="text-xs text-slate-500 dark:text-slate-400">A row filter restricts which rows of every table carrying its tag are visible, for everyone except the exempt roles/users. Multiple applicable policies on one table combine: all must pass.</p>
+            <button @click="openGovRowPolicyModal(null)" class="px-3.5 py-1.5 rounded bg-dbx-orange hover:bg-dbx-orange/90 text-white text-xs font-semibold flex items-center space-x-1.5 shrink-0"><i class="ph ph-plus-circle"></i><span>New row filter</span></button>
+          </div>
+          <div x-show="govRowPolicies.length === 0" class="p-8 text-center text-xs text-slate-500 rounded-xl border border-dashed border-slate-300 dark:border-dbx-border">No row filter policies yet. Tag a table, then create one to restrict its rows.</div>
+          <template x-for="p in govRowPolicies" :key="p.id">
+            <div class="rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div class="space-y-1 min-w-0">
+                <div class="flex items-center space-x-2"><span class="text-sm font-semibold text-slate-900 dark:text-white" x-text="p.name"></span>
+                  <span class="text-[10px] px-1.5 py-0.5 rounded font-mono" :class="p.enabled ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300' : 'bg-slate-200 dark:bg-slate-800 text-slate-500'" x-text="p.enabled ? 'ENABLED' : 'DISABLED'"></span></div>
+                <div class="text-[11px] font-mono text-slate-600 dark:text-slate-400">
+                  <span>tables tagged </span><span class="text-emerald-700 dark:text-emerald-400" x-text="p.tag_key + (p.tag_value ? '=' + p.tag_value : '')"></span>
+                  <span> → keep rows where </span><span class="text-amber-700 dark:text-amber-300 font-semibold" x-text="p.filter_column"></span>
+                  <span x-text="p.filter_mode === 'owner' ? ' = the caller\'s username' : (p.filter_mode === 'attribute' ? (' is assigned to the caller for \'' + p.attribute_key + '\'') : ' matches: ' + p.filter_expr)"></span>
+                </div>
+                <div class="text-[11px] text-slate-500">Exempt: <span class="font-mono" x-text="[...(p.except_roles || []).map(r => 'role:' + r), ...(p.except_users || []).map(u => 'user:' + u)].join(', ') || 'nobody'"></span></div>
+              </div>
+              <div class="flex items-center space-x-1.5 text-xs shrink-0">
+                <button @click="toggleGovRowPolicy(p)" class="px-2.5 py-1 rounded border border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover" x-text="p.enabled ? 'Disable' : 'Enable'"></button>
+                <button @click="openGovRowPolicyModal(p)" class="px-2.5 py-1 rounded border border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover">Edit</button>
+                <button @click="deleteGovRowPolicy(p)" class="px-2.5 py-1 rounded border border-rose-300 dark:border-rose-900/60 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40"><i class="ph ph-trash"></i></button>
+              </div>
+            </div>
+          </template>
+
+          <div class="pt-2 border-t border-slate-200 dark:border-dbx-border space-y-3">
+            <div>
+              <div class="text-sm font-semibold text-slate-900 dark:text-white">User attributes</div>
+              <p class="text-xs text-slate-500 dark:text-slate-400">The membership table 'attribute' mode policies read: which values a user (or, as a default, a role) is assigned for a key. No assignment means no visible rows.</p>
+            </div>
+            <div class="flex flex-wrap items-end gap-2 text-xs">
+              <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Assign to</label>
+                <select x-model="govAttrForm.principal_type" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"><option value="user">a user</option><option value="role">a role (default)</option></select></div>
+              <div><label class="block text-[10px] uppercase text-slate-500 mb-1" x-text="govAttrForm.principal_type === 'role' ? 'Role' : 'Username'"></label>
+                <template x-if="govAttrForm.principal_type === 'role'"><select x-model="govAttrForm.principal_value" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"><option value="admin">admin</option><option value="power_user">power_user</option><option value="user">user</option></select></template>
+                <template x-if="govAttrForm.principal_type !== 'role'"><input x-model="govAttrForm.principal_value" placeholder="analyst_bob" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></template></div>
+              <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Attribute key</label><input x-model="govAttrForm.attribute_key" placeholder="region" class="w-28 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></div>
+              <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Values (comma separated)</label><input x-model="govAttrForm.values_text" placeholder="EMEA, APAC" class="w-40 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></div>
+              <button @click="saveGovAttribute()" class="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-semibold">Assign</button>
+            </div>
+            <div class="rounded-xl border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel overflow-hidden">
+              <table class="w-full text-left text-xs">
+                <thead class="bg-slate-100 dark:bg-slate-900 text-slate-500 uppercase text-[10px] tracking-wider"><tr><th class="py-2 px-3">Principal</th><th class="py-2 px-3">Attribute</th><th class="py-2 px-3">Values</th><th class="py-2 px-3 w-16"></th></tr></thead>
+                <tbody class="divide-y divide-slate-100 dark:divide-dbx-border/40 text-slate-700 dark:text-slate-300">
+                  <template x-for="a in govAttributes" :key="a.principal_type + ':' + a.principal_value + ':' + a.attribute_key">
+                    <tr><td class="py-1.5 px-3 font-mono" x-text="a.principal_type + ':' + a.principal_value"></td>
+                      <td class="py-1.5 px-3 font-mono text-emerald-700 dark:text-emerald-400" x-text="a.attribute_key"></td>
+                      <td class="py-1.5 px-3 font-mono" x-text="a.values.join(', ')"></td>
+                      <td class="py-1.5 px-3"><button @click="deleteGovAttribute(a)" class="text-rose-500 hover:text-rose-700"><i class="ph ph-trash"></i></button></td></tr>
+                  </template>
+                </tbody>
+              </table>
+              <div x-show="govAttributes.length === 0" class="p-6 text-center text-xs text-slate-500">No attribute assignments yet.</div>
+            </div>
+          </div>
+        </div>
+
         <!-- TAB: Suggestions -->
         <div x-show="govTab === 'suggestions'" class="space-y-3">
           <div class="flex flex-wrap items-center gap-2 text-xs">
@@ -1786,9 +1846,10 @@
             <div class="space-y-2 text-xs">
               <div class="p-3 rounded-lg border" :class="govPreviewResult.blocked ? 'border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/30 text-red-800 dark:text-red-200' : 'border-emerald-300 dark:border-emerald-800/60 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-200'">
                 <span x-show="!!(govPreviewResult.blocked)" x-text="'Blocked for ' + govPreviewResult.as_user + ': ' + govPreviewResult.blocked"></span>
-                <span x-show="!govPreviewResult.blocked" x-text="govPreviewResult.masked_columns.length ? (govPreviewResult.masked_columns.length + ' column(s) masked for ' + govPreviewResult.as_user) : ('Nothing is masked for ' + govPreviewResult.as_user + ' in this query')"></span>
+                <span x-show="!govPreviewResult.blocked" x-text="(govPreviewResult.masked_columns.length || govPreviewResult.row_filters_applied.length) ? [govPreviewResult.masked_columns.length ? (govPreviewResult.masked_columns.length + ' column(s) masked') : '', govPreviewResult.row_filters_applied.length ? (govPreviewResult.row_filters_applied.length + ' table(s) row-filtered') : ''].filter(Boolean).join(', ') + ' for ' + govPreviewResult.as_user : ('Nothing is masked or row-filtered for ' + govPreviewResult.as_user + ' in this query')"></span>
               </div>
               <div x-show="!!(govPreviewResult.masked_columns.length)" class="flex flex-wrap gap-1.5"><template x-for="m in govPreviewResult.masked_columns" :key="m.table + m.column"><span class="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-200 font-mono text-[11px]" x-text="m.table + '.' + m.column + ' → ' + m.mask + ' (' + m.policy + ')'"></span></template></div>
+              <div x-show="!!(govPreviewResult.row_filters_applied.length)" class="flex flex-wrap gap-1.5"><template x-for="rf in govPreviewResult.row_filters_applied" :key="rf.table"><span class="px-2 py-0.5 rounded bg-sky-100 dark:bg-sky-950/60 text-sky-800 dark:text-sky-200 font-mono text-[11px]" x-text="rf.table + ' rows kept where ' + rf.column + ' (' + rf.policy + ')'"></span></template></div>
               <div x-show="!!(govPreviewResult.rewritten_sql)"><div class="text-[10px] uppercase text-slate-500 mb-1">Rewritten SQL</div><pre class="p-3 rounded bg-slate-900 text-slate-200 font-mono text-[11px] whitespace-pre-wrap" x-text="govPreviewResult.rewritten_sql"></pre></div>
             </div>
           </template>
@@ -1801,11 +1862,14 @@
               <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Assignments by level</div><div class="font-mono mt-1" x-text="Object.entries(govCoverage.by_level).map(([k, v]) => k + ': ' + v).join('  ·  ') || 'none'"></div></div>
               <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Orphaned tags</div><div class="font-mono mt-1" :class="govCoverage.orphaned ? 'text-amber-600 dark:text-amber-400' : ''" x-text="govCoverage.orphaned"></div><button @click="reconcileGovTags()" class="mt-1 text-[11px] underline text-slate-500 hover:text-slate-800 dark:hover:text-white">Re-check against the catalog</button></div>
               <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Policies matching nothing</div><div class="font-mono mt-1" :class="govCoverage.policies_without_matches.length ? 'text-amber-600 dark:text-amber-400' : ''" x-text="govCoverage.policies_without_matches.join(', ') || 'none'"></div></div>
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Row filters matching nothing</div><div class="font-mono mt-1" :class="govCoverage.row_policies_without_matches.length ? 'text-amber-600 dark:text-amber-400' : ''" x-text="govCoverage.row_policies_without_matches.join(', ') || 'none'"></div></div>
+              <div class="p-3 rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel"><div class="text-[10px] uppercase text-slate-500">Row filters with a missing column somewhere</div><div class="font-mono mt-1" :class="govCoverage.row_policies_with_missing_column.length ? 'text-red-600 dark:text-red-400' : ''" x-text="govCoverage.row_policies_with_missing_column.join(', ') || 'none'"></div></div>
             </div>
           </template>
           <div class="flex items-center space-x-2 text-xs">
             <select x-model="govAuditFilter" @change="fetchGovAudit()" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white">
               <option value="">All events</option><option>MASK_APPLIED</option><option>EXEMPT_READ</option><option>QUERY_BLOCKED</option><option>TAG_SET</option><option>TAG_UNSET</option><option>POLICY_CREATE</option><option>POLICY_UPDATE</option><option>POLICY_DELETE</option>
+              <option>ROW_FILTER_APPLIED</option><option>ROW_FILTER_EXEMPT_READ</option><option>ROW_POLICY_CREATE</option><option>ROW_POLICY_UPDATE</option><option>ROW_POLICY_DELETE</option><option>ATTRIBUTE_SET</option><option>ATTRIBUTE_DELETE</option>
             </select>
             <span class="text-slate-500">Values and SQL text are never stored, only tables, columns and policy names.</span>
           </div>
@@ -10899,6 +10963,40 @@
     </div>
   </div>
 
+  <!-- Modal: create/edit a row filter policy -->
+  <div x-show="govRowPolicyModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="govRowPolicyModal = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-2xl max-h-[92vh] overflow-y-auto shadow-2xl p-6 space-y-4" @click.outside="govRowPolicyModal = false">
+      <div class="flex items-center justify-between border-b border-dbx-border pb-3">
+        <h3 class="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-rows text-amber-500"></i><span x-text="govRowPolicyForm.id ? 'Edit row filter policy' : 'New row filter policy'"></span></h3>
+        <button @click="govRowPolicyModal = false" class="text-slate-400 hover:text-white"><i class="ph ph-x"></i></button>
+      </div>
+      <div class="grid grid-cols-2 gap-3 text-xs">
+        <div class="col-span-2"><label class="block text-[10px] uppercase text-slate-500 mb-1">Name</label><input x-model="govRowPolicyForm.name" placeholder="Restrict rows by region" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white"></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Applies to tables tagged</label>
+          <select x-model="govRowPolicyForm.tag_key" @change="govRowPolicyForm.tag_value = ''" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"><option value="">Choose a tag…</option><template x-for="t in govTags" :key="t.tag_key"><option :value="t.tag_key" x-text="t.tag_key"></option></template></select></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Tag value (optional)</label>
+          <template x-if="rowPolicyTagValues.length"><select x-model="govRowPolicyForm.tag_value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"><option value="">Any value</option><template x-for="v in rowPolicyTagValues" :key="v"><option :value="v" x-text="v"></option></template></select></template>
+          <template x-if="!rowPolicyTagValues.length"><input x-model="govRowPolicyForm.tag_value" placeholder="any value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></template></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Column to filter on</label><input x-model="govRowPolicyForm.filter_column" placeholder="region" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Mode</label>
+          <select x-model="govRowPolicyForm.filter_mode" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white">
+            <option value="owner">owner (column = caller's username)</option><option value="attribute">attribute (caller's assigned values)</option><option value="custom">custom expression</option></select></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Priority</label><input type="number" x-model.number="govRowPolicyForm.priority" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+        <div x-show="govRowPolicyForm.filter_mode === 'attribute'"><label class="block text-[10px] uppercase text-slate-500 mb-1">Attribute key</label><input x-model="govRowPolicyForm.attribute_key" placeholder="region" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+        <div class="col-span-2" x-show="govRowPolicyForm.filter_mode === 'custom'"><label class="block text-[10px] uppercase text-slate-500 mb-1">Expression ({col} the filtered column, {user}/{role} the caller)</label>
+          <textarea x-model="govRowPolicyForm.filter_expr" @input.debounce.500ms="validateGovRowPolicyDraft()" rows="2" placeholder="{col} = {user} OR {role} = 'admin'" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></textarea>
+          <template x-if="govRowPolicyValidation && !govRowPolicyValidation.ok"><div class="mt-1 p-2 rounded bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300" x-text="govRowPolicyValidation.errors.join(' ')"></div></template></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt roles</label>
+          <div class="flex flex-wrap gap-3 text-slate-700 dark:text-slate-300"><template x-for="r in ['admin','power_user','user']" :key="r"><label class="flex items-center space-x-1"><input type="checkbox" :value="r" x-model="govRowPolicyForm.except_roles"><span x-text="r"></span></label></template></div></div>
+        <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt users (comma separated)</label><input x-model="govRowPolicyForm.except_users_text" placeholder="lead_engineer, martin" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-2 border-t border-dbx-border">
+        <button @click="govRowPolicyModal = false" class="px-3 py-1.5 text-xs rounded border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-200">Cancel</button>
+        <button @click="saveGovRowPolicy()" class="px-4 py-1.5 text-xs rounded bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold flex items-center space-x-1.5"><i class="ph ph-check"></i><span>Save row filter</span></button>
+      </div>
+    </div>
+  </div>
+
   <!-- Modal: Create Auto-Loader Pipeline -->
   <div x-show="showCreatePipelineModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showCreatePipelineModal = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-lg shadow-2xl p-6 space-y-4" @click.outside="showCreatePipelineModal = false">
@@ -14556,6 +14654,17 @@
               </div>
             </div>
 
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">User Search Base <span class="text-slate-400 normal-case">(optional, else Base Search DN)</span></label>
+                <input type="text" x-model="authConfig.ldap.user_search_base" placeholder="ou=Employees,dc=company,dc=internal" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:border-indigo-500">
+              </div>
+              <div>
+                <label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Group Search Base <span class="text-slate-400 normal-case">(optional, else Base Search DN)</span></label>
+                <input type="text" x-model="authConfig.ldap.group_search_base" placeholder="ou=Groups,dc=company,dc=internal" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:border-indigo-500">
+              </div>
+            </div>
+
             <!-- LDAP Role Mappings -->
             <div class="p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-dbx-border rounded-xl space-y-2">
               <span class="font-bold text-slate-800 dark:text-white block text-[11px] uppercase tracking-wider text-slate-500">Directory Group to Studio Role Mappings</span>
@@ -14580,17 +14689,33 @@
             </div>
 
             <!-- LDAP Test Connection Action & Feedback -->
-            <div class="flex items-center justify-between pt-1">
+            <div class="flex flex-wrap items-center gap-2 pt-1">
               <button type="button" @click="testLdapConnection()" :disabled="isTestingLdap"
                       class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
                 <i class="ph" :class="isTestingLdap ? 'ph-spinner animate-spin' : 'ph-plugs-connected'"></i>
-                <span>Test LDAP Connectivity</span>
+                <span>Test Connectivity</span>
+              </button>
+              <button type="button" @click="testLdapBind()" :disabled="isTestingLdapBind"
+                      title="Binds as the service account and runs a search, using the currently saved bind password if the field still shows dots"
+                      class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
+                <i class="ph" :class="isTestingLdapBind ? 'ph-spinner animate-spin' : 'ph-key'"></i>
+                <span>Test Bind &amp; Search</span>
+              </button>
+              <button type="button" @click="syncLdapUsers()" :disabled="isSyncingLdap"
+                      title="Re-checks every LDAP-provisioned user's role against the directory now, and deactivates any that were removed there"
+                      class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
+                <i class="ph" :class="isSyncingLdap ? 'ph-spinner animate-spin' : 'ph-arrows-clockwise'"></i>
+                <span>Sync LDAP Users Now</span>
               </button>
 
               <div x-show="ldapTestResult" class="text-xs flex items-center space-x-1.5 px-3 py-1 rounded-lg"
                    :class="ldapTestResult?.success ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800' : 'bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800'">
                 <i class="ph" :class="ldapTestResult?.success ? 'ph-check-circle' : 'ph-warning-circle'"></i>
                 <span x-text="ldapTestResult?.message"></span>
+              </div>
+              <div x-show="ldapSyncResult" class="text-xs flex items-center space-x-1.5 px-3 py-1 rounded-lg bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800">
+                <i class="ph ph-info"></i>
+                <span x-text="ldapSyncResult ? (ldapSyncResult.checked + ' checked, ' + ldapSyncResult.updated + ' updated, ' + ldapSyncResult.deactivated + ' deactivated' + (ldapSyncResult.errors.length ? (', ' + ldapSyncResult.errors.length + ' error(s)') : '')) : ''"></span>
               </div>
             </div>
           </div>
@@ -16106,6 +16231,14 @@
         govPolicyForm: { id: null, name: '', description: '', tag_key: '', tag_value: '', mask_type: 'partial', mask_expr: '', applies_to_types: [], except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true },
         govPolicyValidation: null,
         govPolicyTest: { data_type: 'VARCHAR', value: '', result: null },
+        // Row filter policies (row-level security) + the principal attributes they can read
+        govRowPolicies: [],
+        govRowPolicyModal: false,
+        govRowPolicyForm: { id: null, name: '', description: '', tag_key: '', tag_value: '', filter_column: '', filter_mode: 'owner',
+                            attribute_key: '', filter_expr: '', except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true },
+        govRowPolicyValidation: null,
+        govAttributes: [],
+        govAttrForm: { principal_type: 'user', principal_value: '', attribute_key: '', values_text: '' },
         govSuggestCatalog: 'warehouse',
         govSuggestSchema: '',
         govSuggestions: [],
@@ -16289,6 +16422,9 @@
         },
         isTestingLdap: false,
         ldapTestResult: null,
+        isTestingLdapBind: false,
+        isSyncingLdap: false,
+        ldapSyncResult: null,
         isTestingOidc: false,
         oidcTestResult: null,
         slackConfig: {
@@ -18628,6 +18764,39 @@
             this.ldapTestResult = { success: false, message: 'Network error testing LDAP: ' + e.message };
           } finally {
             this.isTestingLdap = false;
+          }
+        },
+
+        async testLdapBind() {
+          this.isTestingLdapBind = true;
+          this.ldapTestResult = null;
+          try {
+            const res = await fetch('/api/auth/frameworks/ldap/test-bind', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(this.authConfig.ldap)
+            });
+            this.ldapTestResult = await res.json();
+          } catch (e) {
+            this.ldapTestResult = { success: false, message: 'Network error testing the LDAP bind: ' + e.message };
+          } finally {
+            this.isTestingLdapBind = false;
+          }
+        },
+
+        async syncLdapUsers() {
+          this.isSyncingLdap = true;
+          this.ldapSyncResult = null;
+          try {
+            const res = await fetch('/api/auth/frameworks/ldap/sync', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) { this.showToast(data.detail || 'LDAP sync failed', 'error'); return; }
+            this.ldapSyncResult = data;
+            this.showToast(`LDAP sync: ${data.checked} checked, ${data.updated} updated, ${data.deactivated} deactivated`, data.errors.length ? 'error' : 'success');
+          } catch (e) {
+            this.showToast('Error syncing LDAP users: ' + e.message, 'error');
+          } finally {
+            this.isSyncingLdap = false;
           }
         },
 
@@ -24148,6 +24317,10 @@
           const t = this.govTags.find(x => x.tag_key === this.govPolicyForm.tag_key);
           return (t && t.allowed_values) || [];
         },
+        get rowPolicyTagValues() {
+          const t = this.govTags.find(x => x.tag_key === this.govRowPolicyForm.tag_key);
+          return (t && t.allowed_values) || [];
+        },
         get govSuggestSelectedCount() {
           return Object.values(this.govSuggestSel).filter(Boolean).length;
         },
@@ -24173,12 +24346,13 @@
             await Promise.all([
               this.fetchGovTags(),
               isAdmin ? this.fetchGovPolicies() : Promise.resolve(),
+              isAdmin ? this.fetchGovRowPolicies() : Promise.resolve(),
               isAdmin ? this.fetchGovStatus() : Promise.resolve()
             ]);
           } finally {
             this.govLoading = false;
           }
-          if (!isAdmin && ['policies', 'preview', 'audit'].includes(this.govTab)) this.govTab = 'tags';
+          if (!isAdmin && ['policies', 'rowpolicies', 'preview', 'audit'].includes(this.govTab)) this.govTab = 'tags';
         },
         async fetchGovTags() {
           try { this.govTags = (await this.govFetch('/api/governance/tags')).tags || []; }
@@ -24186,6 +24360,14 @@
         },
         async fetchGovPolicies() {
           try { this.govPolicies = (await this.govFetch('/api/governance/masking-policies')).policies || []; }
+          catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async fetchGovRowPolicies() {
+          try { this.govRowPolicies = (await this.govFetch('/api/governance/row-policies')).policies || []; }
+          catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async fetchGovAttributes() {
+          try { this.govAttributes = (await this.govFetch('/api/governance/attributes')).attributes || []; }
           catch (e) { this.showToast(e.message, 'error'); }
         },
         async fetchGovStatus() {
@@ -24312,6 +24494,78 @@
             await this.govFetch('/api/governance/masking-policies/' + p.id, { method: 'DELETE' });
             this.showToast('Policy deleted', 'success');
             this.fetchGovPolicies(); this.fetchGovStatus(); this.fetchGovTags();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+
+        openGovRowPolicyModal(p) {
+          this.govRowPolicyForm = p ? {
+            id: p.id, name: p.name, description: p.description || '', tag_key: p.tag_key, tag_value: p.tag_value || '',
+            filter_column: p.filter_column, filter_mode: p.filter_mode, attribute_key: p.attribute_key || '',
+            filter_expr: p.filter_expr || '', except_roles: [...(p.except_roles || [])],
+            except_users_text: (p.except_users || []).join(', '), priority: p.priority, enabled: p.enabled
+          } : {
+            id: null, name: '', description: '', tag_key: '', tag_value: '', filter_column: '', filter_mode: 'owner',
+            attribute_key: '', filter_expr: '', except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true
+          };
+          this.govRowPolicyValidation = null;
+          this.govRowPolicyModal = true;
+        },
+        async validateGovRowPolicyDraft() {
+          const f = this.govRowPolicyForm;
+          if (f.filter_mode !== 'custom' || !f.filter_expr) { this.govRowPolicyValidation = null; return; }
+          try { this.govRowPolicyValidation = await this.govFetch('/api/governance/row-policies/validate', this.govJson('POST', { filter_expr: f.filter_expr })); }
+          catch (e) { this.govRowPolicyValidation = null; }
+        },
+        async saveGovRowPolicy() {
+          const f = this.govRowPolicyForm;
+          const body = {
+            name: f.name, description: f.description, tag_key: f.tag_key, tag_value: f.tag_value || null,
+            filter_column: f.filter_column, filter_mode: f.filter_mode,
+            attribute_key: f.filter_mode === 'attribute' ? f.attribute_key : null,
+            filter_expr: f.filter_mode === 'custom' ? f.filter_expr : null,
+            except_roles: f.except_roles, except_users: f.except_users_text.split(',').map(u => u.trim()).filter(Boolean),
+            priority: Number(f.priority), enabled: f.enabled
+          };
+          try {
+            await this.govFetch(f.id ? '/api/governance/row-policies/' + f.id : '/api/governance/row-policies', this.govJson(f.id ? 'PUT' : 'POST', body));
+            this.govRowPolicyModal = false;
+            this.showToast('Row filter policy saved', 'success');
+            this.fetchGovRowPolicies(); this.fetchGovStatus(); this.fetchGovTags();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async toggleGovRowPolicy(p) {
+          try {
+            await this.govFetch('/api/governance/row-policies/' + p.id, this.govJson('PUT', { enabled: !p.enabled }));
+            this.fetchGovRowPolicies(); this.fetchGovStatus();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async deleteGovRowPolicy(p) {
+          if (!confirm(`Delete the row filter policy '${p.name}'? The rows it restricted become fully visible.`)) return;
+          try {
+            await this.govFetch('/api/governance/row-policies/' + p.id, { method: 'DELETE' });
+            this.showToast('Row filter policy deleted', 'success');
+            this.fetchGovRowPolicies(); this.fetchGovStatus(); this.fetchGovTags();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async saveGovAttribute() {
+          const f = this.govAttrForm;
+          if (!f.principal_value.trim() || !f.attribute_key.trim()) { this.showToast('Fill in the principal and the attribute key', 'error'); return; }
+          const values = f.values_text.split(',').map(v => v.trim()).filter(Boolean);
+          try {
+            await this.govFetch('/api/governance/attributes', this.govJson('POST', {
+              principal_type: f.principal_type, principal_value: f.principal_value.trim(), attribute_key: f.attribute_key.trim(), values }));
+            this.govAttrForm.values_text = '';
+            this.showToast('Attribute assigned', 'success');
+            this.fetchGovAttributes();
+          } catch (e) { this.showToast(e.message, 'error'); }
+        },
+        async deleteGovAttribute(a) {
+          if (!confirm(`Remove '${a.attribute_key}' from ${a.principal_type}:${a.principal_value}?`)) return;
+          try {
+            const q = new URLSearchParams({ principal_type: a.principal_type, principal_value: a.principal_value, attribute_key: a.attribute_key });
+            await this.govFetch('/api/governance/attributes?' + q.toString(), { method: 'DELETE' });
+            this.showToast('Attribute removed', 'success');
+            this.fetchGovAttributes();
           } catch (e) { this.showToast(e.message, 'error'); }
         },
 

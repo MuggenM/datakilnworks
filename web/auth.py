@@ -270,7 +270,7 @@ def list_users() -> List[Dict[str, Any]]:
     """Returns all registered users (excluding password hashes)."""
     conn = get_db_connection()
     try:
-        rows = conn.execute("SELECT id, username, display_name, role, is_active, created_at, last_login_at FROM users ORDER BY created_at ASC").fetchall()
+        rows = conn.execute("SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source FROM users ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
@@ -320,8 +320,9 @@ def create_user(username: str, password: str, display_name: str, role: str = "us
         conn.close()
 
 
-def update_user(user_id: str, display_name: Optional[str] = None, role: Optional[str] = None, is_active: Optional[bool] = None) -> Optional[Dict[str, Any]]:
-    """Updates user display_name, role, or active status."""
+def update_user(user_id: str, display_name: Optional[str] = None, role: Optional[str] = None,
+                is_active: Optional[bool] = None, auth_source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Updates user display_name, role, active status, or auth_source."""
     conn = get_db_connection()
     try:
         existing = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -341,6 +342,9 @@ def update_user(user_id: str, display_name: Optional[str] = None, role: Optional
         if is_active is not None:
             fields.append("is_active = ?")
             params.append(1 if is_active else 0)
+        if auth_source is not None:
+            fields.append("auth_source = ?")
+            params.append(auth_source)
 
         if not fields:
             return get_user_by_id(user_id)
@@ -349,6 +353,41 @@ def update_user(user_id: str, display_name: Optional[str] = None, role: Optional
         with conn:
             conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", params)
 
+        return get_user_by_id(user_id)
+    finally:
+        conn.close()
+
+
+def upsert_external_user(username: str, display_name: str, role: str, auth_source: str) -> Dict[str, Any]:
+    """
+    Creates or updates the local record of an account whose password lives with an external identity provider
+    (LDAP, and later OIDC/SAML): a random, never-communicated password hash, so `verify_password` can never
+    succeed against it and this account can only sign in through that provider's own auth path. Existing
+    `local` accounts are never touched here -- callers must refuse the login before reaching this function.
+    """
+    clean_username = username.strip().lower()
+    if not clean_username:
+        raise ValueError("Username cannot be empty")
+    if role not in ("admin", "power_user", "user"):
+        role = "user"
+    conn = get_db_connection()
+    try:
+        existing = conn.execute("SELECT * FROM users WHERE username = ?", (clean_username,)).fetchone()
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        if existing:
+            if (existing["auth_source"] or "local") == "local":
+                raise ValueError(f"'{clean_username}' is a local account; it cannot be taken over by {auth_source}.")
+            with conn:
+                conn.execute("UPDATE users SET display_name = ?, role = ?, is_active = 1, auth_source = ? WHERE id = ?",
+                            (display_name.strip() or clean_username, role, auth_source, existing["id"]))
+            return get_user_by_id(existing["id"])
+        user_id = f"u_{clean_username}_{secrets.token_hex(4)}"
+        unusable_hash = hash_password(secrets.token_hex(32))          # a password nobody knows and this module never checks
+        with conn:
+            conn.execute("""
+                INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at, auth_source)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """, (user_id, clean_username, unusable_hash, display_name.strip() or clean_username, role, now_str, auth_source))
         return get_user_by_id(user_id)
     finally:
         conn.close()

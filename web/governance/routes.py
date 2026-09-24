@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from web.auth import resolve_principal, get_user_by_username
-from web.governance import catalog_meta, classify, gateway, macros, masks, policies, store, tags
+from web.governance import catalog_meta, classify, gateway, macros, masks, policies, row_filters, store, tags
 from web.permissions import can_user_access_catalog, can_user_manage_catalog
 
 logger = logging.getLogger("localspark.governance")
@@ -124,6 +124,47 @@ class ValidateIn(BaseModel):
     applies_to_types: Optional[List[str]] = None
     data_type: str = "VARCHAR"
     value: Optional[str] = None
+
+
+class RowPolicyIn(BaseModel):
+    name: str
+    description: str = ""
+    tag_key: str
+    tag_value: Optional[str] = None
+    filter_column: str
+    filter_mode: str
+    attribute_key: Optional[str] = None
+    filter_expr: Optional[str] = None
+    except_roles: List[str] = Field(default_factory=lambda: ["admin"])
+    except_users: List[str] = Field(default_factory=list)
+    priority: int = 100
+    enabled: bool = True
+
+
+class RowPolicyPatch(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    tag_key: Optional[str] = None
+    tag_value: Optional[str] = None
+    filter_column: Optional[str] = None
+    filter_mode: Optional[str] = None
+    attribute_key: Optional[str] = None
+    filter_expr: Optional[str] = None
+    except_roles: Optional[List[str]] = None
+    except_users: Optional[List[str]] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class RowFilterValidateIn(BaseModel):
+    filter_expr: str
+
+
+class AttributeIn(BaseModel):
+    principal_type: str
+    principal_value: str
+    attribute_key: str
+    values: List[str] = Field(default_factory=list)
 
 
 # ----------------------------------------------------------------------------
@@ -333,6 +374,77 @@ async def validate_masking_policy(body: ValidateIn, user: Dict[str, Any] = Depen
     return out
 
 
+# ----------------------------------------------------------------------------
+# Row filter policies (row-level security) and principal attributes
+# ----------------------------------------------------------------------------
+
+@router.get("/row-policies")
+async def list_row_policies_route(user: Dict[str, Any] = Depends(principal)):
+    return {"policies": row_filters.list_row_policies()}
+
+
+@router.post("/row-policies")
+async def create_row_policy_route(body: RowPolicyIn, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    try:
+        return row_filters.create_row_policy(body.model_dump(), actor=_actor(user))
+    except ValueError as exc:
+        raise _translate(exc)
+
+
+@router.put("/row-policies/{policy_id}")
+async def update_row_policy_route(policy_id: str, body: RowPolicyPatch, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    try:
+        return row_filters.update_row_policy(policy_id, body.model_dump(exclude_unset=True), actor=_actor(user))
+    except ValueError as exc:
+        raise _translate(exc)
+
+
+@router.delete("/row-policies/{policy_id}")
+async def delete_row_policy_route(policy_id: str, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    try:
+        row_filters.delete_row_policy(policy_id, actor=_actor(user))
+    except ValueError as exc:
+        raise _translate(exc)
+    return {"deleted": policy_id}
+
+
+@router.post("/row-policies/validate")
+async def validate_row_policy(body: RowFilterValidateIn, user: Dict[str, Any] = Depends(principal)):
+    """Dry run for the row policy editor: static AST verdict for a custom filter expression."""
+    _require_admin(user)
+    return row_filters.validate_filter_expression(body.filter_expr)
+
+
+@router.get("/attributes")
+async def list_attributes_route(principal_type: Optional[str] = None, principal_value: Optional[str] = None,
+                                attribute_key: Optional[str] = None, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    return {"attributes": row_filters.list_attributes(principal_type, principal_value, attribute_key)}
+
+
+@router.post("/attributes")
+async def set_attributes_route(body: AttributeIn, user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    try:
+        return row_filters.set_attribute_values(body.principal_type, body.principal_value, body.attribute_key,
+                                                body.values, actor=_actor(user))
+    except ValueError as exc:
+        raise _translate(exc)
+
+
+@router.delete("/attributes")
+async def delete_attribute_route(principal_type: str, principal_value: str, attribute_key: str,
+                                 user: Dict[str, Any] = Depends(principal)):
+    _require_admin(user)
+    deleted = row_filters.delete_attribute(principal_type, principal_value, attribute_key, actor=_actor(user))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="No such attribute assignment.")
+    return {"deleted": True}
+
+
 @router.get("/effective/{catalog}/{schema_name}/{table_name}")
 async def effective_governance(catalog: str, schema_name: str, table_name: str, as_user: Optional[str] = None,
                                user: Dict[str, Any] = Depends(principal)):
@@ -356,9 +468,12 @@ async def effective_governance(catalog: str, schema_name: str, table_name: str, 
                     "masked": spec is not None,
                     "policy": ({"id": spec.policy_id, "name": spec.policy_name, "mask_type": spec.mask_type,
                                 "tied_with": spec.conflicts} if spec else None)})
+    row_specs = row_filters.filters_for_table(catalog, schema_name, table_name, columns, who)
     return {"object": tags.object_label(tags.norm(catalog), tags.norm(schema_name), tags.norm(table_name)),
             "as_user": subject.get("username"), "role": subject.get("role"), "columns": out,
-            "masked_columns": [c["column"] for c in out if c["masked"]]}
+            "masked_columns": [c["column"] for c in out if c["masked"]],
+            "row_filtered": bool(row_specs),
+            "row_policies": [{"id": s.policy_id, "name": s.policy_name, "filter_column": s.filter_column} for s in row_specs]}
 
 
 @router.get("/status")
@@ -371,6 +486,8 @@ async def governance_status(user: Dict[str, Any] = Depends(principal)):
         "tag_assignments": len(tags.list_assignments(limit=5000)),
         "policies_total": len(policies.list_policies()),
         "policies_enabled": len(policies.enabled_policies()),
+        "row_policies_total": len(row_filters.list_row_policies()),
+        "row_policies_enabled": len(row_filters.enabled_row_policies()),
         "masks_installed": macros.macros_installed(con),
         "posture": _posture(),
         "workers": _workers(),
@@ -422,7 +539,9 @@ async def preview_as(body: PreviewAsIn, user: Dict[str, Any] = Depends(principal
     return {"as_user": subject["username"], "role": subject.get("role"), "blocked": result.blocked, "changed": result.changed,
             "rewritten_sql": result.sql if result.changed else None, "tables": result.tables,
             "masked_columns": gateway.masked_columns_payload(result),
-            "exempt_reads": sorted({f"{m.table}.{m.column}" for m in result.exempt_reads})}
+            "exempt_reads": sorted({f"{m.table}.{m.column}" for m in result.exempt_reads}),
+            "row_filters_applied": gateway.row_filter_payload(result),
+            "row_filter_exempt_reads": sorted({m.table for m in result.row_filter_exempt_reads})}
 
 
 @router.get("/coverage")
@@ -439,6 +558,20 @@ async def coverage(user: Dict[str, Any] = Depends(principal)):
                    and (pol["tag_value"] is None or a["tag_value"] == pol["tag_value"])]
         per_policy.append({"id": pol["id"], "name": pol["name"], "enabled": pol["enabled"], "mask_type": pol["mask_type"],
                            "matching_assignments": len(matched)})
+    # Row policies only match table/schema/catalog-level assignments (a row filter can never bind to a column tag).
+    table_level_assignments = [a for a in assignments if a["level"] in ("table", "schema", "catalog")]
+    per_row_policy = []
+    for pol in row_filters.list_row_policies():
+        matched = [a for a in table_level_assignments if not a["orphaned"] and a["tag_key"] == pol["tag_key"]
+                   and (pol["tag_value"] is None or a["tag_value"] == pol["tag_value"])]
+        missing_column = any(pol["filter_column"].lower() not in {c["column"].lower() for c in catalog_meta.list_columns(
+            _con(), a["catalog"], a["schema_name"], a["table_name"])} for a in matched if a["table_name"])
+        per_row_policy.append({"id": pol["id"], "name": pol["name"], "enabled": pol["enabled"], "filter_mode": pol["filter_mode"],
+                               "filter_column": pol["filter_column"], "matching_assignments": len(matched),
+                               "filter_column_missing_somewhere": missing_column})
     return {"assignments": len(assignments), "by_level": by_level, "orphaned": sum(1 for a in assignments if a["orphaned"]),
             "policies": per_policy,
-            "policies_without_matches": [p["name"] for p in per_policy if p["enabled"] and p["matching_assignments"] == 0]}
+            "policies_without_matches": [p["name"] for p in per_policy if p["enabled"] and p["matching_assignments"] == 0],
+            "row_policies": per_row_policy,
+            "row_policies_without_matches": [p["name"] for p in per_row_policy if p["enabled"] and p["matching_assignments"] == 0],
+            "row_policies_with_missing_column": [p["name"] for p in per_row_policy if p["filter_column_missing_somewhere"]]}

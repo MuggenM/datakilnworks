@@ -49,14 +49,29 @@ docker compose exec datakilnworks-studio python scratch/test_sql_native_inferenc
 - `web/templates/index.html` is a single roughly 27k-line Jinja/Alpine.js file containing every view (Chart.js for charts, Monaco for SQL). Expect large, targeted edits with grep, not whole-file reads. Note the recent fix commits for Alpine expression and scope errors, since inline expressions are brittle.
 - The MLflow shim (`mlflow_shim.py`), model serving (`serving.py`) and SQL-native inference functions (`ai_sql.py`, exposing `predict`, `ai_query` and similar as DuckDB UDFs) emulate Databricks MLflow, serving and AI functions locally. LLM backends (LM Studio and Ollama) are configured in `llm_settings.py`.
 
-## Governance (tags + column masking)
+## Authentication
 
-- `web/governance/` holds tags (`tags.py`), masking policies and masks (`policies.py`, `masks.py`, `macros.py`), the query gateway (`enforce.py`, `gateway.py`) and the REST router (`routes.py`). State lives in `warehouse/.metadata/governance.db`.
+- `web/auth.py` owns the `users` table (local password auth, PBKDF2). `auth_source` on a user row says who owns the
+  password: `local` (default) or an external provider (`ldap`, and later `oidc`/`saml`). `web/auth.py::upsert_external_user`
+  is the only way to create/update a non-local account — it writes a random, never-checked password hash, so that account
+  can only ever authenticate through its provider's own module.
+- `web/ldap_auth.py` is that module for LDAP: real service-account bind, user search (filter-escaped), bind-as-user for the
+  password check, group-to-role mapping, and `sync_user`/`sync_all` to re-resolve role/active status against the directory
+  later (not just at login). `/api/auth/login` in `app.py` routes to it only when there is no local account yet or the
+  existing one is already `auth_source='ldap'`; an existing **local** username is always refused before any LDAP lookup,
+  so a login attempt can never take over a local account.
+- `scratch/test_ldap_auth.py` runs against a real `lldap` server on the compose network (see
+  `/home/martin/volumes/backendservices`), not a mock; it skips cleanly if lldap is unreachable.
+
+## Governance (tags + column masking + row-level security)
+
+- `web/governance/` holds tags (`tags.py`), masking policies and masks (`policies.py`, `masks.py`, `macros.py`), row filter policies and principal attributes (`row_filters.py`), the query gateway (`enforce.py`, `gateway.py`) and the REST router (`routes.py`). State lives in `warehouse/.metadata/governance.db`.
 - **Every code path that runs SQL on behalf of a user must go through the gateway** (`gateway.govern_sql`, `governed_sql_or_raise`, `_gov_or_403` in `app.py`, `masked_relation`, or `mask_arrow` for data Python already holds). Use the *rewritten* SQL for execution and the user's own text for history. Identity comes from `resolve_principal(request)` (never fall back to admin on errors), or `gateway.principal_for_username(owner)` for background work; a missing identity is least privilege.
 - `scratch/test_governance_coverage.py` scans `web/*.py` for DuckDB execution sites; a new one must call the gateway or be added to `web/governance/ALLOWLIST.md` with a reason.
-- Statements that create tables from tagged columns are followed by `gateway.propagate_tags(...)` (SQL editor, job SQL tasks); do the same in any new path that runs user DML.
-- Caches of query results must be keyed by `gateway.fingerprint(result)` (the set of masks the result was computed under).
-- Tests: `scratch/test_governance_phase{0..6}.py` (run inside the studio container against a throwaway warehouse whose directory is named `warehouse`), `scratch/test_governance_coverage.py` (host), `scratch/verify_governance_ui.py` (Playwright, throwaway instance only).
+- Statements that create tables from tagged columns are followed by `gateway.propagate_tags(...)` (SQL editor, job SQL tasks); do the same in any new path that runs user DML. This also propagates the table-level tag of a row-filtered source an exempt principal read unfiltered.
+- Caches of query results must be keyed by `gateway.fingerprint(result)` (the masks *and* row filters the result was computed under; two users under the same policy can resolve to different predicates and must never share a cache entry).
+- Row filter policies bind to a tag on a catalog/schema/table (never a column, since a row filter restricts the whole table) and resolve to a literal `WHERE` predicate appended to the same masked subquery masking already builds (`enforce._build_governed_subquery`). Modes: `owner` (a column = the caller's username), `attribute` (a column must be in the caller's assigned `principal_attributes` values, fail-closed when nothing is assigned) and `custom` (a validated boolean expression). Multiple applicable policies on one table combine with AND.
+- Tests: `scratch/test_governance_phase{0..6}.py` and `scratch/test_governance_rls_phase{1,2}.py` (run inside the studio container against a throwaway warehouse whose directory is named `warehouse`), `scratch/test_governance_coverage.py` (host), `scratch/verify_governance_ui.py` (Playwright, throwaway instance only, covers both masking and row filter UI).
 
 ## Conventions
 
