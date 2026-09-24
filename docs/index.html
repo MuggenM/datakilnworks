@@ -610,6 +610,33 @@ JOIN delta_table_version('warehouse.dbo.silver_employees', 1) prev
 WHERE curr.salary <> prev.salary;</code></pre>
         </div>
 
+        <h3 id="delta-shallow-clone">Delta Shallow Clone</h3>
+        <p>
+          A shallow clone creates a new, independent Delta table from an existing one <strong>without copying any data</strong>: the clone gets its own transaction log and shares the source's immutable Parquet files. It is instant, costs no extra storage until the clone changes, and is ideal for testing a pipeline change or freezing a table at a point in time. Use <em>Clone</em> on a table in the Catalog explorer, the SQL editor, or the REST API.
+        </p>
+        <div class="code-container">
+          <div class="code-header">
+            <div class="code-title"><i class="ph ph-copy"></i><span>Shallow Clone</span></div>
+            <span class="code-lang-tag">SQL</span>
+            <button class="copy-btn"><i class="ph ph-copy"></i> Copy</button>
+          </div>
+          <pre><code class="language-sql">-- Clone the latest version (names must include the schema; a catalog is optional)
+CREATE TABLE dbo.silver_employees_test SHALLOW CLONE dbo.silver_employees;
+
+-- Clone an earlier version, by number or by time
+CREATE OR REPLACE TABLE dbo.silver_employees_v2 SHALLOW CLONE dbo.silver_employees VERSION AS OF 2;
+CREATE TABLE IF NOT EXISTS dbo.silver_employees_1h SHALLOW CLONE dbo.silver_employees TIMESTAMP AS OF '2026-09-24 10:00:00';
+
+-- Across catalogs
+CREATE TABLE sandbox.scratch.emp SHALLOW CLONE warehouse.dbo.silver_employees;</code></pre>
+        </div>
+        <ul>
+          <li><strong>Hard links, not references:</strong> unlike Databricks, where a clone points at the source's files and breaks if the source is vacuumed, the clone here hard-links those files into its own directory. It stays valid if the source is vacuumed, rewritten or dropped, and both readers (delta-rs and DuckDB) see an ordinary table. Source and target must be local catalogs on the same filesystem; a table using deletion vectors or row tracking cannot be cloned.</li>
+          <li><strong>Independent afterwards:</strong> writes, deletes, merges and vacuum on either side never affect the other. The clone's first commit (version 0) is an audited <code>CLONE</code> entry that records the source and version.</li>
+          <li><strong>Governance:</strong> because a clone shares raw files, a user that a masking or row-filter policy applies to cannot clone at all. For everyone else the clone receives the source's tags (including tags the source inherited from its schema or catalog) <em>before</em> it exists, so masking and row filters keep applying to it. Cloning needs read access to the source catalog and write access to the target catalog.</li>
+          <li><strong>REST:</strong> <code>POST /api/table/{schema}/{table}/clone</code> with <code>{"target_table": "...", "target_schema": "...", "target_catalog": "...", "catalog": "...", "version": N, "timestamp": "...", "replace": false, "if_not_exists": false}</code>.</li>
+        </ul>
+
         <h3 id="unity-catalog-volumes">Unity Catalog Volumes</h3>
         <p>
           Volumes govern unstructured and semi-structured assets (raw CSVs, PDF documentation, model weights, audio, images). Volumes are addressed via POSIX-compliant paths:

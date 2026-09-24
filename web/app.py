@@ -1546,6 +1546,161 @@ async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any], r
     )
     return res
 
+# ==============================================================================
+# DELTA SHALLOW CLONE
+# ==============================================================================
+
+class TableClonePayload(BaseModel):
+    target_table: str
+    target_schema: Optional[str] = None       # default: the source's schema
+    target_catalog: Optional[str] = None      # default: the source's catalog
+    catalog: Optional[str] = "warehouse"      # the source's catalog
+    version: Optional[int] = None
+    timestamp: Optional[str] = None
+    replace: bool = False
+    if_not_exists: bool = False
+
+
+def _clone_table_dir(catalog: str, schema: str, table: str, *, must_exist: bool) -> str:
+    """Local directory of catalog.schema.table for a clone endpoint (mounted/S3 catalogs are not supported)."""
+    if catalog == "warehouse":
+        schema_dir = os.path.join(WAREHOUSE_DIR, schema)
+    else:
+        cat = get_catalog(catalog)
+        if not cat:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog}' not found")
+        if cat.get("is_mounted") or not cat.get("path"):
+            raise HTTPException(status_code=400, detail=f"Catalog '{catalog}' is external storage; shallow clone works between local catalogs only.")
+        schema_dir = os.path.join(cat["path"], schema)
+    if not os.path.isdir(schema_dir):
+        raise HTTPException(status_code=404, detail=f"Schema '{schema}' does not exist in catalog '{catalog}'.")
+    path = os.path.join(schema_dir, table)
+    if must_exist and not os.path.isdir(path):
+        raise HTTPException(status_code=404, detail=f"Table {catalog}.{schema}.{table} not found")
+    return path
+
+
+def _copy_table_tags(src: tuple, dst: tuple, actor: str) -> set:
+    """Governance: the clone shares the source's raw files, so it must carry the source's *effective* tags (including
+    ones inherited from its schema/catalog, which the clone may not inherit) before it exists. Returns what was set."""
+    from web.governance import tags as gov_tags
+    if not gov_tags.table_has_any_tags(*src):
+        return set()
+    desired = set()
+    for key, info in gov_tags.effective_table_tags(*src).items():
+        gov_tags.set_tag(catalog=dst[0], schema_name=dst[1], table_name=dst[2], tag_key=key, tag_value=info["value"], actor=actor, source="clone")
+        desired.add((key, ""))
+    from deltalake import DeltaTable
+    cols = [f.name for f in DeltaTable(_clone_table_dir(*src, must_exist=True)).schema().fields]
+    for col, tag_map in gov_tags.effective_tags(*src, cols).items():
+        for key, info in tag_map.items():
+            if info["level"] == "column":
+                gov_tags.set_tag(catalog=dst[0], schema_name=dst[1], table_name=dst[2], column_name=col, tag_key=key,
+                                 tag_value=info["value"], actor=actor, source="clone")
+                desired.add((key, col))
+    return desired
+
+
+def _do_shallow_clone(user: Dict[str, Any], src: tuple, dst: tuple, *, version=None, timestamp=None, replace=False,
+                      if_not_exists=False) -> Dict[str, Any]:
+    """Synchronous; run in a thread. src/dst are (catalog, schema, table). Raises HTTPException."""
+    from web import table_clone
+    from web.governance import tags as gov_tags
+    actor = user.get("username", "admin")
+    if not can_user_access_catalog(user, src[0], action="READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot read catalog '{src[0]}'.")
+    if not can_user_access_catalog(user, dst[0], action="WRITE"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot modify catalog '{dst[0]}'.")
+    try:
+        # A clone shares the source's raw files, so it would hand a masked / row-filtered user the unmasked data.
+        gov_gateway.deny_if_subject(user, "Cloning a table")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    src_dir = _clone_table_dir(*src, must_exist=True)
+    dst_dir = _clone_table_dir(*dst, must_exist=False)
+    existed = os.path.exists(dst_dir)
+    if existed and if_not_exists:
+        return {"created": False, "message": "Target already exists; nothing to do (IF NOT EXISTS)."}
+    try:
+        desired = _copy_table_tags(src, dst, actor)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not copy the source's governance tags, so no clone was made: {exc}")
+    try:
+        result = table_clone.shallow_clone(src_dir, dst_dir, version=version, timestamp=timestamp, replace=replace,
+                                           if_not_exists=if_not_exists, source_label=".".join(src), actor=actor)
+    except table_clone.CloneError as exc:
+        if not existed:
+            gov_tags.drop_object(*dst, actor=actor)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        if not existed:
+            gov_tags.drop_object(*dst, actor=actor)
+        raise
+    if existed:                                     # replaced: drop tags the old table had that the new one doesn't
+        try:
+            for a in gov_tags.list_assignments(catalog=dst[0]):
+                if a.get("schema_name") == dst[1] and a.get("table_name") == dst[2] and (a["tag_key"], a.get("column_name") or "") not in desired:
+                    gov_tags.unset_tag(catalog=dst[0], schema_name=dst[1], table_name=dst[2], column_name=a.get("column_name") or "",
+                                       tag_key=a["tag_key"], actor=actor)
+        except Exception as exc:
+            logger.warning(f"Could not prune stale tags of replaced table {'.'.join(dst)}: {exc}")
+    try:
+        get_duckrun_conn().refresh()
+    except Exception:
+        pass
+    try:
+        from web.lineage import make_table_id, upsert_node, upsert_edge
+        sid, did = make_table_id(*src), make_table_id(*dst)
+        upsert_node(sid, src[2], "TABLE", catalog=src[0], schema_name=src[1])
+        upsert_node(did, dst[2], "TABLE", catalog=dst[0], schema_name=dst[1])
+        upsert_edge(sid, did, edge_type="TRANSFORMS_TO", query_text=f"CREATE TABLE {'.'.join(dst)} SHALLOW CLONE {'.'.join(src)}")
+    except Exception as exc:
+        logger.warning(f"Could not record clone lineage: {exc}")
+    result["source"], result["target"] = ".".join(src), ".".join(dst)
+    return result
+
+
+@app.post("/api/table/{schema_name}/{table_name}/clone")
+async def clone_table_api(schema_name: str, table_name: str, payload: TableClonePayload, request: Request):
+    """Delta shallow clone: a new table sharing the source's data files (hard links), optionally at a past version."""
+    user = await resolve_principal(request)
+    src_cat = payload.catalog or "warehouse"
+    src = (src_cat, sanitize_identifier(schema_name), sanitize_identifier(table_name))
+    dst = (payload.target_catalog or src_cat, sanitize_identifier(payload.target_schema or schema_name), sanitize_identifier(payload.target_table))
+    return await asyncio.to_thread(_do_shallow_clone, user, src, dst, version=payload.version, timestamp=payload.timestamp,
+                                   replace=payload.replace, if_not_exists=payload.if_not_exists)
+
+
+async def _execute_clone_statement(payload, query: str, stmt: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """`CREATE [OR REPLACE] TABLE t SHALLOW CLONE src [VERSION|TIMESTAMP AS OF ...]` from the SQL editor."""
+    start = time.perf_counter()
+    default_cat = payload.catalog or "warehouse"
+
+    def locate(parts):
+        if len(parts) == 3:
+            return (parts[0], sanitize_identifier(parts[1]), sanitize_identifier(parts[2]))
+        if len(parts) == 2:
+            return (default_cat, sanitize_identifier(parts[0]), sanitize_identifier(parts[1]))
+        raise HTTPException(status_code=400, detail="Name the schema too: schema.table or catalog.schema.table.")
+
+    try:
+        src, dst = locate(stmt["source"]), locate(stmt["target"])
+        result = await asyncio.to_thread(_do_shallow_clone, user, src, dst, version=stmt["version"], timestamp=stmt["timestamp"],
+                                         replace=stmt["replace"], if_not_exists=stmt["if_not_exists"])
+        ok, message = True, result["message"]
+    except HTTPException as exc:
+        ok, message = False, str(exc.detail)
+    elapsed = round((time.perf_counter() - start) * 1000, 2)
+    wh_id = payload.warehouse_id or "wh_starter"
+    qid = log_query(query_text=query, duration_ms=elapsed, rows_produced=0, status="SUCCESS" if ok else "FAILED",
+                    error_message=None if ok else message, client="SQL_EDITOR", is_mutation=True, warehouse_id=wh_id,
+                    catalog=default_cat, user=user.get("username", "admin"), executed_by="Studio (shallow clone)")
+    if not ok:
+        return {"success": False, "query_id": qid, "error": message, "elapsed_ms": elapsed, "warehouse_id": wh_id}
+    return {"success": True, "query_id": qid, "is_mutation": True, "message": message, "elapsed_ms": elapsed, "row_count": 0,
+            "warehouse_id": wh_id, "executed_by": "Studio (shallow clone)"}
+
+
 @app.delete("/api/table/{schema_name}/{table_name}")
 async def drop_table_api(schema_name: str, table_name: str, request: Request, catalog: Optional[str] = "warehouse"):
     schema_clean = sanitize_identifier(schema_name)
@@ -1998,6 +2153,11 @@ async def execute_sql(payload: QueryRequest, request: Request):
         return {"success": False, "error": "Empty query"}
 
     current_user = await resolve_principal(request)
+
+    from web import table_clone
+    clone_stmt = table_clone.parse_clone_sql(query)
+    if clone_stmt:                       # not SQL any engine understands: handled (and governed) here, never dispatched
+        return await _execute_clone_statement(payload, query, clone_stmt, current_user)
 
     # Enforce zero-trust catalog permissions
     try:

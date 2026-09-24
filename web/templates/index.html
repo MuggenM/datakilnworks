@@ -2374,6 +2374,10 @@
                     <i class="ph ph-play text-sm"></i>
                     <span>Query in SQL Editor</span>
                   </button>
+                  <button @click="openCloneModal(selectedTable)" class="flex items-center space-x-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 px-2.5 py-1.5 rounded font-medium shadow-sm transition" title="Shallow clone: a new table that shares this table's data files (nothing is copied)">
+                    <i class="ph ph-copy text-sm"></i>
+                    <span>Clone</span>
+                  </button>
                   <button @click="confirmDropTable(selectedTable.schema_name, selectedTable.table_name, selectedTable.catalog)" class="flex items-center space-x-1.5 text-xs bg-slate-800 hover:bg-rose-950 text-slate-300 hover:text-rose-300 border border-slate-700 hover:border-rose-800/80 px-2.5 py-1.5 rounded font-medium shadow-sm transition" title="Drop Table">
                     <i class="ph ph-trash text-sm"></i>
                     <span>Drop Table</span>
@@ -15599,6 +15603,37 @@
   </div>
 
   <!-- Modal: Change my own password (local accounts) -->
+  <!-- Modal: Delta shallow clone -->
+  <div x-show="cloneModal.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="cloneModal.open = false">
+    <form @submit.prevent="submitClone()" class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-md shadow-2xl p-5 space-y-4 text-xs" @click.outside="cloneModal.open = false">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
+        <h4 class="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-1.5"><i class="ph ph-copy text-indigo-500"></i><span>Shallow clone</span></h4>
+        <button type="button" @click="cloneModal.open = false" class="text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+      <p class="text-slate-600 dark:text-slate-300">Creates a new table from <span class="font-mono text-slate-900 dark:text-white" x-text="cloneModal.source"></span> without copying any data: the clone shares the source's data files, so it costs no extra storage until it changes, and it stays valid even if the source is later vacuumed or dropped.</p>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Target schema</label>
+          <input type="text" x-model="cloneModal.schema" required class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-indigo-500">
+        </div>
+        <div>
+          <label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Target table</label>
+          <input type="text" x-model="cloneModal.name" required class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-indigo-500">
+        </div>
+      </div>
+      <div>
+        <label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Version <span class="normal-case font-normal">(optional; empty = latest)</span></label>
+        <input type="number" min="0" x-model="cloneModal.version" placeholder="latest" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-indigo-500">
+      </div>
+      <label class="flex items-center space-x-2 text-slate-700 dark:text-slate-300"><input type="checkbox" x-model="cloneModal.replace" class="rounded"><span>Replace the target if it already exists</span></label>
+      <p class="text-[11px] text-rose-500" x-show="!!cloneModal.error" x-text="cloneModal.error"></p>
+      <div class="flex items-center justify-end space-x-2 pt-2 border-t border-slate-200 dark:border-dbx-border">
+        <button type="button" @click="cloneModal.open = false" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-300 rounded-lg">Cancel</button>
+        <button type="submit" :disabled="cloneModal.busy || !cloneModal.name || !cloneModal.schema" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg shadow transition">Create clone</button>
+      </div>
+    </form>
+  </div>
+
   <!-- Modal: Two-factor authentication (self-service) -->
   <div x-show="mfa.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="mfa.open = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-md shadow-2xl p-5 space-y-4 text-xs max-h-[90vh] overflow-y-auto" @click.outside="mfa.open = false">
@@ -16444,6 +16479,7 @@
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
+        cloneModal: { open: false, source: '', schema: '', name: '', catalog: 'warehouse', srcSchema: '', srcTable: '', version: '', replace: false, busy: false, error: '' },
         changePasswordOpen: false,
         changePasswordForced: false,
         changePasswordForm: { current: '', next: '', repeat: '', error: '', busy: false },
@@ -20307,6 +20343,35 @@
           this.$nextTick(() => {
             this.setEditorValue(sql);
           });
+        },
+
+        openCloneModal(t) {
+          this.cloneModal = { open: true, source: `${t.catalog || 'warehouse'}.${t.schema_name}.${t.table_name}`, schema: t.schema_name, name: `${t.table_name}_clone`,
+                              catalog: t.catalog || 'warehouse', srcSchema: t.schema_name, srcTable: t.table_name, version: '', replace: false, busy: false, error: '' };
+        },
+
+        async submitClone() {
+          const m = this.cloneModal;
+          m.busy = true; m.error = '';
+          try {
+            const res = await fetch(`/api/table/${encodeURIComponent(m.srcSchema)}/${encodeURIComponent(m.srcTable)}/clone`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ catalog: m.catalog, target_schema: m.schema, target_table: m.name, replace: m.replace,
+                                     version: m.version === '' || m.version === null ? null : Number(m.version) })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { m.error = data.detail || 'The clone failed.'; return; }
+            m.open = false;
+            this.showToast(data.message || 'Shallow clone created.', 'success');
+            await this.fetchCatalogs();
+            const [cat, sch, tbl] = (data.target || '').split('.');
+            if (tbl) this.viewTableInCatalog(sch, tbl, cat);
+          } catch (e) {
+            m.error = 'Error: ' + e.message;
+          } finally {
+            m.busy = false;
+          }
         },
 
         async confirmDropTable(schemaName, tableName, catalog = 'warehouse') {
