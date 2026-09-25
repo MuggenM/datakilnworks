@@ -40,7 +40,7 @@ WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 NAME_RE = re.compile(r"^.{1,80}$")
 TOPIC_RE = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
-FORMATS = ("json", "text", "avro")
+FORMATS = ("json", "text", "avro", "protobuf", "jsonschema")
 START = ("earliest", "latest")
 MAX_COLUMNS = 500
 LEASE_SECONDS = 45
@@ -114,8 +114,8 @@ def _clean(data: Dict[str, Any], current: Optional[Dict[str, Any]] = None) -> Di
     fmt = g("format", "json")
     if fmt not in FORMATS:
         raise StreamError(f"The format must be one of {', '.join(FORMATS)}.")
-    if fmt == "avro" and not (conn["config"] or {}).get("schema_registry_url"):
-        raise StreamError("The Avro format needs a Schema Registry: add its URL to the Kafka connection.")
+    if fmt in REGISTRY_FORMATS and not (conn["config"] or {}).get("schema_registry_url"):
+        raise StreamError("This format needs a Schema Registry: add its URL to the Kafka connection.")
     start = g("starting_offsets", "earliest")
     if start not in START:
         raise StreamError("Starting offsets must be 'earliest' or 'latest'.")
@@ -542,15 +542,124 @@ def avro_type(schema: Any, named: Optional[Dict[str, Any]] = None) -> pa.DataTyp
     return pa.string()
 
 
-class AvroDecoder:
-    """Decodes Confluent wire-format messages (magic byte 0, 4-byte big-endian schema id, Avro binary) with schemas fetched from a Schema
-    Registry (cached per id; ids are immutable). `hints` collects the column types the schemas ask for, for `build_batch`."""
+# Schema Registry formats: stream format -> registry schemaType
+REGISTRY_FORMATS = {"avro": "AVRO", "protobuf": "PROTOBUF", "jsonschema": "JSON"}
+FORMAT_LABEL = {"AVRO": "Avro", "PROTOBUF": "Protobuf", "JSON": "JSON Schema"}
+MAX_PROTO_BYTES = 200_000
 
-    def __init__(self, conn: Dict[str, Any]):
+
+def jsonschema_type(schema: Any, depth: int = 0) -> pa.DataType:
+    """Arrow type for a JSON Schema property: integer/number/boolean/string (date-time and date formats typed); objects and arrays become
+    JSON text; ["null", X] / anyOf-with-null is X; anything else text."""
+    if not isinstance(schema, dict) or depth > 4:
+        return pa.string()
+    for key in ("anyOf", "oneOf"):
+        if isinstance(schema.get(key), list):
+            branches = [b for b in schema[key] if not (isinstance(b, dict) and b.get("type") == "null")]
+            return jsonschema_type(branches[0], depth + 1) if len(branches) == 1 else pa.string()
+    t = schema.get("type")
+    if isinstance(t, list):
+        t = [x for x in t if x != "null"]
+        t = t[0] if len(t) == 1 else None
+    fmt = schema.get("format")
+    if t == "integer":
+        return pa.int64()
+    if t == "number":
+        return pa.float64()
+    if t == "boolean":
+        return pa.bool_()
+    if t == "string":
+        return pa.timestamp("us", tz="UTC") if fmt == "date-time" else (pa.date32() if fmt == "date" else pa.string())
+    return pa.string()
+
+
+_PROTO_SCALARS = {"TYPE_DOUBLE": pa.float64(), "TYPE_FLOAT": pa.float32(), "TYPE_INT64": pa.int64(), "TYPE_SINT64": pa.int64(), "TYPE_SFIXED64": pa.int64(),
+                  "TYPE_INT32": pa.int32(), "TYPE_SINT32": pa.int32(), "TYPE_SFIXED32": pa.int32(), "TYPE_UINT32": pa.int64(), "TYPE_FIXED32": pa.int64(),
+                  "TYPE_UINT64": pa.decimal128(20, 0), "TYPE_FIXED64": pa.decimal128(20, 0), "TYPE_BOOL": pa.bool_(), "TYPE_STRING": pa.string(),
+                  "TYPE_BYTES": pa.binary(), "TYPE_ENUM": pa.string()}
+
+
+def _field_type_name(fd) -> str:
+    from google.protobuf.descriptor import FieldDescriptor as F
+    for name in dir(F):
+        if name.startswith("TYPE_") and getattr(F, name) == fd.type:
+            return name
+    return ""
+
+
+def proto_type(fd) -> pa.DataType:
+    """Arrow type of a protobuf field: scalars typed (uint32 as bigint, uint64 as decimal(20,0), enums as their names), Timestamp as a UTC
+    timestamp; repeated fields, maps and messages become JSON text."""
+    from google.protobuf.descriptor import FieldDescriptor as F
+    if fd.label == F.LABEL_REPEATED:
+        return pa.string()
+    if fd.type == F.TYPE_MESSAGE:
+        return pa.timestamp("us", tz="UTC") if fd.message_type.full_name == "google.protobuf.Timestamp" else pa.string()
+    return _PROTO_SCALARS.get(_field_type_name(fd), pa.string())
+
+
+def proto_value(fd, v: Any) -> Any:
+    """A python value for a protobuf field value: messages as dicts (proto field names), enums as names, Timestamp as datetime."""
+    from google.protobuf.descriptor import FieldDescriptor as F
+    if fd.type == F.TYPE_MESSAGE:
+        if fd.message_type.GetOptions().map_entry:
+            vf = fd.message_type.fields_by_name["value"]
+            return {str(k): proto_value(vf, x) for k, x in v.items()}
+        if fd.message_type.full_name == "google.protobuf.Timestamp":
+            return datetime.datetime.fromtimestamp(v.seconds + v.nanos / 1e9, tz=datetime.timezone.utc)
+        return proto_message(v)
+    if fd.type == F.TYPE_ENUM:
+        ev = fd.enum_type.values_by_number.get(v)
+        return ev.name if ev else int(v)
+    return v
+
+
+def proto_message(msg) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for fd in msg.DESCRIPTOR.fields:
+        from google.protobuf.descriptor import FieldDescriptor as F
+        val = getattr(msg, fd.name)
+        if fd.label == F.LABEL_REPEATED:
+            if fd.message_type is not None and fd.message_type.GetOptions().map_entry:
+                out[fd.name] = proto_value(fd, val)
+            else:
+                out[fd.name] = [proto_value(fd, x) for x in val]
+        elif fd.type == F.TYPE_MESSAGE:
+            out[fd.name] = proto_value(fd, val) if msg.HasField(fd.name) else None
+        elif fd.has_presence and not msg.HasField(fd.name):
+            out[fd.name] = None
+        else:
+            out[fd.name] = proto_value(fd, val)
+    return out
+
+
+def _zigzag(buf: bytes, pos: int) -> Tuple[int, int]:
+    shift = result = 0
+    while True:
+        if pos >= len(buf):
+            raise ValueError("truncated message index")
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not b & 0x80:
+            break
+        shift += 7
+        if shift > 35:
+            raise ValueError("bad message index")
+    return (result >> 1) ^ -(result & 1), pos
+
+
+class RegistryDecoder:
+    """Decodes Confluent wire-format messages (magic byte 0, 4-byte big-endian schema id, then Avro binary, Protobuf (with message indexes) or
+    JSON text) with schemas fetched from a Schema Registry (cached per id; ids are immutable). `kind` is the schema type the stream expects
+    (AVRO, PROTOBUF, JSON); another type is a message problem. `hints` collects the column types the schemas ask for, for `build_batch`."""
+
+    def __init__(self, conn: Dict[str, Any], kind: str = "AVRO"):
         cfg, secret = conn["config"], conn.get("secret") or {}
+        self.kind = kind
         self.url = (cfg.get("schema_registry_url") or "").rstrip("/")
         if not self.url:
-            raise StreamError("The Avro format needs a Schema Registry: add its URL to the Kafka connection.")
+            raise StreamError("Schema Registry formats need a Schema Registry: add its URL to the Kafka connection.")
         self.auth = (cfg["registry_username"], secret.get("registry_password", "")) if cfg.get("registry_username") else None
         self.ca_pem = cfg.get("ssl_ca_pem") if self.url.startswith("https://") else None
         self._ca_file: Optional[str] = None
@@ -597,6 +706,7 @@ class AvroDecoder:
             raise RegistryUnavailable(f"The Schema Registry answered HTTP {r.status_code}.")
         return len(r.json())
 
+    # -- schemas
     def _schema(self, sid: int):
         if sid in self.cache:
             return self.cache[sid]
@@ -606,35 +716,104 @@ class AvroDecoder:
         if r.status_code != 200:
             raise RegistryUnavailable(f"The Schema Registry answered HTTP {r.status_code}.")
         body = r.json()
-        if (body.get("schemaType") or "AVRO").upper() != "AVRO":
-            raise UnknownSchema(f"Schema id {sid} is a {body['schemaType']} schema; only Avro is supported.")
+        kind = (body.get("schemaType") or "AVRO").upper()
+        if kind not in FORMAT_LABEL:
+            raise UnknownSchema(f"Schema id {sid} is a {kind} schema; supported are Avro, Protobuf and JSON Schema.")
+        if kind != self.kind:
+            raise UnknownSchema(f"Schema id {sid} is a {FORMAT_LABEL[kind]} schema, but this stream reads {FORMAT_LABEL[self.kind]}: choose the {FORMAT_LABEL[kind]} format.")
         try:
-            import fastavro
-            raw = json.loads(body["schema"])
-            parsed = fastavro.parse_schema(raw)
-        except ImportError:
-            raise StreamError("The fastavro package is not installed in this image (rebuild it: docker compose build).")
+            if kind == "AVRO":
+                import fastavro
+                raw = json.loads(body["schema"])
+                entry = ("AVRO", fastavro.parse_schema(raw), raw)
+            elif kind == "JSON":
+                raw = json.loads(body["schema"])
+                if not isinstance(raw, dict):
+                    raise ValueError("not an object schema")
+                entry = ("JSON", raw, raw)
+            else:
+                entry = ("PROTOBUF", self._compile_proto(sid, body), None)
+        except (UnknownSchema, RegistryUnavailable, StreamError):
+            raise
+        except ImportError as exc:
+            raise StreamError(f"A package for {FORMAT_LABEL[kind]} is not installed in this image (rebuild it: docker compose build): {exc.name}.")
         except Exception as exc:
-            raise UnknownSchema(f"Schema id {sid} is not a valid Avro schema ({str(exc)[:80]}).")
-        self.cache[sid] = (parsed, raw)
-        return self.cache[sid]
+            raise UnknownSchema(f"Schema id {sid} is not a valid {FORMAT_LABEL[kind]} schema ({str(exc)[:100]}).")
+        self.cache[sid] = entry
+        return entry
 
+    def _fetch_references(self, refs: List[Dict[str, Any]], into: Dict[str, str], depth: int = 0) -> None:
+        for ref in refs or []:
+            name = str(ref.get("name") or "")
+            if not name or name.startswith("/") or ".." in name.split("/") or "\\" in name or len(into) >= 50 or depth > 8:
+                raise UnknownSchema(f"The schema imports '{name}', which is not an acceptable file name.")
+            if name in into:
+                continue
+            r = self._get(f"/subjects/{ref['subject']}/versions/{ref['version']}")
+            if r.status_code == 404:
+                raise UnknownSchema(f"The imported schema '{name}' (subject {ref.get('subject')}) does not exist in the Schema Registry.")
+            if r.status_code != 200:
+                raise RegistryUnavailable(f"The Schema Registry answered HTTP {r.status_code}.")
+            body = r.json()
+            into[name] = body["schema"]
+            self._fetch_references(body.get("references") or [], into, depth + 1)
+
+    def _compile_proto(self, sid: int, body: Dict[str, Any]):
+        """Compiles the registry's .proto (and the files it imports) with protoc into a descriptor pool of its own."""
+        import tempfile
+        from grpc_tools import protoc
+        from google.protobuf import descriptor_pb2, descriptor_pool
+        files: Dict[str, str] = {}
+        self._fetch_references(body.get("references") or [], files)
+        text = body["schema"]
+        if len(text) > MAX_PROTO_BYTES or sum(len(v) for v in files.values()) > 5 * MAX_PROTO_BYTES:
+            raise UnknownSchema("The schema is too large.")
+        with tempfile.TemporaryDirectory(prefix="dkw-proto-") as d:
+            main = "schema.proto"
+            for name, content in {**files, main: text}.items():
+                path = os.path.join(d, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            out = os.path.join(d, "out.desc")
+            wkt = os.path.join(os.path.dirname(protoc.__file__), "_proto")
+            rc = protoc.main(["protoc", f"-I{d}", f"-I{wkt}", f"--descriptor_set_out={out}", "--include_imports", os.path.join(d, main)])
+            if rc != 0:
+                raise UnknownSchema("protoc could not compile the .proto schema")
+            fds = descriptor_pb2.FileDescriptorSet()
+            with open(out, "rb") as f:
+                fds.ParseFromString(f.read())
+        pool = descriptor_pool.DescriptorPool()
+        for fdp in fds.file:
+            pool.Add(fdp)
+        return pool.FindFileByName(main)
+
+    # -- messages
     def decode(self, value: bytes) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """(payload, None) or (None, why this message is bad). Raises RegistryUnavailable when the registry cannot be asked."""
         import struct
-        import io
+        label = FORMAT_LABEL[self.kind]
         if len(value) < 5 or value[0] != 0:
-            return None, "Not in the Schema Registry wire format (Avro): the message does not start with the magic byte 0 and a schema id."
+            return None, f"Not in the Schema Registry wire format ({label}): the message does not start with the magic byte 0 and a schema id."
         sid = struct.unpack(">I", value[1:5])[0]
         try:
-            parsed, raw = self._schema(sid)
+            kind, schema, raw = self._schema(sid)
         except UnknownSchema as exc:
             return None, str(exc)
+        body = value[5:]
         try:
-            import fastavro
-            obj = fastavro.schemaless_reader(io.BytesIO(value[5:]), parsed)
+            if kind == "AVRO":
+                return self._decode_avro(sid, schema, raw, body)
+            if kind == "JSON":
+                return self._decode_json(sid, schema, body)
+            return self._decode_proto(sid, schema, body)
         except Exception as exc:
             return None, f"The message does not match schema {sid} ({type(exc).__name__}: {str(exc)[:80]})."
+
+    def _decode_avro(self, sid, parsed, raw, body):
+        import io
+        import fastavro
+        obj = fastavro.schemaless_reader(io.BytesIO(body), parsed)
         if isinstance(obj, dict):
             fields = {f["name"]: f["type"] for f in (raw.get("fields") or [])} if isinstance(raw, dict) else {}
             named: Dict[str, Any] = {}
@@ -644,8 +823,35 @@ class AvroDecoder:
         self.hints["value"] = avro_type(raw)
         return {"value": obj}, None
 
+    def _decode_json(self, sid, schema, body):
+        obj = json.loads(body.decode("utf-8"))
+        if not isinstance(obj, dict):
+            return None, "The JSON value is not an object."
+        for name, sub in (schema.get("properties") or {}).items():
+            self.hints[name] = jsonschema_type(sub)
+        return obj, None
+
+    def _decode_proto(self, sid, file_desc, body):
+        from google.protobuf import message_factory
+        n, pos = _zigzag(body, 0)
+        path = [0]                                       # a single 0 byte is the shorthand for [0]
+        if n != 0:
+            path = []
+            for _ in range(n):
+                idx, pos = _zigzag(body, pos)
+                path.append(idx)
+        desc = file_desc.message_types_by_name[list(file_desc.message_types_by_name)[path[0]]]
+        for idx in path[1:]:
+            desc = desc.nested_types[idx]
+        msg = message_factory.GetMessageClass(desc)()
+        msg.ParseFromString(body[pos:])
+        payload = proto_message(msg)
+        for fd in desc.fields:
+            self.hints[fd.name] = proto_type(fd)
+        return payload, None
+
     def decode_key(self, key: bytes) -> Optional[str]:
-        """An Avro-encoded key as JSON text; None when it is not (the caller falls back to plain text)."""
+        """A registry-encoded key as JSON text; None when it is not (the caller falls back to plain text)."""
         if not key or key[0] != 0:
             return None
         try:
@@ -657,14 +863,21 @@ class AvroDecoder:
         return _stringify(obj["value"] if list(obj) == ["value"] else obj)
 
 
+AvroDecoder = RegistryDecoder            # the original name; the default kind is Avro
+
+
+def decoder_for(conn: Dict[str, Any], fmt: str) -> Optional[RegistryDecoder]:
+    return RegistryDecoder(conn, REGISTRY_FORMATS[fmt]) if fmt in REGISTRY_FORMATS else None
+
+
 def decode_message(fmt: str, value: bytes, decoder: Optional[AvroDecoder] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """(payload, None) or (None, error text)."""
     if fmt == "text":
         return {"value": value.decode("utf-8", errors="replace")}, None
-    if fmt == "avro":
+    if fmt in REGISTRY_FORMATS:
         return decoder.decode(value)
     if value[:1] == b"\x00" and len(value) > 5:
-        return None, "Schema Registry framed message (Avro/Protobuf): choose the Avro format (Avro only; Protobuf is not supported)."
+        return None, "Schema Registry framed message (Avro, Protobuf or JSON Schema): choose the matching Schema Registry format."
     try:
         obj = json.loads(value.decode("utf-8"))
     except UnicodeDecodeError:
@@ -757,7 +970,7 @@ def _key_text(key: Any, decoder: Optional["AvroDecoder"]) -> Optional[str]:
 def _b64_if_binary(fmt: str, value: bytes) -> Optional[str]:
     """The exact bytes of a dead-lettered message when its text form would be lossy (Avro, or bytes that are not UTF-8)."""
     import base64
-    if fmt != "avro":
+    if fmt not in REGISTRY_FORMATS:
         try:
             value.decode("utf-8")
             return None
@@ -847,7 +1060,7 @@ class _Runner(threading.Thread):
             location, so = autoloader.resolve_target(s["target_catalog"], s["target_schema"], s["target_table"])
             if so is None:
                 os.makedirs(os.path.dirname(location), exist_ok=True)
-            self.decoder = AvroDecoder(conn) if s["format"] == "avro" else None
+            self.decoder = decoder_for(conn, s["format"])
             topic = s["topic"]
             md = _list_topics_explained(consumer, self.client_errors, topic)
             t = md.topics.get(topic)
@@ -1083,9 +1296,9 @@ def preview(conn_name: str, topic: str, fmt: str = "json", limit: int = 10) -> D
         raise StreamError("Unknown format.")
     limit = max(1, min(int(limit or 10), 50))
     conn = _connection(conn_name)
-    if fmt == "avro" and not conn["config"].get("schema_registry_url"):
-        raise StreamError("The Avro format needs a Schema Registry: add its URL to the Kafka connection.")
-    decoder = AvroDecoder(conn) if fmt == "avro" else None
+    if fmt in REGISTRY_FORMATS and not conn["config"].get("schema_registry_url"):
+        raise StreamError("This format needs a Schema Registry: add its URL to the Kafka connection.")
+    decoder = decoder_for(conn, fmt)
     consumer = ck.Consumer({**kafka_conf(conn), "group.id": f"dkw-preview-{uuid.uuid4().hex[:8]}", "enable.auto.commit": False})
     try:
         t = consumer.list_topics(topic, timeout=15).topics.get(topic)
