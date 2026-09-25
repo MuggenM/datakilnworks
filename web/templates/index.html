@@ -11281,7 +11281,7 @@
         <div x-show="pipelineSourceKind === 'connection'" class="space-y-3 p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg" data-testid="conn-source">
           <div class="grid grid-cols-3 gap-2">
             <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Connection</label>
-              <select x-model="pipelineConn.name" data-testid="pipe-conn" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-2 text-slate-900 dark:text-white">
+              <select x-model="pipelineConn.name" @change="connPreview = { busy: false, error: '', data: null }" data-testid="pipe-conn" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-2 text-slate-900 dark:text-white">
                 <option value="">— choose —</option>
                 <template x-for="c in connectionsList" :key="c.id"><option :value="c.name" x-text="c.name + ' (' + (c.type === 'sftp' ? 'SFTP' : 'HTTP') + ')'"></option></template>
               </select></div>
@@ -11320,6 +11320,24 @@
           <div x-show="connType() === 'sftp'" class="flex items-center space-x-4">
             <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="pipelineConn.recursive"><span>Include sub-folders</span></label>
             <label class="flex items-center space-x-1.5"><span>Wait until a file is unchanged for</span><input type="number" min="0" x-model.number="pipelineConn.settle_seconds" class="w-16 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1"><span>s</span></label>
+          </div>
+          <div class="space-y-1.5" data-testid="conn-preview-block">
+            <div class="flex items-center space-x-2">
+              <button type="button" @click="previewConnSource()" :disabled="connPreview.busy || !pipelineConn.name || (connType() === 'sftp' && !pipelineConn.path.trim())" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded font-semibold disabled:opacity-50" data-testid="pipe-preview"><i class="ph" :class="connPreview.busy ? 'ph-spinner animate-spin' : 'ph-eye'"></i> Preview first rows</button>
+              <span class="text-[10px] text-slate-500">Reads the source now; nothing is loaded or saved.</span>
+            </div>
+            <div x-show="connPreview.error" class="text-rose-600 dark:text-rose-400" x-text="connPreview.error" data-testid="pipe-preview-error"></div>
+            <div x-show="connPreview.data" class="space-y-1">
+              <div class="text-[10px] text-slate-500 space-y-0.5"><template x-for="n in (connPreview.data ? connPreview.data.notes : [])" :key="n"><div x-text="n"></div></template>
+                <div x-show="connPreview.data && connPreview.data.files.length > 1" x-text="connPreview.data ? 'Files: ' + connPreview.data.files.join(', ') : ''"></div></div>
+              <div class="overflow-x-auto max-h-56 border border-slate-200 dark:border-slate-700 rounded" data-testid="pipe-preview-table">
+                <table class="w-full text-left font-mono text-[11px]">
+                  <thead class="sticky top-0 bg-slate-100 dark:bg-slate-800"><tr><template x-for="c in (connPreview.data ? connPreview.data.columns : [])" :key="c.name"><th class="px-2 py-1 whitespace-nowrap"><span x-text="c.name"></span> <span class="font-normal text-slate-400" x-text="c.type"></span></th></template></tr></thead>
+                  <tbody><template x-for="(row, ri) in (connPreview.data ? connPreview.data.rows : [])" :key="ri"><tr class="border-t border-slate-100 dark:border-slate-800"><template x-for="(v, ci) in row" :key="ci"><td class="px-2 py-1 whitespace-nowrap max-w-[220px] truncate" x-text="v === null ? '∅' : (typeof v === 'object' ? JSON.stringify(v) : String(v))"></td></template></tr></template></tbody>
+                </table>
+              </div>
+              <div class="text-[10px] text-slate-500" x-show="connPreview.data" x-text="connPreview.data ? (connPreview.data.rows.length + ' row(s) shown' + (connPreview.data.truncated ? ' — there are more' : '')) : ''"></div>
+            </div>
           </div>
         </div>
 
@@ -17074,6 +17092,7 @@
         pipelineConn: { name: '', path: '', mode: 'file', records_path: '', params: '', pagination: 'none', page_param: 'page', size_param: '', page_size: 100, offset_param: 'offset', limit_param: 'limit', next_path: '', recursive: false, settle_seconds: 10 },
         showConnectionsModal: false,
         connectionsList: [],
+        connPreview: { busy: false, error: '', data: null },
         connTest: {},
         connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '' },
         autoloaderTargets: [{ id: 'warehouse', name: 'warehouse', kind: 'local' }],
@@ -26265,6 +26284,22 @@
             console.error('Error loading history:', e);
           } finally {
             this.isLoadingPipelineHistory = false;
+          }
+        },
+
+        async previewConnSource() {
+          const p = this.connPreview; p.busy = true; p.error = ''; p.data = null;
+          try {
+            const src = this.connSourceForSubmit();
+            const res = await fetch('/api/autoloader/preview-source', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ...src, file_pattern: this.connType() === 'sftp' ? (this.newPipelineForm.file_pattern || '*') : '*' }) });
+            const data = await res.json();
+            if (!res.ok) { p.error = typeof data.detail === 'string' ? data.detail : 'The preview failed.'; return; }
+            p.data = data;
+          } catch (e) {
+            p.error = 'Error: ' + e.message;
+          } finally {
+            p.busy = false;
           }
         },
 

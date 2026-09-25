@@ -596,8 +596,8 @@ def _parse_merge_keys(raw: Optional[str]) -> List[str]:
     return [k.strip() for k in (raw or "").split(",") if k.strip()]
 
 
-def _open_source_reader(duck_conn, file_path: str, ext_lower: str) -> pa.RecordBatchReader:
-    """Opens a streaming Arrow reader over a source file; nothing is materialized in memory."""
+def _open_source_reader(duck_conn, file_path: str, ext_lower: str, limit: Optional[int] = None) -> pa.RecordBatchReader:
+    """Opens a streaming Arrow reader over a source file; nothing is materialized in memory. `limit` (a preview) caps the rows read."""
     safe_path = file_path.replace("'", "''")
     if ext_lower in ("csv", "tsv", "txt"):
         query = f"SELECT * FROM read_csv_auto('{safe_path}')"
@@ -607,7 +607,9 @@ def _open_source_reader(duck_conn, file_path: str, ext_lower: str) -> pa.RecordB
         query = f"SELECT * FROM read_json_auto('{safe_path}')"
     else:
         raise ValueError(f"Unsupported file format '.{ext_lower}' for Auto-Loader.")
-    return duck_conn.sql(query).fetch_arrow_reader(batch_size=BATCH_ROWS)
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+    return duck_conn.sql(query).fetch_arrow_reader(batch_size=min(BATCH_ROWS, max(1, int(limit))) if limit is not None else BATCH_ROWS)
 
 
 def _looks_like_remote_io_error(err: Exception) -> bool:

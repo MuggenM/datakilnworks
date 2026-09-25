@@ -57,7 +57,7 @@ class Candidate:
     rel: str                                          # shown in history
     identity: Optional[str]                           # checkpoint hash; None = only known after downloading (then the content hash)
     size: int
-    fetch: Callable[[str], Tuple[str, str]]           # (staging_dir) -> (local_path, content_sha256)
+    fetch: Callable[..., Tuple[str, str]]             # (staging_dir, cap_bytes=None) -> (local_path, content_sha256); a preview passes a small cap
 
 
 # ---------------------------------------------------------------- references and paths
@@ -223,8 +223,9 @@ def _ext_for(name: str, content_type: str = "") -> str:
     raise SourceError("The file format cannot be told from the URL or the server's content type. Use a URL ending in .csv, .json, .parquet, ...")
 
 
-def _limit_text() -> str:
-    return f"{MAX_BYTES // (1024 * 1024)} MB" if MAX_BYTES >= 1024 * 1024 else f"{MAX_BYTES} bytes"
+def _limit_text(cap: Optional[int] = None) -> str:
+    cap = cap or MAX_BYTES
+    return f"{cap // (1024 * 1024)} MB" if cap >= 1024 * 1024 else f"{cap} bytes"
 
 
 def _safe_name(name: str) -> str:
@@ -232,13 +233,14 @@ def _safe_name(name: str) -> str:
     return stem
 
 
-def _stream_to(resp, dest: str) -> str:
+def _stream_to(resp, dest: str, cap: Optional[int] = None) -> str:
     h, total = hashlib.sha256(), 0
     with open(dest, "wb") as f:
         for chunk in resp.iter_content(1 << 20):
             total += len(chunk)
-            if total > MAX_BYTES:
-                raise SourceError(f"The download is larger than {_limit_text()} (AUTOLOADER_MAX_DOWNLOAD_MB).")
+            if total > (cap or MAX_BYTES):
+                resp.close()
+                raise SourceError(f"The download is larger than {_limit_text(cap)}" + (" (too large to preview)." if cap else " (AUTOLOADER_MAX_DOWNLOAD_MB)."))
             h.update(chunk)
             f.write(chunk)
     resp.close()
@@ -259,11 +261,11 @@ def _http_file_candidates(conn, rest, pipe) -> List[Candidate]:
         if "HTTP 405" not in str(exc) and "HTTP 501" not in str(exc):
             raise                                              # a real problem (auth, 404, unreachable); only HEAD-unsupported falls through
 
-    def fetch(staging: str) -> Tuple[str, str]:
+    def fetch(staging: str, cap: Optional[int] = None) -> Tuple[str, str]:
         r = _http(conn, url, "GET", stream=True)
         ext = _ext_for(rest, r.headers.get("Content-Type", ""))
         dest = os.path.join(staging, _safe_name(rest) if os.path.splitext(rest)[1].lower().lstrip(".") in SUPPORTED_EXT else f"{_safe_name(rest)}.{ext}")
-        return dest, _stream_to(r, dest)
+        return dest, _stream_to(r, dest, cap)
     return [Candidate(rel=rest, identity=identity, size=size, fetch=fetch)]
 
 
@@ -337,7 +339,7 @@ def _api_pages(conn, rest, opts) -> Iterator[List[Any]]:
 
 
 def _api_candidates(conn, rest, opts) -> List[Candidate]:
-    def fetch(staging: str) -> Tuple[str, str]:
+    def fetch(staging: str, cap: Optional[int] = None) -> Tuple[str, str]:
         dest, h, total = os.path.join(staging, "snapshot.jsonl"), hashlib.sha256(), 0
         with open(dest, "w", encoding="utf-8") as f:
             for page in _api_pages(conn, rest, opts):
@@ -444,7 +446,7 @@ def _sftp_candidates(conn, rest, opts, pipe) -> List[Candidate]:
     host = conn["config"]["host"]
 
     def make(path: str, size: int, mtime: float) -> Candidate:
-        def fetch(staging: str) -> Tuple[str, str]:
+        def fetch(staging: str, cap: Optional[int] = None) -> Tuple[str, str]:
             t2, s2 = open_sftp(conn)
             try:
                 dest = os.path.join(staging, _safe_name(path))
@@ -456,8 +458,8 @@ def _sftp_candidates(conn, rest, opts, pipe) -> List[Candidate]:
                         if not chunk:
                             break
                         total += len(chunk)
-                        if total > MAX_BYTES:
-                            raise SourceError(f"The file is larger than {_limit_text()} (AUTOLOADER_MAX_DOWNLOAD_MB).")
+                        if total > (cap or MAX_BYTES):
+                            raise SourceError(f"The file is larger than {_limit_text(cap)}" + (" (too large to preview)." if cap else " (AUTOLOADER_MAX_DOWNLOAD_MB)."))
                         h.update(chunk)
                         out.write(chunk)
                 return dest, h.hexdigest()
@@ -519,3 +521,76 @@ def test_connection(conn: Dict[str, Any]) -> Dict[str, Any]:
             # The server is there and did not refuse the login; an API's bare base URL often has no page of its own.
             return {"ok": True, "message": f"Reached {urlparse(cfg['base_url']).netloc}. {msg} (fine if the pipeline's path adds the resource)."}
         return {"ok": False, "message": msg}
+
+
+# ---------------------------------------------------------------- preview
+
+PREVIEW_ROWS = 10
+PREVIEW_BYTES = 20 * 1024 * 1024
+PREVIEW_RECORDS = 200          # records of an API's first page that are read to infer the columns
+
+
+def _jsonable(v: Any) -> Any:
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (bytes, bytearray)):
+        return f"<{len(v)} bytes>"
+    return str(v)
+
+
+def preview(path: str, options: Optional[Dict[str, Any]] = None, file_pattern: str = "*", limit: int = PREVIEW_ROWS) -> Dict[str, Any]:
+    """What the first rows of a connection source look like, BEFORE a pipeline exists: nothing is checkpointed, loaded or kept.
+
+    HTTP file: the file (up to 20 MB). REST API: the first page only (the pipeline itself fetches every page). SFTP: the oldest matching file
+    of the folder, plus the names of the others. Raises SourceError with a user-safe message."""
+    import tempfile
+    import duckdb
+    from web import autoloader
+    conn, rest = resolve(path)
+    opts = validate_options(conn["type"], options or {}, rest)
+    notes: List[str] = []
+    files: List[str] = []
+    limit = max(1, min(int(limit or PREVIEW_ROWS), 50))
+    with tempfile.TemporaryDirectory(prefix="dkw_preview_") as tmp:
+        if conn["type"] == "sftp":
+            cands = _sftp_candidates(conn, rest, {**opts, "settle_seconds": 0}, {"file_pattern": file_pattern or "*"})
+            if not cands:
+                raise SourceError("No file in that folder matches the pattern.")
+            files = [c.rel for c in cands[:20]]
+            notes.append(f"{len(cands)} matching file(s); showing the first ({cands[0].rel}). The pipeline loads each file once.")
+            sample = cands[0].rel
+            local, _ = cands[0].fetch(tmp, PREVIEW_BYTES)
+            kind = "sftp"
+        elif opts["mode"] == "file":
+            cand = _http_file_candidates(conn, rest, {})[0]
+            local, _ = cand.fetch(tmp, PREVIEW_BYTES)
+            sample, kind = rest, "file"
+        else:
+            local, kind, sample = os.path.join(tmp, "first_page.jsonl"), "api", f"{rest or '/'} (first page)"
+            pages = _api_pages(conn, rest, opts)
+            first = next(pages, None)
+            if not first:
+                raise SourceError("The API returned no records on its first page.")
+            with open(local, "w", encoding="utf-8") as f:
+                for rec in first[:PREVIEW_RECORDS]:
+                    f.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
+            notes.append(f"First page only ({len(first)} record{'s' if len(first) != 1 else ''}); each poll fetches every page as one snapshot.")
+            pages.close()
+        ext = os.path.splitext(local)[1].lower().lstrip(".")
+        duck = duckdb.connect(":memory:")
+        try:
+            reader = autoloader._open_source_reader(duck, local, ext, limit=limit + 1)
+            table = reader.read_all()
+        except Exception as exc:
+            raise SourceError(f"The data could not be read as {ext.upper() or 'a table'} ({str(exc).splitlines()[0][:160]}).")
+        finally:
+            duck.close()
+        more = table.num_rows > limit
+        table = table.slice(0, limit)
+        return {"ok": True, "source": kind, "sample": sample, "files": files, "notes": notes, "truncated": more,
+                "columns": [{"name": f.name, "type": str(f.type)} for f in table.schema],
+                "rows": [[_jsonable(v) for v in row] for row in zip(*[c.to_pylist() for c in table.columns])] if table.num_columns else []}

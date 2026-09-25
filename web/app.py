@@ -8196,6 +8196,25 @@ async def delete_connection_endpoint(conn_id: str, current_user: Dict[str, Any] 
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+class SourcePreviewPayload(BaseModel):
+    source_volume_path: str
+    source_options: Optional[Dict[str, Any]] = None
+    file_pattern: Optional[str] = "*"
+    limit: Optional[int] = 10
+
+
+@app.post("/api/autoloader/preview-source")
+async def preview_autoloader_source_endpoint(payload: SourcePreviewPayload, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """The first rows of a connection source (HTTP file, REST API first page, SFTP file) as the pipeline would read them. Nothing is stored."""
+    from web import autoloader_conn
+    if not autoloader_conn.is_conn_path(payload.source_volume_path):
+        raise HTTPException(status_code=400, detail="A preview needs a connection source (conn://<connection>/<path>).")
+    try:
+        return await asyncio.to_thread(autoloader_conn.preview, payload.source_volume_path, payload.source_options, payload.file_pattern or "*", payload.limit or 10)
+    except autoloader_conn.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.get("/api/autoloader/target-catalogs")
 async def get_autoloader_target_catalogs(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Catalogs a pipeline can load into: writable local catalogs and writable S3 mounts (the create dialog's dropdown)."""
