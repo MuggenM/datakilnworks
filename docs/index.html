@@ -1210,7 +1210,7 @@ docker compose ps</code></pre>
           After upgrading, recreate the stack to remove the old Jupyter container: <code>docker compose up -d --remove-orphans</code>.
         </p>
         <p>
-          When an upgrade adds a Python dependency (recently <code>boto3</code> for S3 sources and <code>paramiko</code> for SFTP connections) the image must be rebuilt: <code>docker compose build</code>, then <code>docker compose up -d</code>. Edits to <code>web/</code> alone need no rebuild.
+          When an upgrade adds a Python dependency (recently <code>boto3</code> for S3 sources and <code>paramiko</code> for SFTP connections) the image must be rebuilt: <code>docker compose build</code>, then <code>docker compose up -d</code>. Edits to <code>web/</code> alone need no rebuild. A rebuilt image must contain <code>dbt-duckdb</code> (now listed in <code>requirements.txt</code>): duckrun 0.5 stopped installing it, and without it every dbt command and the Git sync's <code>dbt parse</code> check fail with <em>No module named dbt.adapters.duckdb</em>. On an image built earlier, <code>docker compose exec datakilnworks-studio pip install dbt-duckdb</code> is a stopgap until the next build.
         </p>
 
         <h3 id="kubernetes-deployment">Enterprise Kubernetes Deployment (k3s / k8s / KubeRay)</h3>
