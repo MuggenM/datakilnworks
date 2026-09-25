@@ -5559,13 +5559,17 @@ async def list_jobs_endpoint():
 
 @app.post("/api/jobs")
 async def save_job_endpoint(payload: Dict[str, Any], request: Request):
+    from web.workflow import JobValidationError
     user = await resolve_principal(request)
     existing = get_job(payload.get("id")) if payload.get("id") else None
     if existing and existing.get("created_by") and user.get("role") != "admin" and existing["created_by"] != user.get("username"):
         raise HTTPException(status_code=403, detail="Only the job's owner or an admin can change it.")
     # Ownership is server-side: jobs run as their owner, so the client must not be able to name one.
     payload["created_by"] = (existing or {}).get("created_by") or user.get("username")
-    saved = create_or_update_job(payload)
+    try:
+        saved = create_or_update_job(payload)
+    except JobValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return saved
 
 @app.get("/api/jobs/{job_id}")
@@ -5587,14 +5591,65 @@ async def delete_job_endpoint(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"success": True, "deleted_id": job_id}
 
+class JobRunPayload(BaseModel):
+    parameters: Optional[Dict[str, Any]] = None
+    wait: bool = True            # False: return the run id at once and let the run continue (poll /api/jobs/runs/{id}; cancel with /cancel)
+
+
 @app.post("/api/jobs/{job_id}/run")
-async def trigger_job_run_endpoint(job_id: str, request: Request):
+async def trigger_job_run_endpoint(job_id: str, request: Request, payload: Optional[JobRunPayload] = None):
+    """Runs a job now. Parameters must satisfy the job's declared allowed values/patterns; the job itself runs as its owner."""
+    from web import workflow
     await resolve_principal(request)          # authentication only: the job itself runs as its owner
+    payload = payload or JobRunPayload()
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
     try:
-        res = run_pipeline(job_id, trigger="MANUAL")
+        if not payload.wait:
+            if workflow.running_count(job_id) >= int((get_job(job_id).get("max_concurrent_runs") or 1)):
+                raise HTTPException(status_code=409, detail="The maximum number of concurrent runs of this job is already running.")
+            return {"run_id": workflow.start_run_in_background(job_id, trigger="MANUAL", params=payload.parameters), "status": "RUNNING"}
+        res = await asyncio.to_thread(run_pipeline, job_id, "MANUAL", None, None, payload.parameters)
+        if res.get("status") == "SKIPPED":
+            raise HTTPException(status_code=409, detail=res.get("message", "Skipped."))
         return res
+    except workflow.JobValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+def _may_control_run(user: Dict[str, Any], run: Dict[str, Any]) -> bool:
+    job = get_job(run["job_id"]) or {}
+    return user.get("role") == "admin" or not job.get("created_by") or job.get("created_by") == user.get("username")
+
+@app.post("/api/jobs/runs/{run_id}/cancel")
+async def cancel_job_run_endpoint(run_id: str, request: Request):
+    """Stops a running run: nothing further starts and a running SQL statement is interrupted (owner or admin)."""
+    from web import workflow
+    user = await resolve_principal(request)
+    run = get_run_detail(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not _may_control_run(user, run):
+        raise HTTPException(status_code=403, detail="Only the job's owner or an admin can cancel its runs.")
+    if not workflow.cancel_run(run_id):
+        raise HTTPException(status_code=409, detail="That run is not running.")
+    return {"success": True, "run_id": run_id}
+
+@app.post("/api/jobs/runs/{run_id}/repair")
+async def repair_job_run_endpoint(run_id: str, request: Request):
+    """Runs only what did not succeed in a failed or cancelled run, with the same parameters; finished tasks are reused."""
+    from web import workflow
+    await resolve_principal(request)
+    run = get_run_detail(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        return {"run_id": workflow.start_run_in_background(run["job_id"], trigger="REPAIR", repair_of=run_id), "status": "RUNNING"}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 @app.get("/api/jobs/{job_id}/runs")
 async def list_job_runs_endpoint(job_id: str, limit: int = 50):

@@ -7299,6 +7299,7 @@
                             <i class="ph ph-x"></i>
                             <span>FAILED</span>
                           </span>
+                          <span x-show="['TIMEOUT','CANCELLED','SKIPPED'].includes(run.status)" class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-950 text-amber-400 border border-amber-800 inline-flex items-center space-x-1" x-text="run.status"></span>
                           <span x-show="run.status === 'RUNNING'" class="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-950 text-blue-400 border border-blue-800 inline-flex items-center space-x-1 animate-pulse">
                             <i class="ph ph-spinner animate-spin"></i>
                             <span>RUNNING</span>
@@ -10303,7 +10304,8 @@
           <span class="text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase" :class="{
             'bg-emerald-950 text-emerald-400 border border-emerald-800': selectedRunDetail && selectedRunDetail.status === 'SUCCESS',
             'bg-red-950 text-red-400 border border-red-800': selectedRunDetail && selectedRunDetail.status === 'FAILED',
-            'bg-blue-950 text-blue-400 border border-blue-800 animate-pulse': selectedRunDetail && selectedRunDetail.status === 'RUNNING'
+            'bg-blue-950 text-blue-400 border border-blue-800 animate-pulse': selectedRunDetail && selectedRunDetail.status === 'RUNNING',
+            'bg-amber-950 text-amber-400 border border-amber-800': selectedRunDetail && ['TIMEOUT','CANCELLED','SKIPPED'].includes(selectedRunDetail.status)
           }" x-text="selectedRunDetail ? selectedRunDetail.status : ''"></span>
         </div>
         <button @click="showRunDetailModal = false" class="text-slate-400 hover:text-white text-sm">
@@ -10329,6 +10331,18 @@
           <span class="text-slate-500 block text-[10px] uppercase font-mono">Execution Timestamp</span>
           <span class="font-mono text-slate-300 text-[11px]" x-text="selectedRunDetail ? selectedRunDetail.started_at : ''"></span>
         </div>
+      </div>
+
+      <div x-show="selectedRunDetail && (runDetailParams().length || selectedRunDetail.parent_run_id)" class="text-[11px] font-mono text-slate-300 bg-slate-900/60 border border-dbx-border rounded p-2 shrink-0 space-y-1" data-testid="run-params">
+        <div x-show="runDetailParams().length"><span class="text-slate-500 uppercase text-[10px]">Parameters</span>
+          <template x-for="kv in runDetailParams()" :key="kv[0]"><span class="ml-2 text-cyan-300" x-text="kv[0] + ' = ' + kv[1]"></span></template></div>
+        <div x-show="selectedRunDetail && selectedRunDetail.parent_run_id"><span class="text-slate-500 uppercase text-[10px]">Repair of</span> <span class="text-amber-300" x-text="selectedRunDetail ? selectedRunDetail.parent_run_id : ''"></span></div>
+      </div>
+      <div x-show="selectedRunDetail && (selectedRunDetail.notifications || []).length" class="text-[11px] font-mono bg-slate-900/60 border border-dbx-border rounded p-2 shrink-0 space-y-0.5" data-testid="run-notifications">
+        <span class="text-slate-500 uppercase text-[10px]">Notifications</span>
+        <template x-for="(n, ni) in (selectedRunDetail ? selectedRunDetail.notifications : [])" :key="ni">
+          <div :class="n.ok ? 'text-emerald-400' : 'text-red-400'" x-text="n.channel + ' -> ' + (n.target || 'default') + ': ' + (n.ok ? 'sent' : ('failed - ' + (n.error || '')))"></div>
+        </template>
       </div>
 
       <!-- Error box if failed -->
@@ -10357,7 +10371,8 @@
                 <span class="px-2 py-0.5 rounded text-[10px] font-mono uppercase font-bold" :class="{
                   'bg-emerald-950 text-emerald-400 border border-emerald-800': task.status === 'SUCCESS',
                   'bg-red-950 text-red-400 border border-red-800': task.status === 'FAILED',
-                  'bg-slate-800 text-slate-400 border border-slate-700': task.status === 'SKIPPED'
+                  'bg-slate-800 text-slate-400 border border-slate-700': task.status === 'SKIPPED',
+                  'bg-amber-950 text-amber-400 border border-amber-800': task.status === 'CANCELLED'
                 }" x-text="task.status"></span>
               </div>
             </div>
@@ -10365,6 +10380,9 @@
             <!-- Task Output / Logs -->
             <div class="p-3 bg-slate-950/90">
               <pre class="text-[11px] font-mono text-emerald-400/90 whitespace-pre-wrap break-all leading-relaxed" x-text="task.output ? (typeof task.output === 'object' ? JSON.stringify(task.output, null, 2) : task.output) : 'Task completed without text log.'"></pre>
+              <div x-show="(task.attempts || []).length > 1" class="mt-2 text-[11px] font-mono text-amber-300 space-y-0.5" data-testid="task-attempts">
+                <template x-for="a in (task.attempts || [])" :key="a.attempt"><div x-text="'attempt ' + a.attempt + ': ' + a.status + (a.duration_sec != null ? ' (' + a.duration_sec + 's)' : '') + (a.error ? ' - ' + a.error : '')"></div></template>
+              </div>
               <div x-show="task.error_message" class="mt-2 text-xs font-mono text-red-400 bg-red-950/50 p-2 rounded border border-red-900/60 whitespace-pre-wrap" x-text="task.error_message"></div>
             </div>
           </div>
@@ -10373,6 +10391,8 @@
 
       <!-- Modal Footer -->
       <div class="flex items-center justify-end space-x-2 pt-3 border-t border-dbx-border shrink-0">
+        <button x-show="selectedRunDetail && selectedRunDetail.status === 'RUNNING'" @click="cancelRun(selectedRunDetail.run_id)" data-testid="cancel-run" class="px-4 py-1.5 bg-red-950 hover:bg-red-900 border border-red-800 text-red-300 text-xs rounded transition">Cancel run</button>
+        <button x-show="selectedRunDetail && ['FAILED','CANCELLED','TIMEOUT'].includes(selectedRunDetail.status)" @click="repairRun(selectedRunDetail.run_id)" data-testid="repair-run" class="px-4 py-1.5 bg-amber-950 hover:bg-amber-900 border border-amber-800 text-amber-300 text-xs rounded transition" title="Run only the tasks that did not succeed, with the same parameters">Repair run</button>
         <button @click="showRunDetailModal = false" class="px-4 py-1.5 bg-slate-900 hover:bg-dbx-hover border border-dbx-border text-slate-300 text-xs rounded transition">
           Close
         </button>
@@ -10381,6 +10401,25 @@
   </div>
 
   <!-- ================= CREATE / EDIT WORKFLOW JOB MODAL ================= -->
+  <div x-show="showRunParamsModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showRunParamsModal = false">
+    <div class="bg-dbx-panel border border-dbx-border rounded-xl w-full max-w-md shadow-2xl p-5 space-y-3" @click.outside="showRunParamsModal = false" data-testid="run-params-dialog">
+      <h3 class="text-sm font-bold text-white">Run with parameters</h3>
+      <template x-for="p in runParamsForm" :key="p.name">
+        <div>
+          <label class="block text-[11px] text-slate-400 mb-0.5"><span class="font-mono text-cyan-300" x-text="p.name"></span> <span x-text="p.description ? '- ' + p.description : ''"></span></label>
+          <select x-show="(p.allowed || []).length" x-model="p.value" class="w-full bg-slate-950 border border-dbx-border rounded px-2.5 py-1 text-xs font-mono text-white">
+            <template x-for="a in (p.allowed || [])" :key="a"><option :value="a" x-text="a"></option></template>
+          </select>
+          <input x-show="!(p.allowed || []).length" type="text" x-model="p.value" class="w-full bg-slate-950 border border-dbx-border rounded px-2.5 py-1 text-xs font-mono text-white">
+        </div>
+      </template>
+      <div class="flex justify-end space-x-2 pt-2">
+        <button @click="showRunParamsModal = false" class="px-3 py-1.5 bg-slate-900 border border-dbx-border text-slate-300 text-xs rounded">Cancel</button>
+        <button @click="startRunWithParams()" data-testid="run-params-start" class="px-4 py-1.5 bg-dbx-orange text-white text-xs font-semibold rounded">Run</button>
+      </div>
+    </div>
+  </div>
+
   <div x-show="showJobModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showJobModal = false">
     <div class="bg-dbx-panel border border-dbx-border rounded-xl w-full max-w-3xl shadow-2xl p-6 space-y-4 max-h-[92vh] flex flex-col" @click.outside="showJobModal = false">
       <div class="flex items-center justify-between border-b border-dbx-border pb-3 shrink-0">
@@ -10465,6 +10504,64 @@
           </div>
         </div>
 
+        <!-- Orchestration: parameters, limits, triggers, notifications -->
+        <div class="space-y-3 pt-2 border-t border-dbx-border" data-testid="job-orchestration">
+          <h4 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center space-x-1.5"><i class="ph ph-sliders text-cyan-400"></i><span>Runs, parameters, triggers and alerts</span></h4>
+          <div class="grid grid-cols-4 gap-3 text-xs">
+            <div><label class="block text-[10px] text-slate-500 mb-0.5">Job timeout (s, 0 = none)</label><input type="number" min="0" x-model.number="jobForm.timeout_seconds" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+            <div><label class="block text-[10px] text-slate-500 mb-0.5">Max concurrent runs</label><input type="number" min="1" max="10" x-model.number="jobForm.max_concurrent_runs" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+            <label class="flex items-center space-x-2 col-span-2 pt-4 cursor-pointer" title="After downtime, run once for schedule ticks missed while the studio was stopped"><input type="checkbox" x-model="jobForm.catch_up" class="rounded bg-slate-900 border-dbx-border text-cyan-600 focus:ring-0"><span class="text-slate-300">Catch up a missed schedule tick after downtime</span></label>
+          </div>
+
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between"><span class="text-[11px] text-slate-400">Parameters <span class="text-slate-500">(use <span class="font-mono">{&#123; params.name &#125;}</span> in SQL and notebook parameters; values are checked against the pattern or allowed list)</span></span>
+              <button type="button" @click="jobForm.parameters.push({name:'', default:'', description:'', allowed_text:'', pattern:''})" class="text-[11px] text-cyan-400 hover:text-cyan-300">+ parameter</button></div>
+            <template x-for="(p, pi) in jobForm.parameters" :key="pi">
+              <div class="grid grid-cols-12 gap-1.5 text-xs items-center">
+                <input x-model="p.name" placeholder="name" class="col-span-2 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-cyan-300">
+                <input x-model="p.default" placeholder="default" class="col-span-2 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white">
+                <input x-model="p.allowed_text" placeholder="allowed values (a, b, c)" class="col-span-3 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white">
+                <input x-model="p.pattern" placeholder="pattern (regex, optional)" class="col-span-2 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white">
+                <input x-model="p.description" placeholder="description" class="col-span-2 bg-slate-950 border border-dbx-border rounded px-2 py-1 text-white">
+                <button type="button" @click="jobForm.parameters.splice(pi, 1)" class="text-slate-500 hover:text-red-400"><i class="ph ph-trash"></i></button>
+              </div>
+            </template>
+          </div>
+
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between"><span class="text-[11px] text-slate-400">Triggers <span class="text-slate-500">(in addition to the schedule)</span></span>
+              <button type="button" @click="jobForm.triggers.push({type:'job', job_id:'', on:'success', pipeline_id:'', min_files:1, table:''})" class="text-[11px] text-cyan-400 hover:text-cyan-300">+ trigger</button></div>
+            <template x-for="(tr, ti) in jobForm.triggers" :key="ti">
+              <div class="grid grid-cols-12 gap-1.5 text-xs items-center">
+                <select x-model="tr.type" class="col-span-3 bg-slate-950 border border-dbx-border rounded px-1 py-1 text-cyan-300"><option value="job">after another job</option><option value="autoloader">Auto-Loader ingested files</option><option value="table">Delta table changed</option></select>
+                <template x-if="tr.type === 'job'"><div class="col-span-8 grid grid-cols-8 gap-1.5">
+                  <select x-model="tr.job_id" class="col-span-5 bg-slate-950 border border-dbx-border rounded px-1 py-1 font-mono text-white"><option value="">- job -</option><template x-for="j in jobs.filter(j => j.id !== jobForm.id)" :key="j.id"><option :value="j.id" x-text="j.name + ' (' + j.id + ')'"></option></template></select>
+                  <select x-model="tr.on" class="col-span-3 bg-slate-950 border border-dbx-border rounded px-1 py-1 text-white"><option value="success">succeeds</option><option value="failure">fails</option><option value="completion">finishes</option></select></div></template>
+                <template x-if="tr.type === 'autoloader'"><div class="col-span-8 grid grid-cols-8 gap-1.5">
+                  <input x-model="tr.pipeline_id" placeholder="pipeline id" class="col-span-5 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white">
+                  <input type="number" min="1" x-model.number="tr.min_files" title="minimum files per cycle" class="col-span-3 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div></template>
+                <template x-if="tr.type === 'table'"><input x-model="tr.table" placeholder="schema.table" class="col-span-8 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></template>
+                <button type="button" @click="jobForm.triggers.splice(ti, 1)" class="text-slate-500 hover:text-red-400"><i class="ph ph-trash"></i></button>
+              </div>
+            </template>
+          </div>
+
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between"><span class="text-[11px] text-slate-400">Notifications</span>
+              <button type="button" @click="jobForm.notifications.push({on_failure:true, on_success:false, on_cancelled:false, channel:'email', target:''})" class="text-[11px] text-cyan-400 hover:text-cyan-300">+ notification</button></div>
+            <template x-for="(n, ni) in jobForm.notifications" :key="ni">
+              <div class="grid grid-cols-12 gap-1.5 text-xs items-center">
+                <label class="col-span-1 text-slate-300"><input type="checkbox" x-model="n.on_failure"> fail</label>
+                <label class="col-span-2 text-slate-300"><input type="checkbox" x-model="n.on_success"> success</label>
+                <label class="col-span-2 text-slate-300"><input type="checkbox" x-model="n.on_cancelled"> cancel</label>
+                <select x-model="n.channel" class="col-span-2 bg-slate-950 border border-dbx-border rounded px-1 py-1 text-cyan-300"><option value="email">email</option><option value="slack">Slack</option><option value="webhook">webhook</option></select>
+                <input x-model="n.target" :placeholder="n.channel === 'email' ? 'a@x.org, b@x.org' : (n.channel === 'slack' ? 'webhook id (blank = default)' : 'webhook id')" class="col-span-4 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white">
+                <button type="button" @click="jobForm.notifications.splice(ni, 1)" class="text-slate-500 hover:text-red-400"><i class="ph ph-trash"></i></button>
+              </div>
+            </template>
+          </div>
+        </div>
+
         <!-- DAG Tasks Editor Section -->
         <div class="space-y-3 pt-2 border-t border-dbx-border">
           <div class="flex items-center justify-between">
@@ -10506,6 +10603,17 @@
                     <label class="block text-[11px] text-slate-400 mb-0.5">Depends On (comma-separated IDs)</label>
                     <input type="text" :value="(task.depends_on || []).join(', ')" @input="task.depends_on = $event.target.value.split(',').map(s => s.trim()).filter(Boolean)" placeholder="e.g. ingest_raw" class="w-full bg-slate-950 border border-dbx-border rounded px-2.5 py-1 text-xs font-mono text-cyan-400">
                   </div>
+                </div>
+                <div class="grid grid-cols-5 gap-2 text-xs" data-testid="task-resilience">
+                  <div><label class="block text-[10px] text-slate-500 mb-0.5">Retries</label><input type="number" min="0" max="10" x-model.number="task.retries" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                  <div><label class="block text-[10px] text-slate-500 mb-0.5">Retry delay (s)</label><input type="number" min="0" max="3600" x-model.number="task.retry_delay_seconds" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                  <div><label class="block text-[10px] text-slate-500 mb-0.5">Backoff x</label><input type="number" min="1" max="10" step="0.5" x-model.number="task.retry_backoff" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                  <div><label class="block text-[10px] text-slate-500 mb-0.5">Timeout (s, 0 = none)</label><input type="number" min="0" x-model.number="task.timeout_seconds" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                  <div><label class="block text-[10px] text-slate-500 mb-0.5">Run if</label>
+                    <select x-model="task.run_if" class="w-full bg-slate-950 border border-dbx-border rounded px-1 py-1 font-mono text-cyan-300">
+                      <option value="all_success">all succeeded</option><option value="none_failed">none failed</option><option value="all_done">all finished</option>
+                      <option value="at_least_one_success">one succeeded</option><option value="at_least_one_failed">one failed</option><option value="all_failed">all failed</option>
+                    </select></div>
                 </div>
 
                 <!-- Parameters by type -->
@@ -18324,12 +18432,21 @@
         showRunDetailModal: false,
         selectedRunDetail: null,
         jobEditMode: false,
+        showRunParamsModal: false,
+        runParamsForm: [],
+        runParamsJobId: null,
         jobForm: {
           id: '',
           name: '',
           description: '',
           schedule_cron: '',
           enabled: true,
+          timeout_seconds: 0,
+          max_concurrent_runs: 1,
+          catch_up: false,
+          parameters: [],
+          triggers: [],
+          notifications: [],
           tasks: []
         },
 
@@ -25521,23 +25638,82 @@
 
         async runJobNow(jobId) {
           if (!jobId || this.isRunningJob) return;
+          const job = this.jobs.find(j => j.id === jobId) || this.selectedJob;
+          const params = (job && job.parameters) || [];
+          if (params.length) {
+            this.runParamsJobId = jobId;
+            this.runParamsForm = params.map(p => ({ name: p.name, description: p.description || '', allowed: p.allowed || [], value: p.default ?? '' }));
+            this.showRunParamsModal = true;
+            return;
+          }
+          await this.startJobRun(jobId, {});
+        },
+
+        async startRunWithParams() {
+          const values = {};
+          for (const p of this.runParamsForm) values[p.name] = String(p.value ?? '');
+          this.showRunParamsModal = false;
+          await this.startJobRun(this.runParamsJobId, values);
+        },
+
+        async startJobRun(jobId, values) {
           this.isRunningJob = true;
           try {
-            const res = await fetch(`/api/jobs/${jobId}/run`, { method: 'POST' });
-            if (res.ok) {
-              const runResult = await res.json();
-              await this.fetchJobs();
-              await this.fetchJobRuns(jobId);
-              this.openRunDetail(runResult.run_id);
-            } else {
-              const err = await res.json();
+            const res = await fetch(`/api/jobs/${jobId}/run`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ parameters: values, wait: false })
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
               alert('Job execution failed: ' + (err.detail || err.error || 'Unknown error'));
+              return;
             }
+            const started = await res.json();
+            await this.fetchJobRuns(jobId);
+            await this.openRunDetail(started.run_id);
+            this.pollRun(started.run_id, jobId);
           } catch (e) {
             alert('Failed to trigger job run: ' + e.message);
           } finally {
             this.isRunningJob = false;
           }
+        },
+
+        // The run is a background thread; refresh its detail until it ends.
+        async pollRun(runId, jobId) {
+          for (let i = 0; i < 7200; i++) {
+            await new Promise(r => setTimeout(r, 1500));
+            try {
+              const res = await fetch(`/api/jobs/runs/${runId}`);
+              if (!res.ok) return;
+              const d = await res.json();
+              if (this.showRunDetailModal && this.selectedRunDetail && this.selectedRunDetail.run_id === runId) this.selectedRunDetail = d;
+              if (d.status !== 'RUNNING') break;
+            } catch (e) { return; }
+          }
+          await this.fetchJobs();
+          if (this.selectedJob && this.selectedJob.id === jobId) await this.fetchJobRuns(jobId);
+        },
+
+        runDetailParams() {
+          const r = this.selectedRunDetail;
+          if (!r || !r.run_params) return [];
+          try { return Object.entries(typeof r.run_params === 'string' ? JSON.parse(r.run_params) : r.run_params); } catch (e) { return []; }
+        },
+
+        async cancelRun(runId) {
+          const res = await fetch(`/api/jobs/runs/${runId}/cancel`, { method: 'POST' });
+          if (!res.ok) { const err = await res.json().catch(() => ({})); alert('Cancel failed: ' + (err.detail || 'Unknown error')); return; }
+          await this.openRunDetail(runId);
+        },
+
+        async repairRun(runId) {
+          const res = await fetch(`/api/jobs/runs/${runId}/repair`, { method: 'POST' });
+          const d = await res.json().catch(() => ({}));
+          if (!res.ok) { alert('Repair failed: ' + (d.detail || 'Unknown error')); return; }
+          const jobId = this.selectedRunDetail ? this.selectedRunDetail.job_id : null;
+          await this.openRunDetail(d.run_id);
+          if (jobId) { await this.fetchJobRuns(jobId); this.pollRun(d.run_id, jobId); }
         },
 
         async openRunDetail(runId) {
@@ -25561,6 +25737,7 @@
             description: '',
             schedule_cron: '',
             enabled: true,
+            timeout_seconds: 0, max_concurrent_runs: 1, catch_up: false, parameters: [], triggers: [], notifications: [],
             tasks: [
               {
                 id: 'task_1',
@@ -25581,6 +25758,18 @@
           this.jobEditMode = true;
           this.jobForm = JSON.parse(JSON.stringify(job));
           if (!this.jobForm.tasks) this.jobForm.tasks = [];
+          const f = this.jobForm;
+          f.timeout_seconds = f.timeout_seconds || 0; f.max_concurrent_runs = f.max_concurrent_runs || 1; f.catch_up = !!f.catch_up;
+          f.parameters = (f.parameters || []).map(p => ({ name: p.name, default: p.default ?? '', description: p.description || '', pattern: p.pattern || '', allowed_text: (p.allowed || []).join(', ') }));
+          f.triggers = f.triggers || [];
+          f.notifications = (f.notifications || []).map(n => ({ on_failure: (n.on || []).includes('failure'), on_success: (n.on || []).includes('success'), on_cancelled: (n.on || []).includes('cancelled'), channel: n.channel, target: n.target || '' }));
+          for (const t of f.tasks) {
+            if (t.retries == null) t.retries = 0;
+            if (t.retry_delay_seconds == null) t.retry_delay_seconds = 30;
+            if (t.retry_backoff == null) t.retry_backoff = 2;
+            if (t.timeout_seconds == null) t.timeout_seconds = 0;
+            if (!t.run_if) t.run_if = 'all_success';
+          }
           for (const t of this.jobForm.tasks) {
             if (t.type === 'notebook') {
               t.parameters = t.parameters || {};
@@ -25631,6 +25820,7 @@
             name: 'Task ' + num,
             type: 'sql',
             depends_on: num > 1 ? [this.jobForm.tasks[num - 2].id] : [],
+            retries: 0, retry_delay_seconds: 30, retry_backoff: 2, timeout_seconds: 0, run_if: 'all_success',
             parameters: {
               query: 'SELECT 1',
               notebook_path: '',
@@ -25749,6 +25939,16 @@
 
           // Format parameters from param_list for notebook tasks
           const payload = JSON.parse(JSON.stringify(this.jobForm));
+          payload.parameters = (payload.parameters || []).filter(p => (p.name || '').trim()).map(p => {
+            const o = { name: p.name.trim(), default: String(p.default ?? ''), description: p.description || '' };
+            const allowed = (p.allowed_text || '').split(',').map(x => x.trim()).filter(Boolean);
+            if (allowed.length) o.allowed = allowed;
+            if ((p.pattern || '').trim()) o.pattern = p.pattern.trim();
+            return o;
+          });
+          payload.notifications = (payload.notifications || []).map(n => ({
+            on: [n.on_failure && 'failure', n.on_success && 'success', n.on_cancelled && 'cancelled'].filter(Boolean), channel: n.channel, target: n.target || ''
+          }));
           for (const t of payload.tasks || []) {
             if (t.type === 'notebook') {
               t.parameters = t.parameters || {};

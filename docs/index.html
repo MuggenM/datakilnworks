@@ -944,6 +944,34 @@ WHERE trip_distance > 0 AND total_amount > 0</code></pre>
           <li><strong>Headless Notebook (<code>notebook</code>):</strong> Parameterized execution of <code>.ipynb</code> notebooks via Papermill.</li>
           <li><strong>File Ingestion (<code>ingest</code>):</strong> Automated pickup of landing zone files into Delta tables.</li>
         </ul>
+
+        <h4>Reliability: retries, timeouts, run conditions</h4>
+        <ul>
+          <li><strong>Retries:</strong> each task can retry up to 10 times with a delay and an exponential backoff factor; every attempt (status, duration, error) is kept in the run.</li>
+          <li><strong>Timeouts:</strong> per task and for the whole job. A timed-out SQL statement is interrupted; other task types (notebooks, ingestion) are abandoned and their result ignored. A job that runs out of time ends <code>TIMEOUT</code>.</li>
+          <li><strong>Run if:</strong> <code>all succeeded</code> (default), <code>none failed</code>, <code>all finished</code>, <code>one succeeded</code>, <code>one failed</code>, <code>all failed</code>. Use <code>one failed</code> / <code>all finished</code> for error handlers and cleanup tasks. A task whose condition is not met is <code>SKIPPED</code>.</li>
+          <li><strong>Concurrency:</strong> <em>Max concurrent runs</em> (default 1). A run started while the limit is reached is recorded as <code>SKIPPED</code> instead of piling up.</li>
+          <li><strong>Cancel and repair:</strong> a running run can be cancelled (a running SQL statement is interrupted, a wait between retries ends at once). <em>Repair run</em> re-runs only the tasks that did not succeed in a failed, cancelled or timed-out run, with the same parameters; succeeded tasks are reused.</li>
+          <li><strong>Missed schedules:</strong> a run left <code>RUNNING</code> by a restart is marked <code>FAILED</code>; with <em>catch up</em> a schedule tick missed during downtime runs once after the restart.</li>
+          <li>Tasks of one run execute one after another in dependency order (there is no parallel execution of tasks within a run).</li>
+        </ul>
+
+        <h4>Parameters</h4>
+        <p>
+          Declare parameters on the job (name, default, optional allowed values or a regular expression) and reference them as <code>{{ params.name }}</code> in SQL and notebook parameters. <em>Run Now</em> asks for the values. Because a job runs with its owner's rights, every value is checked before it is substituted: by default only letters, digits and <code>_ . : @ - space</code> (max. 100 characters) are accepted, so a value can never break out of a SQL string; an allowed list or your own pattern replaces that rule. A reference to an undeclared parameter is refused when the job is saved.
+        </p>
+
+        <h4>Triggers</h4>
+        <ul>
+          <li><strong>After another job</strong> succeeds, fails or finishes (chains are limited to 5 deep and a loop is stopped).</li>
+          <li><strong>Auto-Loader ingested files:</strong> "file arrived" - runs when a pipeline ingested at least N files in a cycle.</li>
+          <li><strong>Delta table changed:</strong> runs when the table gets a new version (checked every 15 s; the job's own writes do not retrigger it).</li>
+        </ul>
+
+        <h4>Notifications</h4>
+        <p>
+          Per job, choose the events (failure, success, cancelled) and a channel: <strong>email</strong> (comma-separated addresses, SMTP settings of the studio), <strong>Slack</strong> or a configured <strong>webhook</strong>. The message names the failing tasks and their errors; the delivery result of each channel is stored with the run and shown in the run details. A failing channel never affects the run.
+        </p>
       </section>
 
       <!-- SECTION 6: MACHINE LEARNING & AI -->

@@ -910,9 +910,16 @@ def run_pipeline_cycle(pipeline_id: str) -> Dict[str, Any]:
         return {"pipeline_id": pipeline_id, "skipped": "a cycle is already running", "files_found": 0, "files_ingested": 0,
                 "files_quarantined": 0, "rows_ingested": 0, "details": []}
     try:
-        return _run_pipeline_cycle_impl(pipeline_id)
+        result = _run_pipeline_cycle_impl(pipeline_id)
     finally:
         lock.release()
+    try:                                                    # jobs can be triggered by files arriving (web/workflow.py triggers)
+        if result.get("files_ingested"):
+            from web import workflow
+            workflow.fire_event({"type": "autoloader", "pipeline_id": pipeline_id, "files": result["files_ingested"], "rows": result.get("rows_ingested", 0)})
+    except Exception as exc:
+        logger.warning(f"Could not fire job triggers for pipeline {pipeline_id}: {exc}")
+    return result
 
 
 def _run_s3_cycle(pipe: Dict[str, Any]) -> Dict[str, Any]:

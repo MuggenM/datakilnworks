@@ -105,6 +105,7 @@ docker compose up -d
 
 ### 4. 🔄 Jobs & Pipelines (Local Workflows / DLT)
 * **Workflows & DLT Orchestration**: Full DAG orchestration engine running in-process without requiring external workflow tools (no Apache Airflow, Celery, or Redis dependencies).
+* **Orchestration**: per-task **retries with backoff**, **timeouts** (task and job; SQL is interrupted), **run conditions** (`all_success`, `all_done`, `at_least_one_failed`, ... for error handlers), **run parameters** (`{{ params.x }}`, injection-guarded because jobs run with the owner's rights), **event triggers** (after another job, Auto-Loader ingested files, Delta table changed), **cancel** and **repair run** (re-run only what failed), max-concurrent-runs, cron catch-up after downtime and **failure/success notifications** (email, Slack, webhook). Tasks of one run execute sequentially.
 * **Multi-Type Task Pipeline**:
   - **SQL Transformations (`sql`)**: Vectorized DuckDB execution (`CREATE OR REPLACE TABLE ... AS SELECT ...`).
   - **Delta Compaction & Vacuum (`optimize`)**: Native `dt.optimize.compact()` bin-packing and `dt.vacuum()` storage cleanup on Delta tables.
