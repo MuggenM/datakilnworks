@@ -10,7 +10,7 @@ import logging
 import asyncio
 import threading
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import duckdb
 import pyarrow as pa
@@ -259,6 +259,7 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     source_vol = _validate_source(source_vol, watch_enabled, source_mount_id)
     if not target_tbl:
         raise ValueError("Target Delta table name is required.")
+    _validate_target(target_cat, target_sch, target_tbl)
 
     now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -316,6 +317,8 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
         raise ValueError("File watching and a cron schedule are alternatives; choose one trigger.")
     source_mount_id = ((data.get("source_mount_id") or "").strip() or None) if "source_mount_id" in data else pipe.get("source_mount_id")
     source_vol = _validate_source(source_vol, watch_enabled, source_mount_id)
+    if any(k in data for k in ("target_catalog", "target_schema", "target_table")):
+        _validate_target(target_cat, target_sch, target_tbl)
 
     conn = get_db()
     conn.execute("""
@@ -413,18 +416,68 @@ def get_autoloader_stats() -> Dict[str, Any]:
     }
 
 
-def _resolve_target_delta_path(catalog: str, schema: str, table_name: str) -> str:
-    """Returns the local on-disk path for the target Delta table."""
+class TargetError(ValueError):
+    """The target catalog cannot receive data (unknown, read-only, or not a Delta-capable store)."""
+
+
+def resolve_target(catalog: str, schema: str, table_name: str) -> Tuple[str, Optional[Dict[str, str]]]:
+    """(location, storage_options) of the target Delta table: a local path, or s3://bucket/schema/table for a catalog that is an
+    S3 mount (with that mount's endpoint and credentials). Raises TargetError for a catalog that cannot be written to."""
     cat_clean = catalog.strip().lower()
     sch_clean = schema.strip().lower()
     tbl_clean = table_name.strip().lower()
-    
+
     if cat_clean == "warehouse":
-        return os.path.join(WAREHOUSE_DIR, sch_clean, tbl_clean)
-    else:
-        # Check if mounted catalog
-        cat_dir = os.path.join(WAREHOUSE_DIR, "catalogs", cat_clean)
-        return os.path.join(cat_dir, sch_clean, tbl_clean)
+        return os.path.join(WAREHOUSE_DIR, sch_clean, tbl_clean), None
+
+    from web.warehouses import get_catalog
+    cat = get_catalog(cat_clean)
+    if cat is None:
+        raise TargetError(f"Catalog '{catalog}' does not exist.")
+    if cat.get("is_mounted"):
+        if cat.get("read_only"):
+            raise TargetError(f"Catalog '{catalog}' is a read-only mount; it cannot receive data.")
+        if (cat.get("type") or "").lower() != "s3":
+            raise TargetError(f"Catalog '{catalog}' is a {cat.get('type')} mount; only local catalogs and S3 mounts can receive Delta tables from Auto-Loader.")
+        from web.mounts import get_s3_storage_options
+        cfg = cat.get("config") or {}
+        return f"s3://{cfg.get('bucket', 'localspark')}/{sch_clean}/{tbl_clean}", get_s3_storage_options(cfg)
+    if cat.get("read_only"):
+        raise TargetError(f"Catalog '{catalog}' is read-only; it cannot receive data.")
+    return os.path.join(cat.get("path") or os.path.join(WAREHOUSE_DIR, "catalogs", cat_clean), sch_clean, tbl_clean), None
+
+
+def _is_delta(location: str, storage_options: Optional[Dict[str, str]]) -> bool:
+    if location.startswith("s3://"):
+        try:
+            return DeltaTable.is_deltatable(location, storage_options=storage_options)
+        except Exception:
+            return False
+    return os.path.exists(os.path.join(location, "_delta_log"))
+
+
+def target_catalogs() -> List[Dict[str, Any]]:
+    """Catalogs an Auto-Loader pipeline can load into: writable local catalogs and writable S3 mounts (for the UI's dropdown)."""
+    from web.warehouses import load_catalogs
+    from web.mounts import load_mounts
+    out: List[Dict[str, Any]] = [{"id": "warehouse", "name": "warehouse", "kind": "local", "location": "local storage"}]
+    seen = {"warehouse"}
+    for c in load_catalogs():
+        if c["id"] in seen or c.get("read_only"):
+            continue
+        seen.add(c["id"])
+        out.append({"id": c["id"], "name": c.get("name") or c["id"], "kind": "local", "location": "local storage"})
+    for m in load_mounts():
+        cid = m.get("catalog_name")
+        if not cid or cid in seen or m.get("read_only") or (m.get("type") or "").lower() != "s3":
+            continue
+        seen.add(cid)
+        out.append({"id": cid, "name": m.get("name") or cid, "kind": "s3", "location": f"s3://{(m.get('config') or {}).get('bucket', '')}"})
+    return out
+
+
+def _validate_target(catalog: str, schema: str, table: str) -> None:
+    resolve_target(catalog, schema, table)          # raises TargetError (a ValueError) with a user-safe message
 
 
 SCHEMA_EVOLUTION_MODES = {
@@ -447,16 +500,16 @@ def normalize_schema_evolution(value: Optional[str]) -> str:
     return SCHEMA_EVOLUTION_MODES[key]
 
 
-def _plan_schema_policy(columns: List[str], target_path: str, policy: str) -> List[str]:
+def _plan_schema_policy(columns: List[str], target_path: str, policy: str, storage_options: Optional[Dict[str, str]] = None) -> List[str]:
     """
     Enforces the schema-evolution policy for a file's columns against an existing target table.
     - addNewColumns: nothing to do (Delta schema_mode='merge' adds the columns on write).
     - failOnNewColumns: raises if the file has columns unknown to the target.
     - rescue: returns the unknown columns, which the caller folds into `_rescued_data`.
     """
-    if policy == "addNewColumns" or not target_path or not os.path.exists(os.path.join(target_path, "_delta_log")):
+    if policy == "addNewColumns" or not target_path or not _is_delta(target_path, storage_options):
         return []
-    known = {f.name.lower() for f in DeltaTable(target_path).schema().fields}
+    known = {f.name.lower() for f in DeltaTable(target_path, storage_options=storage_options).schema().fields}
     known.discard(RESCUED_COLUMN)
     extra = [c for c in columns if c.lower() not in known]
     if extra and policy == "failOnNewColumns":
@@ -484,14 +537,14 @@ def _rescue_batch(batch: pa.RecordBatch, extra: List[str]) -> List[pa.RecordBatc
     return table.append_column(RESCUED_COLUMN, pa.array(rescued, type=pa.string())).to_batches()
 
 
-def _evolve_schema_for_merge(target_path: str, schema: pa.Schema):
+def _evolve_schema_for_merge(target_path: str, schema: pa.Schema, storage_options: Optional[Dict[str, str]] = None):
     """
     Adds columns that the source has but the target lacks through an empty schema-merging append.
     delta-rs MERGE cannot add columns itself, so this must run before it.
     """
-    existing = {f.name for f in DeltaTable(target_path).schema().fields}
+    existing = {f.name for f in DeltaTable(target_path, storage_options=storage_options).schema().fields}
     if any(f.name not in existing for f in schema):
-        write_deltalake(target_path, schema.empty_table(), mode="append", schema_mode="merge")
+        write_deltalake(target_path, schema.empty_table(), mode="append", schema_mode="merge", storage_options=storage_options)
 
 
 def _build_merge_predicate(keys: List[str], source_columns: List[str]) -> str:
@@ -656,12 +709,9 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
     _, ext = os.path.splitext(file_path)
     ext_lower = ext.lower().lstrip(".")
 
-    target_path = _resolve_target_delta_path(
-        pipeline["target_catalog"],
-        pipeline["target_schema"],
-        pipeline["target_table"]
-    )
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    target_path, target_so = resolve_target(pipeline["target_catalog"], pipeline["target_schema"], pipeline["target_table"])
+    if target_so is None:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -676,7 +726,7 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
         reader = _open_source_reader(duck_conn, file_path, ext_lower)
         read_state["opened"] = True
 
-        table_exists = os.path.exists(target_path) and os.path.exists(os.path.join(target_path, "_delta_log"))
+        table_exists = _is_delta(target_path, target_so)
         ingest_mode = pipeline.get("ingest_mode", "append").lower()
         schema_evol = normalize_schema_evolution(pipeline.get("schema_evolution"))
 
@@ -685,10 +735,10 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
         if schema_evol == "rescue":
             # A fresh (or overwritten) table has nothing to rescue against, but keeps the column for later files.
             replacing = not table_exists or ingest_mode == "overwrite"
-            extra_cols = _plan_schema_policy(reader.schema.names, "" if replacing else target_path, schema_evol)
+            extra_cols = _plan_schema_policy(reader.schema.names, "" if replacing else target_path, schema_evol, target_so)
             out_schema = _rescue_schema(reader.schema, extra_cols)
         elif not (not table_exists or ingest_mode == "overwrite"):
-            _plan_schema_policy(reader.schema.names, target_path, schema_evol)
+            _plan_schema_policy(reader.schema.names, target_path, schema_evol, target_so)
 
         def _batches():
             try:
@@ -705,14 +755,14 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
         source = pa.RecordBatchReader.from_batches(out_schema, _batches())
 
         if not table_exists or ingest_mode == "overwrite":
-            write_deltalake(target_path, source, mode="overwrite", schema_mode="overwrite" if table_exists else None)
+            write_deltalake(target_path, source, mode="overwrite", schema_mode="overwrite" if table_exists else None, storage_options=target_so)
         elif ingest_mode == "append":
-            write_deltalake(target_path, source, mode="append", schema_mode="merge")
+            write_deltalake(target_path, source, mode="append", schema_mode="merge", storage_options=target_so)
         elif ingest_mode == "merge":
             # Primary-Key Upsert
             predicate = _build_merge_predicate(_parse_merge_keys(pipeline.get("merge_keys")), out_schema.names)
-            _evolve_schema_for_merge(target_path, out_schema)
-            (DeltaTable(target_path).merge(
+            _evolve_schema_for_merge(target_path, out_schema, target_so)
+            (DeltaTable(target_path, storage_options=target_so).merge(
                 source=source,
                 predicate=predicate,
                 source_alias="source",

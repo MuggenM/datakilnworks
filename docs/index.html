@@ -852,7 +852,8 @@ SELECT name, region FROM warehouse.hr.employees;
         <ol>
           <li><strong>Upload:</strong> Drop <code>.csv</code>, <code>.tsv</code>, <code>.parquet</code>, or <code>.json</code> files into the upload target.</li>
           <li><strong>In-Process Schema Inference:</strong> DuckDB samples the file in-process to infer column headers, data types, and nullability without loading the entire file into memory.</li>
-          <li><strong>Destination Configuration:</strong> Select target catalog (e.g. <code>warehouse</code>), schema (e.g. <code>bronze</code>), and destination table name.</li>
+          <li><strong>Destination Configuration:</strong> Pick the target catalog from a dropdown, then type the schema (e.g. <code>bronze</code>) and destination table name. The dropdown lists the local catalogs and every writable <strong>S3 mount</strong> (marked <em>S3</em>); read-only mounts and mounts that are not Delta stores (e.g. PostgreSQL) are not offered and are refused by the API. For an S3 catalog the table is written to <code>s3://&lt;bucket&gt;/&lt;schema&gt;/&lt;table&gt;</code> with that mount's endpoint and credentials, and append, merge and schema evolution work as they do locally.</li>
+          <li><strong>File format:</strong> a dropdown (CSV, TSV, Parquet, JSON, JSON Lines, NDJSON) sets the file pattern; <em>Custom pattern…</em> accepts any glob such as <code>sensor_*.csv</code>.</li>
           <li><strong>Write Strategy:</strong> Choose between <code>Overwrite</code> (replace table) or <code>Append</code> (add rows).</li>
           <li><strong>ACID Materialization:</strong> The engine writes Parquet columnar files and commits the transaction into the table's <code>_delta_log/</code>.</li>
         </ol>

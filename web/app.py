@@ -7860,6 +7860,13 @@ async def get_autoloader_pipelines():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/autoloader/target-catalogs")
+async def get_autoloader_target_catalogs(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Catalogs a pipeline can load into: writable local catalogs and writable S3 mounts (the create dialog's dropdown)."""
+    from web.autoloader import target_catalogs
+    return {"catalogs": await asyncio.to_thread(target_catalogs)}
+
+
 @app.post("/api/autoloader/pipelines")
 async def create_autoloader_pipeline_endpoint(payload: Dict[str, Any], request: Request):
     from web.autoloader import create_pipeline
