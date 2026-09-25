@@ -1043,6 +1043,11 @@ async def delete_catalog_endpoint(cat_id: str, request: Request):
 
     try:
         delete_all_catalog_permissions(cat_id)
+        try:
+            from web import groups as _groups
+            _groups.delete_grants_prefix(("table", "schema"), f"{cat_id}.".lower())
+        except Exception as e_grants:
+            logger.warning(f"Could not remove table grants of catalog '{cat_id}': {e_grants}")
     except Exception as e:
         logger.warning(f"Failed cleaning permissions for deleted catalog {cat_id}: {e}")
 
@@ -1622,8 +1627,9 @@ def _do_shallow_clone(user: Dict[str, Any], src: tuple, dst: tuple, *, version=N
     from web import table_clone
     from web.governance import tags as gov_tags
     actor = user.get("username", "admin")
-    if not can_user_access_catalog(user, src[0], action="READ"):
-        raise HTTPException(status_code=403, detail=f"Access denied: you cannot read catalog '{src[0]}'.")
+    from web import table_access
+    if not table_access.can_access_table(user, src[0], src[1], src[2], "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot read '{src[0]}.{src[1]}.{src[2]}'.")
     if not can_user_access_catalog(user, dst[0], action="WRITE"):
         raise HTTPException(status_code=403, detail=f"Access denied: you cannot modify catalog '{dst[0]}'.")
     try:
@@ -1750,6 +1756,12 @@ async def drop_table_api(schema_name: str, table_name: str, request: Request, ca
         logger.warning(f"Error removing dropped table directory {dt_path}: {e}")
 
     try:
+        from web import groups as _groups
+        _groups.delete_grants_prefix(("table",), f"{target_catalog}.{schema_clean}.{table_clean}".lower())   # a new table of the same name must not inherit access
+    except Exception as e_grants:
+        logger.warning(f"Could not remove table grants of {table_ref}: {e_grants}")
+
+    try:
         from web.governance import tags as gov_tags
         removed = gov_tags.drop_object(target_catalog, schema_clean, table_clean, actor=drop_user.get("username", "system"))
         if removed:
@@ -1766,8 +1778,9 @@ async def drop_table_api(schema_name: str, table_name: str, request: Request, ca
 async def get_table_details(schema_name: str, table_name: str, catalog: Optional[str] = None, request: Request = None):
     cat_id = catalog or "warehouse"
     current_user = await resolve_principal(request)
-    if not can_user_access_catalog(current_user, cat_id, action="READ"):
-        raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
+    from web import table_access
+    if not table_access.can_access_table(current_user, cat_id, schema_name, table_name, "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view '{cat_id}.{schema_name}.{table_name}'.")
     # Check if catalog is an external storage mount
     from web.mounts import load_mounts
     mounts = {m["catalog_name"]: m for m in load_mounts() if m.get("enabled", True)}
@@ -2022,8 +2035,9 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
     cat_id = catalog or "warehouse"
     if request:
         current_user = await resolve_principal(request)
-        if not can_user_access_catalog(current_user, cat_id, action="READ"):
-            raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
+        from web import table_access
+        if not table_access.can_access_table(current_user, cat_id, schema_name, table_name, "READ"):
+            raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view '{cat_id}.{schema_name}.{table_name}'.")
     conn = get_duckrun_conn()
     sync_catalogs_with_duckrun(conn)
 
@@ -7185,8 +7199,9 @@ async def get_table_diff_endpoint(
 ):
     from web.time_travel import resolve_table_path, compare_table_versions
     diff_user = await resolve_principal(request)
-    if not can_user_access_catalog(diff_user, catalog or "warehouse", action="READ"):
-        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
+    from web import table_access
+    if not table_access.can_access_table(diff_user, catalog or "warehouse", schema_name, table_name, "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view '{catalog or 'warehouse'}.{schema_name}.{table_name}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
@@ -7234,8 +7249,9 @@ async def preview_table_version_endpoint(
 ):
     from web.time_travel import resolve_table_path, get_version_preview
     preview_user = await resolve_principal(request)
-    if not can_user_access_catalog(preview_user, catalog or "warehouse", action="READ"):
-        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
+    from web import table_access
+    if not table_access.can_access_table(preview_user, catalog or "warehouse", schema_name, table_name, "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view '{catalog or 'warehouse'}.{schema_name}.{table_name}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
@@ -8047,11 +8063,24 @@ def _may_manage_grants(user: Dict[str, Any], resource_type: str, resource_id: st
         from web.saved_queries import get_saved_query
         q = get_saved_query(resource_id)
         return bool(q) and user.get("username") in (q.get("owner"), q.get("created_by"))
+    if resource_type in ("table", "schema"):
+        # Data access is decided by whoever governs the catalog: an administrator, or the catalog's owner (a power user).
+        return can_user_manage_catalog(user, (resource_id or "").split(".")[0].lower())
     if resource_type == "pipeline":
         from web.autoloader import get_pipeline
         p = get_pipeline(resource_id)
         return bool(p) and _pipeline_access(user, p) == "manage"
     return False
+
+
+@app.get("/api/catalogs/{cat_id}/table-grants")
+async def list_catalog_table_grants_endpoint(cat_id: str, request: Request):
+    """Every table- and schema-level grant inside a catalog (for whoever manages the catalog)."""
+    from web import groups
+    current_user = await resolve_principal(request)
+    if not can_user_manage_catalog(current_user, cat_id):
+        raise HTTPException(status_code=403, detail=f"Access denied: you do not have permission to inspect access lists for catalog '{cat_id}'.")
+    return {"grants": groups.list_grants_prefix(("schema", "table"), cat_id.lower() + ".")}
 
 
 @app.get("/api/grants/{resource_type}/{resource_id}")

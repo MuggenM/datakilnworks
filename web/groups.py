@@ -34,7 +34,25 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,59}$")
 RESOURCE_TYPES: Dict[str, tuple] = {
     "saved_query": ("VIEW", "EDIT"),
     "pipeline": ("RUN", "MANAGE"),
+    # Table- and schema-level data access (web/table_access.py). The id is `catalog.schema.table` / `catalog.schema`, lower-case.
+    # SELECT reads; MODIFY also writes. They only ever ADD to what catalog-level access already gives.
+    "table": ("SELECT", "MODIFY"),
+    "schema": ("SELECT", "MODIFY"),
 }
+_ID_PARTS = {"table": 3, "schema": 2}
+_ID_PART_RE = re.compile(r"^[a-z0-9_]{1,128}$")
+
+
+def _rid(resource_type: str, resource_id: str) -> str:
+    """Canonical resource id. Table and schema ids are validated and lower-cased (identifiers are case-insensitive)."""
+    if resource_type in _ID_PARTS:
+        rid = (resource_id or "").strip().lower()
+        parts = rid.split(".")
+        if len(parts) != _ID_PARTS[resource_type] or not all(_ID_PART_RE.match(p) for p in parts):
+            raise GroupError("A " + resource_type + " is named " + ("catalog.schema.table" if resource_type == "table" else "catalog.schema")
+                             + " (letters, digits and underscores).")
+        return rid
+    return resource_id
 
 
 class GroupError(ValueError):
@@ -359,6 +377,7 @@ def _parse_principal(principal: str) -> tuple:
 
 def grant(resource_type: str, resource_id: str, principal: str, permission: str, actor: str) -> Dict[str, Any]:
     ladder = _ladder(resource_type)
+    resource_id = _rid(resource_type, resource_id)
     permission = (permission or "").strip().upper()
     if permission not in ladder:
         raise GroupError(f"The permission for a {resource_type.replace('_', ' ')} must be one of {', '.join(ladder)}.")
@@ -388,6 +407,7 @@ def grant(resource_type: str, resource_id: str, principal: str, permission: str,
 
 def revoke(resource_type: str, resource_id: str, principal: str, actor: str) -> bool:
     _ladder(resource_type)
+    resource_id = _rid(resource_type, resource_id)
     kind, pid = _parse_principal(principal)
     c = _conn()
     try:
@@ -406,6 +426,7 @@ def revoke(resource_type: str, resource_id: str, principal: str, actor: str) -> 
 
 def list_grants(resource_type: str, resource_id: str) -> List[Dict[str, Any]]:
     _ladder(resource_type)
+    resource_id = _rid(resource_type, resource_id)
     c = _conn()
     try:
         out = []
@@ -426,6 +447,7 @@ def list_grants(resource_type: str, resource_id: str) -> List[Dict[str, Any]]:
 def permission_of(user: Dict[str, Any], resource_type: str, resource_id: str) -> Optional[str]:
     """The highest permission the user holds on the resource, directly or through a group; None if none."""
     ladder = _ladder(resource_type)
+    resource_id = _rid(resource_type, resource_id) if resource_type in _ID_PARTS else resource_id
     gids = group_ids_for(user)
     uid = (user or {}).get("id")
     c = _conn()
@@ -468,6 +490,49 @@ def delete_grants_for_resource(resource_type: str, resource_id: str) -> None:
     c = _conn()
     try:
         c.execute("DELETE FROM resource_grants WHERE resource_type = ? AND resource_id = ?", (resource_type, resource_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def granted_map(user: Dict[str, Any], resource_type: str) -> Dict[str, str]:
+    """{resource_id: highest permission} of every resource of the type the user holds anything on, directly or through a group (one query)."""
+    ladder = _ladder(resource_type)
+    gids = group_ids_for(user)
+    uid = (user or {}).get("id")
+    c = _conn()
+    try:
+        best: Dict[str, int] = {}
+        for r in c.execute("SELECT resource_id, principal_type, principal_id, permission FROM resource_grants WHERE resource_type = ?", (resource_type,)):
+            if r["permission"] in ladder and ((r["principal_type"] == "user" and r["principal_id"] == uid) or (r["principal_type"] == "group" and r["principal_id"] in gids)):
+                best[r["resource_id"]] = max(best.get(r["resource_id"], -1), ladder.index(r["permission"]))
+        return {rid: ladder[i] for rid, i in best.items()}
+    finally:
+        c.close()
+
+
+def list_grants_prefix(resource_types, prefix: str) -> List[Dict[str, Any]]:
+    """Every grant of the given types whose resource id starts with `prefix` (e.g. 'sales.'): the grants of one catalog."""
+    c = _conn()
+    try:
+        out = []
+        for rt in resource_types:
+            for r in c.execute("SELECT resource_id FROM resource_grants WHERE resource_type = ? AND resource_id LIKE ? ESCAPE '\\' GROUP BY resource_id ORDER BY resource_id",
+                               (rt, prefix.replace("_", "\\_") + "%")):
+                for g in list_grants(rt, r["resource_id"]):
+                    out.append({**g, "resource_type": rt, "resource_id": r["resource_id"]})
+        return out
+    finally:
+        c.close()
+
+
+def delete_grants_prefix(resource_types, prefix: str) -> None:
+    """Removes the grants under a prefix: a dropped table (`cat.schema.table`) or a deleted catalog (`cat.`)."""
+    c = _conn()
+    try:
+        for rt in resource_types:
+            c.execute("DELETE FROM resource_grants WHERE resource_type = ? AND (resource_id = ? OR resource_id LIKE ? ESCAPE '\\')",
+                      (rt, prefix.rstrip("."), prefix.rstrip(".").replace("_", "\\_") + ".%"))
         c.commit()
     finally:
         c.close()

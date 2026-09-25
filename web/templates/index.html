@@ -2878,6 +2878,34 @@
                         </tbody>
                       </table>
                     </div>
+
+                    <!-- Table- and schema-level access: for people who should reach part of a catalog without being given all of it -->
+                    <div class="space-y-2 mt-3" data-testid="table-grants-panel">
+                      <div class="flex items-center justify-between">
+                        <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">Table &amp; schema access</span>
+                        <div class="space-x-1.5">
+                          <button @click="openShare('table', ((selectedTable?.catalog || 'warehouse') + '.' + selectedTable.schema_name + '.' + selectedTable.table_name).toLowerCase(), selectedTable.table_name)" data-testid="share-table" class="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-semibold">Share this table</button>
+                          <button @click="openShare('schema', ((selectedTable?.catalog || 'warehouse') + '.' + selectedTable.schema_name).toLowerCase(), selectedTable.schema_name)" data-testid="share-schema" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded text-xs">Share schema <span class="font-mono" x-text="selectedTable.schema_name"></span></button>
+                        </div>
+                      </div>
+                      <p class="text-[11px] text-slate-500">Select lets a user or group read a table (or every table in a schema) of this catalog without access to the rest of it. It only adds access; catalog access above is unaffected.</p>
+                      <div class="border border-slate-200 dark:border-dbx-border rounded-lg overflow-hidden">
+                        <table class="w-full text-left text-xs">
+                          <thead class="bg-slate-100 dark:bg-slate-900/80 text-slate-600 dark:text-slate-400 uppercase text-[10px]"><tr><th class="py-2 px-3">Resource</th><th>Principal</th><th>Permission</th><th class="text-right px-3">Action</th></tr></thead>
+                          <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/50">
+                            <template x-for="g in tableGrants" :key="g.resource_type + g.resource_id + g.principal">
+                              <tr data-testid="table-grant-row">
+                                <td class="py-2 px-3 font-mono" x-text="g.resource_id"></td>
+                                <td><span class="font-semibold" x-text="g.name"></span> <span class="text-[9px] px-1.5 py-0.5 rounded border border-slate-300 dark:border-slate-700" x-text="g.principal_type"></span></td>
+                                <td class="font-mono" x-text="g.permission"></td>
+                                <td class="text-right px-3"><button @click="removeTableGrant(g)" class="px-2 py-1 bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded" data-testid="table-grant-revoke">Revoke</button></td>
+                              </tr>
+                            </template>
+                            <tr x-show="!tableGrants.length"><td colspan="4" class="p-3 text-center text-slate-500 italic">No table or schema grants in this catalog.</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
@@ -11085,7 +11113,7 @@
       <div class="flex items-start justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
         <div>
           <h3 class="text-sm font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-share-network text-dbx-orange"></i><span>Share</span><span class="font-mono font-normal text-slate-500" x-text="shareDlg.name"></span></h3>
-          <p class="text-[11px] text-slate-500 mt-0.5" x-text="shareDlg.type === 'pipeline' ? 'Run lets someone trigger the pipeline; Manage also lets them change, reset and delete it. Administrators and power users already manage every pipeline.' : 'View lets someone see and run the query; Edit also lets them change it. Data access is unaffected: the query still runs with each person\'s own permissions.'"></p>
+          <p class="text-[11px] text-slate-500 mt-0.5" x-text="(shareDlg.type === 'table' || shareDlg.type === 'schema') ? 'Select lets them read ' + (shareDlg.type === 'table' ? 'this table' : 'every table in this schema, including ones created later') + ', without access to the rest of the catalog. Modify also lets them write. Masking and row filters still apply to them.' : shareDlg.type === 'pipeline' ? 'Run lets someone trigger the pipeline; Manage also lets them change, reset and delete it. Administrators and power users already manage every pipeline.' : 'View lets someone see and run the query; Edit also lets them change it. Data access is unaffected: the query still runs with each person\'s own permissions.'"></p>
         </div>
         <button @click="shareDlg.open = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
       </div>
@@ -17061,6 +17089,7 @@
         showCreateUserCard: false,
         iamUsers: [],
         iamTab: 'users',
+        tableGrants: [],
         shareDlg: { open: false, type: '', id: '', name: '', grants: [], permissions: [], perm: '', q: '', results: [], error: '' },
         groupsList: [],
         groupSel: null,
@@ -18656,6 +18685,20 @@
           return cat?.owner || 'admin';
         },
 
+        async loadTableGrants() {
+          const cat = (this.selectedTable && this.selectedTable.catalog) || 'warehouse';
+          try {
+            const res = await fetch(`/api/catalogs/${encodeURIComponent(cat)}/table-grants`);
+            this.tableGrants = res.ok ? ((await res.json()).grants || []) : [];
+          } catch (e) { this.tableGrants = []; }
+        },
+
+        async removeTableGrant(g) {
+          const res = await fetch(`/api/grants/${g.resource_type}/${encodeURIComponent(g.resource_id)}?principal=${encodeURIComponent(g.principal)}`, { method: 'DELETE' });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.showToast(d.detail || 'Could not revoke.', 'error'); return; }
+          await this.loadTableGrants();
+        },
+
         async openShare(type, id, name) {
           this.shareDlg = { open: true, type, id, name, grants: [], permissions: [], perm: '', q: '', results: [], error: '' };
           await this.loadShareGrants();
@@ -18669,6 +18712,7 @@
           const data = await res.json().catch(() => ({}));
           if (!res.ok) { d.error = typeof data.detail === 'string' ? data.detail : 'Could not load who this is shared with.'; return; }
           d.grants = data.grants || []; d.permissions = data.permissions || [];
+          if (d.type === 'table' || d.type === 'schema') this.loadTableGrants();
         },
 
         async searchSharePrincipals() {
@@ -19023,6 +19067,7 @@
         async fetchCatalogPermissions(catId) {
           if (!catId) return;
           if (!this.groupsList.length) this.loadGroups();          // for the "Group" choice of the grant form (admins / power users)
+          this.loadTableGrants();
           this.isLoadingCatalogPerms = true;
           try {
             const res = await fetch(`/api/catalogs/${catId}/permissions`);

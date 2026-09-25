@@ -312,8 +312,21 @@ def filter_catalogs_for_user(catalogs_tree: List[Dict[str, Any]], user: Dict[str
         return annotated
 
     filtered = []
+    try:
+        from web import table_access
+        scope = table_access.granted_scope(user)
+    except Exception as exc:
+        logger.warning(f"table grants unavailable for the catalog listing: {exc}")
+        scope = {}
     for cat in catalogs_tree:
         cat_id = cat.get("id")
+        if not can_user_access_catalog(user, cat_id, action="READ") and cat_id in scope:
+            # Access to some tables or schemas only: show just those, read-only.
+            partial = table_access.prune_catalog(cat, scope[cat_id])
+            if partial["schemas"]:
+                partial.update(user_can_manage=False, user_can_write=False, user_can_delete=False, partial_access=True)
+                filtered.append(partial)
+            continue
         if can_user_access_catalog(user, cat_id, action="READ"):
             # Attach user-specific capability flags to the catalog response
             cat_copy = dict(cat)
@@ -328,14 +341,48 @@ def filter_catalogs_for_user(catalogs_tree: List[Dict[str, Any]], user: Dict[str
 # SQL ZERO-TRUST PARSER & QUERY FENCING
 # ==============================================================================
 
+# A statement starting with one of these only reads; a catalog is referenced in it through a dotted name. Any OTHER statement (USE, ATTACH,
+# DETACH, SET, CALL, PRAGMA, COPY, CREATE, ...) can name a catalog on its own (`USE sales` switches the default catalog for the rest of the
+# request, after which `select * from dbo.customers` reads it with no catalog in sight), so there a bare occurrence of the name counts.
+_QUERY_STARTS = {"select", "with", "from", "values", "table", "explain", "describe", "show", "summarize", "pivot", "unpivot", "("}
+
+
+def _catalogs_from_tokens(sql_query: str, all_catalogs: Set[str]) -> Set[str]:
+    """Catalogs referenced according to the SQL tokenizer. Unlike a regex this cannot be fooled by quoted identifiers (`"sales"."dbo"."t"`),
+    comments or whitespace inside a name (`sales/**/.dbo.t`); string literals are not identifiers. Dotted use (`catalog.schema.table`) counts
+    in every statement; a bare name counts in statements that are not plain queries (see _QUERY_STARTS)."""
+    import sqlglot
+    from sqlglot.tokens import TokenType
+    try:
+        toks = sqlglot.tokenize(sql_query, read="duckdb")
+    except Exception:
+        return set(all_catalogs) if all_catalogs else set()      # cannot tokenize (e.g. unterminated string): assume every catalog is touched
+    found: Set[str] = set()
+    segment_start = 0
+    for i, t in enumerate(toks):
+        if t.token_type == TokenType.SEMICOLON:
+            segment_start = i + 1
+            continue
+        if t.token_type == TokenType.STRING or t.text.lower() not in all_catalogs:
+            continue
+        if i > 0 and toks[i - 1].token_type == TokenType.DOT:
+            continue                                   # `x.catalog`: a schema/column part of another name
+        dotted = i + 1 < len(toks) and toks[i + 1].token_type == TokenType.DOT
+        first = toks[segment_start].text.lower() if segment_start < len(toks) else ""
+        if dotted or first not in _QUERY_STARTS:
+            found.add(t.text.lower())
+    return found
+
+
 def extract_catalogs_from_sql(sql_query: str) -> Set[str]:
     """
     Extracts referenced catalog names from a SQL statement.
     Detects 3-part names (catalog.schema.table), catalog-qualified function calls,
-    or attached catalog references.
+    or attached catalog references. Union of a tokenizer pass (robust against quoting and comments)
+    and the original regexes (which also flag a schema that shares a catalog's name: over-cautious, kept).
     """
     all_catalogs = get_all_catalog_ids()
-    referenced = set()
+    referenced = set(_catalogs_from_tokens(sql_query, all_catalogs))
 
     # Match patterns like: `catalog`.`schema`.`table` or catalog.schema.table
     pattern = re.compile(r'\b([a-zA-Z0-9_]+)\s*\.\s*([a-zA-Z0-9_]+)\s*\.\s*([a-zA-Z0-9_]+)\b')
@@ -358,14 +405,23 @@ def enforce_sql_permissions(sql_query: str, user: Dict[str, Any], action: str = 
     """
     Inspects SQL query and verifies that user has appropriate permissions
     for every referenced catalog. Raises HTTPException(403) if unauthorized.
+
+    A catalog the user has no access to as a whole can still be queried when the statement is one plain SELECT whose every reference to it is
+    a fully qualified table (or schema) the user, or one of their groups, was granted SELECT on (web/table_access.py). Anything that cannot
+    be verified that way is refused.
     """
     if user.get("role") == "admin":
         return
 
     referenced_catalogs = extract_catalogs_from_sql(sql_query)
-    for cat_id in referenced_catalogs:
-        if not can_user_access_catalog(user, cat_id, action=action):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied: User '{user.get('username')}' does not have permission to query catalog '{cat_id}'."
-            )
+    denied = [c for c in sorted(referenced_catalogs) if not can_user_access_catalog(user, c, action=action)]
+    if not denied:
+        return
+    if action.upper() == "READ":
+        from web import table_access
+        if table_access.sql_covered(sql_query, user, denied):
+            return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"Access denied: User '{user.get('username')}' does not have permission to query catalog '{denied[0]}'."
+    )
