@@ -1915,6 +1915,10 @@
               <i class="ph ph-folder-plus text-sm text-sky-400"></i>
               <span>New Volume</span>
             </button>
+            <button x-show="currentUser && ['admin', 'power_user'].includes(currentUser.role)" @click="openConnections()" data-testid="open-connections" class="flex items-center space-x-1.5 px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded text-xs font-semibold shadow-sm transition" title="Saved logins for HTTP(S) / REST and SFTP sources">
+              <i class="ph ph-plugs-connected text-sm"></i>
+              <span>Connections</span>
+            </button>
             <button @click="showCreatePipelineModal = true" class="flex items-center space-x-1.5 px-3.5 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold shadow transition">
               <i class="ph ph-plus-circle text-sm"></i>
               <span>New Pipeline</span>
@@ -11071,6 +11075,99 @@
     </div>
   </div>
 
+  <!-- Modal: Connections (HTTP(S)/REST and SFTP sources for Auto-Loader) -->
+  <div x-show="showConnectionsModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showConnectionsModal = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-3xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" @click.outside="showConnectionsModal = false" data-testid="connections-modal">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-3">
+        <div>
+          <h3 class="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-plugs-connected text-dbx-orange"></i><span>Connections</span></h3>
+          <p class="text-[11px] text-slate-500 mt-0.5">A saved login for a server that pipelines read from. The secret is stored encrypted and never shown again; pipelines only refer to the connection by name.</p>
+        </div>
+        <button @click="showConnectionsModal = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+
+      <div x-show="!connForm.open" class="space-y-2">
+        <div class="flex justify-end" x-show="currentUser && currentUser.role === 'admin'">
+          <button @click="newConnection()" data-testid="conn-new" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded font-semibold flex items-center space-x-1"><i class="ph ph-plus-circle"></i><span>New connection</span></button>
+        </div>
+        <div x-show="!connectionsList.length" class="text-slate-500 py-6 text-center">No connections yet.</div>
+        <table x-show="connectionsList.length" class="w-full text-left">
+          <thead class="text-[10px] uppercase text-slate-500"><tr><th class="py-1.5">Name</th><th>Type</th><th>Target</th><th>Secret</th><th class="text-right">Actions</th></tr></thead>
+          <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/50">
+            <template x-for="c in connectionsList" :key="c.id">
+              <tr data-testid="conn-row">
+                <td class="py-2 font-mono font-semibold text-slate-800 dark:text-slate-200" x-text="c.name"></td>
+                <td x-text="c.type === 'sftp' ? 'SFTP' : 'HTTP(S) / REST'"></td>
+                <td class="font-mono text-slate-500" x-text="c.type === 'sftp' ? (c.config.username + '@' + c.config.host + ':' + c.config.port) : c.config.base_url"></td>
+                <td x-text="c.has_secret ? 'stored' : '—'"></td>
+                <td class="text-right space-x-1" x-show="currentUser && currentUser.role === 'admin'">
+                  <button @click="editConnection(c)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="conn-edit">Edit</button>
+                  <button @click="deleteConnection(c)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded text-red-500" data-testid="conn-delete">Delete</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <form x-show="connForm.open" @submit.prevent="saveConnection()" class="space-y-3" data-testid="conn-form">
+        <div class="grid grid-cols-3 gap-3">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Name</label><input type="text" x-model="connForm.name" :disabled="!!connForm.id" placeholder="e.g. crm_api" data-testid="conn-name" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Type</label>
+            <select x-model="connForm.type" :disabled="!!connForm.id" data-testid="conn-type" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"><option value="http">HTTP(S) file / REST API</option><option value="sftp">SFTP</option></select></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Description</label><input type="text" x-model="connForm.description" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+        </div>
+
+        <div x-show="connForm.type === 'http'" class="space-y-3">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Base URL</label><input type="text" x-model="connForm.base_url" placeholder="https://api.example.com/v1" data-testid="conn-base-url" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
+            <p class="text-[10px] text-slate-500 mt-1">Pipelines can only add a path to this URL; the login is never sent anywhere else.</p></div>
+          <div class="grid grid-cols-3 gap-3">
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Authentication</label>
+              <select x-model="connForm.auth" data-testid="conn-auth" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="none">None</option><option value="bearer">Bearer token</option><option value="basic">Basic (user + password)</option><option value="header">Custom header</option></select></div>
+            <div x-show="connForm.auth === 'basic'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">User name</label><input type="text" x-model="connForm.username" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+            <div x-show="connForm.auth === 'header'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Header name</label><input type="text" x-model="connForm.header_name" placeholder="X-Api-Key" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+            <div x-show="connForm.auth !== 'none'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]" x-text="connForm.auth === 'bearer' ? 'Token' : (connForm.auth === 'basic' ? 'Password' : 'Header value')"></label>
+              <input type="password" x-model="connForm.secret" autocomplete="new-password" :placeholder="connForm.id ? 'stored — leave empty to keep' : ''" data-testid="conn-secret" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          </div>
+          <div class="flex items-center space-x-4">
+            <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="connForm.allow_insecure"><span>Allow credentials over plain http:// (trusted internal server only)</span></label>
+            <label class="flex items-center space-x-1.5"><span>Timeout (s)</span><input type="number" min="1" max="120" x-model.number="connForm.timeout_seconds" class="w-16 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1"></label>
+          </div>
+        </div>
+
+        <div x-show="connForm.type === 'sftp'" class="space-y-3">
+          <div class="grid grid-cols-4 gap-3">
+            <div class="col-span-2"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Host</label><input type="text" x-model="connForm.host" data-testid="conn-host" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Port</label><input type="number" x-model.number="connForm.port" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">User name</label><input type="text" x-model="connForm.username" data-testid="conn-user" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Authentication</label><select x-model="connForm.sftp_auth" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="password">Password</option><option value="key">Private key</option></select></div>
+            <div class="col-span-2" x-show="connForm.sftp_auth === 'password'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Password</label>
+              <input type="password" x-model="connForm.secret" autocomplete="new-password" :placeholder="connForm.id ? 'stored — leave empty to keep' : ''" data-testid="conn-sftp-password" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          </div>
+          <div x-show="connForm.sftp_auth === 'key'" class="grid grid-cols-3 gap-3">
+            <div class="col-span-2"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Private key (PEM / OpenSSH)</label>
+              <textarea rows="4" x-model="connForm.private_key" spellcheck="false" :placeholder="connForm.id ? 'stored — leave empty to keep' : '-----BEGIN OPENSSH PRIVATE KEY-----'" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange text-[10px]"></textarea></div>
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Key passphrase (optional)</label><input type="password" x-model="connForm.passphrase" autocomplete="new-password" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          </div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Server host key fingerprint (pinned)</label>
+            <div class="flex space-x-2"><input type="text" x-model="connForm.host_key_sha256" placeholder="SHA256:… — press Test to see what the server presents" data-testid="conn-fingerprint" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
+              <button type="button" x-show="connTest.fingerprint && connTest.fingerprint !== connForm.host_key_sha256" @click="connForm.host_key_sha256 = connTest.fingerprint" class="px-3 bg-emerald-600 text-white rounded whitespace-nowrap" data-testid="conn-pin">Pin this</button></div>
+            <p class="text-[10px] text-slate-500 mt-1">Every connect is checked against this fingerprint, so a changed or impersonated server is refused. Compare it with the one your SFTP provider publishes before pinning.</p></div>
+        </div>
+
+        <div x-show="connTest.message" class="p-2.5 rounded-lg border" :class="connTest.ok ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900 text-emerald-700 dark:text-emerald-300' : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-300'" data-testid="conn-test-result" x-text="connTest.message"></div>
+        <div x-show="connForm.error" class="p-2.5 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="conn-error" x-text="connForm.error"></div>
+        <div class="flex justify-end space-x-2 pt-2 border-t border-slate-200 dark:border-dbx-border">
+          <button type="button" @click="connForm.open = false; connTest = {}" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded">Cancel</button>
+          <button type="button" @click="testConnection()" :disabled="connForm.busy" data-testid="conn-test" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-50">Test</button>
+          <button type="submit" :disabled="connForm.busy" data-testid="conn-save" class="px-4 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold rounded disabled:opacity-50">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Modal: Create Auto-Loader Pipeline -->
   <div x-show="showCreatePipelineModal" x-init="$watch('showCreatePipelineModal', open => { if (open) loadAutoloaderTargets(); })" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showCreatePipelineModal = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-lg shadow-2xl p-6 space-y-4" @click.outside="showCreatePipelineModal = false">
@@ -11091,6 +11188,59 @@
         </div>
 
         <div>
+          <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Source</label>
+          <div class="flex space-x-1.5">
+            <button type="button" @click="pipelineSourceKind = 'volume'" data-testid="src-volume" :class="pipelineSourceKind === 'volume' ? 'bg-dbx-orange text-white border-dbx-orange' : 'bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-dbx-border'" class="flex-1 px-3 py-1.5 rounded border font-medium">Volume / S3</button>
+            <button type="button" @click="pipelineSourceKind = 'connection'; loadConnections()" data-testid="src-connection" :class="pipelineSourceKind === 'connection' ? 'bg-dbx-orange text-white border-dbx-orange' : 'bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-dbx-border'" class="flex-1 px-3 py-1.5 rounded border font-medium">Connection (HTTP / REST / SFTP)</button>
+          </div>
+        </div>
+
+        <div x-show="pipelineSourceKind === 'connection'" class="space-y-3 p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg" data-testid="conn-source">
+          <div class="grid grid-cols-3 gap-2">
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Connection</label>
+              <select x-model="pipelineConn.name" data-testid="pipe-conn" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-2 text-slate-900 dark:text-white">
+                <option value="">— choose —</option>
+                <template x-for="c in connectionsList" :key="c.id"><option :value="c.name" x-text="c.name + ' (' + (c.type === 'sftp' ? 'SFTP' : 'HTTP') + ')'"></option></template>
+              </select></div>
+            <div class="col-span-2"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]" x-text="connType() === 'sftp' ? 'Remote folder (absolute path on the server)' : 'Path (added to the connection\'s base URL)'"></label>
+              <input type="text" x-model="pipelineConn.path" :placeholder="connType() === 'sftp' ? '/upload/daily' : 'exports/daily.csv  or  items'" data-testid="pipe-conn-path" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-2 font-mono text-slate-900 dark:text-white"></div>
+          </div>
+          <p x-show="!connectionsList.length" class="text-[10px] text-amber-600">No connections yet: create one with the Connections button (administrators).</p>
+          <div x-show="connType() === 'http'" class="space-y-2">
+            <div class="flex space-x-4">
+              <label class="flex items-center space-x-1.5"><input type="radio" value="file" x-model="pipelineConn.mode" data-testid="pipe-mode-file"><span>Download a file (CSV, TSV, JSON, JSON Lines, Parquet)</span></label>
+              <label class="flex items-center space-x-1.5"><input type="radio" value="api" x-model="pipelineConn.mode" data-testid="pipe-mode-api"><span>REST API returning JSON</span></label>
+            </div>
+            <div x-show="pipelineConn.mode === 'api'" class="space-y-2">
+              <div class="grid grid-cols-2 gap-2">
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Records path (where the list is)</label><input type="text" x-model="pipelineConn.records_path" placeholder="data.items — empty if the response is the list" data-testid="pipe-records-path" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5 font-mono"></div>
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Pagination</label>
+                  <select x-model="pipelineConn.pagination" data-testid="pipe-pagination" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5">
+                    <option value="none">None (one request)</option><option value="page">Page number</option><option value="offset">Offset + limit</option><option value="next_link">Next link in the response</option></select></div>
+              </div>
+              <div x-show="pipelineConn.pagination === 'page'" class="grid grid-cols-3 gap-2 font-mono">
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Page parameter</label><input type="text" x-model="pipelineConn.page_param" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5"></div>
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Size parameter</label><input type="text" x-model="pipelineConn.size_param" placeholder="per_page (optional)" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5"></div>
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Page size</label><input type="number" x-model.number="pipelineConn.page_size" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5"></div>
+              </div>
+              <div x-show="pipelineConn.pagination === 'offset'" class="grid grid-cols-3 gap-2 font-mono">
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Offset parameter</label><input type="text" x-model="pipelineConn.offset_param" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5"></div>
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Limit parameter</label><input type="text" x-model="pipelineConn.limit_param" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5"></div>
+                <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Page size</label><input type="number" x-model.number="pipelineConn.page_size" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5"></div>
+              </div>
+              <div x-show="pipelineConn.pagination === 'next_link'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Where the next link is in the response</label><input type="text" x-model="pipelineConn.next_path" placeholder="e.g. links.next" data-testid="pipe-next-path" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5 font-mono"></div>
+              <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Query parameters (one name=value per line)</label><textarea rows="2" x-model="pipelineConn.params" placeholder="status=active" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1.5 font-mono"></textarea></div>
+              <p class="text-[10px] text-slate-500">Each poll fetches all pages and loads them as one snapshot; an unchanged response is skipped. For an API that returns the current state, use Merge (with key columns) or Overwrite as the ingestion mode; Append would add the same records again whenever anything changes.</p>
+            </div>
+            <p x-show="pipelineConn.mode === 'file'" class="text-[10px] text-slate-500">The file is loaded when it is new or changed (ETag / Last-Modified, else by content); an unchanged file is not downloaded again.</p>
+          </div>
+          <div x-show="connType() === 'sftp'" class="flex items-center space-x-4">
+            <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="pipelineConn.recursive"><span>Include sub-folders</span></label>
+            <label class="flex items-center space-x-1.5"><span>Wait until a file is unchanged for</span><input type="number" min="0" x-model.number="pipelineConn.settle_seconds" class="w-16 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-1"><span>s</span></label>
+          </div>
+        </div>
+
+        <div x-show="pipelineSourceKind === 'volume'">
           <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Source Volume Path</label>
           <input type="text" x-model="newPipelineForm.source_volume_path" placeholder="/Volumes/warehouse/raw/iot_stream" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
           <p class="text-[10px] text-slate-500 mt-1">A volume folder (<code class="text-sky-400">/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume&gt;</code>) or an S3 / S3-compatible location (<code class="text-sky-400">s3://bucket/prefix/</code>).</p>
@@ -11108,7 +11258,7 @@
         </div>
 
         <div class="grid grid-cols-2 gap-3">
-          <div>
+          <div x-show="pipelineSourceKind === 'volume' || connType() === 'sftp'">
             <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">File Format</label>
             <select x-model="pipelineFormat" @change="if (pipelineFormat !== 'custom') newPipelineForm.file_pattern = pipelineFormat" data-testid="pipeline-format" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-medium focus:outline-none focus:border-dbx-orange">
               <option value="*.csv">CSV (*.csv)</option>
@@ -11128,7 +11278,7 @@
               <option value="10">Standard (10 seconds)</option>
               <option value="30">30 seconds</option>
               <option value="60">1 minute</option>
-              <option value="watch">File events (instant, watches the folder)</option>
+              <option value="watch" x-show="pipelineSourceKind === 'volume'">File events (instant, watches the folder)</option>
               <option value="cron">Scheduled (Cron, UTC)</option>
             </select>
           </div>
@@ -16686,6 +16836,12 @@
         autoloaderLoading: false,
         showCreatePipelineModal: false,
         pipelineFormat: '*.csv',
+        pipelineSourceKind: 'volume',
+        pipelineConn: { name: '', path: '', mode: 'file', records_path: '', params: '', pagination: 'none', page_param: 'page', size_param: '', page_size: 100, offset_param: 'offset', limit_param: 'limit', next_path: '', recursive: false, settle_seconds: 10 },
+        showConnectionsModal: false,
+        connectionsList: [],
+        connTest: {},
+        connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '' },
         autoloaderTargets: [{ id: 'warehouse', name: 'warehouse', kind: 'local' }],
         newPipelineForm: {
           name: '',
@@ -25665,6 +25821,106 @@
           }
         },
 
+        connType() {
+          const c = this.connectionsList.find(x => x.name === this.pipelineConn.name);
+          return c ? c.type : '';
+        },
+
+        async loadConnections() {
+          try {
+            const res = await fetch('/api/connections');
+            if (res.ok) this.connectionsList = (await res.json()).connections || [];
+          } catch (e) { /* the list stays as it was */ }
+        },
+
+        async openConnections() {
+          this.showConnectionsModal = true;
+          this.connForm.open = false;
+          this.connTest = {};
+          await this.loadConnections();
+        },
+
+        newConnection() {
+          this.connTest = {};
+          this.connForm = { open: true, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '' };
+        },
+
+        editConnection(c) {
+          this.connTest = {};
+          const cfg = c.config || {};
+          this.connForm = { open: true, busy: false, error: '', id: c.id, name: c.name, type: c.type, description: c.description || '', base_url: cfg.base_url || '', auth: c.type === 'http' ? (cfg.auth || 'none') : 'none',
+            username: cfg.username || '', header_name: cfg.header_name || '', secret: '', allow_insecure: !!cfg.allow_insecure, timeout_seconds: cfg.timeout_seconds || 30,
+            host: cfg.host || '', port: cfg.port || 22, sftp_auth: c.type === 'sftp' ? (cfg.auth || 'password') : 'password', private_key: '', passphrase: '', host_key_sha256: cfg.host_key_sha256 || '' };
+        },
+
+        connPayload() {
+          const f = this.connForm;
+          if (f.type === 'sftp') {
+            const secret = {};
+            if (f.sftp_auth === 'password' && f.secret) secret.password = f.secret;
+            if (f.sftp_auth === 'key') { if (f.private_key) secret.private_key = f.private_key; if (f.passphrase) secret.passphrase = f.passphrase; }
+            return { id: f.id || null, name: f.name, type: 'sftp', description: f.description,
+              config: { host: f.host, port: f.port, username: f.username, auth: f.sftp_auth, host_key_sha256: f.host_key_sha256 }, secret };
+          }
+          const secret = {};
+          if (f.secret) secret[f.auth === 'bearer' ? 'token' : (f.auth === 'basic' ? 'password' : 'header_value')] = f.secret;
+          return { id: f.id || null, name: f.name, type: 'http', description: f.description,
+            config: { base_url: f.base_url, auth: f.auth, username: f.username, header_name: f.header_name, allow_insecure: f.allow_insecure, timeout_seconds: f.timeout_seconds }, secret };
+        },
+
+        async testConnection() {
+          this.connForm.busy = true; this.connForm.error = ''; this.connTest = {};
+          try {
+            const res = await fetch('/api/connections/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.connPayload()) });
+            const data = await res.json();
+            this.connTest = res.ok ? data : { ok: false, message: typeof data.detail === 'string' ? data.detail : 'The test failed.' };
+          } catch (e) {
+            this.connTest = { ok: false, message: 'Error: ' + e.message };
+          } finally {
+            this.connForm.busy = false;
+          }
+        },
+
+        async saveConnection() {
+          this.connForm.busy = true; this.connForm.error = '';
+          try {
+            const body = this.connPayload();
+            const res = await fetch(this.connForm.id ? '/api/connections/' + this.connForm.id : '/api/connections', { method: this.connForm.id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            const data = await res.json();
+            if (!res.ok) { this.connForm.error = typeof data.detail === 'string' ? data.detail : 'Could not save the connection.'; return; }
+            this.connForm.open = false; this.connTest = {};
+            this.showToast(`Connection '${data.name}' saved.`, 'success');
+            await this.loadConnections();
+          } catch (e) {
+            this.connForm.error = 'Error: ' + e.message;
+          } finally {
+            this.connForm.busy = false;
+          }
+        },
+
+        async deleteConnection(c) {
+          if (!confirm(`Delete the connection '${c.name}'? Its stored secret is removed.`)) return;
+          const res = await fetch('/api/connections/' + c.id, { method: 'DELETE' });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.showToast(d.detail || 'Could not delete the connection.', 'error'); return; }
+          this.showToast(`Connection '${c.name}' deleted.`, 'success');
+          await this.loadConnections();
+        },
+
+        connSourceForSubmit() {
+          const c = this.pipelineConn, kind = this.connType();
+          const path = (c.path || '').trim().replace(/^\/+/, '');
+          const source_volume_path = 'conn://' + c.name + '/' + path;
+          if (kind === 'sftp') return { source_volume_path, source_options: { recursive: !!c.recursive, settle_seconds: Number(c.settle_seconds) || 0 } };
+          if (c.mode === 'file') return { source_volume_path, source_options: { mode: 'file' } };
+          const params = {};
+          (c.params || '').split('\n').map(l => l.trim()).filter(Boolean).forEach(l => { const i = l.indexOf('='); if (i > 0) params[l.slice(0, i).trim()] = l.slice(i + 1).trim(); });
+          const pag = { type: c.pagination };
+          if (c.pagination === 'page') Object.assign(pag, { page_param: c.page_param, size_param: c.size_param, page_size: c.page_size });
+          if (c.pagination === 'offset') Object.assign(pag, { offset_param: c.offset_param, limit_param: c.limit_param, page_size: c.page_size });
+          if (c.pagination === 'next_link') pag.next_path = c.next_path;
+          return { source_volume_path, source_options: { mode: 'api', records_path: c.records_path, params, pagination: pag } };
+        },
+
         async loadAutoloaderTargets() {
           try {
             const res = await fetch('/api/autoloader/target-catalogs');
@@ -25677,24 +25933,32 @@
         },
 
         async createAutoloaderPipelineSubmit() {
-          if (!this.newPipelineForm.name || !this.newPipelineForm.source_volume_path || !this.newPipelineForm.target_table) {
-            this.showToast('Please fill in pipeline name, source volume, and target table.', 'error');
+          const isConn = this.pipelineSourceKind === 'connection';
+          if (isConn && (!this.pipelineConn.name || (this.connType() === 'sftp' && !this.pipelineConn.path.trim()))) {
+            this.showToast('Choose a connection' + (this.connType() === 'sftp' ? ' and the remote folder.' : '.'), 'error');
             return;
           }
-          const isS3 = this.newPipelineForm.source_volume_path.trim().toLowerCase().startsWith('s3://');
-          if (isS3 && this.newPipelineForm.poll_interval_seconds === 'watch') {
-            this.showToast('File events watch local volumes only. Pick a poll interval or a cron schedule for an S3 source.', 'error');
+          const connSource = isConn ? this.connSourceForSubmit() : {};
+          if (!this.newPipelineForm.name || !(isConn ? connSource.source_volume_path : this.newPipelineForm.source_volume_path) || !this.newPipelineForm.target_table) {
+            this.showToast('Please fill in pipeline name, source, and target table.', 'error');
             return;
           }
+          const isS3 = !isConn && this.newPipelineForm.source_volume_path.trim().toLowerCase().startsWith('s3://');
+          if ((isS3 || isConn) && this.newPipelineForm.poll_interval_seconds === 'watch') {
+            this.showToast('File events watch local volumes only. Pick a poll interval or a cron schedule for this source.', 'error');
+            return;
+          }
+          const base = { ...this.newPipelineForm, ...connSource };
+          if (isConn && this.connType() === 'http') base.file_pattern = '*';
           try {
             const res = await fetch('/api/autoloader/pipelines', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(this.newPipelineForm.poll_interval_seconds === 'cron'
-                ? { ...this.newPipelineForm, poll_interval_seconds: 10, watch_enabled: false }
+                ? { ...base, poll_interval_seconds: 10, watch_enabled: false }
                 : this.newPipelineForm.poll_interval_seconds === 'watch'
-                  ? { ...this.newPipelineForm, poll_interval_seconds: 10, cron_schedule: '', watch_enabled: true, watch_sweep_seconds: Number(this.newPipelineForm.watch_sweep_seconds) }
-                  : { ...this.newPipelineForm, cron_schedule: '', watch_enabled: false })
+                  ? { ...base, poll_interval_seconds: 10, cron_schedule: '', watch_enabled: true, watch_sweep_seconds: Number(this.newPipelineForm.watch_sweep_seconds) }
+                  : { ...base, cron_schedule: '', watch_enabled: false })
             });
             const data = await res.json();
             if (res.ok) {

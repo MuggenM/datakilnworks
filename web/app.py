@@ -7860,6 +7860,64 @@ async def get_autoloader_pipelines():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------- Connections (web/connections.py): HTTP(S)/REST and SFTP sources
+class ConnectionPayload(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    type: Optional[str] = None
+    description: Optional[str] = ""
+    config: Optional[Dict[str, Any]] = None
+    secret: Optional[Dict[str, Any]] = None
+
+
+@app.get("/api/connections")
+async def list_connections_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """Names, types and non-secret settings (never a secret; `has_secret` says whether one is stored)."""
+    from web import connections
+    return {"connections": connections.list_connections()}
+
+@app.post("/api/connections")
+async def create_connection_endpoint(payload: ConnectionPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import connections
+    try:
+        return connections.create_connection(payload.dict(), current_user.get("username", "admin"))
+    except connections.ConnectionError_ as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/connections/test")
+async def test_connection_endpoint(payload: ConnectionPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Tries a definition (saved or not) and reports reachability; for SFTP without a pinned host key, the fingerprint the server presents."""
+    from web import connections, autoloader_conn
+    try:
+        definition = connections.definition_for_test(payload.dict())
+    except connections.ConnectionError_ as exc:
+        return {"ok": False, "message": str(exc)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return await asyncio.to_thread(autoloader_conn.test_connection, definition)
+
+@app.put("/api/connections/{conn_id}")
+async def update_connection_endpoint(conn_id: str, payload: ConnectionPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import connections
+    try:
+        return connections.update_connection(conn_id, payload.dict(), current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except connections.ConnectionError_ as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.delete("/api/connections/{conn_id}")
+async def delete_connection_endpoint(conn_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import connections
+    try:
+        connections.delete_connection(conn_id, current_user.get("username", "admin"))
+        return {"success": True}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except connections.ConnectionError_ as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @app.get("/api/autoloader/target-catalogs")
 async def get_autoloader_target_catalogs(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Catalogs a pipeline can load into: writable local catalogs and writable S3 mounts (the create dialog's dropdown)."""
