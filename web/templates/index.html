@@ -2029,7 +2029,8 @@
 
                   <!-- Actions -->
                   <div class="flex items-center space-x-1.5">
-                    <button @click="runPipelineNow(p.id)" title="Trigger Ingestion Scan Now" class="p-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-emerald-600 dark:text-emerald-400 border border-slate-200 dark:border-slate-700 rounded transition flex items-center space-x-1 text-xs px-2.5">
+                    <button x-show="p.my_access === 'manage'" @click="openShare('pipeline', p.id, p.name)" data-testid="pipeline-share" title="Share with users and groups" class="p-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-indigo-600 dark:text-indigo-400 border border-slate-200 dark:border-slate-700 rounded transition text-xs px-2 flex items-center space-x-1"><i class="ph ph-share-network"></i><span>Share</span></button>
+                    <button x-show="p.my_access" @click="runPipelineNow(p.id)" title="Trigger Ingestion Scan Now" class="p-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-emerald-600 dark:text-emerald-400 border border-slate-200 dark:border-slate-700 rounded transition flex items-center space-x-1 text-xs px-2.5">
                       <i class="ph ph-play text-sm"></i>
                       <span>Run Now</span>
                     </button>
@@ -2045,7 +2046,7 @@
                       <i class="ph ph-arrows-counter-clockwise text-sm"></i>
                       <span>Reset</span>
                     </button>
-                    <button @click="deleteAutoloaderPipeline(p.id)" title="Delete Pipeline" class="p-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-rose-600 dark:text-rose-400 border border-slate-200 dark:border-slate-700 rounded transition">
+                    <button x-show="p.my_access === 'manage'" @click="deleteAutoloaderPipeline(p.id)" title="Delete Pipeline" class="p-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-rose-600 dark:text-rose-400 border border-slate-200 dark:border-slate-700 rounded transition">
                       <i class="ph ph-trash text-sm"></i>
                     </button>
                   </div>
@@ -2820,15 +2821,17 @@
 
                     <!-- Grant Access Form -->
                     <div class="p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg space-y-2">
-                      <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">Grant User Access</span>
+                      <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">Grant Access</span>
                       <div class="flex flex-wrap items-center gap-2">
-                        <input type="text" x-model="newGrantUser" placeholder="Enter username (e.g. analyst_bob)" class="flex-1 min-w-[180px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-amber-500">
+                        <select x-model="newGrantKind" data-testid="cat-grant-kind" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-xs text-slate-900 dark:text-white"><option value="user">User</option><option value="group">Group</option></select>
+                        <input x-show="newGrantKind === 'user'" type="text" x-model="newGrantUser" placeholder="Enter username (e.g. analyst_bob)" class="flex-1 min-w-[180px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-amber-500">
+                        <select x-show="newGrantKind === 'group'" x-model="newGrantGroup" data-testid="cat-grant-group" class="flex-1 min-w-[180px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white"><option value="">Choose a group…</option><template x-for="g in groupsList" :key="g.id"><option :value="g.id" x-text="g.name + ' (' + g.member_count + ')'"></option></template></select>
                         <select x-model="newGrantPermission" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-amber-500 cursor-pointer">
                           <option value="READ">READ (Query & Sample Tables)</option>
                           <option value="WRITE">WRITE (Query, Ingest & Create Tables)</option>
                           <option value="ADMIN">ADMIN (Full Catalog Control)</option>
                         </select>
-                        <button @click="submitGrantPermission(selectedTable?.catalog || 'warehouse')" :disabled="isGrantingPerm || !newGrantUser.trim()" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs">
+                        <button @click="submitGrantPermission(selectedTable?.catalog || 'warehouse')" :disabled="isGrantingPerm || (newGrantKind === 'group' ? !newGrantGroup : !newGrantUser.trim())" data-testid="cat-grant-submit" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs">
                           <i class="ph" :class="isGrantingPerm ? 'ph-spinner animate-spin' : 'ph-plus-circle'"></i>
                           <span>Grant Access</span>
                         </button>
@@ -2849,9 +2852,9 @@
                           </tr>
                         </thead>
                         <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/50 text-slate-700 dark:text-slate-300">
-                          <template x-for="perm in catalogPermsList" :key="perm.username">
+                          <template x-for="perm in catalogPermsList" :key="perm.user_id">
                             <tr class="hover:bg-slate-50 dark:hover:bg-dbx-hover/40 transition">
-                              <td class="py-2.5 px-3 font-mono font-bold text-slate-900 dark:text-white" x-text="perm.username"></td>
+                              <td class="py-2.5 px-3 font-mono font-bold text-slate-900 dark:text-white" data-testid="cat-perm-name"><span x-text="perm.username"></span> <span x-show="perm.principal_type === 'group'" class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 font-sans">group</span></td>
                               <td class="py-2.5 px-3" x-text="perm.full_name || '-'"></td>
                               <td class="py-2.5 px-3">
                                 <span class="text-[10px] font-mono px-2 py-0.5 rounded font-semibold"
@@ -2861,7 +2864,7 @@
                               <td class="py-2.5 px-3 font-mono text-slate-500" x-text="perm.granted_by"></td>
                               <td class="py-2.5 px-3 font-mono text-slate-500 text-[11px]" x-text="perm.created_at"></td>
                               <td class="py-2.5 px-3 text-right">
-                                <button @click="submitRevokePermission(selectedTable?.catalog || 'warehouse', perm.username)" class="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900 dark:text-rose-300 dark:border-rose-800 rounded transition font-medium text-[11px]" title="Revoke Permission">
+                                <button @click="submitRevokePermission(selectedTable?.catalog || 'warehouse', perm.principal_type === 'group' ? perm.user_id : perm.username, perm.username)" class="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900 dark:text-rose-300 dark:border-rose-800 rounded transition font-medium text-[11px]" title="Revoke Permission">
                                   Revoke
                                 </button>
                               </td>
@@ -5400,6 +5403,7 @@
                     <i class="ph ph-play-fill text-xs"></i>
                     <span>Run</span>
                   </button>
+                  <button x-show="selectedSavedQuery && selectedSavedQuery.my_access === 'owner'" @click="openShare('saved_query', selectedSavedQuery.id, selectedSavedQuery.name)" data-testid="query-share" class="px-2.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded-md text-xs font-semibold flex items-center space-x-1.5 transition" title="Share with users and groups"><i class="ph ph-share-network text-xs"></i><span>Share</span></button>
                   <button @click="selectedSavedQuery = null" class="p-1.5 text-slate-400 hover:text-white rounded-md hover:bg-dbx-hover transition" title="Close details">
                     <i class="ph ph-x text-base"></i>
                   </button>
@@ -11075,6 +11079,52 @@
     </div>
   </div>
 
+  <!-- Modal: Share a saved query or pipeline with users and groups -->
+  <div x-show="shareDlg.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="shareDlg.open = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-lg shadow-2xl p-5 space-y-3 text-xs max-h-[90vh] overflow-y-auto" @click.outside="shareDlg.open = false" data-testid="share-dialog">
+      <div class="flex items-start justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
+        <div>
+          <h3 class="text-sm font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-share-network text-dbx-orange"></i><span>Share</span><span class="font-mono font-normal text-slate-500" x-text="shareDlg.name"></span></h3>
+          <p class="text-[11px] text-slate-500 mt-0.5" x-text="shareDlg.type === 'pipeline' ? 'Run lets someone trigger the pipeline; Manage also lets them change, reset and delete it. Administrators and power users already manage every pipeline.' : 'View lets someone see and run the query; Edit also lets them change it. Data access is unaffected: the query still runs with each person\'s own permissions.'"></p>
+        </div>
+        <button @click="shareDlg.open = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+      <div class="space-y-1.5">
+        <div class="text-[10px] uppercase font-semibold text-slate-500">Shared with</div>
+        <div x-show="!shareDlg.grants.length" class="text-slate-500 italic">Nobody yet.</div>
+        <template x-for="g in shareDlg.grants" :key="g.principal">
+          <div class="flex items-center justify-between py-1.5 border-b border-slate-100 dark:border-dbx-border/40" data-testid="share-grant">
+            <span><span class="font-semibold text-slate-900 dark:text-white" x-text="g.name"></span>
+              <span class="ml-1 text-[9px] px-1.5 py-0.5 rounded border" :class="g.principal_type === 'group' ? 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-slate-700'" x-text="g.principal_type"></span></span>
+            <span class="flex items-center space-x-1.5">
+              <select :value="g.permission" @change="setShareGrant(g.principal, $event.target.value)" class="bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-1.5 py-1">
+                <template x-for="p in shareDlg.permissions" :key="p"><option :value="p" x-text="p"></option></template></select>
+              <button @click="removeShareGrant(g.principal)" class="px-2 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded text-rose-600" data-testid="share-remove">Remove</button>
+            </span>
+          </div>
+        </template>
+      </div>
+      <div class="space-y-1.5 p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg">
+        <div class="text-[10px] uppercase font-semibold text-slate-500">Add a group or user</div>
+        <div class="flex space-x-2">
+          <input type="text" x-model="shareDlg.q" @input.debounce.250ms="searchSharePrincipals()" placeholder="Group name, or 2+ letters of a user name" data-testid="share-search" class="flex-1 w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white">
+          <select x-model="shareDlg.perm" data-testid="share-perm" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5">
+            <template x-for="p in shareDlg.permissions" :key="p"><option :value="p" x-text="p"></option></template></select>
+        </div>
+        <div class="max-h-40 overflow-y-auto divide-y divide-slate-100 dark:divide-dbx-border/40">
+          <template x-for="r in shareDlg.results" :key="r.principal">
+            <button @click="setShareGrant(r.principal, shareDlg.perm)" class="w-full text-left py-1.5 px-1 hover:bg-slate-100 dark:hover:bg-dbx-hover/40 flex items-center justify-between" data-testid="share-result">
+              <span><span class="font-semibold" x-text="r.name"></span> <span x-show="r.display_name" class="text-slate-400" x-text="'· ' + r.display_name"></span></span>
+              <span class="text-[10px] text-slate-500" x-text="r.type === 'group' ? (r.member_count + ' members') : 'user'"></span>
+            </button>
+          </template>
+          <div x-show="!shareDlg.results.length" class="py-2 text-slate-500 italic">No matches.</div>
+        </div>
+      </div>
+      <div x-show="shareDlg.error" class="text-rose-600 dark:text-rose-400" x-text="shareDlg.error" data-testid="share-error"></div>
+    </div>
+  </div>
+
   <!-- Modal: Connections (HTTP(S)/REST and SFTP sources for Auto-Loader) -->
   <div x-show="showConnectionsModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showConnectionsModal = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-3xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" @click.outside="showConnectionsModal = false" data-testid="connections-modal">
@@ -14195,7 +14245,7 @@
           </div>
         </div>
         <div class="flex items-center space-x-2">
-          <button @click="showCreateUserCard = !showCreateUserCard" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs">
+          <button x-show="iamTab === 'users'" @click="showCreateUserCard = !showCreateUserCard" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs">
             <i class="ph" :class="showCreateUserCard ? 'ph-minus' : 'ph-plus'"></i>
             <span x-text="showCreateUserCard ? 'Close Form' : 'New User'"></span>
           </button>
@@ -14205,8 +14255,79 @@
         </div>
       </div>
 
+      <div class="flex items-center space-x-1 shrink-0 border-b border-slate-200 dark:border-dbx-border -mt-2" data-testid="iam-tabs">
+        <button @click="iamTab = 'users'" :class="iamTab === 'users' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-users">Users</button>
+        <button @click="iamTab = 'groups'; loadGroups()" :class="iamTab === 'groups' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-groups">Groups <span class="ml-1 text-[10px] font-mono px-1.5 rounded bg-slate-100 dark:bg-slate-800" x-text="groupsList.length"></span></button>
+      </div>
+
+      <!-- Groups: named sets of users (local or external accounts). Grant access to a group instead of to each person. -->
+      <div x-show="iamTab === 'groups'" class="flex-1 min-h-0 grid grid-cols-12 gap-4 text-xs" data-testid="groups-panel">
+        <div class="col-span-4 flex flex-col min-h-0 border border-slate-200 dark:border-dbx-border rounded-xl">
+          <div class="p-3 border-b border-slate-200 dark:border-dbx-border space-y-2 shrink-0">
+            <form @submit.prevent="createGroup()" class="flex space-x-2">
+              <input type="text" x-model="groupForm.newName" placeholder="New group, e.g. Analysts" data-testid="group-new-name" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white">
+              <button type="submit" :disabled="groupForm.busy || !groupForm.newName.trim()" data-testid="group-create" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 disabled:opacity-50 text-white rounded font-semibold">Add</button>
+            </form>
+            <div x-show="groupForm.error" class="text-rose-600 dark:text-rose-400" x-text="groupForm.error" data-testid="group-error"></div>
+          </div>
+          <div class="flex-1 overflow-y-auto divide-y divide-slate-200 dark:divide-dbx-border/50">
+            <div x-show="!groupsList.length" class="p-4 text-slate-500 text-center">No groups yet.</div>
+            <template x-for="g in groupsList" :key="g.id">
+              <button @click="selectGroup(g)" data-testid="group-row" :class="groupSel && groupSel.id === g.id ? 'bg-indigo-50 dark:bg-indigo-950/40' : 'hover:bg-slate-50 dark:hover:bg-dbx-hover/40'" class="w-full text-left px-3 py-2.5 flex items-center justify-between">
+                <span><span class="font-semibold text-slate-900 dark:text-white" x-text="g.name"></span><span class="block text-[11px] text-slate-500 truncate" x-text="g.description"></span></span>
+                <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800" x-text="g.member_count + (g.member_count === 1 ? ' member' : ' members')"></span>
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <div class="col-span-8 flex flex-col min-h-0 border border-slate-200 dark:border-dbx-border rounded-xl">
+          <div x-show="!groupSel" class="p-8 text-center text-slate-500">Pick a group to manage its members, or create one.<br><span class="text-[11px]">Then grant the group access from a catalog's <em>Access</em> dialog, a saved query's or pipeline's <em>Share</em> button, or a dashboard's permissions.</span></div>
+          <template x-if="groupSel">
+            <div class="flex flex-col min-h-0 h-full">
+              <div class="p-3 border-b border-slate-200 dark:border-dbx-border space-y-2 shrink-0">
+                <div class="grid grid-cols-5 gap-2">
+                  <input type="text" x-model="groupSel.name" class="col-span-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white font-semibold" data-testid="group-name">
+                  <input type="text" x-model="groupSel.description" placeholder="Description" class="col-span-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white">
+                  <button @click="saveGroup()" :disabled="groupForm.busy" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="group-save">Save</button>
+                </div>
+                <div class="flex justify-between items-center">
+                  <span class="text-[11px] text-slate-500">Members can be local or external (LDAP / OIDC) accounts. Access through groups adds to what a user has; it never changes their role.</span>
+                  <button @click="deleteGroup()" class="px-2.5 py-1 bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded" data-testid="group-delete">Delete group</button>
+                </div>
+                <div class="flex space-x-2 items-center">
+                  <select x-model="groupAddUser" data-testid="group-add-select" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white">
+                    <option value="">Add a member…</option>
+                    <template x-for="u in iamUsers.filter(x => x.is_active && !x.deleted_at && !groupMembers.some(m => m.id === x.id))" :key="u.id">
+                      <option :value="u.id" x-text="u.username + ' — ' + (u.full_name || '') + ' [' + (u.auth_source || 'local') + ']'"></option>
+                    </template>
+                  </select>
+                  <button @click="addGroupMember()" :disabled="!groupAddUser" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="group-add">Add</button>
+                </div>
+              </div>
+              <div class="flex-1 overflow-y-auto">
+                <table class="w-full text-left">
+                  <thead class="text-[10px] uppercase text-slate-500 sticky top-0 bg-white dark:bg-dbx-panel"><tr><th class="py-2 px-3">Member</th><th>Role</th><th>Source</th><th class="text-right px-3">Remove</th></tr></thead>
+                  <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/50">
+                    <tr x-show="!groupMembers.length"><td colspan="4" class="p-4 text-center text-slate-500 italic">No members yet.</td></tr>
+                    <template x-for="m in groupMembers" :key="m.id">
+                      <tr data-testid="group-member">
+                        <td class="py-2 px-3"><span class="font-semibold text-slate-900 dark:text-white" x-text="m.display_name || m.username"></span> <span class="font-mono text-slate-400" x-text="'@' + m.username"></span></td>
+                        <td x-text="m.role"></td>
+                        <td><span class="text-[10px] font-mono px-2 py-0.5 rounded uppercase bg-slate-100 dark:bg-slate-800" x-text="m.auth_source || 'local'"></span></td>
+                        <td class="text-right px-3"><button @click="removeGroupMember(m)" class="px-2 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded text-rose-600" data-testid="group-remove">Remove</button></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
       <!-- Collapsible Add User Card -->
-      <div x-show="showCreateUserCard" class="p-4 bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-dbx-border rounded-xl space-y-3 shrink-0">
+      <div x-show="iamTab === 'users' && showCreateUserCard" class="p-4 bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-dbx-border rounded-xl space-y-3 shrink-0">
         <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider block">Provision New User Account</span>
         <form @submit.prevent="createUser()" class="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
           <div>
@@ -14244,19 +14365,20 @@
       </div>
 
       <!-- Users List Table -->
-      <div class="flex items-center justify-end shrink-0">
+      <div x-show="iamTab === 'users'" class="flex items-center justify-end shrink-0">
         <label class="flex items-center space-x-1.5 text-[11px] text-slate-500 dark:text-slate-400 cursor-pointer select-none">
           <input type="checkbox" x-model="showDeletedUsers" @change="fetchUsers()" class="w-3.5 h-3.5 text-indigo-600 rounded cursor-pointer">
           <span>Show deleted users</span>
         </label>
       </div>
-      <div class="flex-1 overflow-y-auto border border-slate-200 dark:border-dbx-border rounded-xl">
+      <div x-show="iamTab === 'users'" class="flex-1 overflow-y-auto border border-slate-200 dark:border-dbx-border rounded-xl">
         <table class="w-full text-left text-xs">
           <thead class="bg-slate-100 dark:bg-slate-900/80 text-slate-600 dark:text-slate-400 border-b border-slate-200 dark:border-dbx-border font-semibold uppercase text-[10px] sticky top-0 backdrop-blur-md">
             <tr>
               <th class="py-2.5 px-4">User</th>
               <th class="py-2.5 px-4 hidden xl:table-cell">Email</th>
               <th class="py-2.5 px-4">Role</th>
+              <th class="py-2.5 px-4">Groups</th>
               <th class="py-2.5 px-4">Source</th>
               <th class="py-2.5 px-4">Status</th>
               <th class="py-2.5 px-4">Created At</th>
@@ -14286,6 +14408,12 @@
                     <option value="power_user">Power User</option>
                     <option value="user">User</option>
                   </select>
+                </td>
+                <td class="py-3 px-4">
+                  <div class="flex flex-wrap gap-1 max-w-[180px]">
+                    <template x-for="g in (u.groups || [])" :key="g.id"><span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800" x-text="g.name"></span></template>
+                    <span x-show="!(u.groups || []).length" class="text-slate-400">—</span>
+                  </div>
                 </td>
                 <td class="py-3 px-4">
                   <span class="text-[10px] font-mono px-2 py-0.5 rounded font-semibold uppercase"
@@ -14362,15 +14490,17 @@
 
       <!-- Grant Access Form -->
       <div class="p-3.5 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-xl space-y-2 shrink-0">
-        <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider block">Grant User Access</span>
+        <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider block">Grant Access</span>
         <div class="flex flex-wrap items-center gap-2">
-          <input type="text" x-model="newGrantUser" placeholder="Enter username (e.g. analyst_bob)" class="flex-1 min-w-[180px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-amber-500">
+          <select x-model="newGrantKind" data-testid="cat-grant-kind" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-xs text-slate-900 dark:text-white"><option value="user">User</option><option value="group">Group</option></select>
+                        <input x-show="newGrantKind === 'user'" type="text" x-model="newGrantUser" placeholder="Enter username (e.g. analyst_bob)" class="flex-1 min-w-[180px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-amber-500">
+                        <select x-show="newGrantKind === 'group'" x-model="newGrantGroup" data-testid="cat-grant-group" class="flex-1 min-w-[180px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white"><option value="">Choose a group…</option><template x-for="g in groupsList" :key="g.id"><option :value="g.id" x-text="g.name + ' (' + g.member_count + ')'"></option></template></select>
           <select x-model="newGrantPermission" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-amber-500 cursor-pointer">
             <option value="READ">READ (Query & Sample Tables)</option>
             <option value="WRITE">WRITE (Query, Ingest & Create)</option>
             <option value="ADMIN">ADMIN (Full Catalog Control)</option>
           </select>
-          <button @click="submitGrantPermission(activeCatalogForPerms)" :disabled="isGrantingPerm || !newGrantUser.trim()" class="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs">
+          <button @click="submitGrantPermission(activeCatalogForPerms)" data-testid="cat-grant-submit" :disabled="isGrantingPerm || (newGrantKind === 'group' ? !newGrantGroup : !newGrantUser.trim())" class="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs">
             <i class="ph" :class="isGrantingPerm ? 'ph-spinner animate-spin' : 'ph-plus-circle'"></i>
             <span>Grant Access</span>
           </button>
@@ -14390,9 +14520,9 @@
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/50 text-slate-700 dark:text-slate-300">
-            <template x-for="perm in catalogPermsList" :key="perm.username">
+            <template x-for="perm in catalogPermsList" :key="perm.user_id">
               <tr class="hover:bg-slate-50 dark:hover:bg-dbx-hover/40 transition">
-                <td class="py-2.5 px-3 font-mono font-bold text-slate-900 dark:text-white" x-text="perm.username"></td>
+                <td class="py-2.5 px-3 font-mono font-bold text-slate-900 dark:text-white" data-testid="cat-perm-name"><span x-text="perm.username"></span> <span x-show="perm.principal_type === 'group'" class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 font-sans">group</span></td>
                 <td class="py-2.5 px-3" x-text="perm.full_name || '-'"></td>
                 <td class="py-2.5 px-3">
                   <span class="text-[10px] font-mono px-2 py-0.5 rounded font-semibold"
@@ -14401,7 +14531,7 @@
                 </td>
                 <td class="py-2.5 px-3 font-mono text-slate-500" x-text="perm.granted_by"></td>
                 <td class="py-2.5 px-3 text-right">
-                  <button @click="submitRevokePermission(activeCatalogForPerms, perm.username)" class="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900 dark:text-rose-300 dark:border-rose-800 rounded transition font-medium text-[11px]" title="Revoke Permission">
+                  <button @click="submitRevokePermission(activeCatalogForPerms, perm.principal_type === 'group' ? perm.user_id : perm.username, perm.username)" class="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900 dark:text-rose-300 dark:border-rose-800 rounded transition font-medium text-[11px]" title="Revoke Permission">
                     Revoke
                   </button>
                 </td>
@@ -15650,8 +15780,16 @@
           <!-- Grant Permission Form -->
           <div x-show="showGrantPermissionForm" class="mb-3 p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg space-y-2">
             <div>
+              <label class="block text-[10px] font-medium text-slate-700 dark:text-slate-300 mb-1">Grant to</label>
+              <select x-model="newPermission.kind" @change="if (newPermission.kind === 'group') loadGroups()" data-testid="dash-grant-kind" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-xs"><option value="user">A user</option><option value="group">A group</option></select>
+            </div>
+            <div x-show="newPermission.kind !== 'group'">
               <label class="block text-[10px] font-medium text-slate-700 dark:text-slate-300 mb-1">Username</label>
               <input type="text" x-model="newPermission.user" placeholder="alice" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-xs">
+            </div>
+            <div x-show="newPermission.kind === 'group'">
+              <label class="block text-[10px] font-medium text-slate-700 dark:text-slate-300 mb-1">Group</label>
+              <select x-model="newPermission.group" data-testid="dash-grant-group" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-xs"><option value="">Choose a group…</option><template x-for="g in groupsList" :key="g.id"><option :value="g.id" x-text="g.name"></option></template></select>
             </div>
             <div>
               <label class="block text-[10px] font-medium text-slate-700 dark:text-slate-300 mb-1">Permission Level</label>
@@ -15665,7 +15803,7 @@
               <button @click="grantPermission()" class="flex-1 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs transition">
                 Grant Access
               </button>
-              <button @click="showGrantPermissionForm = false; newPermission = {user: '', level: 'viewer'}" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded text-xs transition">
+              <button @click="showGrantPermissionForm = false; newPermission = {kind: 'user', user: '', group: '', level: 'viewer'}" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded text-xs transition">
                 Cancel
               </button>
             </div>
@@ -15677,13 +15815,13 @@
               No additional users have access
             </div>
 
-            <template x-for="perm in dashboardPermissions.permissions" :key="perm.user || perm.role">
+            <template x-for="perm in dashboardPermissions.permissions" :key="perm.user || perm.role || perm.group">
               <div class="p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg">
                 <div class="flex items-center justify-between">
                   <div class="flex-1">
                     <div class="flex items-center space-x-2">
                       <i class="ph ph-user text-sm text-slate-600 dark:text-slate-400"></i>
-                      <span class="font-semibold text-slate-800 dark:text-white" x-text="perm.user || perm.role"></span>
+                      <span class="font-semibold text-slate-800 dark:text-white" x-text="perm.user || perm.role || perm.group_name || perm.group"></span><span x-show="perm.group" class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">group</span>
                       <span class="px-1.5 py-0.5 text-[9px] rounded font-medium uppercase"
                             :class="{
                               'bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300': perm.level === 'owner',
@@ -15698,7 +15836,7 @@
                       <span x-text="perm.granted_at"></span>
                     </div>
                   </div>
-                  <button @click="revokePermission(perm.user, perm.role)" class="p-1.5 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 transition" title="Revoke Access">
+                  <button @click="revokePermission(perm.user, perm.role, perm.group)" class="p-1.5 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 transition" title="Revoke Access">
                     <i class="ph ph-trash text-sm"></i>
                   </button>
                 </div>
@@ -16894,6 +17032,13 @@
         showIamModal: false,
         showCreateUserCard: false,
         iamUsers: [],
+        iamTab: 'users',
+        shareDlg: { open: false, type: '', id: '', name: '', grants: [], permissions: [], perm: '', q: '', results: [], error: '' },
+        groupsList: [],
+        groupSel: null,
+        groupMembers: [],
+        groupAddUser: '',
+        groupForm: { newName: '', busy: false, error: '' },
         showDeletedUsers: false,
         iamLoading: false,
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
@@ -16915,6 +17060,8 @@
         catalogPermsList: [],
         isLoadingCatalogPerms: false,
         newGrantUser: '',
+        newGrantKind: 'user',
+        newGrantGroup: '',
         newGrantPermission: 'READ',
         isGrantingPerm: false,
 
@@ -17079,7 +17226,9 @@
         },
         showGrantPermissionForm: false,
         newPermission: {
+          kind: 'user',
           user: '',
+          group: '',
           level: 'viewer'
         },
         transferOwnershipTo: '',
@@ -18478,6 +18627,131 @@
           return cat?.owner || 'admin';
         },
 
+        async openShare(type, id, name) {
+          this.shareDlg = { open: true, type, id, name, grants: [], permissions: [], perm: '', q: '', results: [], error: '' };
+          await this.loadShareGrants();
+          this.shareDlg.perm = this.shareDlg.permissions[0] || '';
+          await this.searchSharePrincipals();
+        },
+
+        async loadShareGrants() {
+          const d = this.shareDlg;
+          const res = await fetch(`/api/grants/${d.type}/${encodeURIComponent(d.id)}`);
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { d.error = typeof data.detail === 'string' ? data.detail : 'Could not load who this is shared with.'; return; }
+          d.grants = data.grants || []; d.permissions = data.permissions || [];
+        },
+
+        async searchSharePrincipals() {
+          const res = await fetch('/api/principals?q=' + encodeURIComponent(this.shareDlg.q || ''));
+          if (!res.ok) return;
+          const data = await res.json();
+          const already = new Set(this.shareDlg.grants.map(g => g.principal));
+          this.shareDlg.results = [...(data.groups || []), ...(data.users || [])].filter(r => !already.has(r.principal));
+        },
+
+        async setShareGrant(principal, permission) {
+          const d = this.shareDlg; d.error = '';
+          const res = await fetch(`/api/grants/${d.type}/${encodeURIComponent(d.id)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ principal, permission }) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { d.error = typeof data.detail === 'string' ? data.detail : 'Could not share.'; return; }
+          await this.loadShareGrants();
+          await this.searchSharePrincipals();
+        },
+
+        async removeShareGrant(principal) {
+          const d = this.shareDlg; d.error = '';
+          const res = await fetch(`/api/grants/${d.type}/${encodeURIComponent(d.id)}?principal=${encodeURIComponent(principal)}`, { method: 'DELETE' });
+          if (!res.ok) { const data = await res.json().catch(() => ({})); d.error = data.detail || 'Could not remove.'; return; }
+          await this.loadShareGrants();
+          await this.searchSharePrincipals();
+        },
+
+        async loadGroups() {
+          try {
+            const res = await fetch('/api/groups');
+            if (res.ok) {
+              this.groupsList = (await res.json()).groups || [];
+              if (this.groupSel) {
+                const cur = this.groupsList.find(g => g.id === this.groupSel.id);
+                if (!cur) { this.groupSel = null; this.groupMembers = []; }
+              }
+            }
+          } catch (e) { /* the list stays as it was */ }
+        },
+
+        async selectGroup(g) {
+          this.groupSel = { ...g };
+          this.groupAddUser = '';
+          this.groupForm.error = '';
+          await this.loadGroupMembers();
+        },
+
+        async loadGroupMembers() {
+          if (!this.groupSel) return;
+          const res = await fetch(`/api/groups/${this.groupSel.id}/members`);
+          this.groupMembers = res.ok ? ((await res.json()).members || []) : [];
+        },
+
+        async createGroup() {
+          this.groupForm.busy = true; this.groupForm.error = '';
+          try {
+            const res = await fetch('/api/groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: this.groupForm.newName }) });
+            const data = await res.json();
+            if (!res.ok) { this.groupForm.error = typeof data.detail === 'string' ? data.detail : 'Could not create the group.'; return; }
+            this.groupForm.newName = '';
+            await this.loadGroups();
+            const g = this.groupsList.find(x => x.id === data.id);
+            if (g) await this.selectGroup(g);
+          } finally {
+            this.groupForm.busy = false;
+          }
+        },
+
+        async saveGroup() {
+          this.groupForm.busy = true; this.groupForm.error = '';
+          try {
+            const res = await fetch(`/api/groups/${this.groupSel.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: this.groupSel.name, description: this.groupSel.description }) });
+            const data = await res.json();
+            if (!res.ok) { this.groupForm.error = typeof data.detail === 'string' ? data.detail : 'Could not save the group.'; return; }
+            this.showToast(`Group '${data.name}' saved.`, 'success');
+            await this.loadGroups();
+            await this.fetchUsers();
+          } finally {
+            this.groupForm.busy = false;
+          }
+        },
+
+        async deleteGroup() {
+          const g = this.groupSel;
+          if (!g || !confirm(`Delete the group '${g.name}'? Every access it was granted (catalogs, dashboards, shared queries, pipelines) is removed.`)) return;
+          const res = await fetch(`/api/groups/${g.id}`, { method: 'DELETE' });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.showToast(d.detail || 'Could not delete the group.', 'error'); return; }
+          this.groupSel = null; this.groupMembers = [];
+          this.showToast(`Group '${g.name}' deleted.`, 'success');
+          await this.loadGroups();
+          await this.fetchUsers();
+        },
+
+        async addGroupMember() {
+          if (!this.groupAddUser) return;
+          const res = await fetch(`/api/groups/${this.groupSel.id}/members`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_ids: [this.groupAddUser] }) });
+          const data = await res.json();
+          if (!res.ok) { this.showToast(typeof data.detail === 'string' ? data.detail : 'Could not add the member.', 'error'); return; }
+          this.groupMembers = data.members || [];
+          this.groupAddUser = '';
+          await this.loadGroups();
+          await this.fetchUsers();
+        },
+
+        async removeGroupMember(m) {
+          const res = await fetch(`/api/groups/${this.groupSel.id}/members/${m.id}`, { method: 'DELETE' });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.showToast(d.detail || 'Could not remove the member.', 'error'); return; }
+          this.groupMembers = this.groupMembers.filter(x => x.id !== m.id);
+          await this.loadGroups();
+          await this.fetchUsers();
+        },
+
         async openIamModal() {
           this.showIamModal = true;
           this.showCreateUserCard = false;
@@ -18664,12 +18938,16 @@
           this.activeCatalogForPerms = catId;
           this.showCatalogPermissionsModal = true;
           this.newGrantUser = '';
+          this.newGrantKind = 'user';
+          this.newGrantGroup = '';
           this.newGrantPermission = 'READ';
+          this.loadGroups();
           this.fetchCatalogPermissions(catId);
         },
 
         async fetchCatalogPermissions(catId) {
           if (!catId) return;
+          if (!this.groupsList.length) this.loadGroups();          // for the "Group" choice of the grant form (admins / power users)
           this.isLoadingCatalogPerms = true;
           try {
             const res = await fetch(`/api/catalogs/${catId}/permissions`);
@@ -18690,24 +18968,25 @@
         },
 
         async submitGrantPermission(catId) {
-          if (!catId || !this.newGrantUser.trim()) return;
+          const isGroup = this.newGrantKind === 'group';
+          if (!catId || (isGroup ? !this.newGrantGroup : !this.newGrantUser.trim())) return;
           this.isGrantingPerm = true;
+          const label = isGroup ? ((this.groupsList.find(g => g.id === this.newGrantGroup) || {}).name || 'group') : this.newGrantUser.trim();
           try {
             const res = await fetch(`/api/catalogs/${catId}/permissions`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                username: this.newGrantUser.trim(),
-                permission: this.newGrantPermission
-              })
+              body: JSON.stringify(isGroup
+                ? { user_id: 'group:' + this.newGrantGroup, permission: this.newGrantPermission }
+                : { username: this.newGrantUser.trim(), permission: this.newGrantPermission })
             });
             const data = await res.json();
             if (!res.ok) {
               this.showToast(data.detail || 'Failed to grant catalog permission', 'error');
               return;
             }
-            this.showToast(`Granted ${this.newGrantPermission} access on ${catId} to ${this.newGrantUser}`, 'success');
-            this.newGrantUser = '';
+            this.showToast(`Granted ${this.newGrantPermission} access on ${catId} to ${label}`, 'success');
+            this.newGrantUser = ''; this.newGrantGroup = '';
             await this.fetchCatalogPermissions(catId);
           } catch (e) {
             this.showToast('Error granting permission: ' + e.message, 'error');
@@ -18716,10 +18995,11 @@
           }
         },
 
-        async submitRevokePermission(catId, username) {
-          if (!confirm(`Revoke catalog permissions on '${catId}' for user '${username}'?`)) return;
+        async submitRevokePermission(catId, target, label) {
+          const username = label || target;
+          if (!confirm(`Revoke catalog permissions on '${catId}' for '${username}'?`)) return;
           try {
-            const res = await fetch(`/api/catalogs/${catId}/permissions/${username}`, { method: 'DELETE' });
+            const res = await fetch(`/api/catalogs/${catId}/permissions/${encodeURIComponent(target)}`, { method: 'DELETE' });
             const data = await res.json();
             if (!res.ok) {
               this.showToast(data.detail || 'Failed to revoke permission', 'error');
@@ -19281,8 +19561,9 @@
         },
 
         async grantPermission() {
-          if (!this.newPermission.user) {
-            alert('❌ Please enter a username');
+          const isGroup = this.newPermission.kind === 'group';
+          if (isGroup ? !this.newPermission.group : !this.newPermission.user) {
+            alert(isGroup ? '❌ Please choose a group' : '❌ Please enter a username');
             return;
           }
 
@@ -19290,17 +19571,16 @@
             const res = await fetch(`/api/dashboards/${this.currentDashboard.id}/permissions/grant`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                user: this.newPermission.user,
-                level: this.newPermission.level
-              })
+              body: JSON.stringify(isGroup
+                ? { group: this.newPermission.group, level: this.newPermission.level }
+                : { user: this.newPermission.user, level: this.newPermission.level })
             });
 
             const data = await res.json();
 
             if (res.ok && data.success) {
               this.showToast(`Permission granted to ${this.newPermission.user}`, 'success');
-              this.newPermission = { user: '', level: 'viewer' };
+              this.newPermission = { kind: 'user', user: '', group: '', level: 'viewer' };
               this.showGrantPermissionForm = false;
               await this.loadDashboardPermissions();
             } else {
@@ -19311,8 +19591,8 @@
           }
         },
 
-        async revokePermission(user, role) {
-          const target = user || role;
+        async revokePermission(user, role, group) {
+          const target = user || role || group;
           if (!confirm(`Remove ${target}'s access to this dashboard?`)) {
             return;
           }
@@ -19321,7 +19601,7 @@
             const res = await fetch(`/api/dashboards/${this.currentDashboard.id}/permissions/revoke`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ user, role })
+              body: JSON.stringify({ user, role, group })
             });
 
             const data = await res.json();

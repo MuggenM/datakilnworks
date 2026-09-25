@@ -89,7 +89,21 @@ def get_user_permission_level(dashboard_id: str, username: str, user_role: str) 
     max_level = "none"
     max_level_value = 0
 
+    try:
+        from web import groups
+        my_groups = groups.group_ids_for_username(username)
+    except Exception:
+        my_groups = set()
+
     for perm in dashboard_perms.get("permissions", []):
+        # Match by group membership (a user takes the highest level of their own grant, their role's and their groups')
+        if perm.get("group") and perm["group"] in my_groups:
+            level = perm.get("level", "none")
+            if PERMISSION_LEVELS.get(level, 0) > max_level_value:
+                max_level = level
+                max_level_value = PERMISSION_LEVELS[level]
+            continue
+
         # Match by username
         if perm.get("user") == username:
             level = perm.get("level", "none")
@@ -135,38 +149,48 @@ def can_manage_permissions(dashboard_id: str, username: str, user_role: str) -> 
     return PERMISSION_LEVELS.get(level, 0) >= PERMISSION_LEVELS["owner"]
 
 
+def _same_principal(perm: Dict[str, Any], user: Optional[str], role: Optional[str], group: Optional[str]) -> bool:
+    """Does an existing entry belong to the principal being granted/revoked? (Compares only the key that was given: an entry without
+    a `role` must not match a grant whose role is also absent, or granting to one user would overwrite another's entry.)"""
+    if user:
+        return perm.get("user") == user
+    if role:
+        return perm.get("role") == role
+    if group:
+        return perm.get("group") == group
+    return False
+
+
 def grant_permission(
     dashboard_id: str,
     user: Optional[str] = None,
     role: Optional[str] = None,
     level: str = "viewer",
-    granted_by: str = "admin"
+    granted_by: str = "admin",
+    group: Optional[str] = None
 ) -> bool:
-    """Grant permission to a user or role."""
+    """Grant permission to a user, a role or a group (group id)."""
     load_permissions()
 
     if dashboard_id not in DASHBOARD_PERMISSIONS:
         return False
 
-    if not user and not role:
+    if not user and not role and not group:
         return False
 
     if level not in PERMISSION_LEVELS:
         return False
 
-    # Check if permission already exists
     permissions = DASHBOARD_PERMISSIONS[dashboard_id].get("permissions", [])
 
     for perm in permissions:
-        if perm.get("user") == user or perm.get("role") == role:
-            # Update existing permission
+        if _same_principal(perm, user, role, group):
             perm["level"] = level
             perm["granted_by"] = granted_by
             perm["granted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_permissions()
             return True
 
-    # Add new permission
     new_perm = {
         "level": level,
         "granted_by": granted_by,
@@ -175,8 +199,17 @@ def grant_permission(
 
     if user:
         new_perm["user"] = user
-    if role:
+    elif role:
         new_perm["role"] = role
+    elif group:
+        new_perm["group"] = group
+        try:
+            from web import groups
+            g = groups.get_group(group)
+            if g:
+                new_perm["group_name"] = g["name"]
+        except Exception:
+            pass
 
     DASHBOARD_PERMISSIONS[dashboard_id]["permissions"].append(new_perm)
     save_permissions()
@@ -186,9 +219,10 @@ def grant_permission(
 def revoke_permission(
     dashboard_id: str,
     user: Optional[str] = None,
-    role: Optional[str] = None
+    role: Optional[str] = None,
+    group: Optional[str] = None
 ) -> bool:
-    """Revoke permission from a user or role."""
+    """Revoke permission from a user, a role or a group."""
     load_permissions()
 
     if dashboard_id not in DASHBOARD_PERMISSIONS:
@@ -197,17 +231,26 @@ def revoke_permission(
     permissions = DASHBOARD_PERMISSIONS[dashboard_id].get("permissions", [])
     original_count = len(permissions)
 
-    # Remove matching permissions
-    DASHBOARD_PERMISSIONS[dashboard_id]["permissions"] = [
-        p for p in permissions
-        if not ((user and p.get("user") == user) or (role and p.get("role") == role))
-    ]
+    DASHBOARD_PERMISSIONS[dashboard_id]["permissions"] = [p for p in permissions if not _same_principal(p, user, role, group)]
 
     if len(DASHBOARD_PERMISSIONS[dashboard_id]["permissions"]) < original_count:
         save_permissions()
         return True
 
     return False
+
+
+def remove_group_everywhere(group_id: str) -> None:
+    """A deleted group loses its dashboard grants (called by groups.delete_group)."""
+    load_permissions()
+    changed = False
+    for perms in DASHBOARD_PERMISSIONS.values():
+        kept = [p for p in perms.get("permissions", []) if p.get("group") != group_id]
+        if len(kept) != len(perms.get("permissions", [])):
+            perms["permissions"] = kept
+            changed = True
+    if changed:
+        save_permissions()
 
 
 def set_dashboard_public(dashboard_id: str, is_public: bool) -> bool:

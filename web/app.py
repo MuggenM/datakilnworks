@@ -710,7 +710,9 @@ async def get_current_user_profile(request: Request):
 
 @app.get("/api/users")
 async def get_users_endpoint(include_deleted: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    return {"users": list_users(include_deleted=include_deleted)}
+    from web import groups
+    membership = groups.memberships_by_user()
+    return {"users": [{**u, "groups": membership.get(u.get("id"), [])} for u in list_users(include_deleted=include_deleted)]}
 
 
 @app.post("/api/users")
@@ -4112,27 +4114,44 @@ async def get_dashboard_permissions(dashboard_id: str, current_user: dict = Depe
 
     return {"success": True, "permissions": perms}
 
+class DashboardGrantPayload(BaseModel):
+    user: Optional[str] = None
+    role: Optional[str] = None
+    group: Optional[str] = None
+    level: Optional[str] = None
+
+
 @app.post("/api/dashboards/{dashboard_id}/permissions/grant")
 async def grant_dashboard_permission(
     dashboard_id: str,
+    payload: Optional[DashboardGrantPayload] = None,
     user: Optional[str] = None,
     role: Optional[str] = None,
     level: str = "viewer",
+    group: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Grant permission to a user or role."""
+    """Grant permission to a user, a role or a group (`group` = the group's id). Values come from the JSON body (what the UI sends) or, as
+    before, from query parameters."""
     from web.dashboard_permissions import grant_permission, can_manage_permissions
+    if payload:
+        user, role, group, level = payload.user or user, payload.role or role, payload.group or group, payload.level or level
 
     # Check if user can manage permissions
     if not can_manage_permissions(dashboard_id, current_user["username"], current_user["role"]):
         raise HTTPException(status_code=403, detail="You don't have permission to grant permissions")
+    if group:
+        from web import groups
+        if not groups.get_group(group):
+            raise HTTPException(status_code=404, detail="That group does not exist.")
 
     success = grant_permission(
         dashboard_id=dashboard_id,
         user=user,
         role=role,
         level=level,
-        granted_by=current_user["username"]
+        granted_by=current_user["username"],
+        group=group
     )
 
     if not success:
@@ -4143,18 +4162,22 @@ async def grant_dashboard_permission(
 @app.post("/api/dashboards/{dashboard_id}/permissions/revoke")
 async def revoke_dashboard_permission(
     dashboard_id: str,
+    payload: Optional[DashboardGrantPayload] = None,
     user: Optional[str] = None,
     role: Optional[str] = None,
+    group: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Revoke permission from a user or role."""
+    """Revoke permission from a user, a role or a group."""
     from web.dashboard_permissions import revoke_permission, can_manage_permissions
+    if payload:
+        user, role, group = payload.user or user, payload.role or role, payload.group or group
 
     # Check if user can manage permissions
     if not can_manage_permissions(dashboard_id, current_user["username"], current_user["role"]):
         raise HTTPException(status_code=403, detail="You don't have permission to revoke permissions")
 
-    success = revoke_permission(dashboard_id=dashboard_id, user=user, role=role)
+    success = revoke_permission(dashboard_id=dashboard_id, user=user, role=role, group=group)
 
     if not success:
         raise HTTPException(status_code=400, detail="Failed to revoke permission")
@@ -5156,15 +5179,35 @@ class SavedQueryUpdateRequest(BaseModel):
     schema_name: Optional[str] = None
     tags: Optional[List[str]] = None
 
+def _saved_query_access(q: Dict[str, Any], user: Dict[str, Any]) -> Optional[str]:
+    """owner | edit | view | None for a user on a saved query. Sharing (web/groups.py) can grant VIEW or EDIT to users and groups; only the
+    owner or an admin changes who it is shared with or deletes it. Starter/default queries are visible to everyone and editable by admins."""
+    from web.groups import permission_of
+    from web.saved_queries import get_default_saved_queries
+    if user.get("role") == "admin":
+        return "owner"
+    name = user.get("username", "")
+    if name and name in (q.get("owner"), q.get("created_by")):
+        return "owner"
+    granted = permission_of(user, "saved_query", q.get("id", ""))
+    if granted == "EDIT":
+        return "edit"
+    if granted == "VIEW" or q.get("is_starter") or q.get("id") in {d["id"] for d in get_default_saved_queries()}:
+        return "view"
+    return None
+
+
 @app.get("/api/queries")
 async def list_saved_queries(request: Request, q: Optional[str] = None, tag: Optional[str] = None):
     from web.saved_queries import get_saved_queries
+    from web import groups
     current_user = await resolve_principal(request)
     username = current_user.get("username", "admin")
     is_admin = current_user.get("role") == "admin"
     try:
-        queries = get_saved_queries(q=q, tag=tag, user_id=username, is_admin=is_admin)
-        return {"queries": queries}
+        queries = get_saved_queries(q=q, tag=tag, user_id=username, is_admin=is_admin,
+                                    shared_ids=groups.granted_ids(current_user, "saved_query", "VIEW"))
+        return {"queries": [{**item, "my_access": _saved_query_access(item, current_user)} for item in queries]}
     except Exception as e:
         logger.error(f"Failed to list saved queries: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -5185,16 +5228,25 @@ async def create_new_saved_query(payload: SavedQueryCreateRequest, request: Requ
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/queries/{query_id}")
-async def get_single_saved_query(query_id: str):
+async def get_single_saved_query(query_id: str, request: Request):
     from web.saved_queries import get_saved_query
+    current_user = await resolve_principal(request)
     q = get_saved_query(query_id)
-    if not q:
+    access = _saved_query_access(q, current_user) if q else None
+    if not q or not access:
         raise HTTPException(status_code=404, detail="Saved query not found")
-    return q
+    return {**q, "my_access": access}
 
 @app.put("/api/queries/{query_id}")
-async def update_existing_saved_query(query_id: str, payload: SavedQueryUpdateRequest):
-    from web.saved_queries import update_saved_query
+async def update_existing_saved_query(query_id: str, payload: SavedQueryUpdateRequest, request: Request):
+    from web.saved_queries import update_saved_query, get_saved_query
+    current_user = await resolve_principal(request)
+    q = get_saved_query(query_id)
+    access = _saved_query_access(q, current_user) if q else None
+    if not q or not access:
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    if access not in ("owner", "edit") or (q.get("is_starter") and current_user.get("role") != "admin"):
+        raise HTTPException(status_code=403, detail="You can view this query but not change it.")
     data_dict = {k: v for k, v in payload.dict().items() if v is not None}
     updated = update_saved_query(query_id, data_dict)
     if not updated:
@@ -5202,17 +5254,30 @@ async def update_existing_saved_query(query_id: str, payload: SavedQueryUpdateRe
     return updated
 
 @app.delete("/api/queries/{query_id}")
-async def delete_existing_saved_query(query_id: str):
-    from web.saved_queries import delete_saved_query
+async def delete_existing_saved_query(query_id: str, request: Request):
+    from web.saved_queries import delete_saved_query, get_saved_query
+    from web import groups
+    current_user = await resolve_principal(request)
+    q = get_saved_query(query_id)
+    access = _saved_query_access(q, current_user) if q else None
+    if not q or not access:
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    if access != "owner":
+        raise HTTPException(status_code=403, detail="Only the owner (or an administrator) can delete a saved query.")
     deleted = delete_saved_query(query_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Saved query not found")
+    groups.delete_grants_for_resource("saved_query", query_id)
     return {"success": True, "deleted_query_id": query_id}
 
 @app.post("/api/queries/{query_id}/duplicate")
-async def duplicate_existing_saved_query(query_id: str):
-    from web.saved_queries import duplicate_saved_query
-    cloned = duplicate_saved_query(query_id)
+async def duplicate_existing_saved_query(query_id: str, request: Request):
+    from web.saved_queries import duplicate_saved_query, get_saved_query
+    current_user = await resolve_principal(request)
+    q = get_saved_query(query_id)
+    if not q or not _saved_query_access(q, current_user):
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    cloned = duplicate_saved_query(query_id, owner=current_user.get("username", "admin"))
     if not cloned:
         raise HTTPException(status_code=404, detail="Saved query not found")
     return cloned
@@ -7849,15 +7914,148 @@ async def preview_volume_file_endpoint(
 # Auto-Loader Pipeline Endpoints
 # ------------------------------------------------------------------------------
 
+def _pipeline_access(user: Dict[str, Any], pipe: Dict[str, Any]) -> Optional[str]:
+    """manage | run | None. Admins and power users manage every pipeline (as before); a plain user can be given RUN or MANAGE on a
+    pipeline directly or through a group (Share dialog / IAM > Groups)."""
+    from web.groups import permission_of
+    if user.get("role") in ("admin", "power_user") or user.get("username") == pipe.get("created_by"):
+        return "manage"
+    granted = permission_of(user, "pipeline", pipe.get("id", ""))
+    return {"MANAGE": "manage", "RUN": "run"}.get(granted or "")
+
+
 @app.get("/api/autoloader/pipelines")
-async def get_autoloader_pipelines():
+async def get_autoloader_pipelines(request: Request):
     from web.autoloader import list_pipelines
+    current_user = await resolve_principal(request)
     try:
-        pipes = list_pipelines()
+        pipes = [{**p, "my_access": _pipeline_access(current_user, p)} for p in list_pipelines()]
         return {"pipelines": pipes}
     except Exception as e:
         logger.error(f"Error listing autoloader pipelines: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------- Groups (web/groups.py) and generic resource grants
+class GroupPayload(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class GroupMembersPayload(BaseModel):
+    user_ids: List[str]
+
+
+class GrantPayload(BaseModel):
+    principal: str            # user:<id or username> | group:<id>
+    permission: str
+
+
+def _groups_call(fn, *args, **kw):
+    from web import groups
+    try:
+        return fn(*args, **kw)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except groups.GroupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/groups")
+async def list_groups_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    from web import groups
+    return {"groups": groups.list_groups()}
+
+@app.post("/api/groups")
+async def create_group_endpoint(payload: GroupPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    return _groups_call(groups.create_group, payload.name or "", payload.description or "", current_user.get("username", "admin"))
+
+@app.put("/api/groups/{group_id}")
+async def update_group_endpoint(group_id: str, payload: GroupPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    return _groups_call(groups.update_group, group_id, payload.name, payload.description, current_user.get("username", "admin"))
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group_endpoint(group_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    _groups_call(groups.delete_group, group_id, current_user.get("username", "admin"))
+    return {"success": True}
+
+@app.get("/api/groups/{group_id}/members")
+async def list_group_members_endpoint(group_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    if not groups.get_group(group_id):
+        raise HTTPException(status_code=404, detail="Group not found.")
+    return {"members": groups.list_members(group_id)}
+
+@app.post("/api/groups/{group_id}/members")
+async def add_group_members_endpoint(group_id: str, payload: GroupMembersPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    return {"members": _groups_call(groups.add_members, group_id, payload.user_ids, current_user.get("username", "admin"))}
+
+@app.delete("/api/groups/{group_id}/members/{user_id}")
+async def remove_group_member_endpoint(group_id: str, user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    _groups_call(groups.remove_member, group_id, user_id, current_user.get("username", "admin"))
+    return {"success": True}
+
+@app.get("/api/principals")
+async def search_principals_endpoint(q: str = "", current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Users and groups to pick from in a share dialog (at most 20 of each; users need at least 2 typed characters)."""
+    from web import groups
+    from web.auth import get_db_connection
+    q = (q or "").strip().lower()
+    users = []
+    if len(q) >= 2:
+        conn = get_db_connection()
+        try:
+            users = [{"principal": f"user:{r['id']}", "type": "user", "name": r["username"], "display_name": r["display_name"], "auth_source": r["auth_source"]}
+                     for r in conn.execute("SELECT id, username, display_name, auth_source FROM users WHERE deleted_at IS NULL AND is_active = 1 "
+                                           "AND (lower(username) LIKE ? OR lower(display_name) LIKE ?) ORDER BY username LIMIT 20", (f"%{q}%", f"%{q}%"))]
+        finally:
+            conn.close()
+    gs = [{"principal": f"group:{g['id']}", "type": "group", "name": g["name"], "member_count": g["member_count"]}
+          for g in groups.list_groups() if not q or q in g["name"].lower()][:20]
+    return {"users": users, "groups": gs}
+
+
+def _may_manage_grants(user: Dict[str, Any], resource_type: str, resource_id: str) -> bool:
+    if user.get("role") == "admin":
+        return True
+    if resource_type == "saved_query":
+        from web.saved_queries import get_saved_query
+        q = get_saved_query(resource_id)
+        return bool(q) and user.get("username") in (q.get("owner"), q.get("created_by"))
+    if resource_type == "pipeline":
+        from web.autoloader import get_pipeline
+        p = get_pipeline(resource_id)
+        return bool(p) and _pipeline_access(user, p) == "manage"
+    return False
+
+
+@app.get("/api/grants/{resource_type}/{resource_id}")
+async def list_grants_endpoint(resource_type: str, resource_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from web import groups
+    if not _may_manage_grants(current_user, resource_type, resource_id):
+        raise HTTPException(status_code=403, detail="Only the owner or an administrator can see who this is shared with.")
+    return {"permissions": list(groups.RESOURCE_TYPES.get(resource_type, ())), "grants": _groups_call(groups.list_grants, resource_type, resource_id)}
+
+@app.post("/api/grants/{resource_type}/{resource_id}")
+async def set_grant_endpoint(resource_type: str, resource_id: str, payload: GrantPayload, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from web import groups
+    if not _may_manage_grants(current_user, resource_type, resource_id):
+        raise HTTPException(status_code=403, detail="Only the owner or an administrator can share this.")
+    return _groups_call(groups.grant, resource_type, resource_id, payload.principal, payload.permission, current_user.get("username", "admin"))
+
+@app.delete("/api/grants/{resource_type}/{resource_id}")
+async def revoke_grant_endpoint(resource_type: str, resource_id: str, principal: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from web import groups
+    if not _may_manage_grants(current_user, resource_type, resource_id):
+        raise HTTPException(status_code=403, detail="Only the owner or an administrator can change who this is shared with.")
+    if not _groups_call(groups.revoke, resource_type, resource_id, principal, current_user.get("username", "admin")):
+        raise HTTPException(status_code=404, detail="That grant does not exist.")
+    return {"success": True}
 
 
 # ---------------------------------------------------------------- Connections (web/connections.py): HTTP(S)/REST and SFTP sources
@@ -7955,10 +8153,14 @@ async def get_autoloader_pipeline_endpoint(pipeline_id: str):
 @app.put("/api/autoloader/pipelines/{pipeline_id}")
 async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[str, Any], request: Request):
     from web.autoloader import update_pipeline
+    from web.autoloader import get_pipeline as _get_pipe
     current_user = await resolve_principal(request)
 
-    if current_user.get("role") not in ("admin", "power_user"):
-        raise HTTPException(status_code=403, detail="Only admins and power users can modify Auto-Loader pipelines.")
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) != "manage":
+        raise HTTPException(status_code=403, detail="Only admins, power users and users with Manage access can modify Auto-Loader pipelines.")
 
     try:
         pipe = update_pipeline(pipeline_id, payload)
@@ -7971,22 +8173,33 @@ async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[st
 
 @app.delete("/api/autoloader/pipelines/{pipeline_id}")
 async def delete_autoloader_pipeline_endpoint(pipeline_id: str, request: Request):
-    from web.autoloader import delete_pipeline
+    from web.autoloader import delete_pipeline, get_pipeline as _get_pipe
+    from web import groups
     current_user = await resolve_principal(request)
 
-    if current_user.get("role") not in ("admin", "power_user"):
-        raise HTTPException(status_code=403, detail="Only admins and power users can delete Auto-Loader pipelines.")
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) != "manage":
+        raise HTTPException(status_code=403, detail="Only admins, power users and users with Manage access can delete Auto-Loader pipelines.")
 
     ok = delete_pipeline(pipeline_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Pipeline not found")
+    groups.delete_grants_for_resource("pipeline", pipeline_id)
     return {"success": True, "message": f"Pipeline '{pipeline_id}' deleted."}
 
 
 @app.post("/api/autoloader/pipelines/{pipeline_id}/run")
 @app.post("/api/autoloader/pipelines/{pipeline_id}/run-now")
-async def run_autoloader_pipeline_now(pipeline_id: str):
-    from web.autoloader import run_pipeline_cycle
+async def run_autoloader_pipeline_now(pipeline_id: str, request: Request):
+    from web.autoloader import run_pipeline_cycle, get_pipeline as _get_pipe
+    current_user = await resolve_principal(request)
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) is None:
+        raise HTTPException(status_code=403, detail="You need Run or Manage access on this pipeline (ask an administrator to add you or one of your groups).")
     try:
         res = run_pipeline_cycle(pipeline_id)
         if "error" in res and res.get("files_found") is None:
@@ -8000,10 +8213,14 @@ async def run_autoloader_pipeline_now(pipeline_id: str):
 @app.post("/api/autoloader/pipelines/{pipeline_id}/reset")
 async def reset_autoloader_pipeline_checkpoints(pipeline_id: str, request: Request):
     from web.autoloader import reset_pipeline_checkpoints
+    from web.autoloader import get_pipeline as _get_pipe
     current_user = await resolve_principal(request)
 
-    if current_user.get("role") not in ("admin", "power_user"):
-        raise HTTPException(status_code=403, detail="Only admins and power users can reset checkpoints.")
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) != "manage":
+        raise HTTPException(status_code=403, detail="Only admins, power users and users with Manage access can reset checkpoints.")
 
     res = reset_pipeline_checkpoints(pipeline_id)
     return res

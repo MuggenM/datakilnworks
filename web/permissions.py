@@ -137,27 +137,35 @@ def can_user_access_catalog(user: Dict[str, Any], catalog_id: str, action: str =
     if is_catalog_owner(user, catalog_id):
         return True
 
-    # Standard check against catalog_permissions table
+    # Standard check against catalog_permissions: the user's own grant and the grants of every group they belong to;
+    # the highest one wins (groups only ever add access).
     user_id = user.get("id", "")
     username = user.get("username", "")
+    principals = [user_id, username]
+    try:
+        from web import groups
+        principals += [f"group:{g}" for g in groups.group_ids_for(user)]
+    except Exception as exc:
+        logger.warning(f"group membership unavailable for catalog check: {exc}")
+    principals = [p for p in principals if p]
+    if not principals:
+        return False
 
     conn = get_db_connection()
     try:
-        row = conn.execute("""
-        SELECT permission FROM catalog_permissions 
-        WHERE catalog_id = ? AND (user_id = ? OR user_id = ?)
-        """, (catalog_id, user_id, username)).fetchone()
-
-        if not row:
+        rows = conn.execute(
+            f"SELECT permission FROM catalog_permissions WHERE catalog_id = ? AND user_id IN ({','.join('?' * len(principals))})",
+            (catalog_id, *principals)).fetchall()
+        perms = {r["permission"].upper() for r in rows}
+        if not perms:
             return False
-
-        perm = row["permission"].upper()
-        if action.upper() == "READ":
-            return perm in ("READ", "WRITE", "ADMIN")
-        elif action.upper() == "WRITE":
-            return perm in ("WRITE", "ADMIN")
-        elif action.upper() == "ADMIN":
-            return perm == "ADMIN"
+        act = action.upper()
+        if act == "READ":
+            return bool(perms & {"READ", "WRITE", "ADMIN"})
+        if act == "WRITE":
+            return bool(perms & {"WRITE", "ADMIN"})
+        if act == "ADMIN":
+            return "ADMIN" in perms
         return False
     finally:
         conn.close()
@@ -179,13 +187,20 @@ def list_catalog_permissions(catalog_id: str) -> Dict[str, Any]:
 
         grants = []
         for r in rows:
+            is_group = str(r["user_id"]).startswith("group:")
+            gname = None
+            if is_group:
+                gr = conn.execute("SELECT name FROM user_groups WHERE id = ?", (r["user_id"][len("group:"):],)).fetchone() \
+                    if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_groups'").fetchone() else None
+                gname = gr["name"] if gr else r["user_id"]
             grants.append({
                 "id": r["id"],
                 "catalog_id": r["catalog_id"],
                 "user_id": r["user_id"],
-                "username": r["username"] or r["user_id"],
-                "display_name": r["display_name"] or r["username"] or r["user_id"],
-                "role": r["role"] or "user",
+                "principal_type": "group" if is_group else "user",
+                "username": gname or r["username"] or r["user_id"],
+                "display_name": gname or r["display_name"] or r["username"] or r["user_id"],
+                "role": "group" if is_group else (r["role"] or "user"),
                 "permission": r["permission"],
                 "granted_by": r["granted_by"],
                 "created_at": r["created_at"]
@@ -218,8 +233,14 @@ def grant_catalog_permission(
         raise HTTPException(status_code=400, detail="Invalid permission. Must be READ, WRITE, or ADMIN.")
 
     target_clean = target_user_id.strip()
-    target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
-    effective_user_id = target_user["id"] if target_user else target_clean
+    if target_clean.startswith("group:"):
+        from web import groups
+        if not groups.get_group(target_clean[len("group:"):]):
+            raise HTTPException(status_code=404, detail="That group does not exist.")
+        effective_user_id = target_clean
+    else:
+        target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
+        effective_user_id = target_user["id"] if target_user else target_clean
 
     conn = get_db_connection()
     try:
@@ -259,9 +280,12 @@ def revoke_catalog_permission(
         )
 
     target_clean = target_user_id.strip()
-    target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
-    target_id = target_user["id"] if target_user else target_clean
-    target_name = target_user["username"] if target_user else target_clean
+    if target_clean.startswith("group:"):
+        target_id = target_name = target_clean
+    else:
+        target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
+        target_id = target_user["id"] if target_user else target_clean
+        target_name = target_user["username"] if target_user else target_clean
 
     conn = get_db_connection()
     try:
