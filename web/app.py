@@ -1792,6 +1792,32 @@ async def _execute_clone_statement(payload, query: str, stmt: Dict[str, Any], us
             "warehouse_id": wh_id, "executed_by": "Studio (shallow clone)"}
 
 
+async def _execute_grant_statement(payload, query: str, stmt: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """`GRANT ... ON ... TO ...`, `REVOKE ... ON ... FROM ...` and `SHOW GRANTS` from the SQL editor."""
+    from web import sql_grants
+    start = time.perf_counter()
+    default_cat = payload.catalog or "warehouse"
+    wh_id = payload.warehouse_id or "wh_starter"
+    is_show = stmt["op"] == "show"
+    try:
+        result = await asyncio.to_thread(sql_grants.run, stmt, query, user, default_cat)
+        ok, message = True, result.get("message", "")
+    except (sql_grants.GrantSqlError, HTTPException) as exc:
+        ok, message, result = False, str(getattr(exc, "detail", exc)), {}
+    elapsed = round((time.perf_counter() - start) * 1000, 2)
+    qid = log_query(query_text=query, duration_ms=elapsed, rows_produced=result.get("row_count", 0) if ok else 0, status="SUCCESS" if ok else "FAILED",
+                    error_message=None if ok else message, client="SQL_EDITOR", is_mutation=not is_show, warehouse_id=wh_id,
+                    catalog=default_cat, user=user.get("username", "admin"), executed_by="Studio (access management)")
+    if not ok:
+        return {"success": False, "query_id": qid, "error": message, "elapsed_ms": elapsed, "warehouse_id": wh_id}
+    if is_show:
+        names = [c["name"] for c in result["columns"]]          # the grid reads row[column name]
+        return {"success": True, "query_id": qid, "is_mutation": False, "masked_columns": [], "columns": result["columns"], "rows": [dict(zip(names, r)) for r in result["rows"]],
+                "row_count": result["row_count"], "elapsed_ms": elapsed, "warehouse_id": wh_id, "executed_by": "Studio (access management)"}
+    return {"success": True, "query_id": qid, "is_mutation": True, "message": message, "elapsed_ms": elapsed, "row_count": 0,
+            "warehouse_id": wh_id, "executed_by": "Studio (access management)"}
+
+
 @app.delete("/api/table/{schema_name}/{table_name}")
 async def drop_table_api(schema_name: str, table_name: str, request: Request, catalog: Optional[str] = "warehouse"):
     schema_clean = sanitize_identifier(schema_name)
@@ -2262,6 +2288,14 @@ async def execute_sql(payload: QueryRequest, request: Request):
     clone_stmt = table_clone.parse_clone_sql(query)
     if clone_stmt:                       # not SQL any engine understands: handled (and governed) here, never dispatched
         return await _execute_clone_statement(payload, query, clone_stmt, current_user)
+
+    from web import sql_grants
+    try:
+        grant_stmt = sql_grants.parse(query)
+    except sql_grants.GrantSqlError as exc:
+        return {"success": False, "error": str(exc), "warehouse_id": payload.warehouse_id or "wh_starter"}
+    if grant_stmt:                       # GRANT / REVOKE / SHOW GRANTS: access management, not data (see web/sql_grants.py)
+        return await _execute_grant_statement(payload, query, grant_stmt, current_user)
 
     # Enforce zero-trust catalog permissions
     try:
