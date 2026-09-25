@@ -8000,6 +8000,26 @@ async def remove_group_member_endpoint(group_id: str, user_id: str, current_user
     _groups_call(groups.remove_member, group_id, user_id, current_user.get("username", "admin"))
     return {"success": True}
 
+class GroupMappingPayload(BaseModel):
+    source: str = "local"
+    external_ref: Optional[str] = ""
+
+
+@app.put("/api/groups/{group_id}/mapping")
+async def set_group_mapping_endpoint(group_id: str, payload: GroupMappingPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Maps the group to an LDAP group DN / OIDC group value (members then follow the directory), or clears it (source 'local')."""
+    from web import groups
+    return _groups_call(groups.set_mapping, group_id, payload.source, payload.external_ref or "", current_user.get("username", "admin"))
+
+@app.get("/api/groups/directory/ldap")
+async def list_ldap_groups_endpoint(q: str = "", current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """LDAP groups to choose from when mapping (admins only; uses the configured service account)."""
+    from web import ldap_auth
+    try:
+        return {"groups": await asyncio.to_thread(ldap_auth.list_directory_groups, None, q)}
+    except ldap_auth.LdapError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
 @app.get("/api/principals")
 async def search_principals_endpoint(q: str = "", current_user: Dict[str, Any] = Depends(get_current_user)):
     """Users and groups to pick from in a share dialog (at most 20 of each; users need at least 2 typed characters)."""

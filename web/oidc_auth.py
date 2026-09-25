@@ -246,4 +246,12 @@ def complete_login(cfg: Dict[str, Any], code: str, state: str, state_cookie: Opt
                     claims.setdefault(k, v)
         except Exception as exc:
             logger.warning(f"OIDC userinfo request failed (continuing without it): {exc}")
-    return _provision(cfg, claims)
+    user = _provision(cfg, claims)
+    # Group sync: only when the identity provider actually sent the groups claim (an absent claim is not "no groups": it would strip access).
+    if claim_name in claims:
+        try:
+            from web import groups
+            groups.sync_external_memberships(user["id"], "oidc", _as_list(claims.get(claim_name)))
+        except Exception as exc:
+            logger.warning(f"OIDC group sync for {user.get('username')} failed: {exc}")
+    return user

@@ -30,7 +30,7 @@ import os
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
-from ldap3 import ALL, SIMPLE, SUBTREE, Connection, Server
+from ldap3 import ALL, BASE, SIMPLE, SUBTREE, Connection, Server
 from ldap3.core.exceptions import LDAPException
 from ldap3.utils.conv import escape_filter_chars
 
@@ -151,21 +151,80 @@ def list_directory_users(conn: Connection, cfg: Dict[str, Any]) -> List[Dict[str
     return list(seen.values())
 
 
-def find_groups(conn: Connection, cfg: Dict[str, Any], user_dn: str) -> List[str]:
-    """DNs of every group `user_dn` belongs to, by reverse membership search (works for both AD- and
-    OpenLDAP/lldap-style directories; a directory that instead exposes `memberOf` on the user entry is covered too
-    since `find_user` already read every attribute -- `_map_role` also checks that)."""
+def find_groups_checked(conn: Connection, cfg: Dict[str, Any], user_dn: str) -> Tuple[List[str], bool]:
+    """(group DNs the user belongs to, whether the directory was actually asked). The second value matters for group *sync*: a failed
+    search yields no groups, and that must never be mistaken for "the user left every group"."""
     base = _search_base(cfg, "group_search_base")
     if not base:
-        return []
+        return [], False
     filt = _cfg_str(cfg, "group_membership_filter", DEFAULT_GROUP_MEMBERSHIP_FILTER)
     filt = filt.replace("{user_dn}", escape_filter_chars(user_dn))
     try:
         conn.search(base, filt, search_scope=SUBTREE, attributes=["cn"])
     except Exception as exc:
         logger.warning(f"LDAP group search failed: {exc}")
-        return []
-    return [e.entry_dn for e in conn.entries]
+        return [], False
+    # ldap3's search() returns False both for "no entries" and for a failed operation; only result code 0 means the directory answered.
+    if (conn.result or {}).get("result") != 0:
+        logger.warning(f"LDAP group search was refused: {(conn.result or {}).get('description')}")
+        return [], False
+    dns = [e.entry_dn for e in conn.entries]
+    if not dns and not _base_exists(conn, base):
+        # Some servers (lldap) answer a filter search under a base that does not exist with success and no entries, which would read as
+        # "in no groups" and strip every synced membership after a typo in the group search base.
+        logger.warning(f"LDAP group search base '{base}' does not exist; group membership is unknown")
+        return [], False
+    return dns, True
+
+
+def _base_exists(conn: Connection, base: str) -> bool:
+    try:
+        conn.search(base, "(objectClass=*)", search_scope=BASE, attributes=["1.1"], size_limit=1)
+        return (conn.result or {}).get("result") == 0 and bool(conn.entries)
+    except Exception:
+        return False
+
+
+def find_groups(conn: Connection, cfg: Dict[str, Any], user_dn: str) -> List[str]:
+    """DNs of every group `user_dn` belongs to, by reverse membership search (works for both AD- and
+    OpenLDAP/lldap-style directories; a directory that instead exposes `memberOf` on the user entry is covered too
+    since `find_user` already read every attribute -- `_map_role` also checks that)."""
+    return find_groups_checked(conn, cfg, user_dn)[0]
+
+
+def _sync_group_memberships(user_id: Optional[str], group_dns: List[str], asked: bool) -> None:
+    """Applies the directory's answer to the platform groups mapped to LDAP groups (web/groups.py). Best effort: never breaks a login or a sync."""
+    if not user_id or not asked:
+        return
+    try:
+        from web import groups
+        groups.sync_external_memberships(user_id, "ldap", group_dns)
+    except Exception as exc:
+        logger.warning(f"LDAP group sync for user {user_id} failed: {exc}")
+
+
+def list_directory_groups(cfg: Optional[Dict[str, Any]] = None, query: str = "", limit: int = 300) -> List[Dict[str, str]]:
+    """Groups under the group search base, to pick from when mapping a platform group ([{dn, name}]). Raises LdapError."""
+    from web import auth_frameworks
+    cfg = cfg if cfg is not None else auth_frameworks.load_raw_config().get("ldap", {})
+    if not cfg.get("enabled"):
+        raise LdapError("LDAP is not enabled.")
+    base = _search_base(cfg, "group_search_base")
+    if not base:
+        raise LdapError("No group search base / base DN is configured.")
+    filt = "(|(objectClass=groupOfNames)(objectClass=groupOfUniqueNames)(objectClass=group)(objectClass=posixGroup))"
+    if query.strip():
+        filt = f"(&{filt}(cn=*{escape_filter_chars(query.strip())}*))"
+    svc = _service_connection(cfg)
+    try:
+        svc.check_names = False       # the filter names group classes of several directory types (AD `group`, OpenLDAP, lldap); ldap3 would reject the ones this server's schema lacks
+        svc.search(base, filt, search_scope=SUBTREE, attributes=["cn"], size_limit=limit)
+        out = {e.entry_dn: (str(e["cn"].value) if "cn" in e and e["cn"].value else e.entry_dn) for e in svc.entries}
+    except Exception as exc:
+        raise LdapError(f"The directory groups could not be listed: {exc}") from exc
+    finally:
+        _safe_unbind(svc)
+    return sorted(({"dn": dn, "name": name} for dn, name in out.items()), key=lambda g: g["name"].lower())
 
 
 def _in_sync_group(cfg: Dict[str, Any], group_dns: List[str]) -> bool:
@@ -232,7 +291,7 @@ def authenticate(username: str, password: str, cfg: Optional[Dict[str, Any]] = N
         return None, "Invalid username or password."          # bad password, locked/disabled account, etc.
 
     try:
-        groups = find_groups(user_conn, cfg, entry["dn"])
+        groups, groups_asked = find_groups_checked(user_conn, cfg, entry["dn"])
     finally:
         _safe_unbind(user_conn)
     if not _in_sync_group(cfg, groups):
@@ -245,6 +304,7 @@ def authenticate(username: str, password: str, cfg: Optional[Dict[str, Any]] = N
                                       auth_source="ldap")
     except ValueError as exc:                    # e.g. the account was deleted and needs an admin to restore it
         return None, str(exc)
+    _sync_group_memberships(record.get("id"), groups, groups_asked)
     return record, None
 
 
@@ -272,14 +332,17 @@ def sync_user(username: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, 
         if entry is None:
             if local.get("is_active"):
                 update_user(local["id"], is_active=False)
+            _sync_group_memberships(local["id"], [], True)          # gone from the directory: gone from its mapped groups
             return {"username": username, "status": "deactivated", "reason": "no longer found in the directory"}
-        groups = find_groups(svc, cfg, entry["dn"])
+        groups, groups_asked = find_groups_checked(svc, cfg, entry["dn"])
         if not _in_sync_group(cfg, groups):
             if local.get("is_active"):
                 update_user(local["id"], is_active=False)
+            _sync_group_memberships(local["id"], [], groups_asked)
             return {"username": username, "status": "deactivated", "reason": "no longer a member of the sync group"}
         role = _map_role(cfg, groups)
         upsert_external_user(username=entry["username"], display_name=entry["display_name"], role=role, auth_source="ldap")
+        _sync_group_memberships(local["id"], groups, groups_asked)
         if not local.get("is_active"):
             update_user(local["id"], is_active=True)
         changed = role != local.get("role") or entry["display_name"] != local.get("display_name") or not local.get("is_active")
@@ -320,13 +383,14 @@ def discover_and_provision(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, An
                 if username:
                     skipped.append(username)               # already local (local or ldap): never touched here
                 continue
-            groups = find_groups(svc, cfg, entry["dn"])
+            groups, groups_asked = find_groups_checked(svc, cfg, entry["dn"])
             if not _in_sync_group(cfg, groups):
                 skipped.append(username)                    # outside the configured sync group: never provisioned
                 continue
             role = _map_role(cfg, groups)
             try:
-                upsert_external_user(username=username, display_name=entry["display_name"], role=role, auth_source="ldap")
+                created = upsert_external_user(username=username, display_name=entry["display_name"], role=role, auth_source="ldap")
+                _sync_group_memberships(created.get("id"), groups, groups_asked)
                 discovered.append(username)
             except ValueError:
                 skipped.append(username)                    # a local account was created for this name meanwhile

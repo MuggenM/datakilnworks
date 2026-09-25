@@ -11,6 +11,11 @@ Tables (in auth.db, next to `users` and `catalog_permissions`)
                        had no sharing of their own (saved queries, pipelines). Catalogs keep `catalog_permissions` (a group is stored there as
                        user_id `group:<id>`), dashboards keep their own permission file (an entry with a `group` key).
 
+Directory sync: a group can be *mapped* to an LDAP group (its DN) or an OIDC group-claim value. Members of the directory group are added to
+the platform group by the sign-in / sync of that identity source (`sync_external_memberships`), marked origin `sync`; they leave it when the
+directory says so. Manual members (origin `manual`) are never touched by sync, and a synced member cannot be removed by hand (the directory is
+the source of truth). Sync is skipped, never destructive, when the directory could not be asked.
+
 Everything that changes membership or grants is written to the governance audit log (`GROUP_*`, `GRANT_*`; ids and names, never secrets).
 """
 import datetime
@@ -47,6 +52,16 @@ def _conn() -> sqlite3.Connection:
     conn.execute("""CREATE TABLE IF NOT EXISTS user_group_members (
         group_id TEXT NOT NULL, user_id TEXT NOT NULL, added_by TEXT, added_at TEXT, PRIMARY KEY (group_id, user_id))""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_group_members_user ON user_group_members(user_id)")
+    gcols = {r[1] for r in conn.execute("PRAGMA table_info(user_groups)")}
+    if "source" not in gcols:                       # directory mapping: 'local' (none) | 'ldap' | 'oidc'
+        conn.execute("ALTER TABLE user_groups ADD COLUMN source TEXT NOT NULL DEFAULT 'local'")
+    if "external_ref" not in gcols:                 # normalised LDAP group DN / OIDC claim value
+        conn.execute("ALTER TABLE user_groups ADD COLUMN external_ref TEXT")
+    if "external_label" not in gcols:               # the value as the admin entered it (shown in the UI)
+        conn.execute("ALTER TABLE user_groups ADD COLUMN external_label TEXT")
+    mcols = {r[1] for r in conn.execute("PRAGMA table_info(user_group_members)")}
+    if "origin" not in mcols:                       # 'manual' (added by an admin) | 'sync' (from the directory)
+        conn.execute("ALTER TABLE user_group_members ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'")
     conn.execute("""CREATE TABLE IF NOT EXISTS resource_grants (
         id INTEGER PRIMARY KEY AUTOINCREMENT, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
         principal_type TEXT NOT NULL CHECK(principal_type IN ('user', 'group')), principal_id TEXT NOT NULL,
@@ -74,7 +89,8 @@ def _audit(actor: str, action: str, obj: str, detail: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------- groups
 
 def _public(row) -> Dict[str, Any]:
-    return {"id": row["id"], "name": row["name"], "description": row["description"] or "", "created_by": row["created_by"], "created_at": row["created_at"]}
+    return {"id": row["id"], "name": row["name"], "description": row["description"] or "", "created_by": row["created_by"], "created_at": row["created_at"],
+            "source": row["source"] or "local", "external_ref": row["external_label"] or row["external_ref"] or ""}
 
 
 def list_groups() -> List[Dict[str, Any]]:
@@ -110,7 +126,7 @@ def create_group(name: str, description: str, actor: str) -> Dict[str, Any]:
         if c.execute("SELECT 1 FROM user_groups WHERE name = ?", (name,)).fetchone():
             raise GroupError(f"A group named '{name}' already exists.")
         gid = f"grp_{uuid.uuid4().hex[:8]}"
-        c.execute("INSERT INTO user_groups VALUES (?,?,?,?,?)", (gid, name, (description or "").strip()[:300], actor, _now()))
+        c.execute("INSERT INTO user_groups (id, name, description, created_by, created_at) VALUES (?,?,?,?,?)", (gid, name, (description or "").strip()[:300], actor, _now()))
         c.commit()
     finally:
         c.close()
@@ -164,7 +180,7 @@ def delete_group(group_id: str, actor: str) -> None:
 def list_members(group_id: str) -> List[Dict[str, Any]]:
     c = _conn()
     try:
-        rows = c.execute("""SELECT u.id, u.username, u.display_name, u.role, u.auth_source, u.is_active, m.added_by, m.added_at
+        rows = c.execute("""SELECT u.id, u.username, u.display_name, u.role, u.auth_source, u.is_active, m.added_by, m.added_at, m.origin
                             FROM user_group_members m JOIN users u ON u.id = m.user_id
                             WHERE m.group_id = ? AND u.deleted_at IS NULL ORDER BY u.username""", (group_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -183,7 +199,7 @@ def add_members(group_id: str, user_ids: List[str], actor: str) -> List[Dict[str
             u = c.execute("SELECT id, username FROM users WHERE (id = ? OR username = ?) AND deleted_at IS NULL", (uid, uid)).fetchone()
             if not u:
                 raise GroupError(f"User '{uid}' does not exist.")
-            if c.execute("INSERT OR IGNORE INTO user_group_members VALUES (?,?,?,?)", (group_id, u["id"], actor, _now())).rowcount:
+            if c.execute("INSERT OR IGNORE INTO user_group_members (group_id, user_id, added_by, added_at) VALUES (?,?,?,?)", (group_id, u["id"], actor, _now())).rowcount:
                 added.append(u["username"])
         c.commit()
     finally:
@@ -200,8 +216,13 @@ def remove_member(group_id: str, user_id: str, actor: str) -> None:
     c = _conn()
     try:
         u = c.execute("SELECT id, username FROM users WHERE id = ? OR username = ?", (user_id, user_id)).fetchone()
-        if not u or not c.execute("DELETE FROM user_group_members WHERE group_id = ? AND user_id = ?", (group_id, u["id"])).rowcount:
+        row = c.execute("SELECT origin FROM user_group_members WHERE group_id = ? AND user_id = ?", (group_id, u["id"])).fetchone() if u else None
+        if not row:
             raise LookupError("That user is not a member of the group.")
+        if row["origin"] == "sync":
+            raise GroupError("This member comes from the directory group this group is mapped to. Remove them from the directory group "
+                             "(or clear the mapping); a manual removal would be undone by the next sync.")
+        c.execute("DELETE FROM user_group_members WHERE group_id = ? AND user_id = ?", (group_id, u["id"]))
         c.commit()
     finally:
         c.close()
@@ -246,6 +267,79 @@ def memberships_by_user() -> Dict[str, List[Dict[str, str]]]:
         return out
     finally:
         c.close()
+
+
+# ---------------------------------------------------------------- directory mapping and sync
+
+SOURCES = ("local", "ldap", "oidc")
+
+
+def normalise_ref(source: str, ref: str) -> str:
+    """Comparable form of a directory reference: an LDAP DN ignores case and spaces around ',' and '='; an OIDC value ignores case."""
+    ref = (ref or "").strip().lower()
+    return re.sub(r"\s*([,=])\s*", r"\1", ref) if source == "ldap" else ref
+
+
+def set_mapping(group_id: str, source: str, external_ref: str, actor: str) -> Dict[str, Any]:
+    """Maps the group to an LDAP group DN / OIDC group value, or clears the mapping (source 'local'). Clearing removes the members that
+    came from the directory (manual members stay): without the mapping nothing would ever remove them when they leave the directory."""
+    cur = get_group(group_id)
+    if not cur:
+        raise LookupError("Group not found.")
+    source = (source or "local").strip().lower()
+    if source not in SOURCES:
+        raise GroupError(f"The source must be one of {', '.join(SOURCES)}.")
+    label = (external_ref or "").strip()
+    ref = normalise_ref(source, label)
+    if source != "local" and not ref:
+        raise GroupError("Enter the directory group (an LDAP group DN, or the OIDC group value) this group is mapped to.")
+    if len(label) > 500:
+        raise GroupError("The directory reference is too long.")
+    c = _conn()
+    try:
+        if source != "local":
+            clash = c.execute("SELECT name FROM user_groups WHERE source = ? AND external_ref = ? AND id != ?", (source, ref, group_id)).fetchone()
+            if clash:
+                raise GroupError(f"'{clash['name']}' is already mapped to that directory group.")
+        removed = 0
+        if source == "local" or (cur["source"] != "local" and (cur["source"] != source or normalise_ref(source, cur["external_ref"]) != ref)):
+            removed = c.execute("DELETE FROM user_group_members WHERE group_id = ? AND origin = 'sync'", (group_id,)).rowcount
+        c.execute("UPDATE user_groups SET source = ?, external_ref = ?, external_label = ? WHERE id = ?",
+                  (source, ref or None, label or None, group_id))
+        c.commit()
+    finally:
+        c.close()
+    _audit(actor, "GROUP_MAPPING", f"group:{cur['name']}", {"group_id": group_id, "source": source, "external_ref": label, "synced_members_removed": removed})
+    return get_group(group_id)
+
+
+def sync_external_memberships(user_id: str, source: str, refs, actor: str = "directory-sync") -> Dict[str, List[str]]:
+    """Makes the user's *synced* memberships in every group mapped to `source` match the directory groups they are in now (`refs`: LDAP group
+    DNs or OIDC group values). Adds what is missing, removes only synced rows that no longer apply; manual memberships are never touched.
+    Callers pass `refs` only when the directory was actually asked: 'could not ask' must not look like 'in no groups'."""
+    if source not in ("ldap", "oidc"):
+        raise GroupError("Unknown directory source.")
+    have = {normalise_ref(source, r) for r in (refs or []) if r}
+    added: List[str] = []
+    removed: List[str] = []
+    c = _conn()
+    try:
+        u = c.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+        for g in c.execute("SELECT id, name, external_ref FROM user_groups WHERE source = ? AND external_ref IS NOT NULL", (source,)).fetchall():
+            row = c.execute("SELECT origin FROM user_group_members WHERE group_id = ? AND user_id = ?", (g["id"], user_id)).fetchone()
+            if g["external_ref"] in have:
+                if row is None:
+                    c.execute("INSERT INTO user_group_members (group_id, user_id, added_by, added_at, origin) VALUES (?,?,?,?,'sync')", (g["id"], user_id, actor, _now()))
+                    added.append(g["name"])
+            elif row is not None and row["origin"] == "sync":
+                c.execute("DELETE FROM user_group_members WHERE group_id = ? AND user_id = ?", (g["id"], user_id))
+                removed.append(g["name"])
+        c.commit()
+    finally:
+        c.close()
+    if added or removed:
+        _audit(actor, "GROUP_SYNC", f"user:{u['username'] if u else user_id}", {"source": source, "added": added, "removed": removed})
+    return {"added": added, "removed": removed}
 
 
 # ---------------------------------------------------------------- generic resource grants

@@ -14295,6 +14295,33 @@
                   <span class="text-[11px] text-slate-500">Members can be local or external (LDAP / OIDC) accounts. Access through groups adds to what a user has; it never changes their role.</span>
                   <button @click="deleteGroup()" class="px-2.5 py-1 bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded" data-testid="group-delete">Delete group</button>
                 </div>
+                <div class="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border space-y-2" data-testid="group-directory">
+                  <div class="flex items-center space-x-2">
+                    <span class="text-[10px] uppercase font-semibold text-slate-500 whitespace-nowrap">Directory sync</span>
+                    <select x-model="groupMap.source" data-testid="group-map-source" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white">
+                      <option value="local">Not mapped: members are added by hand</option>
+                      <option value="ldap">Members of an LDAP group</option>
+                      <option value="oidc">Users whose OIDC groups claim has a value</option>
+                    </select>
+                  </div>
+                  <div x-show="groupMap.source !== 'local'" class="space-y-1.5">
+                    <div class="flex space-x-2">
+                      <input type="text" x-model="groupMap.ref" :placeholder="groupMap.source === 'ldap' ? 'cn=analysts,ou=groups,dc=example,dc=com' : 'e.g. data-analysts'" data-testid="group-map-ref" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white font-mono">
+                      <button x-show="groupMap.source === 'ldap'" @click="browseLdapGroups()" type="button" :disabled="groupMap.busy" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="group-map-browse">Browse…</button>
+                    </div>
+                    <select x-show="groupMap.source === 'ldap' && groupMap.options.length" @change="groupMap.ref = $event.target.value" data-testid="group-map-options" class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white">
+                      <option value="">Pick a directory group…</option>
+                      <template x-for="o in groupMap.options" :key="o.dn"><option :value="o.dn" x-text="o.name + '  —  ' + o.dn"></option></template>
+                    </select>
+                    <p class="text-[10px] text-slate-500" x-text="groupMap.source === 'ldap' ? 'Members are added when they sign in and whenever the LDAP directory is synced, and removed when they leave the directory group. Members added by hand are never touched.' : 'Members are added when they sign in and their identity provider sends this value in its groups claim (the claim name is set in the OIDC settings). Removal happens at their next sign-in.'"></p>
+                  </div>
+                  <div class="flex items-center space-x-2">
+                    <button @click="saveGroupMapping()" :disabled="groupMap.busy" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="group-map-save">Save mapping</button>
+                    <button x-show="groupSel && groupSel.source === 'ldap'" @click="syncLdapNow()" :disabled="groupMap.busy" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="group-map-sync">Sync LDAP now</button>
+                    <span x-show="groupMap.msg" class="text-[11px] text-emerald-600 dark:text-emerald-400" x-text="groupMap.msg" data-testid="group-map-msg"></span>
+                    <span x-show="groupMap.error" class="text-[11px] text-rose-600 dark:text-rose-400" x-text="groupMap.error" data-testid="group-map-error"></span>
+                  </div>
+                </div>
                 <div class="flex space-x-2 items-center">
                   <select x-model="groupAddUser" data-testid="group-add-select" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2.5 py-1.5 text-slate-900 dark:text-white">
                     <option value="">Add a member…</option>
@@ -14314,8 +14341,9 @@
                       <tr data-testid="group-member">
                         <td class="py-2 px-3"><span class="font-semibold text-slate-900 dark:text-white" x-text="m.display_name || m.username"></span> <span class="font-mono text-slate-400" x-text="'@' + m.username"></span></td>
                         <td x-text="m.role"></td>
-                        <td><span class="text-[10px] font-mono px-2 py-0.5 rounded uppercase bg-slate-100 dark:bg-slate-800" x-text="m.auth_source || 'local'"></span></td>
-                        <td class="text-right px-3"><button @click="removeGroupMember(m)" class="px-2 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded text-rose-600" data-testid="group-remove">Remove</button></td>
+                        <td><span class="text-[10px] font-mono px-2 py-0.5 rounded uppercase bg-slate-100 dark:bg-slate-800" x-text="m.auth_source || 'local'"></span>
+                          <span x-show="m.origin === 'sync'" class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800" data-testid="member-synced">via directory</span></td>
+                        <td class="text-right px-3"><button @click="removeGroupMember(m)" :disabled="m.origin === 'sync'" :title="m.origin === 'sync' ? 'Comes from the directory group; remove them there' : ''" class="px-2 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded text-rose-600 disabled:opacity-40" data-testid="group-remove">Remove</button></td>
                       </tr>
                     </template>
                   </tbody>
@@ -17038,6 +17066,7 @@
         groupSel: null,
         groupMembers: [],
         groupAddUser: '',
+        groupMap: { source: 'local', ref: '', options: [], busy: false, msg: '', error: '' },
         groupForm: { newName: '', busy: false, error: '' },
         showDeletedUsers: false,
         iamLoading: false,
@@ -18667,6 +18696,51 @@
           await this.searchSharePrincipals();
         },
 
+        async saveGroupMapping() {
+          const m = this.groupMap;
+          if (m.source === 'local' && this.groupSel.source !== 'local' && !confirm('Clear the mapping? Members that came from the directory are removed from this group (members added by hand stay).')) return;
+          m.busy = true; m.error = ''; m.msg = '';
+          try {
+            const res = await fetch(`/api/groups/${this.groupSel.id}/mapping`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: m.source, external_ref: m.ref }) });
+            const data = await res.json();
+            if (!res.ok) { m.error = typeof data.detail === 'string' ? data.detail : 'Could not save the mapping.'; return; }
+            this.groupSel = { ...this.groupSel, source: data.source, external_ref: data.external_ref };
+            m.msg = m.source === 'local' ? 'Mapping cleared.' : 'Mapping saved. Members follow the directory from now on' + (m.source === 'ldap' ? ' (use Sync LDAP now to apply it immediately).' : '.');
+            await this.loadGroupMembers();
+            await this.loadGroups();
+          } finally {
+            m.busy = false;
+          }
+        },
+
+        async browseLdapGroups() {
+          const m = this.groupMap; m.busy = true; m.error = '';
+          try {
+            const res = await fetch('/api/groups/directory/ldap?q=' + encodeURIComponent((m.ref || '').startsWith('cn=') ? '' : (m.ref || '')));
+            const data = await res.json();
+            if (!res.ok) { m.error = typeof data.detail === 'string' ? data.detail : 'Could not list the directory groups.'; return; }
+            m.options = data.groups || [];
+            if (!m.options.length) m.error = 'No groups found under the LDAP group search base.';
+          } finally {
+            m.busy = false;
+          }
+        },
+
+        async syncLdapNow() {
+          const m = this.groupMap; m.busy = true; m.error = ''; m.msg = '';
+          try {
+            const res = await fetch('/api/auth/frameworks/ldap/sync', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) { m.error = typeof data.detail === 'string' ? data.detail : 'The directory sync failed.'; return; }
+            m.msg = `Synced ${data.checked} LDAP account(s)` + (data.errors && data.errors.length ? `, ${data.errors.length} error(s)` : '') + '.';
+            await this.loadGroupMembers();
+            await this.loadGroups();
+            await this.fetchUsers();
+          } finally {
+            m.busy = false;
+          }
+        },
+
         async loadGroups() {
           try {
             const res = await fetch('/api/groups');
@@ -18682,6 +18756,7 @@
 
         async selectGroup(g) {
           this.groupSel = { ...g };
+          this.groupMap = { source: g.source || 'local', ref: g.external_ref || '', options: [], busy: false, msg: '', error: '' };
           this.groupAddUser = '';
           this.groupForm.error = '';
           await this.loadGroupMembers();
