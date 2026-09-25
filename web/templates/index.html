@@ -16082,12 +16082,12 @@
       <div x-show="dbtCfg.git && dbtCfg.git.configured" class="p-3 rounded-lg bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border space-y-2 shrink-0" data-testid="git-panel">
         <div class="flex items-center justify-between">
           <span class="font-semibold text-slate-800 dark:text-slate-200"><i class="ph ph-git-branch text-teal-500"></i> Git
-            <span class="font-mono font-normal text-slate-500" x-text="dbtCfg.git ? (dbtCfg.git.branch + ' · ' + (dbtCfg.git.remote || '')) : ''"></span></span>
+            <span class="font-mono font-normal text-slate-500" x-text="dbtCfg.git ? (dbtCfg.git.branch + ' · ' + (dbtCfg.git.remote || '')) : ''"></span><span x-show="dbtCfg.git.mode === 'pull_request'" class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 font-sans" data-testid="git-mode">pull-request mode<span x-show="!dbtCfg.git.on_base" x-text="' · on ' + dbtCfg.git.current_branch"></span></span></span>
           <div class="flex items-center space-x-1.5" x-show="dbtCfg.git && dbtCfg.git.connected">
             <span class="text-[11px] text-slate-500" x-text="'ahead ' + dbtCfg.git.ahead + ' · behind ' + dbtCfg.git.behind + ' · ' + (dbtCfg.git.head ? dbtCfg.git.head.slice(0, 8) : 'no commits')"></span>
             <button type="button" @click="gitAction('status?fetch=true', 'GET')" :disabled="dbtCfg.gitBusy" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="git-refresh">Refresh</button>
-            <button type="button" @click="gitAction('pull')" :disabled="dbtCfg.gitBusy || dbtCfg.git.dirty || !dbtCfg.git.behind" :title="dbtCfg.git.dirty ? 'Commit or discard local changes first' : 'Fast-forward pull, checked with dbt parse'" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="git-pull">Pull</button>
-            <button type="button" @click="gitAction('push')" :disabled="dbtCfg.gitBusy || !dbtCfg.git.ahead" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="git-push">Push</button>
+            <button type="button" @click="gitAction('pull')" :disabled="dbtCfg.gitBusy || dbtCfg.git.dirty || !dbtCfg.git.behind || (dbtCfg.git.mode === 'pull_request' && !dbtCfg.git.on_base)" :title="dbtCfg.git.dirty ? 'Commit or discard local changes first' : 'Fast-forward pull, checked with dbt parse'" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="git-pull">Pull</button>
+            <button type="button" @click="gitAction('push')" :disabled="dbtCfg.gitBusy || !dbtCfg.git.unpushed" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="git-push">Push</button>
           </div>
           <button type="button" x-show="dbtCfg.git && !dbtCfg.git.connected && !dbtCfg.git.error" @click="gitAction('connect')" :disabled="dbtCfg.gitBusy" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="git-connect">Connect to repository</button>
         </div>
@@ -16097,7 +16097,24 @@
             <span class="font-mono" x-text="dbtCfg.git ? dbtCfg.git.changes.slice(0, 6).map(c => c.status + ' ' + c.path).join(', ') + (dbtCfg.git.changes.length > 6 ? ', …' : '') : ''"></span></div>
           <div class="flex space-x-2">
             <input type="text" x-model="dbtCfg.gitMsg" placeholder="Commit message" maxlength="200" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="git-message">
-            <button type="button" @click="gitAction('commit', 'POST', { message: dbtCfg.gitMsg })" :disabled="dbtCfg.gitBusy || !dbtCfg.gitMsg.trim()" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="git-commit">Commit</button>
+            <input type="text" x-show="dbtCfg.git.mode === 'pull_request' && dbtCfg.git.on_base && dbtCfg.git.remote_has_base" x-model="dbtCfg.gitBranchName" placeholder="Branch (optional)" maxlength="60" class="w-36 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 font-mono" data-testid="git-branch-name" title="Committing on the base branch opens a change branch; name it or leave this empty">
+            <button type="button" @click="gitAction('commit', 'POST', { message: dbtCfg.gitMsg, branch: dbtCfg.gitBranchName || null })" :disabled="dbtCfg.gitBusy || !dbtCfg.gitMsg.trim()" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="git-commit">Commit</button>
+          </div>
+        </div>
+
+        <div x-show="dbtCfg.git.connected && dbtCfg.git.mode === 'pull_request' && !dbtCfg.git.on_base" class="space-y-1.5 p-2 rounded bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-900" data-testid="git-pr-block">
+          <div class="text-[11px] text-slate-600 dark:text-slate-300">Change branch <span class="font-mono font-semibold" x-text="dbtCfg.git.current_branch"></span> ·
+            <span x-text="dbtCfg.git.pull_request ? ('pull request #' + dbtCfg.git.pull_request.number + ' ' + (dbtCfg.git.pull_request.merged ? 'merged' : dbtCfg.git.pull_request.state)) : 'no pull request yet'" data-testid="git-pr-state"></span>
+            <a x-show="dbtCfg.git.pull_request && dbtCfg.git.pull_request.url" :href="dbtCfg.git.pull_request && dbtCfg.git.pull_request.url" target="_blank" rel="noopener noreferrer" class="underline text-indigo-600 dark:text-indigo-300" data-testid="git-pr-link">open on the server</a></div>
+          <div x-show="!dbtCfg.git.pull_request || (!dbtCfg.git.pull_request.merged && dbtCfg.git.pull_request.state !== 'open')" class="space-y-1.5">
+            <input type="text" x-model="dbtCfg.prTitle" placeholder="Pull request title (default: the last commit's message)" maxlength="200" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="git-pr-title">
+            <textarea rows="2" x-model="dbtCfg.prBody" placeholder="Description for the reviewer (optional)" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="git-pr-body"></textarea>
+            <button type="button" @click="gitAction('repos/dbt/pr', 'POST', { title: dbtCfg.prTitle, body: dbtCfg.prBody })" :disabled="dbtCfg.gitBusy || dbtCfg.git.dirty || dbtCfg.git.unpushed > 0" :title="dbtCfg.git.dirty ? 'Commit your changes first' : (dbtCfg.git.unpushed > 0 ? 'Push first' : 'Ask the server for a review')" class="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white rounded font-semibold" data-testid="git-pr-open">Open pull request</button>
+          </div>
+          <div class="flex flex-wrap gap-1.5">
+            <button type="button" @click="gitAction('repos/dbt/update', 'POST')" :disabled="dbtCfg.gitBusy || dbtCfg.git.dirty || !dbtCfg.git.behind" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" :title="'Merge ' + dbtCfg.git.branch + ' into this branch'" data-testid="git-pr-update">Update from <span x-text="dbtCfg.git.branch"></span></button>
+            <button type="button" @click="gitAction('repos/dbt/finish', 'POST')" :disabled="dbtCfg.gitBusy || dbtCfg.git.dirty" class="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white rounded font-semibold" title="After the pull request is merged on the server: return to the base branch" data-testid="git-pr-finish">Finish (after merge)</button>
+            <button type="button" @click="if (confirm('Leave this change branch without merging? It stays on the server.')) gitAction('repos/dbt/abandon', 'POST')" :disabled="dbtCfg.gitBusy || dbtCfg.git.dirty" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="git-pr-abandon">Abandon</button>
           </div>
         </div>
         <div x-show="dbtCfg.gitNote" class="text-[11px] text-emerald-600 dark:text-emerald-400" x-text="dbtCfg.gitNote"></div>
@@ -16183,7 +16200,8 @@
       <div x-show="!nbGit.git.configured" class="text-slate-500">Git sync is not configured. Set <span class="font-mono">NOTEBOOKS_GIT_REMOTE_URL</span> (and <span class="font-mono">NOTEBOOKS_GIT_TOKEN</span>, or <span class="font-mono">GIT_TOKEN</span>) and restart the studio.</div>
       <div x-show="nbGit.git.configured" class="space-y-2">
         <div class="flex items-center justify-between">
-          <span class="font-mono text-slate-500" x-text="nbGit.git.branch + ' · ' + (nbGit.git.remote || '')"></span>
+          <span class="font-mono text-slate-500"><span x-text="nbGit.git.branch + ' · ' + (nbGit.git.remote || '')"></span>
+            <span x-show="nbGit.git.mode === 'pull_request'" class="ml-1 text-[9px] px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 font-sans" data-testid="nb-git-mode">pull-request mode<span x-show="!nbGit.git.on_base" x-text="' · on ' + nbGit.git.current_branch"></span></span></span>
           <button type="button" x-show="!nbGit.git.connected && !nbGit.git.error" @click="nbGitAction('connect')" :disabled="nbGit.busy" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="nb-git-connect">Connect to repository</button>
         </div>
         <p x-show="!nbGit.git.connected" class="text-[11px] text-slate-500" x-text="nbGit.git.error || nbGit.git.reason || ''"></p>
@@ -16192,8 +16210,8 @@
             <span class="text-[11px] text-slate-500" x-text="'ahead ' + nbGit.git.ahead + ' · behind ' + nbGit.git.behind + ' · ' + (nbGit.git.head ? nbGit.git.head.slice(0, 8) : 'no commits')"></span>
             <div class="space-x-1.5">
               <button type="button" @click="nbGitAction('status?fetch=true', 'GET')" :disabled="nbGit.busy" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="nb-git-refresh">Refresh</button>
-              <button type="button" @click="nbGitAction('pull')" :disabled="nbGit.busy || nbGit.git.dirty || !nbGit.git.behind" :title="nbGit.git.dirty ? 'Commit or discard local changes first' : 'Fast-forward pull'" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-pull">Pull</button>
-              <button type="button" @click="nbGitAction('push')" :disabled="nbGit.busy || !nbGit.git.ahead" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-push">Push</button>
+              <button type="button" @click="nbGitAction('pull')" :disabled="nbGit.busy || nbGit.git.dirty || !nbGit.git.behind || (nbGit.git.mode === 'pull_request' && !nbGit.git.on_base)" :title="nbGit.git.dirty ? 'Commit or discard local changes first' : 'Fast-forward pull'" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-pull">Pull</button>
+              <button type="button" @click="nbGitAction('push')" :disabled="nbGit.busy || !nbGit.git.unpushed" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-push">Push</button>
             </div>
           </div>
           <div x-show="nbGit.git.dirty" class="space-y-1.5">
@@ -16201,11 +16219,28 @@
               <span class="font-mono" x-text="nbGit.git.changes.slice(0, 6).map(c => c.status + ' ' + c.path).join(', ') + (nbGit.git.changes.length > 6 ? ', …' : '')"></span></div>
             <div class="flex space-x-2">
               <input type="text" x-model="nbGit.msg" placeholder="Commit message" maxlength="200" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="nb-git-message">
-              <button type="button" @click="nbGitAction('commit', 'POST', { message: nbGit.msg })" :disabled="nbGit.busy || !nbGit.msg.trim()" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="nb-git-commit">Commit</button>
+              <input type="text" x-show="nbGit.git.mode === 'pull_request' && nbGit.git.on_base && nbGit.git.remote_has_base" x-model="nbGit.branchName" placeholder="Branch (optional)" maxlength="60" class="w-36 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 font-mono" data-testid="nb-git-branch-name">
+              <button type="button" @click="nbGitAction('commit', 'POST', { message: nbGit.msg, branch: nbGit.branchName || null })" :disabled="nbGit.busy || !nbGit.msg.trim()" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="nb-git-commit">Commit</button>
             </div>
           </div>
         </div>
       </div>
+
+        <div x-show="nbGit.git.connected && nbGit.git.mode === 'pull_request' && !nbGit.git.on_base" class="space-y-1.5 p-2 rounded bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-900" data-testid="nb-git-pr-block">
+          <div class="text-[11px] text-slate-600 dark:text-slate-300">Change branch <span class="font-mono font-semibold" x-text="nbGit.git.current_branch"></span> ·
+            <span x-text="nbGit.git.pull_request ? ('pull request #' + nbGit.git.pull_request.number + ' ' + (nbGit.git.pull_request.merged ? 'merged' : nbGit.git.pull_request.state)) : 'no pull request yet'" data-testid="nb-git-pr-state"></span>
+            <a x-show="nbGit.git.pull_request && nbGit.git.pull_request.url" :href="nbGit.git.pull_request && nbGit.git.pull_request.url" target="_blank" rel="noopener noreferrer" class="underline text-indigo-600 dark:text-indigo-300" data-testid="nb-git-pr-link">open on the server</a></div>
+          <div x-show="!nbGit.git.pull_request || (!nbGit.git.pull_request.merged && nbGit.git.pull_request.state !== 'open')" class="space-y-1.5">
+            <input type="text" x-model="nbGit.prTitle" placeholder="Pull request title (default: the last commit's message)" maxlength="200" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="nb-git-pr-title">
+            <textarea rows="2" x-model="nbGit.prBody" placeholder="Description for the reviewer (optional)" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="nb-git-pr-body"></textarea>
+            <button type="button" @click="nbGitAction('pr', 'POST', { title: nbGit.prTitle, body: nbGit.prBody })" :disabled="nbGit.busy || nbGit.git.dirty || nbGit.git.unpushed > 0" :title="nbGit.git.dirty ? 'Commit your changes first' : (nbGit.git.unpushed > 0 ? 'Push first' : 'Ask the server for a review')" class="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white rounded font-semibold" data-testid="nb-git-pr-open">Open pull request</button>
+          </div>
+          <div class="flex flex-wrap gap-1.5">
+            <button type="button" @click="nbGitAction('update', 'POST')" :disabled="nbGit.busy || nbGit.git.dirty || !nbGit.git.behind" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" :title="'Merge ' + nbGit.git.branch + ' into this branch'" data-testid="nb-git-pr-update">Update from <span x-text="nbGit.git.branch"></span></button>
+            <button type="button" @click="nbGitAction('finish', 'POST')" :disabled="nbGit.busy || nbGit.git.dirty" class="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white rounded font-semibold" title="After the pull request is merged on the server: return to the base branch" data-testid="nb-git-pr-finish">Finish (after merge)</button>
+            <button type="button" @click="if (confirm('Leave this change branch without merging? It stays on the server.')) nbGitAction('abandon', 'POST')" :disabled="nbGit.busy || nbGit.git.dirty" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-pr-abandon">Abandon</button>
+          </div>
+        </div>
       <div x-show="nbGit.note" class="text-[11px] text-emerald-600 dark:text-emerald-400" x-text="nbGit.note"></div>
       <pre x-show="nbGit.error" class="whitespace-pre-wrap font-mono text-[11px] text-rose-600 dark:text-rose-400" x-text="nbGit.error" data-testid="nb-git-error"></pre>
     </div>
@@ -17107,8 +17142,8 @@
         newUserData: { username: '', full_name: '', email: '', password: '', role: 'user' },
         isCreatingUser: false,
         historyEdit: { sql: '', notes: null, busy: false, error: '' },
-        nbGit: { open: false, busy: false, msg: '', note: '', error: '', git: { configured: false, connected: false, ahead: 0, behind: 0, dirty: false, changes: [], head: null } },
-        dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', git: { configured: false, connected: false, ahead: 0, behind: 0, dirty: false, changes: [], head: null }, gitMsg: '', gitBusy: false, gitNote: '', gitError: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
+        nbGit: { open: false, busy: false, msg: '', branchName: '', prTitle: '', prBody: '', note: '', error: '', git: { configured: false, connected: false, ahead: 0, behind: 0, unpushed: 0, dirty: false, changes: [], head: null, mode: 'direct', on_base: true, remote_has_base: false, pull_request: null } },
+        dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', git: { configured: false, connected: false, ahead: 0, behind: 0, unpushed: 0, dirty: false, changes: [], head: null, mode: 'direct', on_base: true, remote_has_base: false, pull_request: null }, gitMsg: '', gitBranchName: '', prTitle: '', prBody: '', gitBusy: false, gitNote: '', gitError: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
         cloneModal: { open: false, source: '', schema: '', name: '', catalog: 'warehouse', srcSchema: '', srcTable: '', version: '', replace: false, busy: false, error: '' },
         changePasswordOpen: false,
         changePasswordForced: false,
@@ -24644,10 +24679,10 @@
               return;
             }
             this.nbGit.git = data;
-            if (data.committed) { this.nbGit.msg = ''; this.nbGit.note = 'Committed ' + data.committed.slice(0, 8) + '.'; }
+            if (data.committed) { this.nbGit.msg = ''; this.nbGit.branchName = ''; this.nbGit.note = 'Committed ' + data.committed.slice(0, 8) + (data.started_branch ? ' on the new branch ' + data.started_branch : '') + '.'; }
             else if (data.pushed) this.nbGit.note = 'Pushed.';
             else if (data.message) this.nbGit.note = data.message;
-            if (data.pulled || path === 'connect') await this.fetchWorkspaceTree();
+            if (data.pulled || data.finished_branch || data.abandoned_branch || path === 'connect') await this.fetchWorkspaceTree();
           } catch (e) {
             this.nbGit.error = 'Error: ' + e.message;
           } finally {
@@ -24669,10 +24704,10 @@
             const data = await res.json();
             if (!res.ok) { this.dbtCfg.gitError = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail); await this.loadDbtGit(); return; }
             this.dbtCfg.git = data;
-            if (data.committed) { this.dbtCfg.gitMsg = ''; this.dbtCfg.gitNote = 'Committed ' + data.committed.slice(0, 8) + '.'; }
+            if (data.committed) { this.dbtCfg.gitMsg = ''; this.dbtCfg.gitBranchName = ''; this.dbtCfg.gitNote = 'Committed ' + data.committed.slice(0, 8) + (data.started_branch ? ' on the new branch ' + data.started_branch : '') + '.'; }
             else if (data.pushed) this.dbtCfg.gitNote = 'Pushed.';
             else if (data.message) this.dbtCfg.gitNote = data.message;
-            if (data.pulled) await this.openDbtConfig();     // the files on disk changed: reload the editors
+            if (data.pulled || data.finished_branch || data.abandoned_branch) await this.openDbtConfig();     // the files on disk changed: reload the editors
           } catch (e) {
             this.dbtCfg.gitError = 'Error: ' + e.message;
           } finally {

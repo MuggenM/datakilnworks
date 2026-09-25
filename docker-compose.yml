@@ -26,10 +26,15 @@ services:
       - GIT_REMOTE_URL=${GIT_REMOTE_URL:-}
       - GIT_BRANCH=${GIT_BRANCH:-main}
       - GIT_TOKEN=${GIT_TOKEN:-}
+      # direct (default) | pull_request: commit to a change branch and open a pull request on the server (Gitea API) instead of pushing to the base branch
+      - GIT_MODE=${GIT_MODE:-direct}
+      - GIT_API_URL=${GIT_API_URL:-}
       # Git sync of the shared notebooks (Workspace > Git; only notebooks/Shared). The token falls back to GIT_TOKEN.
       - NOTEBOOKS_GIT_REMOTE_URL=${NOTEBOOKS_GIT_REMOTE_URL:-}
       - NOTEBOOKS_GIT_BRANCH=${NOTEBOOKS_GIT_BRANCH:-main}
       - NOTEBOOKS_GIT_TOKEN=${NOTEBOOKS_GIT_TOKEN:-}
+      - NOTEBOOKS_GIT_MODE=${NOTEBOOKS_GIT_MODE:-direct}
+      - NOTEBOOKS_GIT_API_URL=${NOTEBOOKS_GIT_API_URL:-}
     volumes:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse

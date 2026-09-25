@@ -12,8 +12,13 @@ deployment, but this is plain git over HTTP(S), so any server works). Rules that
 * Pulls are fast-forward only and refused on a dirty tree, so nothing is merged or overwritten. The pulled project is then checked
   with `dbt parse`; if dbt rejects it the pull is rolled back to the previous commit.
 * Commits are refused while a project file holds a plaintext credential, are authored as the acting user, and are audited.
+* Two modes per repository (`GIT_MODE` / `NOTEBOOKS_GIT_MODE`): `direct` (default: commit and push straight to the branch) and `pull_request`:
+  the base branch is never pushed to; a commit made on it first opens a change branch (`dkw/<user>-<timestamp>`), Push publishes that branch,
+  *Open pull request* asks the forge (Gitea API) to review it, and *Finish* returns to the base branch once the pull request is merged there
+  (merging is done on the forge by a reviewer, never from here). Nothing is ever force-pushed and a merge conflict is never left half-done.
 * One lock serialises every operation (the project is a single working tree, so run a single replica).
 """
+import datetime
 import json
 import shutil
 import logging
@@ -22,7 +27,7 @@ import re
 import subprocess
 import sys
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger("localspark.git_sync")
@@ -76,6 +81,34 @@ class Repo:
 
     def configured(self) -> bool:
         return bool(self.remote_url())
+
+    def mode(self) -> str:
+        m = self._var("MODE", "direct").lower()
+        if m not in ("direct", "pull_request"):
+            raise GitError("The mode must be 'direct' or 'pull_request'.")
+        return m
+
+    def pr_mode(self) -> bool:
+        try:
+            return self.mode() == "pull_request"
+        except GitError:
+            return False
+
+    def _repo_ref(self) -> Tuple[str, str, str]:
+        """(prefix, owner, repo) from the remote URL: http(s)://host[/prefix]/owner/repo(.git)."""
+        parts = [p for p in urlparse(self.remote_url()).path.split("/") if p]
+        if len(parts) < 2:
+            raise GitError("The remote URL must look like http(s)://host/owner/repo.git.")
+        repo = parts[-1][:-4] if parts[-1].endswith(".git") else parts[-1]
+        return "/".join(parts[:-2]), parts[-2], repo
+
+    def api_base(self) -> str:
+        explicit = (os.getenv("GIT_API_URL" if self.kind == "dbt" else "NOTEBOOKS_GIT_API_URL") or "").strip()
+        if explicit:
+            return explicit.rstrip("/")
+        u = urlparse(self.remote_url())
+        prefix = self._repo_ref()[0]
+        return f"{u.scheme}://{u.netloc}" + (f"/{prefix}" if prefix else "") + "/api/v1"          # Gitea
 
     def _check_url(self) -> None:
         u = urlparse(self.remote_url())
@@ -195,15 +228,81 @@ class Repo:
                 found.append(f"{c['path']} is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB (data does not belong in git)")
         return found
 
+    # ---- branches and the forge
+    def current_branch(self) -> Optional[str]:
+        code, _, name = self._git(["symbolic-ref", "--short", "-q", "HEAD"], check=False).partition("\n")
+        return name.strip() if code == "0" and name.strip() else None
+
+    def _has_ref(self, ref: str) -> bool:
+        return self._git(["rev-parse", "--verify", "-q", ref], check=False).startswith("0")
+
+    def _count(self, rng: str) -> int:
+        out = self._git(["rev-list", "--count", rng], check=False)
+        code, _, n = out.partition("\n")
+        return int(n) if code == "0" and n.strip().isdigit() else 0
+
+    def _api(self, method: str, path: str, body: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Any:
+        """One call to the forge's REST API with the repository token. Errors are turned into short, token-free messages."""
+        import requests
+        if not self.token():
+            raise GitError("A token is needed to talk to the repository server (set the token variable).")
+        owner_repo = self._repo_ref()
+        url = f"{self.api_base()}/repos/{owner_repo[1]}/{owner_repo[2]}{path}"
+        try:
+            r = requests.request(method, url, json=body, params=params, timeout=20, allow_redirects=False,
+                                 headers={"Authorization": f"token {self.token()}", "Accept": "application/json", "User-Agent": "DataKilnWorks-Git/1"})
+        except requests.RequestException as exc:
+            raise GitError(f"The repository server could not be reached ({type(exc).__name__}).")
+        if r.status_code in (401, 403):
+            raise GitError(f"The repository server refused the token (HTTP {r.status_code}); pull requests need the write:repository scope.")
+        if r.status_code == 404:
+            raise GitError("The repository or pull request was not found (check the URL and that the token can see the repository).")
+        if r.status_code >= 400:
+            try:
+                msg = str(r.json().get("message") or "")[:300]
+            except ValueError:
+                msg = ""
+            raise GitError(self._scrub(f"The repository server answered HTTP {r.status_code}: {msg}".strip()))
+        try:
+            return r.json()
+        except ValueError:
+            return {}
+
+    @staticmethod
+    def _pr_view(p: Dict[str, Any]) -> Dict[str, Any]:
+        return {"number": p.get("number"), "url": p.get("html_url"), "title": p.get("title"), "state": p.get("state"),
+                "merged": bool(p.get("merged") or p.get("merged_at")), "mergeable": p.get("mergeable")}
+
+    def _pr_for_branch(self, branch: str) -> Optional[Dict[str, Any]]:
+        """The open pull request from `branch`, else the most recent one, else None."""
+        prs = [p for p in (self._api("GET", "/pulls", params={"state": "all", "sort": "recentupdate", "limit": 50}) or [])
+               if (p.get("head") or {}).get("ref") == branch and (p.get("base") or {}).get("ref") == self.branch()]
+        if not prs:
+            return None
+        open_ones = [p for p in prs if p.get("state") == "open"]
+        return self._pr_view((open_ones or prs)[0])
+
+    def _change_name(self, actor: str, name: Optional[str] = None) -> str:
+        if name:
+            name = name.strip()
+            if not _BRANCH.match(name) or ".." in name or name.endswith((".lock", "/")) or name == self.branch():
+                raise GitError("That is not a usable branch name.")
+            return name
+        who = re.sub(r"[^a-z0-9]+", "-", (actor or "user").lower()).strip("-")[:30] or "user"
+        return f"dkw/{who}-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
     # ---- operations
     def status(self, fetch: bool = False) -> Dict[str, Any]:
         with _LOCK:
             info: Dict[str, Any] = {"configured": self.configured(), "remote": self.remote_url() or None, "branch": None, "connected": False,
-                                    "token_set": bool(self.token()), "head": None, "changes": [], "dirty": False, "ahead": 0, "behind": 0, "log": []}
+                                    "token_set": bool(self.token()), "head": None, "changes": [], "dirty": False, "ahead": 0, "behind": 0,
+                                    "unpushed": 0, "log": [], "mode": "direct", "current_branch": None, "on_base": True,
+                                    "remote_has_base": False, "pull_request": None}
             if not self.configured():
                 return info
             try:
                 info["branch"] = self.branch()
+                info["mode"] = self.mode()
                 self._check_url()
             except GitError as exc:
                 info["error"] = str(exc)
@@ -215,14 +314,17 @@ class Repo:
             b = self.branch()
             if fetch:
                 try:
-                    self._git(["fetch", "origin", b])
+                    self._git(["fetch", "origin", "--prune"])
                 except GitError as exc:
                     info["fetch_error"] = str(exc)
             info["head"] = self._head()
             info["changes"] = self._changes()
             info["dirty"] = bool(info["changes"])
+            cur = self.current_branch()
+            info["current_branch"], info["on_base"] = cur, (cur == b or cur is None)
             ref = f"refs/remotes/origin/{b}"
-            if self._git(["rev-parse", "--verify", "-q", ref], check=False).startswith("0"):
+            info["remote_has_base"] = self._has_ref(ref)
+            if info["remote_has_base"]:
                 counts = self._git(["rev-list", "--left-right", "--count", f"HEAD...{ref}"], check=False).split("\n", 1)[-1].split()
                 if len(counts) == 2 and info["head"]:
                     info["ahead"], info["behind"] = int(counts[0]), int(counts[1])
@@ -231,8 +333,20 @@ class Repo:
                 info["remote_head"] = self._git(["rev-parse", ref])
             elif info["head"]:
                 info["ahead"] = int(self._git(["rev-list", "--count", "HEAD"]))     # the remote has no such branch yet
+            # Commits of the current branch the remote does not have yet (what Push would send).
+            if info["on_base"] or not cur:
+                info["unpushed"] = info["ahead"]
+            elif self._has_ref(f"refs/remotes/origin/{cur}"):
+                info["unpushed"] = self._count(f"origin/{cur}..HEAD")
+            else:
+                info["unpushed"] = info["ahead"]
             log = self._git(["log", "-n", "10", "--format=%H%x1f%an%x1f%aI%x1f%s"], check=False).split("\n", 1)[-1]
             info["log"] = [dict(zip(("sha", "author", "date", "subject"), l.split("\x1f"))) for l in log.splitlines() if "\x1f" in l]
+            if info["mode"] == "pull_request" and not info["on_base"] and cur and self.token() and info["remote_has_base"]:
+                try:
+                    info["pull_request"] = self._pr_for_branch(cur)
+                except GitError as exc:
+                    info["pr_error"] = str(exc)
             return info
 
     def connect(self, actor: str) -> Dict[str, Any]:
@@ -284,6 +398,9 @@ class Repo:
         with _LOCK:
             self._require_repo()
             b = self.branch()
+            if self.pr_mode() and self.current_branch() not in (None, b):
+                raise GitError(f"Pull updates '{b}'. You are on the change branch '{self.current_branch()}': use 'Update from {b}' "
+                               f"to bring it in, or finish the change once its pull request is merged.")
             if self._changes():
                 raise GitError("There are uncommitted local changes. Commit them (or discard them) before pulling.")
             before = self._head()
@@ -310,7 +427,7 @@ class Repo:
             self._audit(actor, "PULL", {"from": before, "to": after})
             return {**self.status(), "pulled": True, "message": f"Updated to {after[:8]}."}
 
-    def commit(self, actor: str, message: str) -> Dict[str, Any]:
+    def commit(self, actor: str, message: str, branch: Optional[str] = None) -> Dict[str, Any]:
         with _LOCK:
             self._require_repo()
             message = (message or "").strip()
@@ -326,11 +443,14 @@ class Repo:
             author = re.sub(r"[^A-Za-z0-9._-]", "_", actor or "unknown")[:60] or "unknown"
             ident = {"GIT_AUTHOR_NAME": author, "GIT_AUTHOR_EMAIL": f"{author}@datakilnworks.local",
                      "GIT_COMMITTER_NAME": "Data Kiln Works", "GIT_COMMITTER_EMAIL": "dkw@localhost"}
+            started = None
+            if self.pr_mode() and self.current_branch() in (None, self.branch()) and self._has_ref(f"refs/remotes/origin/{self.branch()}") and self._head():
+                started = self._start_change(actor, branch)        # the base branch is never committed to in pull-request mode
             self._git(["add", "-A"])
             self._git(["commit", "-q", "-m", message], extra_env=ident)
             sha = self._head()
-            self._audit(actor, "COMMIT", {"sha": sha, "message": message[:200]})
-            return {**self.status(), "committed": sha}
+            self._audit(actor, "COMMIT", {"sha": sha, "message": message[:200], "branch": self.current_branch()})
+            return {**self.status(), "committed": sha, **({"started_branch": started} if started else {})}
 
     def push(self, actor: str) -> Dict[str, Any]:
         with _LOCK:
@@ -338,16 +458,153 @@ class Repo:
             b = self.branch()
             if not self._head():
                 raise GitError("Nothing to push: there are no commits yet.")
+            target = b
+            if self.pr_mode():
+                cur = self.current_branch()
+                if cur in (None, b):
+                    if self._has_ref(f"refs/remotes/origin/{b}"):
+                        raise GitError(f"In pull-request mode '{b}' is only changed through a reviewed pull request. Commit your changes "
+                                       "(that opens a change branch) and push that.")
+                else:
+                    target = cur                                    # a change branch; the very first commit of an empty remote may go to the base
             try:
-                self._git(["push", "origin", f"HEAD:refs/heads/{b}"])
+                self._git(["push", "-u", "origin", f"HEAD:refs/heads/{target}"])
             except GitError as exc:
                 if any(w in str(exc) for w in ("rejected", "non-fast-forward", "fetch first")):
                     raise GitError("The remote has commits you do not have. Pull first (history is never force-pushed).")
                 raise
-            self._git(["fetch", "origin", b], check=False)
-            self._git(["branch", "--set-upstream-to", f"origin/{b}"], check=False)
-            self._audit(actor, "PUSH", {"sha": self._head(), "branch": b})
-            return {**self.status(), "pushed": True}
+            self._git(["fetch", "origin", target], check=False)
+            self._audit(actor, "PUSH", {"sha": self._head(), "branch": target})
+            return {**self.status(), "pushed": True, "pushed_branch": target}
+
+    # ---- pull-request mode
+    def _require_pr_mode(self) -> None:
+        self._require_repo()
+        if not self.pr_mode():
+            raise GitError("Branch and pull-request mode is off. Set the mode variable to pull_request to use it.")
+
+    def _start_change(self, actor: str, name: Optional[str] = None) -> str:
+        """Creates and switches to a change branch from the current HEAD (working changes come along). Caller holds the lock."""
+        b = self.branch()
+        cur = self.current_branch()
+        if cur not in (None, b):
+            raise GitError(f"You are already on the change branch '{cur}'. Open its pull request, or finish it, before starting another.")
+        if not self._head():
+            raise GitError("There is nothing to branch from yet: make the first commit (it goes to the base branch).")
+        branch = self._change_name(actor, name)
+        if self._has_ref(f"refs/heads/{branch}") or self._has_ref(f"refs/remotes/origin/{branch}"):
+            raise GitError(f"The branch '{branch}' already exists.")
+        self._git(["switch", "-c", branch])
+        self._audit(actor, "BRANCH_CREATE", {"branch": branch, "from": self._head()})
+        return branch
+
+    def start_change(self, actor: str, name: Optional[str] = None) -> Dict[str, Any]:
+        with _LOCK:
+            self._require_pr_mode()
+            b = self.branch()
+            if not self._changes() and self._has_ref(f"refs/remotes/origin/{b}") and self.current_branch() in (None, b):
+                try:                                              # a clean base that is behind: start from the latest
+                    self._git(["fetch", "origin", b])
+                    if self._count(f"HEAD..origin/{b}"):
+                        self.pull(actor)
+                except GitError:
+                    pass
+            return {**self.status(), "started_branch": self._start_change(actor, name)}
+
+    def open_pull_request(self, actor: str, title: str = "", body: str = "") -> Dict[str, Any]:
+        with _LOCK:
+            self._require_pr_mode()
+            b = self.branch()
+            cur = self.current_branch()
+            if cur in (None, b):
+                raise GitError(f"You are on '{b}': there is no change to propose. Commit your changes first (that opens a change branch).")
+            if self._changes():
+                raise GitError("There are uncommitted changes. Commit them before opening the pull request.")
+            self._git(["fetch", "origin", "--prune"], check=False)
+            if not self._has_ref(f"refs/remotes/origin/{cur}") or self._count(f"origin/{cur}..HEAD"):
+                raise GitError("The branch has commits the server does not have. Push first.")
+            existing = self._pr_for_branch(cur)
+            if existing and existing["state"] == "open":
+                return {**self.status(), "pull_request": existing, "message": f"Pull request #{existing['number']} is already open."}
+            problem = self._problem_with_tree()
+            if problem:
+                raise GitError("The change does not validate, so no pull request was opened:\n" + problem)
+            subject = (title or "").strip() or self._git(["log", "-1", "--format=%s"], check=False).split("\n", 1)[-1].strip() or cur
+            created = self._api("POST", "/pulls", body={"head": cur, "base": b, "title": subject[:250], "body": (body or "")[:20000]})
+            pr = self._pr_view(created)
+            self._audit(actor, "PR_OPEN", {"branch": cur, "number": pr["number"], "url": pr["url"]})
+            return {**self.status(), "pull_request": pr, "message": f"Opened pull request #{pr['number']}."}
+
+    def finish_change(self, actor: str) -> Dict[str, Any]:
+        """Back to the base branch after the change was merged there (on the forge); drops the local change branch."""
+        with _LOCK:
+            self._require_pr_mode()
+            b = self.branch()
+            cur = self.current_branch()
+            if cur in (None, b):
+                raise GitError(f"You are already on '{b}'.")
+            if self._changes():
+                raise GitError("There are uncommitted changes on this branch. Commit or discard them first.")
+            self._git(["fetch", "origin", "--prune"])
+            merged = self._git(["merge-base", "--is-ancestor", "HEAD", f"origin/{b}"], check=False).startswith("0")
+            if not merged:
+                try:
+                    pr = self._pr_for_branch(cur)
+                except GitError:
+                    pr = None
+                merged = bool(pr and pr["merged"])
+            if not merged:
+                raise GitError("The change is not merged into '" + b + "' yet. Merge its pull request on the server first (or use Abandon to leave it).")
+            self._git(["switch", b])
+            result = self.pull(actor)
+            self._git(["branch", "-D", cur], check=False)
+            self._audit(actor, "CHANGE_FINISH", {"branch": cur})
+            return {**result, "finished_branch": cur}
+
+    def abandon_change(self, actor: str) -> Dict[str, Any]:
+        """Leaves the change branch without merging. Refused while anything would be lost: uncommitted changes or unpushed commits."""
+        with _LOCK:
+            self._require_pr_mode()
+            b = self.branch()
+            cur = self.current_branch()
+            if cur in (None, b):
+                raise GitError(f"You are already on '{b}'.")
+            if self._changes():
+                raise GitError("There are uncommitted changes on this branch; leaving would carry them to the base branch. Commit or discard them first.")
+            self._git(["fetch", "origin", "--prune"], check=False)
+            if not self._has_ref(f"refs/remotes/origin/{cur}") or self._count(f"origin/{cur}..HEAD"):
+                raise GitError("The branch has commits that were never pushed; leaving would lose them. Push it first.")
+            self._git(["switch", b])
+            self._git(["branch", "-D", cur], check=False)
+            self._audit(actor, "CHANGE_ABANDON", {"branch": cur})
+            return {**self.status(fetch=True), "abandoned_branch": cur, "message": f"Left '{cur}' (it stays on the server)."}
+
+    def update_from_base(self, actor: str) -> Dict[str, Any]:
+        """Merges the base branch into the change branch. A conflict is aborted cleanly, never left half-merged."""
+        with _LOCK:
+            self._require_pr_mode()
+            b = self.branch()
+            cur = self.current_branch()
+            if cur in (None, b):
+                raise GitError(f"You are on '{b}'; use Pull there.")
+            if self._changes():
+                raise GitError("There are uncommitted changes. Commit them first.")
+            self._git(["fetch", "origin", b])
+            if not self._count(f"HEAD..origin/{b}"):
+                return {**self.status(), "message": f"Already contains everything on '{b}'."}
+            before = self._head()
+            ident = {"GIT_AUTHOR_NAME": "Data Kiln Works", "GIT_AUTHOR_EMAIL": "dkw@localhost", "GIT_COMMITTER_NAME": "Data Kiln Works", "GIT_COMMITTER_EMAIL": "dkw@localhost"}
+            try:
+                self._git(["merge", "--no-edit", "-m", f"Merge {b} into {cur}", f"origin/{b}"], extra_env=ident)
+            except GitError as exc:
+                self._git(["merge", "--abort"], check=False)
+                raise GitError(f"Merging '{b}' into '{cur}' conflicts, so nothing was changed. Resolve it in the repository. ({str(exc)[:200]})")
+            problem = self._problem_with_tree()
+            if problem:
+                self._git(["reset", "-q", "--hard", before])
+                raise GitError(f"The merged result does not validate, so the merge was undone:\n{problem}")
+            self._audit(actor, "BRANCH_UPDATE", {"branch": cur, "from": b})
+            return {**self.status(), "message": f"Merged '{b}' into '{cur}'."}
 
 
 DBT = Repo("dbt")

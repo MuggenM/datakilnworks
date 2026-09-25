@@ -5614,6 +5614,16 @@ async def save_dbt_config(name: str, payload: DbtConfigPayload, current_user: Di
 
 class GitCommitPayload(BaseModel):
     message: str
+    branch: Optional[str] = None            # pull-request mode: name of the change branch a first commit opens (default dkw/<user>-<time>)
+
+
+class GitPrPayload(BaseModel):
+    title: Optional[str] = ""
+    body: Optional[str] = ""
+
+
+class GitChangePayload(BaseModel):
+    name: Optional[str] = None
 
 
 async def _git_call(fn, *args):
@@ -5649,7 +5659,7 @@ async def git_pull_endpoint(current_user: Dict[str, Any] = Depends(require_role(
 
 @app.post("/api/git/commit")
 async def git_commit_endpoint(payload: GitCommitPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    return await _git_call(_git_repo("dbt").commit, current_user.get("username", "admin"), payload.message)
+    return await _git_call(_git_repo("dbt").commit, current_user.get("username", "admin"), payload.message, payload.branch)
 
 @app.post("/api/git/push")
 async def git_push_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
@@ -5669,7 +5679,28 @@ async def git_repo_pull_endpoint(kind: str, current_user: Dict[str, Any] = Depen
 
 @app.post("/api/git/repos/{kind}/commit")
 async def git_repo_commit_endpoint(kind: str, payload: GitCommitPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    return await _git_call(_git_repo(kind).commit, current_user.get("username", "admin"), payload.message)
+    return await _git_call(_git_repo(kind).commit, current_user.get("username", "admin"), payload.message, payload.branch)
+
+# Pull-request mode (GIT_MODE=pull_request): change branches and pull requests on the forge (Gitea API).
+@app.post("/api/git/repos/{kind}/change")
+async def git_repo_start_change_endpoint(kind: str, payload: GitChangePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).start_change, current_user.get("username", "admin"), payload.name)
+
+@app.post("/api/git/repos/{kind}/pr")
+async def git_repo_open_pr_endpoint(kind: str, payload: GitPrPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).open_pull_request, current_user.get("username", "admin"), payload.title or "", payload.body or "")
+
+@app.post("/api/git/repos/{kind}/finish")
+async def git_repo_finish_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).finish_change, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/abandon")
+async def git_repo_abandon_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).abandon_change, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/update")
+async def git_repo_update_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).update_from_base, current_user.get("username", "admin"))
 
 @app.post("/api/git/repos/{kind}/push")
 async def git_repo_push_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
