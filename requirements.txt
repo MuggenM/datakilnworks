@@ -1,6 +1,7 @@
 duckdb>=1.5.4,<1.6.0
 deltalake==1.5.0
 duckrun>=0.4.71   # also the dbt adapter (type: duckrun in dbt_project/profiles.yml); it builds on dbt-duckdb
+dbt-duckdb>=1.9.0  # required by the duckrun dbt adapter; duckrun 0.5+ no longer installs it, and without it every dbt command fails with "No module named dbt.adapters.duckdb"
 dbt-core>=1.10.0  # dbt transformations (Transformations view, workflow dbt tasks); listed explicitly, duckrun also pulls it in
 jinja2>=3.1.0     # dbt's SQL templating and the studio's HTML templates (Jinja2Templates)
 sqlframe[duckdb]>=3.25.0
