@@ -152,10 +152,21 @@ async def startup_event():
         asyncio.create_task(autoloader_daemon_loop())
     except Exception as e_al:
         logger.warning(f"Failed to auto-start autoloader daemon on startup: {e_al}")
+    # Streaming ingestion (Kafka / Redpanda) runners
+    try:
+        from web.streaming import streaming_daemon_loop
+        asyncio.create_task(streaming_daemon_loop())
+    except Exception as e_st:
+        logger.warning(f"Failed to start the streaming ingestion daemon: {e_st}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
+    try:
+        from web import streaming
+        streaming.shutdown()
+    except Exception:
+        pass
     from web.scheduled_exports import shutdown_scheduler
     shutdown_scheduler()
 
@@ -8324,13 +8335,15 @@ async def create_connection_endpoint(payload: ConnectionPayload, current_user: D
 @app.post("/api/connections/test")
 async def test_connection_endpoint(payload: ConnectionPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     """Tries a definition (saved or not) and reports reachability; for SFTP without a pinned host key, the fingerprint the server presents."""
-    from web import connections, autoloader_conn
+    from web import connections, autoloader_conn, streaming
     try:
         definition = connections.definition_for_test(payload.dict())
     except connections.ConnectionError_ as exc:
         return {"ok": False, "message": str(exc)}
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    if definition["type"] == "kafka":
+        return await asyncio.to_thread(streaming.test_connection, definition)
     return await asyncio.to_thread(autoloader_conn.test_connection, definition)
 
 @app.put("/api/connections/{conn_id}")
@@ -8353,6 +8366,94 @@ async def delete_connection_endpoint(conn_id: str, current_user: Dict[str, Any] 
         raise HTTPException(status_code=404, detail=str(exc))
     except connections.ConnectionError_ as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+# ---------------------------------------------------------------- Streaming ingestion (web/streaming.py): Kafka / Redpanda -> Delta
+class StreamPayload(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    connection: Optional[str] = None
+    topic: Optional[str] = None
+    format: Optional[str] = None
+    starting_offsets: Optional[str] = None
+    target_catalog: Optional[str] = None
+    target_schema: Optional[str] = None
+    target_table: Optional[str] = None
+    max_records: Optional[int] = None
+    max_wait_seconds: Optional[int] = None
+    evolve_schema: Optional[bool] = None
+    enabled: Optional[bool] = None
+
+
+class StreamPreviewPayload(BaseModel):
+    connection: str
+    topic: str
+    format: str = "json"
+    limit: int = 10
+
+
+def _stream_call(fn, *args, **kwargs):
+    from web import streaming
+    try:
+        return fn(*args, **kwargs)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except streaming.StreamError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+_STREAM_ROLES = ["admin", "power_user"]
+
+@app.get("/api/streams")
+async def list_streams_endpoint(current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return {"streams": streaming.list_streams()}
+
+@app.post("/api/streams")
+async def create_stream_endpoint(payload: StreamPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.create_stream, payload.dict(exclude_none=True), current_user.get("username", "admin"))
+
+@app.get("/api/streams/topics")
+async def stream_topics_endpoint(connection: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Topics visible to a Kafka connection (for the create dialog's dropdown)."""
+    from web import streaming
+    return {"topics": await asyncio.to_thread(_stream_call, streaming.list_topics, connection)}
+
+@app.post("/api/streams/preview")
+async def preview_stream_endpoint(payload: StreamPreviewPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """The newest messages of a topic as the table would receive them; reads only, creates nothing."""
+    from web import streaming
+    return await asyncio.to_thread(_stream_call, streaming.preview, payload.connection, payload.topic, payload.format, payload.limit)
+
+@app.get("/api/streams/{stream_id}")
+async def get_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    s = streaming.get_stream(stream_id, detail=True)
+    if not s:
+        raise HTTPException(status_code=404, detail="Stream not found.")
+    return s
+
+@app.put("/api/streams/{stream_id}")
+async def update_stream_endpoint(stream_id: str, payload: StreamPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.update_stream, stream_id, payload.dict(exclude_none=True), current_user.get("username", "admin"))
+
+@app.post("/api/streams/{stream_id}/start")
+async def start_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.set_enabled, stream_id, True, current_user.get("username", "admin"))
+
+@app.post("/api/streams/{stream_id}/stop")
+async def stop_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.set_enabled, stream_id, False, current_user.get("username", "admin"))
+
+@app.delete("/api/streams/{stream_id}")
+async def delete_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Stops and removes the stream; the Delta table (and its dead-letter table) stay."""
+    from web import streaming
+    await asyncio.to_thread(_stream_call, streaming.delete_stream, stream_id, current_user.get("username", "admin"))
+    return {"success": True}
 
 
 class SourcePreviewPayload(BaseModel):

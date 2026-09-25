@@ -934,6 +934,25 @@ WHERE trip_distance > 0 AND total_amount > 0</code></pre>
           <li><strong>Governance:</strong> ingestion runs as the pipeline owner, and tags propagate to the target table.</li>
         </ul>
 
+        <h3 id="streaming-ingestion">Streaming Ingestion (Kafka / Redpanda to Delta)</h3>
+        <p>
+          A <strong>stream</strong> continuously loads one Kafka topic into a Delta table in micro-batches (Apache Kafka, Redpanda, Confluent Cloud, MSK and other Kafka-compatible brokers). Open it with the <em>Streams</em> button of the Auto-Loader view (administrators and power users).
+        </p>
+        <ol>
+          <li><strong>Create a Kafka connection</strong> (<em>Connections</em> > Type <em>Kafka / Redpanda</em>): bootstrap servers (<code>host:port</code>, comma-separated), the security protocol (<code>PLAINTEXT</code>, <code>SSL</code>, <code>SASL_SSL</code>, <code>SASL_PLAINTEXT</code>), the SASL mechanism (<code>PLAIN</code>, <code>SCRAM-SHA-256</code>, <code>SCRAM-SHA-512</code>), user name and password, and a CA certificate for a private CA. The password is stored encrypted and never shown again. A password over <code>SASL_PLAINTEXT</code> is refused unless you tick <em>allow</em> for a trusted internal broker. <em>Test</em> connects and reports a rejected login or a TLS problem in plain words.</li>
+          <li><strong>Create a stream</strong>: pick the connection, the topic (the list shows what the login can see), the target catalog/schema/table, the format, where to start (<em>earliest</em> = the whole topic, <em>latest</em> = only new messages), the batch size and the maximum wait per batch. <em>Preview newest messages</em> shows the columns and types the table would get, and how many messages would be dead-lettered, without creating anything.</li>
+          <li><strong>Watch it</strong>: the list shows the status (running, error, stopped), rows loaded, lag (messages behind the end of the topic), the last batch and the last error. <em>Stop</em> and <em>Start</em> pause and resume; a stopped stream resumes exactly where it ended.</li>
+        </ol>
+        <ul>
+          <li><strong>Exactly-once.</strong> Each Delta commit records, per partition, the next offset to read (Delta application transactions), so the table itself says how far it has been loaded. After a crash, a restart or even a wiped studio database the stream resumes from the table, and no message is loaded twice; a batch interrupted before its commit is loaded once. Consumer-group offsets are also committed to Kafka after each batch so external lag tools work, but they are never used to resume.</li>
+          <li><strong>Columns.</strong> The first batch defines them: numbers become <code>bigint</code>/<code>double</code>, <code>true</code>/<code>false</code> boolean, everything else text; nested objects and arrays are stored as JSON text (query them with DuckDB's JSON functions). Every row also gets <code>_key</code>, <code>_topic</code>, <code>_partition</code>, <code>_offset</code>, <code>_timestamp</code> and <code>_rescued_data</code>. Timestamps in the payload stay text unless the target column is a timestamp.</li>
+          <li><strong>Schema drift never stops the stream.</strong> A field the table does not have, or a value that does not fit its column, is kept as JSON in <code>_rescued_data</code>. With <em>Add new fields as columns</em> new fields become columns instead. The format <em>Text</em> loads the message as one column <code>value</code>.</li>
+          <li><strong>Dead letters.</strong> A message that is not valid UTF-8 JSON, is not a JSON object, or is Schema-Registry framed (Avro/Protobuf) goes to <code>&lt;table&gt;_dlq</code> (topic, partition, offset, timestamp, key, value, error) and the stream continues. A message without a value (tombstone) is skipped.</li>
+          <li><strong>Partitions and restarts.</strong> A partition added later is read from its beginning. A stream that cannot reach the broker or is refused shows the reason and retries with a growing delay. If the broker's retention deleted messages the stream had not read yet, it continues from the oldest available and says so in the last error.</li>
+          <li><strong>Lineage and downstream.</strong> The topic appears in the lineage graph feeding the table. The table is an ordinary Delta table, so a workflow can start when it changes (<em>Delta table changed</em> trigger).</li>
+          <li><strong>Limits.</strong> The connection, topic and target of a stream cannot be changed after creation (its stored offsets belong to them; create a new stream). Avro/Protobuf with a Schema Registry is not supported yet, and there is no rewind. Only one studio process reads a stream at a time (a lease prevents duplicate consumers).</li>
+        </ul>
+
         <h3 id="jobs-pipelines-workflows">Jobs & Pipelines (Local Workflows DAG)</h3>
         <p>
           The <strong>Jobs & Pipelines</strong> engine orchestrates multi-task workflows without requiring external schedulers (such as Apache Airflow or Celery). Supported task types include:
@@ -1748,6 +1767,7 @@ with mlflow.start_run(run_name="fare_tip_estimator"):
         <li class="toc-item"><a href="#data-ingestion-wizard" class="toc-link">Data Engineering</a></li>
         <li class="toc-item"><a href="#dbt-core-transformations" class="toc-link" style="padding-left: 1rem;">dbt Transformations</a></li>
         <li class="toc-item"><a href="#autoloader-pipelines" class="toc-link" style="padding-left: 1rem;">Auto-Loader</a></li>
+        <li class="toc-item"><a href="#streaming-ingestion" class="toc-link" style="padding-left: 1rem;">Streaming (Kafka)</a></li>
         <li class="toc-item"><a href="#jobs-pipelines-workflows" class="toc-link" style="padding-left: 1rem;">Jobs & Workflows</a></li>
         <li class="toc-item"><a href="#mlflow-experiments" class="toc-link">Machine Learning & AI</a></li>
         <li class="toc-item"><a href="#mlflow-genai-tracing" class="toc-link" style="padding-left: 1rem;">LLM Tracing & Gantt</a></li>

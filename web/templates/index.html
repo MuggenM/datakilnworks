@@ -1920,6 +1920,10 @@
               <i class="ph ph-plugs-connected text-sm"></i>
               <span>Connections</span>
             </button>
+            <button x-show="currentUser && ['admin', 'power_user'].includes(currentUser.role)" @click="openStreams()" data-testid="open-streams" class="flex items-center space-x-1.5 px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded text-xs font-semibold shadow-sm transition" title="Continuous ingestion from Kafka / Redpanda topics">
+              <i class="ph ph-broadcast text-sm"></i>
+              <span>Streams</span>
+            </button>
             <button @click="showCreatePipelineModal = true" class="flex items-center space-x-1.5 px-3.5 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold shadow transition">
               <i class="ph ph-plus-circle text-sm"></i>
               <span>New Pipeline</span>
@@ -11288,8 +11292,8 @@
             <template x-for="c in connectionsList" :key="c.id">
               <tr data-testid="conn-row">
                 <td class="py-2 font-mono font-semibold text-slate-800 dark:text-slate-200" x-text="c.name"></td>
-                <td x-text="c.type === 'sftp' ? 'SFTP' : 'HTTP(S) / REST'"></td>
-                <td class="font-mono text-slate-500" x-text="c.type === 'sftp' ? (c.config.username + '@' + c.config.host + ':' + c.config.port) : c.config.base_url"></td>
+                <td x-text="connTypeLabel(c)"></td>
+                <td class="font-mono text-slate-500" x-text="connTarget(c)"></td>
                 <td x-text="c.has_secret ? 'stored' : '—'"></td>
                 <td class="text-right space-x-1" x-show="currentUser && currentUser.role === 'admin'">
                   <button @click="editConnection(c)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="conn-edit">Edit</button>
@@ -11305,7 +11309,7 @@
         <div class="grid grid-cols-3 gap-3">
           <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Name</label><input type="text" x-model="connForm.name" :disabled="!!connForm.id" placeholder="e.g. crm_api" data-testid="conn-name" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"></div>
           <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Type</label>
-            <select x-model="connForm.type" :disabled="!!connForm.id" data-testid="conn-type" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"><option value="http">HTTP(S) file / REST API</option><option value="sftp">SFTP</option></select></div>
+            <select x-model="connForm.type" :disabled="!!connForm.id" data-testid="conn-type" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"><option value="http">HTTP(S) file / REST API</option><option value="sftp">SFTP</option><option value="kafka">Kafka / Redpanda</option></select></div>
           <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Description</label><input type="text" x-model="connForm.description" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
         </div>
 
@@ -11348,12 +11352,114 @@
             <p class="text-[10px] text-slate-500 mt-1">Every connect is checked against this fingerprint, so a changed or impersonated server is refused. Compare it with the one your SFTP provider publishes before pinning.</p></div>
         </div>
 
+        <div x-show="connForm.type === 'kafka'" class="space-y-3" data-testid="conn-kafka">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Bootstrap servers</label><input type="text" x-model="connForm.bootstrap_servers" placeholder="broker1:9092, broker2:9092" data-testid="conn-bootstrap" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
+            <p class="text-[10px] text-slate-500 mt-1">Apache Kafka, Redpanda, Confluent Cloud, MSK... Streams read topics through this connection (Auto-Loader pipelines do not use it).</p></div>
+          <div class="grid grid-cols-3 gap-3">
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Security</label><select x-model="connForm.security_protocol" data-testid="conn-protocol" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="PLAINTEXT">PLAINTEXT (no login, no TLS)</option><option value="SSL">SSL (TLS)</option><option value="SASL_SSL">SASL_SSL (login + TLS)</option><option value="SASL_PLAINTEXT">SASL_PLAINTEXT (login, no TLS)</option></select></div>
+            <div x-show="connForm.security_protocol.startsWith('SASL')"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">SASL mechanism</label><select x-model="connForm.sasl_mechanism" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="PLAIN">PLAIN</option><option value="SCRAM-SHA-256">SCRAM-SHA-256</option><option value="SCRAM-SHA-512">SCRAM-SHA-512</option></select></div>
+            <div x-show="connForm.security_protocol.startsWith('SASL')"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">User name</label><input type="text" x-model="connForm.username" data-testid="conn-kafka-user" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          </div>
+          <div x-show="connForm.security_protocol.startsWith('SASL')" class="grid grid-cols-3 gap-3">
+            <div class="col-span-2"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Password</label><input type="password" x-model="connForm.secret" autocomplete="new-password" :placeholder="connForm.id ? 'stored — leave empty to keep' : ''" data-testid="conn-kafka-password" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+            <label x-show="connForm.security_protocol === 'SASL_PLAINTEXT'" class="flex items-center space-x-1.5 pt-5"><input type="checkbox" x-model="connForm.allow_insecure"><span>Allow the password without TLS (trusted internal broker only)</span></label>
+          </div>
+          <div x-show="connForm.security_protocol.endsWith('SSL')"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">CA certificate (PEM, only for a private CA)</label>
+            <textarea rows="3" x-model="connForm.ssl_ca_pem" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></textarea></div>
+        </div>
+
         <div x-show="connTest.message" class="p-2.5 rounded-lg border" :class="connTest.ok ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900 text-emerald-700 dark:text-emerald-300' : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-300'" data-testid="conn-test-result" x-text="connTest.message"></div>
         <div x-show="connForm.error" class="p-2.5 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="conn-error" x-text="connForm.error"></div>
         <div class="flex justify-end space-x-2 pt-2 border-t border-slate-200 dark:border-dbx-border">
           <button type="button" @click="connForm.open = false; connTest = {}" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded">Cancel</button>
           <button type="button" @click="testConnection()" :disabled="connForm.busy" data-testid="conn-test" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-50">Test</button>
           <button type="submit" :disabled="connForm.busy" data-testid="conn-save" class="px-4 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold rounded disabled:opacity-50">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Streams (Kafka / Redpanda topic -> Delta table) -->
+  <div x-show="showStreamsModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showStreamsModal = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-5xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" @click.outside="showStreamsModal = false" data-testid="streams-modal">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-3">
+        <div>
+          <h3 class="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-broadcast text-dbx-orange"></i><span>Streams</span></h3>
+          <p class="text-[11px] text-slate-500 mt-0.5">Continuous, exactly-once ingestion of a Kafka / Redpanda topic into a Delta table in micro-batches. Unparsable messages go to a <span class="font-mono">_dlq</span> table next to it.</p>
+        </div>
+        <button @click="showStreamsModal = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+
+      <div x-show="!streamForm.open" class="space-y-2">
+        <div class="flex justify-end"><button @click="newStream()" data-testid="stream-new" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded font-semibold flex items-center space-x-1"><i class="ph ph-plus-circle"></i><span>New stream</span></button></div>
+        <div x-show="!streamsList.length" class="text-slate-500 py-6 text-center">No streams yet. Create a Kafka connection first (Connections), then a stream.</div>
+        <table x-show="streamsList.length" class="w-full text-left">
+          <thead class="text-[10px] uppercase text-slate-500"><tr><th class="py-1.5">Stream</th><th>Topic</th><th>Target table</th><th>Status</th><th class="text-right">Rows</th><th class="text-right">Lag</th><th>Last batch</th><th class="text-right">Actions</th></tr></thead>
+          <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/50">
+            <template x-for="st in streamsList" :key="st.id">
+              <tr data-testid="stream-row" class="align-top">
+                <td class="py-2 font-semibold text-slate-800 dark:text-slate-200"><span x-text="st.name"></span><div class="text-[10px] font-mono text-slate-500" x-text="st.connection"></div></td>
+                <td class="font-mono" x-text="st.topic"></td>
+                <td class="font-mono" x-text="st.target_catalog + '.' + st.target_schema + '.' + st.target_table"></td>
+                <td><span class="px-2 py-0.5 rounded text-[10px] font-bold border" data-testid="stream-status" :class="st.status === 'running' ? 'bg-emerald-950 text-emerald-400 border-emerald-800' : (st.status === 'error' ? 'bg-red-950 text-red-400 border-red-800' : 'bg-slate-800 text-slate-300 border-slate-700')" x-text="st.status"></span>
+                  <div x-show="st.last_error" class="text-[10px] text-red-500 max-w-xs mt-1" x-text="st.last_error" data-testid="stream-error"></div></td>
+                <td class="text-right font-mono" x-text="st.rows_total"></td>
+                <td class="text-right font-mono" x-text="st.lag_total"></td>
+                <td class="font-mono text-slate-500" x-text="st.last_batch_at || '—'"></td>
+                <td class="text-right space-x-1 whitespace-nowrap">
+                  <button x-show="!st.enabled" @click="streamAction(st, 'start')" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="stream-start">Start</button>
+                  <button x-show="st.enabled" @click="streamAction(st, 'stop')" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="stream-stop">Stop</button>
+                  <button @click="editStream(st)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="stream-edit">Edit</button>
+                  <button @click="deleteStream(st)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded text-red-500" data-testid="stream-delete">Delete</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <form x-show="streamForm.open" @submit.prevent="saveStream()" class="space-y-3" data-testid="stream-form">
+        <div class="grid grid-cols-3 gap-3">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Name</label><input type="text" x-model="streamForm.name" data-testid="stream-name" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Kafka connection</label>
+            <select x-model="streamForm.connection" @change="loadStreamTopics()" :disabled="!!streamForm.id" data-testid="stream-connection" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"><option value="">— choose —</option>
+              <template x-for="c in connectionsList.filter(x => x.type === 'kafka')" :key="c.id"><option :value="c.name" x-text="c.name"></option></template></select></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Topic</label>
+            <input type="text" x-model="streamForm.topic" list="stream-topics" :disabled="!!streamForm.id" data-testid="stream-topic" placeholder="orders" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60">
+            <datalist id="stream-topics"><template x-for="t in streamTopics" :key="t.name"><option :value="t.name" x-text="t.partitions + ' partition(s)'"></option></template></datalist></div>
+        </div>
+        <div class="grid grid-cols-4 gap-3">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Target catalog</label>
+            <select x-model="streamForm.target_catalog" :disabled="!!streamForm.id" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"><template x-for="c in autoloaderTargets" :key="c.id"><option :value="c.id" x-text="c.id + (c.kind === 's3' ? ' (S3)' : '')"></option></template></select></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Schema</label><input type="text" x-model="streamForm.target_schema" :disabled="!!streamForm.id" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Table</label><input type="text" x-model="streamForm.target_table" :disabled="!!streamForm.id" data-testid="stream-table" placeholder="orders_raw" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Message format</label><select x-model="streamForm.format" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="json">JSON object per message</option><option value="text">Text (one column)</option></select></div>
+        </div>
+        <div class="grid grid-cols-4 gap-3">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Start from</label><select x-model="streamForm.starting_offsets" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="earliest">Earliest (whole topic)</option><option value="latest">Latest (new messages only)</option></select></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Batch size (messages)</label><input type="number" min="1" max="100000" x-model.number="streamForm.max_records" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Max wait per batch (s)</label><input type="number" min="1" max="300" x-model.number="streamForm.max_wait_seconds" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          <label class="flex items-center space-x-1.5 pt-5"><input type="checkbox" x-model="streamForm.evolve_schema"><span>Add new fields as columns</span></label>
+        </div>
+        <p class="text-[10px] text-slate-500">Columns come from the first batch (numbers, text, true/false; nested objects are kept as JSON text). Later messages are cast to the table; a field that does not fit or is new goes to <span class="font-mono">_rescued_data</span> unless "Add new fields" is on. <span class="font-mono">_key, _topic, _partition, _offset, _timestamp</span> are added to every row. Connection, topic and target cannot be changed after creation (the stored offsets belong to them).</p>
+
+        <div class="flex items-center space-x-2">
+          <button type="button" @click="previewStream()" :disabled="streamForm.busy || !streamForm.connection || !streamForm.topic" data-testid="stream-preview" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-50">Preview newest messages</button>
+          <span x-show="streamPreview.busy" class="text-slate-500">Reading...</span>
+        </div>
+        <div x-show="streamPreview.error" class="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-300" x-text="streamPreview.error"></div>
+        <div x-show="streamPreview.data" class="overflow-x-auto border border-slate-200 dark:border-dbx-border rounded" data-testid="stream-preview-result">
+          <div class="px-2 py-1 text-[10px] text-slate-500" x-text="streamPreview.data ? (streamPreview.data.messages + ' message(s) read; ' + streamPreview.data.bad + ' would be dead-lettered' + (streamPreview.data.note ? ' — ' + streamPreview.data.note : '')) : ''"></div>
+          <table class="w-full text-left font-mono text-[10px]">
+            <thead class="text-slate-500"><tr><template x-for="c in (streamPreview.data ? streamPreview.data.columns : [])" :key="c.name"><th class="px-2 py-1" x-text="c.name + ' : ' + c.type"></th></template></tr></thead>
+            <tbody><template x-for="(r, ri) in (streamPreview.data ? streamPreview.data.rows : [])" :key="ri"><tr class="border-t border-slate-200 dark:border-dbx-border/50"><template x-for="c in (streamPreview.data ? streamPreview.data.columns : [])" :key="c.name"><td class="px-2 py-1 whitespace-nowrap" x-text="r[c.name] === null ? '∅' : String(r[c.name])"></td></template></tr></template></tbody>
+          </table>
+        </div>
+
+        <div x-show="streamForm.error" class="p-2.5 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="stream-form-error" x-text="streamForm.error"></div>
+        <div class="flex justify-end space-x-2 pt-2 border-t border-slate-200 dark:border-dbx-border">
+          <button type="button" @click="streamForm.open = false; streamPreview = {}" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded">Cancel</button>
+          <button type="submit" :disabled="streamForm.busy" data-testid="stream-save" class="px-4 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white font-semibold rounded disabled:opacity-50">Save and start</button>
         </div>
       </form>
     </div>
@@ -11391,7 +11497,7 @@
             <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Connection</label>
               <select x-model="pipelineConn.name" @change="connPreview = { busy: false, error: '', data: null }" data-testid="pipe-conn" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-2 text-slate-900 dark:text-white">
                 <option value="">— choose —</option>
-                <template x-for="c in connectionsList" :key="c.id"><option :value="c.name" x-text="c.name + ' (' + (c.type === 'sftp' ? 'SFTP' : 'HTTP') + ')'"></option></template>
+                <template x-for="c in connectionsList.filter(x => x.type !== 'kafka')" :key="c.id"><option :value="c.name" x-text="c.name + ' (' + (c.type === 'sftp' ? 'SFTP' : 'HTTP') + ')'"></option></template>
               </select></div>
             <div class="col-span-2"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]" x-text="connType() === 'sftp' ? 'Remote folder (absolute path on the server)' : 'Path (added to the connection\'s base URL)'"></label>
               <input type="text" x-model="pipelineConn.path" :placeholder="connType() === 'sftp' ? '/upload/daily' : 'exports/daily.csv  or  items'" data-testid="pipe-conn-path" class="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded px-2 py-2 font-mono text-slate-900 dark:text-white"></div>
@@ -17231,9 +17337,15 @@
         pipelineConn: { name: '', path: '', mode: 'file', records_path: '', params: '', pagination: 'none', page_param: 'page', size_param: '', page_size: 100, offset_param: 'offset', limit_param: 'limit', next_path: '', recursive: false, settle_seconds: 10 },
         showConnectionsModal: false,
         connectionsList: [],
+        showStreamsModal: false,
+        streamsList: [],
+        streamTopics: [],
+        streamPreview: {},
+        streamsTimer: null,
+        streamForm: { open: false, busy: false, error: '', id: '', name: '', connection: '', topic: '', target_catalog: 'warehouse', target_schema: 'dbo', target_table: '', format: 'json', starting_offsets: 'earliest', max_records: 5000, max_wait_seconds: 5, evolve_schema: false },
         connPreview: { busy: false, error: '', data: null },
         connTest: {},
-        connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '' },
+        connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '' },
         autoloaderTargets: [{ id: 'warehouse', name: 'warehouse', kind: 'local' }],
         newPipelineForm: {
           name: '',
@@ -26573,7 +26685,7 @@
 
         newConnection() {
           this.connTest = {};
-          this.connForm = { open: true, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '' };
+          this.connForm = { open: true, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '' };
         },
 
         editConnection(c) {
@@ -26581,11 +26693,98 @@
           const cfg = c.config || {};
           this.connForm = { open: true, busy: false, error: '', id: c.id, name: c.name, type: c.type, description: c.description || '', base_url: cfg.base_url || '', auth: c.type === 'http' ? (cfg.auth || 'none') : 'none',
             username: cfg.username || '', header_name: cfg.header_name || '', secret: '', allow_insecure: !!cfg.allow_insecure, timeout_seconds: cfg.timeout_seconds || 30,
-            host: cfg.host || '', port: cfg.port || 22, sftp_auth: c.type === 'sftp' ? (cfg.auth || 'password') : 'password', private_key: '', passphrase: '', host_key_sha256: cfg.host_key_sha256 || '' };
+            host: cfg.host || '', port: cfg.port || 22, sftp_auth: c.type === 'sftp' ? (cfg.auth || 'password') : 'password', private_key: '', passphrase: '', host_key_sha256: cfg.host_key_sha256 || '',
+            bootstrap_servers: cfg.bootstrap_servers || '', security_protocol: cfg.security_protocol || 'PLAINTEXT', sasl_mechanism: cfg.sasl_mechanism || 'PLAIN', ssl_ca_pem: cfg.ssl_ca_pem || '' };
+          if (c.type === 'kafka') { this.connForm.allow_insecure = !!cfg.allow_insecure; }
+        },
+
+        async loadStreams() {
+          try {
+            const res = await fetch('/api/streams');
+            if (res.ok) this.streamsList = (await res.json()).streams || [];
+          } catch (e) { /* keep the list */ }
+        },
+
+        async openStreams() {
+          this.showStreamsModal = true;
+          this.streamForm.open = false;
+          await Promise.all([this.loadConnections(), this.loadStreams(), this.loadAutoloaderTargets()]);
+          clearInterval(this.streamsTimer);
+          this.streamsTimer = setInterval(() => { if (this.showStreamsModal) this.loadStreams(); else clearInterval(this.streamsTimer); }, 4000);
+        },
+
+        newStream() {
+          this.streamPreview = {}; this.streamTopics = [];
+          this.streamForm = { open: true, busy: false, error: '', id: '', name: '', connection: (this.connectionsList.find(c => c.type === 'kafka') || {}).name || '', topic: '', target_catalog: (this.autoloaderTargets[0] || {}).id || 'warehouse', target_schema: 'dbo', target_table: '', format: 'json', starting_offsets: 'earliest', max_records: 5000, max_wait_seconds: 5, evolve_schema: false };
+          if (this.streamForm.connection) this.loadStreamTopics();
+        },
+
+        editStream(st) {
+          this.streamPreview = {}; this.streamTopics = [];
+          this.streamForm = { open: true, busy: false, error: '', id: st.id, name: st.name, connection: st.connection, topic: st.topic, target_catalog: st.target_catalog, target_schema: st.target_schema, target_table: st.target_table, format: st.format, starting_offsets: st.starting_offsets, max_records: st.max_records, max_wait_seconds: st.max_wait_seconds, evolve_schema: !!st.evolve_schema };
+        },
+
+        async loadStreamTopics() {
+          this.streamTopics = [];
+          if (!this.streamForm.connection) return;
+          try {
+            const res = await fetch('/api/streams/topics?connection=' + encodeURIComponent(this.streamForm.connection));
+            if (res.ok) this.streamTopics = (await res.json()).topics || [];
+          } catch (e) { /* the topic can still be typed */ }
+        },
+
+        async previewStream() {
+          this.streamPreview = { busy: true };
+          try {
+            const res = await fetch('/api/streams/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ connection: this.streamForm.connection, topic: this.streamForm.topic, format: this.streamForm.format, limit: 10 }) });
+            const d = await res.json();
+            this.streamPreview = res.ok ? { data: d, error: (d.errors && d.errors.length && !d.rows.length) ? d.errors[0] : '' } : { error: typeof d.detail === 'string' ? d.detail : 'The preview failed.' };
+          } catch (e) { this.streamPreview = { error: 'Error: ' + e.message }; }
+        },
+
+        async saveStream() {
+          const f = this.streamForm;
+          f.busy = true; f.error = '';
+          try {
+            const body = { name: f.name, connection: f.connection, topic: f.topic, target_catalog: f.target_catalog, target_schema: f.target_schema, target_table: f.target_table, format: f.format, starting_offsets: f.starting_offsets, max_records: f.max_records, max_wait_seconds: f.max_wait_seconds, evolve_schema: !!f.evolve_schema, enabled: true };
+            const res = await fetch(f.id ? '/api/streams/' + f.id : '/api/streams', { method: f.id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            const d = await res.json();
+            if (!res.ok) { f.error = typeof d.detail === 'string' ? d.detail : 'Could not save the stream.'; return; }
+            f.open = false; this.streamPreview = {};
+            this.showToast(`Stream '${d.name}' saved.`, 'success');
+            await this.loadStreams();
+          } catch (e) { f.error = 'Error: ' + e.message; } finally { f.busy = false; }
+        },
+
+        async streamAction(st, action) {
+          const res = await fetch(`/api/streams/${st.id}/${action}`, { method: 'POST' });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.showToast(d.detail || 'The action failed.', 'error'); return; }
+          await this.loadStreams();
+        },
+
+        async deleteStream(st) {
+          if (!confirm(`Delete the stream '${st.name}'? Ingestion stops; the table ${st.target_table} and its data stay.`)) return;
+          const res = await fetch('/api/streams/' + st.id, { method: 'DELETE' });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.showToast(d.detail || 'Could not delete the stream.', 'error'); return; }
+          this.showToast(`Stream '${st.name}' deleted.`, 'success');
+          await this.loadStreams();
+        },
+
+        connTypeLabel(c) { return c.type === 'sftp' ? 'SFTP' : (c.type === 'kafka' ? 'Kafka / Redpanda' : 'HTTP(S) / REST'); },
+        connTarget(c) {
+          const g = c.config || {};
+          return c.type === 'sftp' ? (g.username + '@' + g.host + ':' + g.port) : (c.type === 'kafka' ? (g.bootstrap_servers + ' (' + g.security_protocol + ')') : g.base_url);
         },
 
         connPayload() {
           const f = this.connForm;
+          if (f.type === 'kafka') {
+            const sasl = f.security_protocol.startsWith('SASL');
+            const config = { bootstrap_servers: f.bootstrap_servers, security_protocol: f.security_protocol };
+            if (sasl) Object.assign(config, { sasl_mechanism: f.sasl_mechanism, username: f.username, allow_insecure: !!f.allow_insecure });
+            if (f.security_protocol.endsWith('SSL') && (f.ssl_ca_pem || '').trim()) config.ssl_ca_pem = f.ssl_ca_pem;
+            return { id: f.id || null, name: f.name, type: 'kafka', description: f.description, config, secret: (sasl && f.secret) ? { password: f.secret } : {} };
+          }
           if (f.type === 'sftp') {
             const secret = {};
             if (f.sftp_auth === 'password' && f.secret) secret.password = f.secret;

@@ -9,6 +9,8 @@ another host.
 
 Types
   http  base_url (http/https), auth none | bearer | basic | header, timeout_seconds. Used for a file download or a REST/JSON API.
+  kafka bootstrap_servers, security_protocol (PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL), SASL mechanism/user, optional CA certificate;
+        the password is the secret. Read by streams (`web/streaming.py`), not by Auto-Loader pipelines.
   sftp  host, port, username, auth password | key, and `host_key_sha256`: the server's host key fingerprint, REQUIRED. It is
         checked on every connect (a changed key is refused, never silently trusted); the Test action shows the fingerprint to pin.
 """
@@ -28,12 +30,14 @@ logger = logging.getLogger("localspark.connections")
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
-TYPES = ("http", "sftp")
+TYPES = ("http", "sftp", "kafka")
+KAFKA_PROTOCOLS = ("PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL")
+KAFKA_MECHANISMS = ("PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512")
 HTTP_AUTH = ("none", "bearer", "basic", "header")
 SFTP_AUTH = ("password", "key")
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
 # Secret fields per type: accepted on write, stored encrypted, never read back.
-SECRET_FIELDS = {"http": ("token", "password", "header_value"), "sftp": ("password", "private_key", "passphrase")}
+SECRET_FIELDS = {"http": ("token", "password", "header_value"), "sftp": ("password", "private_key", "passphrase"), "kafka": ("password",)}
 
 
 def _db_path() -> str:
@@ -130,6 +134,34 @@ def _validate_config(kind: str, cfg: Dict[str, Any], secret: Dict[str, Any], for
         if not FINGERPRINT_RE.match(fp):
             raise ConnectionError_("The server's host key fingerprint is required (SHA256:...). Use Test to see it, check it against the server, then save.")
         return {"host": host, "port": port, "username": user, "auth": auth, "host_key_sha256": fp}
+    if kind == "kafka":
+        servers = [x.strip() for x in str(cfg.get("bootstrap_servers") or "").split(",") if x.strip()]
+        if not servers or len(servers) > 20 or not all(re.fullmatch(r"[A-Za-z0-9._-]{1,253}:\d{1,5}", x) and 1 <= int(x.rsplit(":", 1)[1]) <= 65535 for x in servers):
+            raise ConnectionError_("Bootstrap servers are required as host:port, comma-separated (e.g. kafka:9092).")
+        proto = cfg.get("security_protocol") or "PLAINTEXT"
+        if proto not in KAFKA_PROTOCOLS:
+            raise ConnectionError_(f"The security protocol must be one of {', '.join(KAFKA_PROTOCOLS)}.")
+        out = {"bootstrap_servers": ",".join(servers), "security_protocol": proto}
+        if proto.startswith("SASL"):
+            mech = cfg.get("sasl_mechanism") or "PLAIN"
+            if mech not in KAFKA_MECHANISMS:
+                raise ConnectionError_(f"The SASL mechanism must be one of {', '.join(KAFKA_MECHANISMS)}.")
+            user = str(cfg.get("username") or "").strip()
+            if not user or len(user) > 128:
+                raise ConnectionError_("A user name is required for SASL.")
+            if not secret.get("password"):
+                raise ConnectionError_("The password is required for SASL.")
+            if proto == "SASL_PLAINTEXT" and not cfg.get("allow_insecure"):
+                raise ConnectionError_("A password over SASL_PLAINTEXT is sent unencrypted. Use SASL_SSL, or tick 'allow insecure' for a trusted internal broker.")
+            out.update(sasl_mechanism=mech, username=user, allow_insecure=bool(cfg.get("allow_insecure")))
+        ca = str(cfg.get("ssl_ca_pem") or "").strip()
+        if ca:
+            if "BEGIN CERTIFICATE" not in ca or len(ca) > 40000:
+                raise ConnectionError_("The CA certificate must be PEM text (-----BEGIN CERTIFICATE-----).")
+            if not proto.endswith("SSL"):
+                raise ConnectionError_("A CA certificate only applies to the SSL and SASL_SSL protocols.")
+            out["ssl_ca_pem"] = ca
+        return out
     raise ConnectionError_(f"Unknown connection type '{kind}'.")
 
 
@@ -234,8 +266,13 @@ def delete_connection(name_or_id: str, actor: str) -> None:
         users = [p["name"] for p in autoloader.list_pipelines() if str(p.get("source_volume_path", "")).startswith(f"conn://{cur['name']}/")]
     except Exception:
         users = []
+    try:
+        from web import streaming
+        users += [x["name"] for x in streaming.list_streams() if x["connection"] == cur["name"]]
+    except Exception:
+        pass
     if users:
-        raise ConnectionError_(f"Used by pipeline(s): {', '.join(users)}. Delete or change those first.")
+        raise ConnectionError_(f"Used by pipeline(s) or stream(s): {', '.join(users)}. Delete or change those first.")
     c = _db()
     try:
         c.execute("DELETE FROM connections WHERE id = ?", (cur["id"],))
