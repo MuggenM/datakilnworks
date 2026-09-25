@@ -190,6 +190,11 @@ def delete_group(group_id: str, actor: str) -> None:
         dashboard_permissions.remove_group_everywhere(group_id)
     except Exception as exc:
         logger.warning(f"dashboard permissions of group {group_id} not cleaned: {exc}")
+    try:
+        from web.governance import policies
+        policies.remove_group_everywhere(group_id, actor)
+    except Exception as exc:
+        logger.warning(f"governance policies of group {group_id} not cleaned: {exc}")
     _audit(actor, "GROUP_DELETE", f"group:{cur['name']}", {"group_id": group_id})
 
 

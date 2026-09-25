@@ -33,10 +33,16 @@ class Principal:
     role: str = "user"
     user_id: str = ""
     is_system: bool = False
+    groups: frozenset = frozenset()            # ids of the user's groups (web/groups.py): they can exempt from a policy or carry attributes
 
     @classmethod
     def from_user(cls, user: Dict[str, Any]) -> "Principal":
-        return cls(username=user.get("username", ""), role=user.get("role", "user"), user_id=user.get("id", ""))
+        try:
+            from web import groups
+            member_of = frozenset(groups.group_ids_for(user))
+        except Exception:
+            member_of = frozenset()            # cannot tell: no group-based exemption (the restrictive answer)
+        return cls(username=user.get("username", ""), role=user.get("role", "user"), user_id=user.get("id", ""), groups=member_of)
 
     @classmethod
     def system(cls) -> "Principal":
@@ -59,7 +65,7 @@ class MaskSpec:
 def _row(r) -> Dict[str, Any]:
     d = dict(r)
     d["enabled"] = bool(d["enabled"])
-    for key in ("applies_to_types", "except_roles", "except_users"):
+    for key in ("applies_to_types", "except_roles", "except_users", "except_groups"):
         d[key] = json.loads(d[key]) if d.get(key) else ([] if key != "applies_to_types" else None)
     return d
 
@@ -99,6 +105,7 @@ def _validate(data: Dict[str, Any]) -> Dict[str, Any]:
     except_users = data.get("except_users", [])
     if not isinstance(except_users, list) or any(not isinstance(u, str) or not u.strip() for u in except_users):
         raise ValueError("except_users must be a list of usernames.")
+    except_groups = clean_group_ids(data.get("except_groups", []))
     try:
         priority = int(data.get("priority", 100))
     except (TypeError, ValueError):
@@ -108,7 +115,7 @@ def _validate(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": name, "description": (data.get("description") or "").strip(), "tag_key": tag_key, "tag_value": tag_value,
             "mask_type": mask_type, "mask_expr": mask_expr, "applies_to_types": applies,
             "except_roles": sorted(set(except_roles)), "except_users": sorted({u.strip() for u in except_users}),
-            "priority": priority, "enabled": bool(data.get("enabled", True))}
+            "except_groups": except_groups, "priority": priority, "enabled": bool(data.get("enabled", True))}
 
 
 def create_policy(data: Dict[str, Any], actor: str = "admin") -> Dict[str, Any]:
@@ -122,12 +129,12 @@ def create_policy(data: Dict[str, Any], actor: str = "admin") -> Dict[str, Any]:
             raise ValueError(f"A policy named '{rec['name']}' already exists.")
         conn.execute("""
             INSERT INTO masking_policies (id, name, description, tag_key, tag_value, mask_type, mask_expr, applies_to_types,
-                                          except_roles, except_users, priority, enabled, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          except_roles, except_users, except_groups, priority, enabled, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (pid, rec["name"], rec["description"], rec["tag_key"], rec["tag_value"], rec["mask_type"], rec["mask_expr"],
               json.dumps(rec["applies_to_types"]) if rec["applies_to_types"] else None,
-              json.dumps(rec["except_roles"]), json.dumps(rec["except_users"]), rec["priority"], int(rec["enabled"]),
-              actor, now, now))
+              json.dumps(rec["except_roles"]), json.dumps(rec["except_users"]), json.dumps(rec["except_groups"]),
+              rec["priority"], int(rec["enabled"]), actor, now, now))
         store.bump_version(conn)
         store.write_audit(conn, actor, "POLICY_CREATE", pid, rec)
         conn.commit()
@@ -168,11 +175,11 @@ def update_policy(policy_id: str, changes: Dict[str, Any], actor: str = "admin")
             raise ValueError(f"A policy named '{rec['name']}' already exists.")
         conn.execute("""
             UPDATE masking_policies SET name=?, description=?, tag_key=?, tag_value=?, mask_type=?, mask_expr=?,
-                   applies_to_types=?, except_roles=?, except_users=?, priority=?, enabled=?, updated_at=? WHERE id=?
+                   applies_to_types=?, except_roles=?, except_users=?, except_groups=?, priority=?, enabled=?, updated_at=? WHERE id=?
         """, (rec["name"], rec["description"], rec["tag_key"], rec["tag_value"], rec["mask_type"], rec["mask_expr"],
               json.dumps(rec["applies_to_types"]) if rec["applies_to_types"] else None,
-              json.dumps(rec["except_roles"]), json.dumps(rec["except_users"]), rec["priority"], int(rec["enabled"]),
-              store.utcnow(), policy_id))
+              json.dumps(rec["except_roles"]), json.dumps(rec["except_users"]), json.dumps(rec["except_groups"]),
+              rec["priority"], int(rec["enabled"]), store.utcnow(), policy_id))
         store.bump_version(conn)
         store.write_audit(conn, actor, "POLICY_UPDATE", policy_id, {"before": {k: current[k] for k in rec if k in current}, "after": rec})
         conn.commit()
@@ -211,7 +218,45 @@ def enabled_policies() -> List[Dict[str, Any]]:
 
 
 def is_exempt(policy: Dict[str, Any], principal: Principal) -> bool:
-    return principal.is_system or principal.role in policy["except_roles"] or principal.username in policy["except_users"]
+    """Exempt when the principal is the system, has an exempt role, is an exempt user, or belongs to an exempt group (any one is enough)."""
+    return (principal.is_system or principal.role in policy["except_roles"] or principal.username in policy["except_users"]
+            or bool(principal.groups and principal.groups.intersection(policy.get("except_groups") or ())))
+
+
+def clean_group_ids(value: Any) -> List[str]:
+    """Validates a list of group ids (they must exist) for `except_groups`; returns them sorted and unique."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list) or any(not isinstance(g, str) or not g.strip() for g in value):
+        raise ValueError("except_groups must be a list of group ids.")
+    from web import groups
+    ids = sorted({g.strip() for g in value})
+    missing = [g for g in ids if not groups.get_group(g)]
+    if missing:
+        raise ValueError(f"Unknown group(s): {', '.join(missing)}.")
+    return ids
+
+
+def remove_group_everywhere(group_id: str, actor: str = "system") -> None:
+    """A deleted group stops exempting from policies (the restrictive direction) and loses its row-filter attributes."""
+    store.init_governance_db()
+    conn = store.get_db()
+    try:
+        changed = False
+        for table in ("masking_policies", "row_policies"):
+            for r in conn.execute(f"SELECT id, except_groups FROM {table}").fetchall():
+                ids = json.loads(r["except_groups"] or "[]")
+                if group_id in ids:
+                    conn.execute(f"UPDATE {table} SET except_groups = ? WHERE id = ?", (json.dumps([g for g in ids if g != group_id]), r["id"]))
+                    changed = True
+        if conn.execute("DELETE FROM principal_attributes WHERE principal_type = 'group' AND principal_value = ?", (group_id,)).rowcount:
+            changed = True
+        if changed:
+            store.bump_version(conn)
+            store.write_audit(conn, actor, "GROUP_REMOVED_FROM_POLICIES", f"group:{group_id}", {})
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def resolve_column_policy(column: str, data_type: str, effective: Dict[str, Dict[str, str]],

@@ -1676,7 +1676,7 @@
         <div class="flex flex-wrap gap-2 text-xs font-medium">
           <button @click="govTab = 'tags'" :class="govTab === 'tags' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-tag"></i><span>Tags</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govTags.length"></span></button>
           <button x-show="currentUser?.role === 'admin'" @click="govTab = 'policies'" :class="govTab === 'policies' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-eye-slash"></i><span>Masking Policies</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govPolicies.length"></span></button>
-          <button x-show="currentUser?.role === 'admin'" @click="govTab = 'rowpolicies'; if (!govAttributes.length) fetchGovAttributes();" :class="govTab === 'rowpolicies' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-rows"></i><span>Row Filters</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govRowPolicies.length"></span></button>
+          <button x-show="currentUser?.role === 'admin'" @click="govTab = 'rowpolicies'; loadGroups(); if (!govAttributes.length) fetchGovAttributes();" :class="govTab === 'rowpolicies' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-rows"></i><span>Row Filters</span><span class="text-[10px] px-1.5 rounded-full bg-black/30 font-mono" x-text="govRowPolicies.length"></span></button>
           <button @click="govTab = 'suggestions'" :class="govTab === 'suggestions' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-magic-wand"></i><span>Suggestions</span></button>
           <button x-show="currentUser?.role === 'admin'" @click="govTab = 'preview'; if (!govUsers.length) fetchGovUsers();" :class="govTab === 'preview' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-user-focus"></i><span>Preview as user</span></button>
           <button x-show="currentUser?.role === 'admin'" @click="govTab = 'audit'; fetchGovAudit(); fetchGovCoverage();" :class="govTab === 'audit' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-dbx-border'" class="px-3.5 py-1.5 rounded-lg transition flex items-center space-x-1.5"><i class="ph ph-list-checks"></i><span>Audit &amp; Coverage</span></button>
@@ -1742,7 +1742,7 @@
                   <span x-show="!!(p.applies_to_types)" x-text="' on ' + (p.applies_to_types || []).join('/') + ' columns'"></span>
                   <span x-text="' · priority ' + p.priority"></span>
                 </div>
-                <div class="text-[11px] text-slate-500">Exempt: <span class="font-mono" x-text="[...(p.except_roles || []).map(r => 'role:' + r), ...(p.except_users || []).map(u => 'user:' + u)].join(', ') || 'nobody'"></span></div>
+                <div class="text-[11px] text-slate-500">Exempt: <span class="font-mono" x-text="[...(p.except_roles || []).map(r => 'role:' + r), ...(p.except_users || []).map(u => 'user:' + u), ...(p.except_groups || []).map(g => 'group:' + groupName(g))].join(', ') || 'nobody'"></span></div>
               </div>
               <div class="flex items-center space-x-1.5 text-xs shrink-0">
                 <button @click="toggleGovPolicy(p)" class="px-2.5 py-1 rounded border border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover" x-text="p.enabled ? 'Disable' : 'Enable'"></button>
@@ -1770,7 +1770,7 @@
                   <span> → keep rows where </span><span class="text-amber-700 dark:text-amber-300 font-semibold" x-text="p.filter_column"></span>
                   <span x-text="p.filter_mode === 'owner' ? ' = the caller\'s username' : (p.filter_mode === 'attribute' ? (' is assigned to the caller for \'' + p.attribute_key + '\'') : ' matches: ' + p.filter_expr)"></span>
                 </div>
-                <div class="text-[11px] text-slate-500">Exempt: <span class="font-mono" x-text="[...(p.except_roles || []).map(r => 'role:' + r), ...(p.except_users || []).map(u => 'user:' + u)].join(', ') || 'nobody'"></span></div>
+                <div class="text-[11px] text-slate-500">Exempt: <span class="font-mono" x-text="[...(p.except_roles || []).map(r => 'role:' + r), ...(p.except_users || []).map(u => 'user:' + u), ...(p.except_groups || []).map(g => 'group:' + groupName(g))].join(', ') || 'nobody'"></span></div>
               </div>
               <div class="flex items-center space-x-1.5 text-xs shrink-0">
                 <button @click="toggleGovRowPolicy(p)" class="px-2.5 py-1 rounded border border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover" x-text="p.enabled ? 'Disable' : 'Enable'"></button>
@@ -1787,10 +1787,11 @@
             </div>
             <div class="flex flex-wrap items-end gap-2 text-xs">
               <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Assign to</label>
-                <select x-model="govAttrForm.principal_type" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"><option value="user">a user</option><option value="role">a role (default)</option></select></div>
-              <div><label class="block text-[10px] uppercase text-slate-500 mb-1" x-text="govAttrForm.principal_type === 'role' ? 'Role' : 'Username'"></label>
+                <select x-model="govAttrForm.principal_type" @change="govAttrForm.principal_value = ''; if ($event.target.value === 'group') loadGroups()" data-testid="attr-type" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"><option value="user">a user</option><option value="role">a role (default)</option><option value="group">a group</option></select></div>
+              <div><label class="block text-[10px] uppercase text-slate-500 mb-1" x-text="govAttrForm.principal_type === 'role' ? 'Role' : (govAttrForm.principal_type === 'group' ? 'Group' : 'Username')"></label>
+                <template x-if="govAttrForm.principal_type === 'group'"><select x-model="govAttrForm.principal_value" @focus="loadGroups()" data-testid="attr-group" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"><option value="">Choose a group…</option><template x-for="g in groupsList" :key="g.id"><option :value="g.id" x-text="g.name"></option></template></select></template>
                 <template x-if="govAttrForm.principal_type === 'role'"><select x-model="govAttrForm.principal_value" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"><option value="admin">admin</option><option value="power_user">power_user</option><option value="user">user</option></select></template>
-                <template x-if="govAttrForm.principal_type !== 'role'"><input x-model="govAttrForm.principal_value" placeholder="analyst_bob" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></template></div>
+                <template x-if="govAttrForm.principal_type === 'user'"><input x-model="govAttrForm.principal_value" placeholder="analyst_bob" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></template></div>
               <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Attribute key</label><input x-model="govAttrForm.attribute_key" placeholder="region" class="w-28 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></div>
               <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Values (comma separated)</label><input x-model="govAttrForm.values_text" placeholder="EMEA, APAC" class="w-40 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></div>
               <button @click="saveGovAttribute()" class="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-semibold">Assign</button>
@@ -1800,7 +1801,7 @@
                 <thead class="bg-slate-100 dark:bg-slate-900 text-slate-500 uppercase text-[10px] tracking-wider"><tr><th class="py-2 px-3">Principal</th><th class="py-2 px-3">Attribute</th><th class="py-2 px-3">Values</th><th class="py-2 px-3 w-16"></th></tr></thead>
                 <tbody class="divide-y divide-slate-100 dark:divide-dbx-border/40 text-slate-700 dark:text-slate-300">
                   <template x-for="a in govAttributes" :key="a.principal_type + ':' + a.principal_value + ':' + a.attribute_key">
-                    <tr><td class="py-1.5 px-3 font-mono" x-text="a.principal_type + ':' + a.principal_value"></td>
+                    <tr><td class="py-1.5 px-3 font-mono" x-text="a.principal_type + ':' + (a.principal_type === 'group' ? groupName(a.principal_value) : a.principal_value)"></td>
                       <td class="py-1.5 px-3 font-mono text-emerald-700 dark:text-emerald-400" x-text="a.attribute_key"></td>
                       <td class="py-1.5 px-3 font-mono" x-text="a.values.join(', ')"></td>
                       <td class="py-1.5 px-3"><button @click="deleteGovAttribute(a)" class="text-rose-500 hover:text-rose-700"><i class="ph ph-trash"></i></button></td></tr>
@@ -11053,6 +11054,8 @@
         <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt roles</label>
           <div class="flex flex-wrap gap-3 text-slate-700 dark:text-slate-300"><template x-for="r in ['admin','power_user','user']" :key="r"><label class="flex items-center space-x-1"><input type="checkbox" :value="r" x-model="govPolicyForm.except_roles"><span x-text="r"></span></label></template></div></div>
         <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt users (comma separated)</label><input x-model="govPolicyForm.except_users_text" placeholder="lead_engineer, admin" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+        <div x-show="groupsList.length" data-testid="mask-exempt-groups"><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt groups (members are exempt)</label>
+          <div class="flex flex-wrap gap-3 text-slate-700 dark:text-slate-300"><template x-for="g in groupsList" :key="g.id"><label class="flex items-center space-x-1"><input type="checkbox" :value="g.id" x-model="govPolicyForm.except_groups"><span x-text="g.name"></span></label></template></div></div>
       </div>
       <!-- live behaviour + tester -->
       <div class="rounded-lg border border-slate-200 dark:border-dbx-border p-3 space-y-2 text-xs">
@@ -11099,6 +11102,8 @@
         <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt roles</label>
           <div class="flex flex-wrap gap-3 text-slate-700 dark:text-slate-300"><template x-for="r in ['admin','power_user','user']" :key="r"><label class="flex items-center space-x-1"><input type="checkbox" :value="r" x-model="govRowPolicyForm.except_roles"><span x-text="r"></span></label></template></div></div>
         <div><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt users (comma separated)</label><input x-model="govRowPolicyForm.except_users_text" placeholder="lead_engineer, admin" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 font-mono text-slate-900 dark:text-white"></div>
+        <div x-show="groupsList.length" data-testid="row-exempt-groups"><label class="block text-[10px] uppercase text-slate-500 mb-1">Exempt groups (members are exempt)</label>
+          <div class="flex flex-wrap gap-3 text-slate-700 dark:text-slate-300"><template x-for="g in groupsList" :key="g.id"><label class="flex items-center space-x-1"><input type="checkbox" :value="g.id" x-model="govRowPolicyForm.except_groups"><span x-text="g.name"></span></label></template></div></div>
       </div>
       <div class="flex justify-end space-x-2 pt-2 border-t border-dbx-border">
         <button @click="govRowPolicyModal = false" class="px-3 py-1.5 text-xs rounded border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-200">Cancel</button>
@@ -16994,14 +16999,14 @@
         govUsageTag: null,
         govUsage: [],
         govPolicyModal: false,
-        govPolicyForm: { id: null, name: '', description: '', tag_key: '', tag_value: '', mask_type: 'partial', mask_expr: '', applies_to_types: [], except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true },
+        govPolicyForm: { id: null, name: '', description: '', tag_key: '', tag_value: '', mask_type: 'partial', mask_expr: '', applies_to_types: [], except_roles: ['admin'], except_groups: [], except_users_text: '', priority: 100, enabled: true },
         govPolicyValidation: null,
         govPolicyTest: { data_type: 'VARCHAR', value: '', result: null },
         // Row filter policies (row-level security) + the principal attributes they can read
         govRowPolicies: [],
         govRowPolicyModal: false,
         govRowPolicyForm: { id: null, name: '', description: '', tag_key: '', tag_value: '', filter_column: '', filter_mode: 'owner',
-                            attribute_key: '', filter_expr: '', except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true },
+                            attribute_key: '', filter_expr: '', except_roles: ['admin'], except_groups: [], except_users_text: '', priority: 100, enabled: true },
         govRowPolicyValidation: null,
         govAttributes: [],
         govAttrForm: { principal_type: 'user', principal_value: '', attribute_key: '', values_text: '' },
@@ -18783,6 +18788,11 @@
           } finally {
             m.busy = false;
           }
+        },
+
+        groupName(id) {
+          const g = this.groupsList.find(x => x.id === id);
+          return g ? g.name : id;
         },
 
         async loadGroups() {
@@ -25831,14 +25841,15 @@
         },
 
         openGovPolicyModal(p) {
+          this.loadGroups();
           this.govPolicyForm = p ? {
             id: p.id, name: p.name, description: p.description || '', tag_key: p.tag_key, tag_value: p.tag_value || '',
             mask_type: p.mask_type, mask_expr: p.mask_expr || '', applies_to_types: [...(p.applies_to_types || [])],
-            except_roles: [...(p.except_roles || [])], except_users_text: (p.except_users || []).join(', '),
+            except_roles: [...(p.except_roles || [])], except_users_text: (p.except_users || []).join(', '), except_groups: [...(p.except_groups || [])],
             priority: p.priority, enabled: p.enabled
           } : {
             id: null, name: '', description: '', tag_key: '', tag_value: '', mask_type: 'partial', mask_expr: '',
-            applies_to_types: [], except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true
+            applies_to_types: [], except_roles: ['admin'], except_groups: [], except_users_text: '', priority: 100, enabled: true
           };
           this.govPolicyTest = { data_type: 'VARCHAR', value: '', result: null };
           this.govPolicyValidation = null;
@@ -25873,7 +25884,7 @@
             name: f.name, description: f.description, tag_key: f.tag_key, tag_value: f.tag_value || null,
             mask_type: f.mask_type, mask_expr: f.mask_type === 'custom' ? f.mask_expr : null,
             applies_to_types: f.applies_to_types.length ? f.applies_to_types : null,
-            except_roles: f.except_roles, except_users: f.except_users_text.split(',').map(u => u.trim()).filter(Boolean),
+            except_roles: f.except_roles, except_users: f.except_users_text.split(',').map(u => u.trim()).filter(Boolean), except_groups: f.except_groups || [],
             priority: Number(f.priority), enabled: f.enabled
           };
           try {
@@ -25899,14 +25910,15 @@
         },
 
         openGovRowPolicyModal(p) {
+          this.loadGroups();
           this.govRowPolicyForm = p ? {
             id: p.id, name: p.name, description: p.description || '', tag_key: p.tag_key, tag_value: p.tag_value || '',
             filter_column: p.filter_column, filter_mode: p.filter_mode, attribute_key: p.attribute_key || '',
             filter_expr: p.filter_expr || '', except_roles: [...(p.except_roles || [])],
-            except_users_text: (p.except_users || []).join(', '), priority: p.priority, enabled: p.enabled
+            except_users_text: (p.except_users || []).join(', '), except_groups: [...(p.except_groups || [])], priority: p.priority, enabled: p.enabled
           } : {
             id: null, name: '', description: '', tag_key: '', tag_value: '', filter_column: '', filter_mode: 'owner',
-            attribute_key: '', filter_expr: '', except_roles: ['admin'], except_users_text: '', priority: 100, enabled: true
+            attribute_key: '', filter_expr: '', except_roles: ['admin'], except_groups: [], except_users_text: '', priority: 100, enabled: true
           };
           this.govRowPolicyValidation = null;
           this.govRowPolicyModal = true;
@@ -25924,7 +25936,7 @@
             filter_column: f.filter_column, filter_mode: f.filter_mode,
             attribute_key: f.filter_mode === 'attribute' ? f.attribute_key : null,
             filter_expr: f.filter_mode === 'custom' ? f.filter_expr : null,
-            except_roles: f.except_roles, except_users: f.except_users_text.split(',').map(u => u.trim()).filter(Boolean),
+            except_roles: f.except_roles, except_users: f.except_users_text.split(',').map(u => u.trim()).filter(Boolean), except_groups: f.except_groups || [],
             priority: Number(f.priority), enabled: f.enabled
           };
           try {

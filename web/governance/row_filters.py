@@ -33,11 +33,11 @@ from typing import Any, Dict, List, Optional
 
 from web.governance import store, tags
 from web.governance.masks import quote_ident
-from web.governance.policies import NAME_RE, ROLES, Principal, is_exempt
+from web.governance.policies import NAME_RE, ROLES, Principal, clean_group_ids, is_exempt
 
 FILTER_MODES = ("owner", "attribute", "custom")
 ATTR_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
-PRINCIPAL_TYPES = ("user", "role")
+PRINCIPAL_TYPES = ("user", "role", "group")
 
 
 class NotFound(tags.NotFound):
@@ -62,7 +62,7 @@ def _literal(value: str) -> str:
 def _row(r) -> Dict[str, Any]:
     d = dict(r)
     d["enabled"] = bool(d["enabled"])
-    for key in ("except_roles", "except_users"):
+    for key in ("except_roles", "except_users", "except_groups"):
         d[key] = json.loads(d[key]) if d.get(key) else []
     return d
 
@@ -160,6 +160,7 @@ def _validate(data: Dict[str, Any]) -> Dict[str, Any]:
     except_users = data.get("except_users", [])
     if not isinstance(except_users, list) or any(not isinstance(u, str) or not u.strip() for u in except_users):
         raise ValueError("except_users must be a list of usernames.")
+    except_groups = clean_group_ids(data.get("except_groups", []))
     try:
         priority = int(data.get("priority", 100))
     except (TypeError, ValueError):
@@ -169,7 +170,7 @@ def _validate(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": name, "description": (data.get("description") or "").strip(), "tag_key": tag_key, "tag_value": tag_value,
             "filter_column": filter_column, "filter_mode": filter_mode, "attribute_key": attribute_key,
             "filter_expr": filter_expr, "except_roles": sorted(set(except_roles)),
-            "except_users": sorted({u.strip() for u in except_users}), "priority": priority,
+            "except_users": sorted({u.strip() for u in except_users}), "except_groups": except_groups, "priority": priority,
             "enabled": bool(data.get("enabled", True))}
 
 
@@ -184,12 +185,12 @@ def create_row_policy(data: Dict[str, Any], actor: str = "admin") -> Dict[str, A
             raise ValueError(f"A row policy named '{rec['name']}' already exists.")
         conn.execute("""
             INSERT INTO row_policies (id, name, description, tag_key, tag_value, filter_column, filter_mode,
-                                      attribute_key, filter_expr, except_roles, except_users, priority, enabled,
+                                      attribute_key, filter_expr, except_roles, except_users, except_groups, priority, enabled,
                                       created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (pid, rec["name"], rec["description"], rec["tag_key"], rec["tag_value"], rec["filter_column"], rec["filter_mode"],
               rec["attribute_key"], rec["filter_expr"], json.dumps(rec["except_roles"]), json.dumps(rec["except_users"]),
-              rec["priority"], int(rec["enabled"]), actor, now, now))
+              json.dumps(rec["except_groups"]), rec["priority"], int(rec["enabled"]), actor, now, now))
         store.bump_version(conn)
         store.write_audit(conn, actor, "ROW_POLICY_CREATE", pid, rec)
         conn.commit()
@@ -230,10 +231,10 @@ def update_row_policy(policy_id: str, changes: Dict[str, Any], actor: str = "adm
             raise ValueError(f"A row policy named '{rec['name']}' already exists.")
         conn.execute("""
             UPDATE row_policies SET name=?, description=?, tag_key=?, tag_value=?, filter_column=?, filter_mode=?,
-                   attribute_key=?, filter_expr=?, except_roles=?, except_users=?, priority=?, enabled=?, updated_at=? WHERE id=?
+                   attribute_key=?, filter_expr=?, except_roles=?, except_users=?, except_groups=?, priority=?, enabled=?, updated_at=? WHERE id=?
         """, (rec["name"], rec["description"], rec["tag_key"], rec["tag_value"], rec["filter_column"], rec["filter_mode"],
               rec["attribute_key"], rec["filter_expr"], json.dumps(rec["except_roles"]), json.dumps(rec["except_users"]),
-              rec["priority"], int(rec["enabled"]), store.utcnow(), policy_id))
+              json.dumps(rec["except_groups"]), rec["priority"], int(rec["enabled"]), store.utcnow(), policy_id))
         store.bump_version(conn)
         store.write_audit(conn, actor, "ROW_POLICY_UPDATE", policy_id, {"before": {k: current[k] for k in rec if k in current}, "after": rec})
         conn.commit()
@@ -281,6 +282,10 @@ def set_attribute_values(principal_type: str, principal_value: str, attribute_ke
         principal_value = principal_value.lower()
         if principal_value not in ROLES:
             raise ValueError(f"principal_value must be one of: {', '.join(ROLES)} when principal_type is 'role'.")
+    elif principal_type == "group":
+        from web import groups
+        if not groups.get_group(principal_value):
+            raise ValueError("principal_value must be the id of an existing group when principal_type is 'group'.")
     elif not principal_value:
         raise ValueError("principal_value (a username) is required.")
     key = tags.norm(attribute_key)
@@ -373,11 +378,14 @@ def _attr_index() -> Dict[tuple, List[str]]:
 
 
 def resolve_attribute_values(principal: Principal, attribute_key: str) -> List[str]:
-    """Union of the values assigned directly to this user and to their role, for one attribute key."""
+    """Union of the values assigned directly to this user, to their role and to each of their groups, for one attribute key. (A group
+    only ever adds values, so belonging to more groups can only show more rows; no value at all still means no rows.)"""
     idx = _attr_index()
     key = tags.norm(attribute_key)
     out = set(idx.get(("user", principal.username, key), []))
     out |= set(idx.get(("role", principal.role, key), []))
+    for gid in principal.groups:
+        out |= set(idx.get(("group", gid, key), []))
     return sorted(out)
 
 

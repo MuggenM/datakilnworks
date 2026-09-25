@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS masking_policies (
     applies_to_types TEXT,
     except_roles TEXT NOT NULL DEFAULT '["admin"]',
     except_users TEXT NOT NULL DEFAULT '[]',
+    except_groups TEXT NOT NULL DEFAULT '[]',
     priority INTEGER NOT NULL DEFAULT 100,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL,
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS row_policies (
     filter_expr TEXT,
     except_roles TEXT NOT NULL DEFAULT '["admin"]',
     except_users TEXT NOT NULL DEFAULT '[]',
+    except_groups TEXT NOT NULL DEFAULT '[]',
     priority INTEGER NOT NULL DEFAULT 100,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL,
@@ -91,7 +93,7 @@ CREATE TABLE IF NOT EXISTS row_policies (
 
 CREATE TABLE IF NOT EXISTS principal_attributes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    principal_type TEXT NOT NULL CHECK (principal_type IN ('user','role')),
+    principal_type TEXT NOT NULL CHECK (principal_type IN ('user','role','group')),
     principal_value TEXT NOT NULL,
     attribute_key TEXT NOT NULL,
     attribute_value TEXT NOT NULL,
@@ -134,11 +136,42 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive upgrades of databases created by earlier versions (group support: `except_groups` on both policy tables, and the
+    principal_attributes CHECK that now admits 'group', which SQLite can only change by rebuilding the table)."""
+    for table in ("masking_policies", "row_policies"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "except_groups" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN except_groups TEXT NOT NULL DEFAULT '[]'")
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'principal_attributes'").fetchone()
+    if row and "'group'" not in (row[0] or ""):
+        conn.executescript("""
+            BEGIN;
+            ALTER TABLE principal_attributes RENAME TO principal_attributes_old;
+            CREATE TABLE principal_attributes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                principal_type TEXT NOT NULL CHECK (principal_type IN ('user','role','group')),
+                principal_value TEXT NOT NULL,
+                attribute_key TEXT NOT NULL,
+                attribute_value TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (principal_type, principal_value, attribute_key, attribute_value)
+            );
+            INSERT INTO principal_attributes (id, principal_type, principal_value, attribute_key, attribute_value, created_by, created_at)
+                SELECT id, principal_type, principal_value, attribute_key, attribute_value, created_by, created_at FROM principal_attributes_old;
+            DROP TABLE principal_attributes_old;
+            CREATE INDEX IF NOT EXISTS idx_principal_attributes ON principal_attributes(attribute_key, principal_type, principal_value);
+            COMMIT;
+        """)
+
+
 def init_governance_db() -> None:
     """Creates the schema, the version counter and the seed tag definitions (once). Idempotent."""
     conn = get_db()
     try:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
         conn.execute("INSERT OR IGNORE INTO governance_meta (key, value) VALUES ('version', '1')")
         seeded = conn.execute("SELECT value FROM governance_meta WHERE key = 'seeded'").fetchone()
         if not seeded:
