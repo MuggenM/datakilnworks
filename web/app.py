@@ -603,9 +603,11 @@ def _oidc_redirect_uri(cfg: Dict[str, Any], request: Request) -> str:
 @app.get("/api/auth/sso")
 async def sso_providers():
     """Public: which single sign-on buttons the login screen should show (no secrets, no config detail)."""
-    from web import oidc_auth
+    from web import oidc_auth, saml_auth
     cfg = auth_frameworks.load_raw_config().get("oidc", {})
-    return {"oidc": {"enabled": oidc_auth.is_configured(cfg), "provider_name": (cfg.get("provider_name") or "SSO").strip()}}
+    scfg = auth_frameworks.load_raw_config().get("saml", {})
+    return {"oidc": {"enabled": oidc_auth.is_configured(cfg), "provider_name": (cfg.get("provider_name") or "SSO").strip()},
+            "saml": {"enabled": saml_auth.is_configured(scfg), "provider_name": (scfg.get("provider_name") or "SAML SSO").strip()}}
 
 
 def _sso_failure(message: str) -> RedirectResponse:
@@ -653,6 +655,74 @@ async def oidc_callback(request: Request, code: str = "", state: str = "", error
                     secure=redirect_uri.startswith("https://"))
     resp.delete_cookie(oidc_auth.STATE_COOKIE, path="/api/auth/oidc")
     return resp
+
+
+def _saml_base(cfg: Dict[str, Any], request: Request) -> str:
+    return (cfg.get("sp_base_url") or "").strip().rstrip("/") or f"{request.url.scheme}://{request.url.netloc}"
+
+
+@app.get("/api/auth/saml/login")
+async def saml_login(request: Request):
+    """Starts SAML sign-in: redirects the browser to the identity provider with an AuthnRequest."""
+    from web import saml_auth
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    base = _saml_base(cfg, request)
+    try:
+        url, browser = await asyncio.to_thread(saml_auth.begin_login, cfg, base, base.startswith("https://"))
+    except saml_auth.SamlError as exc:
+        return _sso_failure(str(exc))
+    resp = RedirectResponse(url=url, status_code=302)
+    if browser:   # the ACS is a cross-site POST: only a SameSite=None cookie reaches it, and that needs https
+        resp.set_cookie(saml_auth.STATE_COOKIE, browser, max_age=saml_auth.STATE_TTL_SECONDS, httponly=True, samesite="none", secure=True, path="/api/auth/saml")
+    return resp
+
+
+@app.post("/api/auth/saml/acs")
+async def saml_acs(request: Request):
+    """The identity provider POSTs its signed response here: validate, provision the account, start a session."""
+    from web import saml_auth
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    base = _saml_base(cfg, request)
+    form = await request.form()
+    try:
+        u = await asyncio.to_thread(saml_auth.complete_login, cfg, base, str(form.get("SAMLResponse") or ""), str(form.get("RelayState") or ""),
+                                    request.cookies.get(saml_auth.STATE_COOKIE), base.startswith("https://"))
+    except saml_auth.SamlError as exc:
+        resp = _sso_failure(str(exc))
+        resp.status_code = 303
+        return resp
+    record_user_login(u["id"])
+    resp = RedirectResponse(url="/", status_code=303)             # 303: the browser must GET / after this POST
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u), max_age=86400, httponly=True, samesite="lax", secure=base.startswith("https://"))
+    resp.delete_cookie(saml_auth.STATE_COOKIE, path="/api/auth/saml")
+    return resp
+
+
+@app.get("/api/auth/saml/metadata")
+async def saml_metadata(request: Request):
+    """Service-provider metadata XML to hand to the identity provider's administrator (public; it holds no secret)."""
+    from web import saml_auth
+    from fastapi.responses import Response
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    try:
+        return Response(content=await asyncio.to_thread(saml_auth.metadata_xml, cfg, _saml_base(cfg, request)), media_type="application/samlmetadata+xml")
+    except saml_auth.SamlError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class SamlMetadataImport(BaseModel):
+    url: Optional[str] = ""
+    xml: Optional[str] = ""
+
+
+@app.post("/api/auth/frameworks/saml/import-metadata")
+async def saml_import_metadata_endpoint(payload: SamlMetadataImport, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Reads the IdP's entity id, SSO URL and signing certificate from its metadata (URL or pasted XML) for the settings form."""
+    from web import saml_auth
+    try:
+        return await asyncio.to_thread(saml_auth.import_idp_metadata, payload.url or "", payload.xml or "")
+    except saml_auth.SamlError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/auth/change-password")

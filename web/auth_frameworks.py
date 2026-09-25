@@ -65,6 +65,15 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "x509_cert": "",
         "attribute_username": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
         "attribute_email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+        "provider_name": "SAML SSO",
+        "idp_entity_id": "",             # the IdP's issuer: responses from any other issuer are refused
+        "sp_base_url": "",               # the studio's public URL (ACS = <it>/api/auth/saml/acs); empty = derived from the request
+        "attribute_display_name": "",
+        "attribute_groups": "groups",    # the assertion attribute that carries group / role values
+        "admin_value": "",
+        "power_user_value": "",
+        "want_assertions_signed": True,
+        "allow_idp_initiated": False,    # off: only responses to a sign-in this studio started are accepted
         "default_role": "user"
     }
 }

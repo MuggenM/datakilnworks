@@ -294,7 +294,7 @@ def memberships_by_user() -> Dict[str, List[Dict[str, str]]]:
 
 # ---------------------------------------------------------------- directory mapping and sync
 
-SOURCES = ("local", "ldap", "oidc")
+SOURCES = ("local", "ldap", "oidc", "saml")
 
 
 def normalise_ref(source: str, ref: str) -> str:
@@ -340,7 +340,7 @@ def sync_external_memberships(user_id: str, source: str, refs, actor: str = "dir
     """Makes the user's *synced* memberships in every group mapped to `source` match the directory groups they are in now (`refs`: LDAP group
     DNs or OIDC group values). Adds what is missing, removes only synced rows that no longer apply; manual memberships are never touched.
     Callers pass `refs` only when the directory was actually asked: 'could not ask' must not look like 'in no groups'."""
-    if source not in ("ldap", "oidc"):
+    if source not in ("ldap", "oidc", "saml"):
         raise GroupError("Unknown directory source.")
     have = {normalise_ref(source, r) for r in (refs or []) if r}
     added: List[str] = []

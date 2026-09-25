@@ -28,3 +28,4 @@ azure-storage-file-datalake>=12.14.0
 cryptography>=41.0.0
 boto3>=1.34.0    # Auto-Loader S3 sources (ListObjectsV2 polling, quarantine copies)
 paramiko>=3.4.0      # Connections: SFTP sources for Auto-Loader (host key pinned per connection)
+python3-saml>=1.16.0  # SAML 2.0 single sign-on (SP); xmlsec ships as a manylinux wheel, no system packages needed

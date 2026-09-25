@@ -14276,6 +14276,13 @@
           <span x-text="'Sign in with ' + (ssoProviders.oidc.provider_name || 'SSO')"></span>
         </a>
       </div>
+      <div x-show="!loginForm.mfaToken && ssoProviders.saml && ssoProviders.saml.enabled && !(ssoProviders.oidc && ssoProviders.oidc.enabled)" class="flex items-center space-x-2 text-[10px] uppercase text-slate-400"><span class="flex-1 border-t border-slate-200 dark:border-dbx-border"></span><span>or</span><span class="flex-1 border-t border-slate-200 dark:border-dbx-border"></span></div>
+      <div x-show="!loginForm.mfaToken && ssoProviders.saml && ssoProviders.saml.enabled" class="space-y-3 text-xs">
+        <a href="/api/auth/saml/login" data-testid="saml-login" class="w-full px-4 py-2 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-300 dark:border-dbx-border text-slate-800 dark:text-slate-200 font-semibold rounded-lg flex items-center justify-center space-x-2 transition">
+          <i class="ph ph-shield-check"></i>
+          <span x-text="'Sign in with ' + (ssoProviders.saml.provider_name || 'SAML SSO')"></span>
+        </a>
+      </div>
     </div>
   </div>
 
@@ -14353,6 +14360,7 @@
                       <option value="local">Not mapped: members are added by hand</option>
                       <option value="ldap">Members of an LDAP group</option>
                       <option value="oidc">Users whose OIDC groups claim has a value</option>
+                      <option value="saml">Users whose SAML groups attribute has a value</option>
                     </select>
                   </div>
                   <div x-show="groupMap.source !== 'local'" class="space-y-1.5">
@@ -14364,7 +14372,7 @@
                       <option value="">Pick a directory group…</option>
                       <template x-for="o in groupMap.options" :key="o.dn"><option :value="o.dn" x-text="o.name + '  —  ' + o.dn"></option></template>
                     </select>
-                    <p class="text-[10px] text-slate-500" x-text="groupMap.source === 'ldap' ? 'Members are added when they sign in and whenever the LDAP directory is synced, and removed when they leave the directory group. Members added by hand are never touched.' : 'Members are added when they sign in and their identity provider sends this value in its groups claim (the claim name is set in the OIDC settings). Removal happens at their next sign-in.'"></p>
+                    <p class="text-[10px] text-slate-500" x-text="groupMap.source === 'ldap' ? 'Members are added when they sign in and whenever the LDAP directory is synced, and removed when they leave the directory group. Members added by hand are never touched.' : (groupMap.source === 'saml' ? 'Members are added when they sign in and the SAML assertion carries this value in its groups attribute (the attribute name is set in the SAML settings). Removal happens at their next sign-in.' : 'Members are added when they sign in and their identity provider sends this value in its groups claim (the claim name is set in the OIDC settings). Removal happens at their next sign-in.')"></p>
                   </div>
                   <div class="flex items-center space-x-2">
                     <button @click="saveGroupMapping()" :disabled="groupMap.busy" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="group-map-save">Save mapping</button>
@@ -15355,6 +15363,29 @@
             <div>
               <label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">IdP Public X.509 Certificate (PEM)</label>
               <textarea x-model="authConfig.saml.x509_cert" rows="2" placeholder="-----BEGIN CERTIFICATE-----&#10;MIIC...&#10;-----END CERTIFICATE-----" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:border-indigo-500"></textarea>
+            </div>
+            <div class="p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-xl space-y-2.5">
+              <div class="flex items-center justify-between"><span class="font-semibold text-slate-800 dark:text-slate-200 text-[11px]">Identity provider</span>
+                <span class="text-[10px] text-slate-500">Import fills the entity id, SSO URL and certificate from the IdP's metadata (the URL field above, or paste the XML).</span></div>
+              <div class="flex space-x-2">
+                <button type="button" @click="importSamlMetadata()" :disabled="samlImport.busy || !authConfig.saml.idp_metadata_url" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="saml-import">Import from metadata URL</button>
+                <span x-show="samlImport.msg" class="text-emerald-600 dark:text-emerald-400 self-center" x-text="samlImport.msg" data-testid="saml-import-msg"></span>
+                <span x-show="samlImport.error" class="text-rose-600 dark:text-rose-400 self-center" x-text="samlImport.error" data-testid="saml-import-error"></span>
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">IdP Entity ID (issuer)</label><input type="text" x-model="authConfig.saml.idp_entity_id" data-testid="saml-idp-entity" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
+                <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Button label</label><input type="text" x-model="authConfig.saml.provider_name" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
+                <div class="col-span-2"><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Studio public URL (SP base URL)</label><input type="text" x-model="authConfig.saml.sp_base_url" placeholder="https://studio.company.internal" data-testid="saml-sp-base" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500">
+                  <p class="text-[10px] text-slate-500 mt-1">The ACS is <span class="font-mono" x-text="((authConfig.saml.sp_base_url || window.location.origin).replace(/\/$/, '')) + '/api/auth/saml/acs'"></span>. Give the IdP's administrator <a href="/api/auth/saml/metadata" target="_blank" class="underline text-indigo-600 dark:text-indigo-300" data-testid="saml-metadata-link">this studio's metadata</a> (save first).</p></div>
+                <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Group / role attribute</label><input type="text" x-model="authConfig.saml.attribute_groups" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
+                <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Display name attribute</label><input type="text" x-model="authConfig.saml.attribute_display_name" placeholder="displayName" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
+                <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Admin value</label><input type="text" x-model="authConfig.saml.admin_value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
+                <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Power user value</label><input type="text" x-model="authConfig.saml.power_user_value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
+              </div>
+              <div class="flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-slate-700 dark:text-slate-300">
+                <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="authConfig.saml.want_assertions_signed"><span>Require signed assertions (recommended)</span></label>
+                <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="authConfig.saml.allow_idp_initiated"><span>Allow IdP-initiated sign-in (responses not started here)</span></label>
+              </div>
             </div>
           </div>
         </div>
@@ -17273,6 +17304,8 @@
             x509_cert: '',
             attribute_username: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name',
             attribute_email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress',
+            provider_name: 'SAML SSO', idp_entity_id: '', sp_base_url: '', attribute_display_name: '', attribute_groups: 'groups',
+            admin_value: '', power_user_value: '', want_assertions_signed: true, allow_idp_initiated: false,
             default_role: 'user'
           }
         },
@@ -17281,7 +17314,8 @@
         isTestingLdapBind: false,
         isSyncingLdap: false,
         ldapSyncResult: null,
-        ssoProviders: { oidc: { enabled: false, provider_name: '' } },
+        samlImport: { busy: false, msg: '', error: '' },
+        ssoProviders: { oidc: { enabled: false, provider_name: '' }, saml: { enabled: false, provider_name: '' } },
         isTestingOidc: false,
         oidcTestResult: null,
         slackConfig: {
@@ -20009,6 +20043,21 @@
             this.showToast('Error syncing LDAP users: ' + e.message, 'error');
           } finally {
             this.isSyncingLdap = false;
+          }
+        },
+
+        async importSamlMetadata() {
+          const m = this.samlImport; m.busy = true; m.msg = ''; m.error = '';
+          try {
+            const res = await fetch('/api/auth/frameworks/saml/import-metadata', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: this.authConfig.saml.idp_metadata_url }) });
+            const data = await res.json();
+            if (!res.ok) { m.error = typeof data.detail === 'string' ? data.detail : 'Could not read the metadata.'; return; }
+            Object.assign(this.authConfig.saml, { idp_entity_id: data.idp_entity_id, sso_url: data.sso_url, x509_cert: data.x509_cert || this.authConfig.saml.x509_cert });
+            m.msg = 'Imported. Review the fields, then save.';
+          } catch (e) {
+            m.error = 'Error: ' + e.message;
+          } finally {
+            m.busy = false;
           }
         },
 
