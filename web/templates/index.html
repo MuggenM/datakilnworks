@@ -11364,8 +11364,17 @@
             <div class="col-span-2"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Password</label><input type="password" x-model="connForm.secret" autocomplete="new-password" :placeholder="connForm.id ? 'stored — leave empty to keep' : ''" data-testid="conn-kafka-password" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
             <label x-show="connForm.security_protocol === 'SASL_PLAINTEXT'" class="flex items-center space-x-1.5 pt-5"><input type="checkbox" x-model="connForm.allow_insecure"><span>Allow the password without TLS (trusted internal broker only)</span></label>
           </div>
-          <div x-show="connForm.security_protocol.endsWith('SSL')"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">CA certificate (PEM, only for a private CA)</label>
+          <div x-show="connForm.security_protocol.endsWith('SSL') || (connForm.schema_registry_url || '').startsWith('https://')"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">CA certificate (PEM, only for a private CA; also used for an https Schema Registry)</label>
             <textarea rows="3" x-model="connForm.ssl_ca_pem" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></textarea></div>
+          <div class="border-t border-slate-200 dark:border-dbx-border pt-3 space-y-3" data-testid="conn-registry">
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Schema Registry URL (optional, needed for Avro topics)</label><input type="text" x-model="connForm.schema_registry_url" placeholder="https://registry.example.com:8081" data-testid="conn-registry-url" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
+              <p class="text-[10px] text-slate-500 mt-1">Confluent-compatible registry (Confluent, Redpanda, Karapace, Apicurio compat API). Streams with the Avro format fetch the message schemas from it; the login is never sent to another host.</p></div>
+            <div x-show="connForm.schema_registry_url" class="grid grid-cols-3 gap-3">
+              <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Registry user / API key (optional)</label><input type="text" x-model="connForm.registry_username" data-testid="conn-registry-user" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+              <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Registry password / API secret</label><input type="password" x-model="connForm.registry_password" autocomplete="new-password" :placeholder="connForm.id ? 'stored — leave empty to keep' : ''" data-testid="conn-registry-password" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+              <label x-show="connForm.registry_username && connForm.schema_registry_url.startsWith('http://')" class="flex items-center space-x-1.5 pt-5"><input type="checkbox" x-model="connForm.allow_insecure"><span>Allow the login over http:// (trusted internal registry only)</span></label>
+            </div>
+          </div>
         </div>
 
         <div x-show="connTest.message" class="p-2.5 rounded-lg border" :class="connTest.ok ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900 text-emerald-700 dark:text-emerald-300' : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-300'" data-testid="conn-test-result" x-text="connTest.message"></div>
@@ -11433,7 +11442,7 @@
             <select x-model="streamForm.target_catalog" :disabled="!!streamForm.id" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"><template x-for="c in autoloaderTargets" :key="c.id"><option :value="c.id" x-text="c.id + (c.kind === 's3' ? ' (S3)' : '')"></option></template></select></div>
           <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Schema</label><input type="text" x-model="streamForm.target_schema" :disabled="!!streamForm.id" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"></div>
           <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Table</label><input type="text" x-model="streamForm.target_table" :disabled="!!streamForm.id" data-testid="stream-table" placeholder="orders_raw" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange disabled:opacity-60"></div>
-          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Message format</label><select x-model="streamForm.format" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="json">JSON object per message</option><option value="text">Text (one column)</option></select></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Message format</label><select x-model="streamForm.format" data-testid="stream-format" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="json">JSON object per message</option><option value="avro">Avro (Schema Registry)</option><option value="text">Text (one column)</option></select></div>
         </div>
         <div class="grid grid-cols-4 gap-3">
           <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Start from</label><select x-model="streamForm.starting_offsets" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="earliest">Earliest (whole topic)</option><option value="latest">Latest (new messages only)</option></select></div>
@@ -17345,7 +17354,7 @@
         streamForm: { open: false, busy: false, error: '', id: '', name: '', connection: '', topic: '', target_catalog: 'warehouse', target_schema: 'dbo', target_table: '', format: 'json', starting_offsets: 'earliest', max_records: 5000, max_wait_seconds: 5, evolve_schema: false },
         connPreview: { busy: false, error: '', data: null },
         connTest: {},
-        connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '' },
+        connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '', schema_registry_url: '', registry_username: '', registry_password: '' },
         autoloaderTargets: [{ id: 'warehouse', name: 'warehouse', kind: 'local' }],
         newPipelineForm: {
           name: '',
@@ -26685,7 +26694,7 @@
 
         newConnection() {
           this.connTest = {};
-          this.connForm = { open: true, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '' };
+          this.connForm = { open: true, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '', schema_registry_url: '', registry_username: '', registry_password: '' };
         },
 
         editConnection(c) {
@@ -26694,7 +26703,7 @@
           this.connForm = { open: true, busy: false, error: '', id: c.id, name: c.name, type: c.type, description: c.description || '', base_url: cfg.base_url || '', auth: c.type === 'http' ? (cfg.auth || 'none') : 'none',
             username: cfg.username || '', header_name: cfg.header_name || '', secret: '', allow_insecure: !!cfg.allow_insecure, timeout_seconds: cfg.timeout_seconds || 30,
             host: cfg.host || '', port: cfg.port || 22, sftp_auth: c.type === 'sftp' ? (cfg.auth || 'password') : 'password', private_key: '', passphrase: '', host_key_sha256: cfg.host_key_sha256 || '',
-            bootstrap_servers: cfg.bootstrap_servers || '', security_protocol: cfg.security_protocol || 'PLAINTEXT', sasl_mechanism: cfg.sasl_mechanism || 'PLAIN', ssl_ca_pem: cfg.ssl_ca_pem || '' };
+            bootstrap_servers: cfg.bootstrap_servers || '', security_protocol: cfg.security_protocol || 'PLAINTEXT', sasl_mechanism: cfg.sasl_mechanism || 'PLAIN', ssl_ca_pem: cfg.ssl_ca_pem || '', schema_registry_url: cfg.schema_registry_url || '', registry_username: cfg.registry_username || '', registry_password: '' };
           if (c.type === 'kafka') { this.connForm.allow_insecure = !!cfg.allow_insecure; }
         },
 
@@ -26780,10 +26789,15 @@
           const f = this.connForm;
           if (f.type === 'kafka') {
             const sasl = f.security_protocol.startsWith('SASL');
-            const config = { bootstrap_servers: f.bootstrap_servers, security_protocol: f.security_protocol };
-            if (sasl) Object.assign(config, { sasl_mechanism: f.sasl_mechanism, username: f.username, allow_insecure: !!f.allow_insecure });
-            if (f.security_protocol.endsWith('SSL') && (f.ssl_ca_pem || '').trim()) config.ssl_ca_pem = f.ssl_ca_pem;
-            return { id: f.id || null, name: f.name, type: 'kafka', description: f.description, config, secret: (sasl && f.secret) ? { password: f.secret } : {} };
+            const config = { bootstrap_servers: f.bootstrap_servers, security_protocol: f.security_protocol, allow_insecure: !!f.allow_insecure };
+            if (sasl) Object.assign(config, { sasl_mechanism: f.sasl_mechanism, username: f.username });
+            const reg = (f.schema_registry_url || '').trim();
+            if (reg) { config.schema_registry_url = reg; if ((f.registry_username || '').trim()) config.registry_username = f.registry_username; }
+            if ((f.ssl_ca_pem || '').trim() && (f.security_protocol.endsWith('SSL') || reg.startsWith('https://'))) config.ssl_ca_pem = f.ssl_ca_pem;
+            const secret = {};
+            if (sasl && f.secret) secret.password = f.secret;
+            if (reg && f.registry_username && f.registry_password) secret.registry_password = f.registry_password;
+            return { id: f.id || null, name: f.name, type: 'kafka', description: f.description, config, secret };
           }
           if (f.type === 'sftp') {
             const secret = {};

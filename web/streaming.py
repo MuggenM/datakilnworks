@@ -40,7 +40,7 @@ WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 NAME_RE = re.compile(r"^.{1,80}$")
 TOPIC_RE = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
-FORMATS = ("json", "text")
+FORMATS = ("json", "text", "avro")
 START = ("earliest", "latest")
 MAX_COLUMNS = 500
 LEASE_SECONDS = 45
@@ -51,7 +51,8 @@ META_FIELDS = [("_key", pa.string()), ("_topic", pa.string()), ("_partition", pa
 RESCUED = "_rescued_data"
 RESERVED = {n for n, _ in META_FIELDS} | {RESCUED}
 DLQ_SCHEMA = pa.schema([("topic", pa.string()), ("partition", pa.int32()), ("offset", pa.int64()), ("timestamp", pa.timestamp("us", tz="UTC")),
-                        ("key", pa.string()), ("value", pa.string()), ("error", pa.string()), ("ingested_at", pa.timestamp("us", tz="UTC"))])
+                        ("key", pa.string()), ("value", pa.string()), ("error", pa.string()), ("ingested_at", pa.timestamp("us", tz="UTC")),
+                        ("value_b64", pa.string())])          # the exact bytes, for messages that are not text (Avro): re-decode or replay them later
 
 
 class StreamError(ValueError):
@@ -113,6 +114,8 @@ def _clean(data: Dict[str, Any], current: Optional[Dict[str, Any]] = None) -> Di
     fmt = g("format", "json")
     if fmt not in FORMATS:
         raise StreamError(f"The format must be one of {', '.join(FORMATS)}.")
+    if fmt == "avro" and not (conn["config"] or {}).get("schema_registry_url"):
+        raise StreamError("The Avro format needs a Schema Registry: add its URL to the Kafka connection.")
     start = g("starting_offsets", "earliest")
     if start not in START:
         raise StreamError("Starting offsets must be 'earliest' or 'latest'.")
@@ -293,7 +296,7 @@ def kafka_conf(conn: Dict[str, Any]) -> Dict[str, Any]:
                             "client.id": "datakilnworks", "socket.timeout.ms": 15000}
     if cfg.get("security_protocol", "PLAINTEXT").startswith("SASL"):
         conf.update({"sasl.mechanism": cfg["sasl_mechanism"], "sasl.username": cfg["username"], "sasl.password": secret.get("password", "")})
-    if cfg.get("ssl_ca_pem"):
+    if cfg.get("ssl_ca_pem") and cfg.get("security_protocol", "PLAINTEXT").endswith("SSL"):
         conf["ssl.ca.pem"] = cfg["ssl_ca_pem"]
     return conf
 
@@ -350,7 +353,16 @@ def test_connection(definition: Dict[str, Any]) -> Dict[str, Any]:
     try:
         md = _metadata(kafka_conf({"config": definition["config"], "secret": definition["secret"]}))
         topics = [t for t in md.topics if not t.startswith("__")]
-        return {"ok": True, "message": f"Connected to {len(md.brokers)} broker(s); {len(topics)} topic(s) visible."}
+        msg = f"Connected to {len(md.brokers)} broker(s); {len(topics)} topic(s) visible."
+        if definition["config"].get("schema_registry_url"):
+            dec = AvroDecoder({"config": definition["config"], "secret": definition["secret"]})
+            try:
+                msg += f" Schema Registry reachable ({dec.ping()} subject(s))."
+            except StreamError as exc:
+                return {"ok": False, "message": msg + " " + str(exc)}
+            finally:
+                dec.close()
+        return {"ok": True, "message": msg}
     except StreamError as exc:
         return {"ok": False, "message": str(exc)}
     except Exception as exc:
@@ -374,7 +386,19 @@ def _clean_col(name: Any) -> Optional[str]:
 def _stringify(v: Any) -> Optional[str]:
     if v is None:
         return None
-    return v if isinstance(v, str) else json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+    return v if isinstance(v, str) else json.dumps(v, separators=(",", ":"), ensure_ascii=False, default=_json_default)
+
+
+def _json_default(o: Any) -> Any:
+    import base64
+    import decimal
+    if isinstance(o, (datetime.datetime, datetime.date)):
+        return o.isoformat()
+    if isinstance(o, decimal.Decimal):
+        return str(o)
+    if isinstance(o, (bytes, bytearray)):
+        return base64.b64encode(bytes(o)).decode("ascii")
+    return str(o)
 
 
 def infer_type(values: List[Any]) -> pa.DataType:
@@ -416,7 +440,7 @@ def coerce(values: List[Any], typ: pa.DataType) -> Tuple[pa.Array, List[int]]:
     return pa.array(out, type=typ), bad
 
 
-def build_batch(rows: List[Dict[str, Any]], schema: Optional[pa.Schema], evolve: bool) -> Tuple[pa.Table, int]:
+def build_batch(rows: List[Dict[str, Any]], schema: Optional[pa.Schema], evolve: bool, hints: Optional[Dict[str, pa.DataType]] = None) -> Tuple[pa.Table, int]:
     """rows: [{"payload": {...}, "key", "topic", "partition", "offset", "timestamp_ms"}]. Returns (arrow table in the target's shape, number
     of rows that have something in `_rescued_data`). `schema` is the existing table's schema (None: the first batch defines it)."""
     known: Dict[str, Optional[pa.DataType]] = {}
@@ -449,7 +473,7 @@ def build_batch(rows: List[Dict[str, Any]], schema: Optional[pa.Schema], evolve:
         if c in RESERVED:
             continue
         vals = payload_cols.get(c, [None] * n)
-        typ = known[c] if known[c] is not None else infer_type(vals)
+        typ = known[c] if known[c] is not None else ((hints or {}).get(c) or infer_type(vals))
         arr, bad = coerce(vals, typ)
         for i in bad:
             src = next((k for k in rows[i]["payload"] if _clean_col(k) == c), c)
@@ -462,7 +486,7 @@ def build_batch(rows: List[Dict[str, Any]], schema: Optional[pa.Schema], evolve:
     cols["_offset"] = pa.array([r["offset"] for r in rows], type=pa.int64())
     ts = [r.get("timestamp_ms") for r in rows]
     cols["_timestamp"] = pa.array(ts, type=pa.timestamp("ms", tz="UTC")).cast(pa.timestamp("us", tz="UTC"))
-    cols[RESCUED] = pa.array([json.dumps(d, separators=(",", ":"), ensure_ascii=False, default=str) if d else None for d in rescued], type=pa.string())
+    cols[RESCUED] = pa.array([json.dumps(d, separators=(",", ":"), ensure_ascii=False, default=_json_default) if d else None for d in rescued], type=pa.string())
     # columns of an existing table that this batch does not have: nulls, so the table's shape is kept
     if schema is not None:
         for f in schema:
@@ -473,12 +497,174 @@ def build_batch(rows: List[Dict[str, Any]], schema: Optional[pa.Schema], evolve:
     return pa.table(cols), sum(1 for d in rescued if d)
 
 
-def decode_message(fmt: str, value: bytes) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+# ---------------------------------------------------------------- Avro with a Schema Registry
+
+class RegistryUnavailable(StreamError):
+    """The Schema Registry could not be asked (network, TLS, login, 5xx). Not a bad message: the batch is retried, nothing is dead-lettered."""
+
+
+class UnknownSchema(ValueError):
+    """The registry answered that a schema id does not exist, or it is not an Avro schema: a property of the message."""
+
+
+def avro_type(schema: Any, named: Optional[Dict[str, Any]] = None) -> pa.DataType:
+    """The Arrow type a column of this Avro (sub)schema gets. Records, arrays and maps become JSON text (as with JSON messages); a union with
+    null is its other branch; any other union is text."""
+    named = named if named is not None else {}
+    if isinstance(schema, list):
+        branches = [b for b in schema if b != "null"]
+        return avro_type(branches[0], named) if len(branches) == 1 else pa.string()
+    if isinstance(schema, str):
+        if schema in named:
+            return avro_type(named[schema], named)
+        return {"boolean": pa.bool_(), "int": pa.int32(), "long": pa.int64(), "float": pa.float32(), "double": pa.float64(), "string": pa.string(),
+                "bytes": pa.binary()}.get(schema, pa.string())
+    if isinstance(schema, dict):
+        t, logical = schema.get("type"), schema.get("logicalType")
+        if isinstance(t, (dict, list)):
+            return avro_type(t, named)
+        if schema.get("name"):
+            named[schema["name"]] = schema
+        if logical in ("timestamp-millis", "timestamp-micros"):
+            return pa.timestamp("us", tz="UTC")
+        if logical in ("local-timestamp-millis", "local-timestamp-micros"):
+            return pa.timestamp("us")
+        if logical == "date":
+            return pa.date32()
+        if logical == "decimal" and t in ("bytes", "fixed"):
+            prec, scale = int(schema.get("precision") or 0), int(schema.get("scale") or 0)
+            return pa.decimal128(prec, scale) if 1 <= prec <= 38 and 0 <= scale <= prec else pa.string()
+        if t in ("enum", "array", "map", "record", "error"):
+            return pa.string()
+        if t == "fixed":
+            return pa.binary()
+        return avro_type(t, named) if isinstance(t, str) else pa.string()
+    return pa.string()
+
+
+class AvroDecoder:
+    """Decodes Confluent wire-format messages (magic byte 0, 4-byte big-endian schema id, Avro binary) with schemas fetched from a Schema
+    Registry (cached per id; ids are immutable). `hints` collects the column types the schemas ask for, for `build_batch`."""
+
+    def __init__(self, conn: Dict[str, Any]):
+        cfg, secret = conn["config"], conn.get("secret") or {}
+        self.url = (cfg.get("schema_registry_url") or "").rstrip("/")
+        if not self.url:
+            raise StreamError("The Avro format needs a Schema Registry: add its URL to the Kafka connection.")
+        self.auth = (cfg["registry_username"], secret.get("registry_password", "")) if cfg.get("registry_username") else None
+        self.ca_pem = cfg.get("ssl_ca_pem") if self.url.startswith("https://") else None
+        self._ca_file: Optional[str] = None
+        self.cache: Dict[int, Any] = {}
+        self.hints: Dict[str, pa.DataType] = {}
+
+    def _verify(self):
+        if not self.ca_pem:
+            return True
+        if self._ca_file is None:
+            import tempfile
+            f = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+            f.write(self.ca_pem)
+            f.close()
+            self._ca_file = f.name
+        return self._ca_file
+
+    def close(self):
+        if self._ca_file:
+            try:
+                os.unlink(self._ca_file)
+            except OSError:
+                pass
+
+    def _get(self, path: str):
+        import requests
+        try:
+            # No redirects: a stored login must never be sent to another host.
+            r = requests.get(self.url + path, auth=self.auth, timeout=10, verify=self._verify(), allow_redirects=False,
+                             headers={"Accept": "application/vnd.schemaregistry.v1+json"})
+        except requests.exceptions.SSLError:
+            raise RegistryUnavailable("TLS to the Schema Registry failed: check the CA certificate.")
+        except requests.exceptions.RequestException as exc:
+            raise RegistryUnavailable(f"The Schema Registry is not reachable ({type(exc).__name__}).")
+        if r.status_code in (401, 403):
+            raise RegistryUnavailable("The Schema Registry refused the login.")
+        if 300 <= r.status_code < 400:
+            raise RegistryUnavailable("The Schema Registry redirected the request; the redirect was not followed.")
+        return r
+
+    def ping(self) -> int:
+        r = self._get("/subjects")
+        if r.status_code != 200:
+            raise RegistryUnavailable(f"The Schema Registry answered HTTP {r.status_code}.")
+        return len(r.json())
+
+    def _schema(self, sid: int):
+        if sid in self.cache:
+            return self.cache[sid]
+        r = self._get(f"/schemas/ids/{sid}")
+        if r.status_code == 404:
+            raise UnknownSchema(f"Schema id {sid} does not exist in the Schema Registry.")
+        if r.status_code != 200:
+            raise RegistryUnavailable(f"The Schema Registry answered HTTP {r.status_code}.")
+        body = r.json()
+        if (body.get("schemaType") or "AVRO").upper() != "AVRO":
+            raise UnknownSchema(f"Schema id {sid} is a {body['schemaType']} schema; only Avro is supported.")
+        try:
+            import fastavro
+            raw = json.loads(body["schema"])
+            parsed = fastavro.parse_schema(raw)
+        except ImportError:
+            raise StreamError("The fastavro package is not installed in this image (rebuild it: docker compose build).")
+        except Exception as exc:
+            raise UnknownSchema(f"Schema id {sid} is not a valid Avro schema ({str(exc)[:80]}).")
+        self.cache[sid] = (parsed, raw)
+        return self.cache[sid]
+
+    def decode(self, value: bytes) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """(payload, None) or (None, why this message is bad). Raises RegistryUnavailable when the registry cannot be asked."""
+        import struct
+        import io
+        if len(value) < 5 or value[0] != 0:
+            return None, "Not in the Schema Registry wire format (Avro): the message does not start with the magic byte 0 and a schema id."
+        sid = struct.unpack(">I", value[1:5])[0]
+        try:
+            parsed, raw = self._schema(sid)
+        except UnknownSchema as exc:
+            return None, str(exc)
+        try:
+            import fastavro
+            obj = fastavro.schemaless_reader(io.BytesIO(value[5:]), parsed)
+        except Exception as exc:
+            return None, f"The message does not match schema {sid} ({type(exc).__name__}: {str(exc)[:80]})."
+        if isinstance(obj, dict):
+            fields = {f["name"]: f["type"] for f in (raw.get("fields") or [])} if isinstance(raw, dict) else {}
+            named: Dict[str, Any] = {}
+            for name, ftype in fields.items():
+                self.hints[name] = avro_type(ftype, named)
+            return obj, None
+        self.hints["value"] = avro_type(raw)
+        return {"value": obj}, None
+
+    def decode_key(self, key: bytes) -> Optional[str]:
+        """An Avro-encoded key as JSON text; None when it is not (the caller falls back to plain text)."""
+        if not key or key[0] != 0:
+            return None
+        try:
+            obj, err = self.decode(key)
+        except RegistryUnavailable:
+            return None
+        if err or obj is None:
+            return None
+        return _stringify(obj["value"] if list(obj) == ["value"] else obj)
+
+
+def decode_message(fmt: str, value: bytes, decoder: Optional[AvroDecoder] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """(payload, None) or (None, error text)."""
     if fmt == "text":
         return {"value": value.decode("utf-8", errors="replace")}, None
+    if fmt == "avro":
+        return decoder.decode(value)
     if value[:1] == b"\x00" and len(value) > 5:
-        return None, "Schema Registry framed message (Avro/Protobuf): only JSON messages are supported."
+        return None, "Schema Registry framed message (Avro/Protobuf): choose the Avro format (Avro only; Protobuf is not supported)."
     try:
         obj = json.loads(value.decode("utf-8"))
     except UnicodeDecodeError:
@@ -553,6 +739,33 @@ def _store_offsets(sid: str, nxt: Dict[int, int]) -> None:
         c.close()
 
 
+def _key_text(key: Any, decoder: Optional["AvroDecoder"]) -> Optional[str]:
+    if key is None:
+        return None
+    if not isinstance(key, (bytes, bytearray)):
+        return str(key)
+    if decoder is not None:
+        try:
+            decoded = decoder.decode_key(bytes(key))
+        except Exception:
+            decoded = None
+        if decoded is not None:
+            return decoded
+    return key.decode("utf-8", errors="replace")
+
+
+def _b64_if_binary(fmt: str, value: bytes) -> Optional[str]:
+    """The exact bytes of a dead-lettered message when its text form would be lossy (Avro, or bytes that are not UTF-8)."""
+    import base64
+    if fmt != "avro":
+        try:
+            value.decode("utf-8")
+            return None
+        except UnicodeDecodeError:
+            pass
+    return base64.b64encode(value[:100000]).decode("ascii")
+
+
 def _open_table(location: str, so: Optional[Dict[str, str]]):
     from deltalake import DeltaTable
     from web import autoloader
@@ -583,6 +796,7 @@ class _Runner(threading.Thread):
         super().__init__(name=f"stream-{sid}", daemon=True)
         self.sid = sid
         self.stop = threading.Event()
+        self.decoder: Optional[AvroDecoder] = None
         self.client_errors: List[str] = []             # what librdkafka reported (a rejected login shows up only here)
 
     # -- thread body
@@ -633,6 +847,7 @@ class _Runner(threading.Thread):
             location, so = autoloader.resolve_target(s["target_catalog"], s["target_schema"], s["target_table"])
             if so is None:
                 os.makedirs(os.path.dirname(location), exist_ok=True)
+            self.decoder = AvroDecoder(conn) if s["format"] == "avro" else None
             topic = s["topic"]
             md = _list_topics_explained(consumer, self.client_errors, topic)
             t = md.topics.get(topic)
@@ -677,6 +892,8 @@ class _Runner(threading.Thread):
                 consumer.close()
             except Exception:
                 pass
+            if self.decoder:
+                self.decoder.close()
 
     def _start_positions(self, consumer, s, parts, location, so) -> Dict[int, int]:
         ck = _kafka()
@@ -729,16 +946,16 @@ class _Runner(threading.Thread):
             p, o = m.partition(), m.offset()
             next_off[p] = max(next_off.get(p, 0), o + 1)
             v = m.value()
-            key = m.key().decode("utf-8", errors="replace") if isinstance(m.key(), (bytes, bytearray)) else (m.key() if m.key() is not None else None)
+            key = _key_text(m.key(), self.decoder)
             tst = m.timestamp()
             ts = tst[1] if tst and tst[0] != ck.TIMESTAMP_NOT_AVAILABLE and tst[1] and tst[1] > 0 else None
             if v is None:
                 skipped += 1
                 continue
-            payload, err = decode_message(s["format"], v)
+            payload, err = decode_message(s["format"], v, self.decoder)      # may raise RegistryUnavailable: nothing is written, the batch is retried
             base = {"key": key, "topic": topic, "partition": p, "offset": o, "timestamp_ms": ts}
             if err:
-                bad.append({**base, "value": v.decode("utf-8", errors="replace")[:100000], "error": err})
+                bad.append({**base, "value": v.decode("utf-8", errors="replace")[:100000], "error": err, "value_b64": _b64_if_binary(s["format"], v)})
             else:
                 good.append({**base, "payload": payload})
         # Dead letters first; on a replay after a crash, those already committed are recognised by their offsets.
@@ -746,7 +963,7 @@ class _Runner(threading.Thread):
             self._write_dlq(s, bad, location, so)
         if good:
             schema = _arrow_schema(table) if table is not None else None
-            tbl, _rescued = build_batch(good, schema, bool(s["evolve_schema"]))
+            tbl, _rescued = build_batch(good, schema, bool(s["evolve_schema"]), self.decoder.hints if self.decoder else None)
             last_good: Dict[int, int] = {}
             for r in good:
                 last_good[r["partition"]] = max(last_good.get(r["partition"], -1), r["offset"])
@@ -794,11 +1011,12 @@ class _Runner(threading.Thread):
                         "offset": pa.array([b["offset"] for b in fresh], pa.int64()),
                         "timestamp": pa.array([b["timestamp_ms"] for b in fresh], pa.timestamp("ms", tz="UTC")).cast(pa.timestamp("us", tz="UTC")),
                         "key": [b["key"] for b in fresh], "value": [b["value"] for b in fresh], "error": [b["error"] for b in fresh],
-                        "ingested_at": pa.array([now] * len(fresh), pa.timestamp("us", tz="UTC"))}, schema=DLQ_SCHEMA)
+                        "ingested_at": pa.array([now] * len(fresh), pa.timestamp("us", tz="UTC")),
+                        "value_b64": [b.get("value_b64") for b in fresh]}, schema=DLQ_SCHEMA)
         top: Dict[int, int] = {}
         for b in fresh:
             top[b["partition"]] = max(top.get(b["partition"], -1), b["offset"])
-        write_deltalake(dlq_loc if table is None else table, tbl, mode="append", storage_options=so,
+        write_deltalake(dlq_loc if table is None else table, tbl, mode="append", schema_mode="merge", storage_options=so,
                         commit_properties=CommitProperties(app_transactions=[Transaction(_txn_app(s["id"], s["topic"], p, dlq=True), o + 1) for p, o in top.items()]))
 
 
@@ -864,7 +1082,11 @@ def preview(conn_name: str, topic: str, fmt: str = "json", limit: int = 10) -> D
     if fmt not in FORMATS:
         raise StreamError("Unknown format.")
     limit = max(1, min(int(limit or 10), 50))
-    consumer = ck.Consumer({**kafka_conf(_connection(conn_name)), "group.id": f"dkw-preview-{uuid.uuid4().hex[:8]}", "enable.auto.commit": False})
+    conn = _connection(conn_name)
+    if fmt == "avro" and not conn["config"].get("schema_registry_url"):
+        raise StreamError("The Avro format needs a Schema Registry: add its URL to the Kafka connection.")
+    decoder = AvroDecoder(conn) if fmt == "avro" else None
+    consumer = ck.Consumer({**kafka_conf(conn), "group.id": f"dkw-preview-{uuid.uuid4().hex[:8]}", "enable.auto.commit": False})
     try:
         t = consumer.list_topics(topic, timeout=15).topics.get(topic)
         if t is None or t.error is not None:
@@ -885,19 +1107,21 @@ def preview(conn_name: str, topic: str, fmt: str = "json", limit: int = 10) -> D
                 break
     finally:
         consumer.close()
+        if decoder:
+            decoder.close()
     msgs.sort(key=lambda m: (m.timestamp()[1] if m.timestamp() else 0), reverse=True)
     msgs = msgs[:limit]
     good, bad = [], []
     for m in msgs:
         if m.value() is None:
             continue
-        payload, err = decode_message(fmt, m.value())
-        base = {"key": m.key().decode("utf-8", errors="replace") if isinstance(m.key(), (bytes, bytearray)) else None, "topic": topic, "partition": m.partition(),
+        payload, err = decode_message(fmt, m.value(), decoder)
+        base = {"key": _key_text(m.key(), decoder), "topic": topic, "partition": m.partition(),
                 "offset": m.offset(), "timestamp_ms": (m.timestamp()[1] if m.timestamp() and m.timestamp()[1] > 0 else None)}
         (bad if err else good).append({**base, "payload": payload} if not err else {**base, "error": err})
     if not good:
         return {"columns": [], "rows": [], "bad": len(bad), "messages": len(msgs), "errors": [b["error"] for b in bad[:3]]}
-    tbl, rescued = build_batch(good, None, False)
+    tbl, rescued = build_batch(good, None, False, decoder.hints if decoder else None)
     cols = [{"name": f.name, "type": str(f.type)} for f in tbl.schema]
     rows = [{k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} for r in tbl.to_pylist()]
     return {"columns": cols, "rows": rows, "bad": len(bad), "messages": len(msgs), "errors": [b["error"] for b in bad[:3]]}

@@ -37,7 +37,7 @@ HTTP_AUTH = ("none", "bearer", "basic", "header")
 SFTP_AUTH = ("password", "key")
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
 # Secret fields per type: accepted on write, stored encrypted, never read back.
-SECRET_FIELDS = {"http": ("token", "password", "header_value"), "sftp": ("password", "private_key", "passphrase"), "kafka": ("password",)}
+SECRET_FIELDS = {"http": ("token", "password", "header_value"), "sftp": ("password", "private_key", "passphrase"), "kafka": ("password", "registry_password")}
 
 
 def _db_path() -> str:
@@ -154,12 +154,26 @@ def _validate_config(kind: str, cfg: Dict[str, Any], secret: Dict[str, Any], for
             if proto == "SASL_PLAINTEXT" and not cfg.get("allow_insecure"):
                 raise ConnectionError_("A password over SASL_PLAINTEXT is sent unencrypted. Use SASL_SSL, or tick 'allow insecure' for a trusted internal broker.")
             out.update(sasl_mechanism=mech, username=user, allow_insecure=bool(cfg.get("allow_insecure")))
+        reg = str(cfg.get("schema_registry_url") or "").strip()
+        if reg:
+            u = urlparse(reg)
+            if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password or u.query or u.fragment:
+                raise ConnectionError_("The Schema Registry URL must be http(s)://host[:port] without credentials, query or fragment.")
+            out["schema_registry_url"] = reg.rstrip("/")
+            ruser = str(cfg.get("registry_username") or "").strip()
+            if ruser:
+                if not secret.get("registry_password"):
+                    raise ConnectionError_("The Schema Registry password (or API secret) is required with a user name (or API key).")
+                if u.scheme == "http" and not cfg.get("allow_insecure"):
+                    raise ConnectionError_("Credentials to the Schema Registry over plain http:// are refused. Use https://, or tick 'allow insecure' for a trusted internal registry.")
+                out["registry_username"] = ruser
+                out["allow_insecure"] = bool(cfg.get("allow_insecure"))
         ca = str(cfg.get("ssl_ca_pem") or "").strip()
         if ca:
             if "BEGIN CERTIFICATE" not in ca or len(ca) > 40000:
                 raise ConnectionError_("The CA certificate must be PEM text (-----BEGIN CERTIFICATE-----).")
-            if not proto.endswith("SSL"):
-                raise ConnectionError_("A CA certificate only applies to the SSL and SASL_SSL protocols.")
+            if not proto.endswith("SSL") and not reg.startswith("https://"):
+                raise ConnectionError_("A CA certificate only applies to the SSL and SASL_SSL protocols or an https:// Schema Registry.")
             out["ssl_ca_pem"] = ca
         return out
     raise ConnectionError_(f"Unknown connection type '{kind}'.")
