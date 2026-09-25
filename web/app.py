@@ -8398,6 +8398,8 @@ def _stream_call(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except streaming.StreamBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except streaming.StreamError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -8424,6 +8426,39 @@ async def preview_stream_endpoint(payload: StreamPreviewPayload, current_user: D
     """The newest messages of a topic as the table would receive them; reads only, creates nothing."""
     from web import streaming
     return await asyncio.to_thread(_stream_call, streaming.preview, payload.connection, payload.topic, payload.format, payload.limit)
+
+class StreamRewindPayload(BaseModel):
+    start: Dict[str, Any]
+    mode: str = "replace"
+    dry_run: bool = False
+
+
+class StreamMovePayload(BaseModel):
+    connection: Optional[str] = None
+    topic: Optional[str] = None
+    target_catalog: Optional[str] = None
+    target_schema: Optional[str] = None
+    target_table: Optional[str] = None
+    start: Optional[Dict[str, Any]] = None
+    same_cluster: bool = False
+    dry_run: bool = False
+
+
+@app.post("/api/streams/{stream_id}/rewind")
+async def rewind_stream_endpoint(stream_id: str, payload: StreamRewindPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Reads the topic again from earliest / latest / a timestamp / offsets. The stream must be stopped. With mode 'replace' the rows at or after
+    the new position are deleted in the same Delta commit that lowers the recorded offsets (no duplicates); 'keep' appends them again.
+    `dry_run` returns the plan (per-partition positions and the number of rows that would be deleted) and changes nothing."""
+    from web import stream_ops
+    return await asyncio.to_thread(_stream_call, stream_ops.rewind, stream_id, payload.start, payload.mode, payload.dry_run, current_user.get("username", "admin"))
+
+@app.post("/api/streams/{stream_id}/move")
+async def move_stream_endpoint(stream_id: str, payload: StreamMovePayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Changes the connection, topic and/or target table of a stopped stream. Offsets are kept for another connection to the same cluster
+    and a new target table; another topic or cluster needs a `start` position. `dry_run` shows what would happen."""
+    from web import stream_ops
+    changes = {k: v for k, v in payload.dict().items() if k in ("connection", "topic", "target_catalog", "target_schema", "target_table")}
+    return await asyncio.to_thread(_stream_call, stream_ops.move, stream_id, changes, payload.start, payload.same_cluster, payload.dry_run, current_user.get("username", "admin"))
 
 @app.get("/api/streams/{stream_id}")
 async def get_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):

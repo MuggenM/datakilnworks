@@ -59,6 +59,10 @@ class StreamError(ValueError):
     """Invalid stream definition or unknown stream (the message is safe to show)."""
 
 
+class StreamBusy(StreamError):
+    """The operation needs the stream to be stopped (or another process holds it); HTTP 409."""
+
+
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -85,6 +89,9 @@ def _db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS stream_batches (id INTEGER PRIMARY KEY AUTOINCREMENT, stream_id TEXT NOT NULL, at TEXT, rows INTEGER,
             bad INTEGER, skipped INTEGER, offsets_json TEXT, seconds REAL);
     """)
+    if "pending" not in [r[1] for r in c.execute("PRAGMA table_info(streams)")]:
+        c.execute("ALTER TABLE streams ADD COLUMN pending TEXT")        # a rewind / move that is being applied (see web/stream_ops.py)
+        c.commit()
     return c
 
 
@@ -94,6 +101,7 @@ def _row(r: sqlite3.Row) -> Dict[str, Any]:
     d = dict(r)
     d["enabled"] = bool(d["enabled"])
     d["evolve_schema"] = bool(d["evolve_schema"])
+    d["pending"] = bool(d.get("pending"))
     return d
 
 
@@ -160,8 +168,9 @@ def create_stream(data: Dict[str, Any], actor: str) -> Dict[str, Any]:
         if clash:
             raise StreamError(f"The stream '{clash['name']}' already loads that table.")
         sid = f"stm_{uuid.uuid4().hex[:8]}"
-        c.execute("INSERT INTO streams VALUES (:id,:name,:description,:connection,:topic,:format,:starting_offsets,:target_catalog,:target_schema,"
-                  ":target_table,:max_records,:max_wait_seconds,:evolve_schema,:enabled,:by,:at,:at)", {**v, "id": sid, "by": actor, "at": _now()})
+        c.execute("INSERT INTO streams (id,name,description,connection,topic,format,starting_offsets,target_catalog,target_schema,target_table,max_records,"
+                  "max_wait_seconds,evolve_schema,enabled,created_by,created_at,updated_at) VALUES (:id,:name,:description,:connection,:topic,:format,:starting_offsets,"
+                  ":target_catalog,:target_schema,:target_table,:max_records,:max_wait_seconds,:evolve_schema,:enabled,:by,:at,:at)", {**v, "id": sid, "by": actor, "at": _now()})
         c.commit()
     finally:
         c.close()
@@ -177,7 +186,7 @@ def update_stream(sid: str, data: Dict[str, Any], actor: str) -> Dict[str, Any]:
     # The topic and target decide what the stored offsets mean; changing them would resume from offsets of another topic.
     for locked in ("connection", "topic", "target_catalog", "target_schema", "target_table"):
         if locked in data and str(data[locked]).strip().lower() != str(cur[locked]).strip().lower():
-            raise StreamError("The connection, topic and target of a stream cannot be changed (its stored offsets belong to them). Create a new stream instead.")
+            raise StreamError("The connection, topic and target of a stream are changed with Move (the stream must be stopped), because its stored offsets belong to them.")
     v = _clean(data, cur)
     c = _db()
     try:
@@ -1023,6 +1032,10 @@ class _Runner(threading.Thread):
                 self.stop.wait(LEASE_SECONDS / 3)
                 continue
             try:
+                if s.get("pending"):                                      # a rewind / move was interrupted: complete it first
+                    from web import stream_ops
+                    stream_ops.finish_pending(self.sid)
+                    continue
                 _set_state(self.sid, status="running", last_error=None, started_at=_now())
                 self._session(s)
                 backoff = 1
@@ -1253,7 +1266,15 @@ def stop_runner(sid: str, wait: float = 10.0) -> None:
 
 def sync_runners() -> None:
     """Starts a runner for every enabled stream that has none and stops the runners of disabled or deleted streams."""
-    wanted = {s["id"] for s in list_streams() if s["enabled"]}
+    all_streams = list_streams()
+    for s in all_streams:
+        if s["pending"] and not s["enabled"]:
+            try:
+                from web import stream_ops
+                stream_ops.finish_pending(s["id"])
+            except Exception as exc:
+                logger.error(f"Stream {s['name']}: could not finish an interrupted operation: {exc}")
+    wanted = {s["id"] for s in all_streams if s["enabled"]}
     with _runners_lock:
         running = list(_runners.items())
     for sid, r in running:

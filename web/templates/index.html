@@ -11399,7 +11399,7 @@
         <button @click="showStreamsModal = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
       </div>
 
-      <div x-show="!streamForm.open" class="space-y-2">
+      <div x-show="!streamForm.open && !streamOp.open" class="space-y-2">
         <div class="flex justify-end"><button @click="newStream()" data-testid="stream-new" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded font-semibold flex items-center space-x-1"><i class="ph ph-plus-circle"></i><span>New stream</span></button></div>
         <div x-show="!streamsList.length" class="text-slate-500 py-6 text-center">No streams yet. Create a Kafka connection first (Connections), then a stream.</div>
         <table x-show="streamsList.length" class="w-full text-left">
@@ -11419,12 +11419,56 @@
                   <button x-show="!st.enabled" @click="streamAction(st, 'start')" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="stream-start">Start</button>
                   <button x-show="st.enabled" @click="streamAction(st, 'stop')" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="stream-stop">Stop</button>
                   <button @click="editStream(st)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="stream-edit">Edit</button>
+                  <button @click="openStreamOp(st, 'rewind')" :disabled="st.enabled" :title="st.enabled ? 'Stop the stream first' : 'Read the topic again from an earlier position'" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="stream-rewind">Rewind</button>
+                  <button @click="openStreamOp(st, 'move')" :disabled="st.enabled" :title="st.enabled ? 'Stop the stream first' : 'Change connection, topic or target table'" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="stream-move">Move</button>
                   <button @click="deleteStream(st)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded text-red-500" data-testid="stream-delete">Delete</button>
                 </td>
               </tr>
             </template>
           </tbody>
         </table>
+      </div>
+
+      <div x-show="streamOp.open" class="space-y-3" data-testid="stream-op">
+        <h4 class="text-sm font-bold text-slate-800 dark:text-slate-100" x-text="(streamOp.kind === 'rewind' ? 'Rewind ' : 'Move ') + (streamOp.st ? streamOp.st.name : '')"></h4>
+        <p x-show="streamOp.kind === 'rewind'" class="text-[11px] text-slate-500">Read the topic again from an earlier position (or skip ahead). The recorded offsets live in the Delta table, so this writes a Delta commit; with <b>replace</b> the rows that will be read again are deleted in the same commit, so nothing is duplicated.</p>
+        <p x-show="streamOp.kind === 'move'" class="text-[11px] text-slate-500">Change what the stream reads or where it writes. Another connection to the same cluster and another table keep the position; another topic or cluster starts at the position you choose.</p>
+
+        <div x-show="streamOp.kind === 'move'" class="grid grid-cols-4 gap-3" data-testid="op-move-fields">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Connection</label><select x-model="streamOp.move.connection" @change="loadStreamTopicsFor(streamOp.move.connection)" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="op-connection"><template x-for="c in connectionsList.filter(x => x.type === 'kafka')" :key="c.id"><option :value="c.name" x-text="c.name"></option></template></select></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Topic</label><input type="text" x-model="streamOp.move.topic" list="stream-topics" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="op-topic"></div>
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Target catalog</label><select x-model="streamOp.move.target_catalog" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><template x-for="c in autoloaderTargets" :key="c.id"><option :value="c.id" x-text="c.id"></option></template></select></div>
+          <div class="grid grid-cols-2 gap-2"><div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Schema</label><input type="text" x-model="streamOp.move.target_schema" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div><div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Table</label><input type="text" x-model="streamOp.move.target_table" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="op-table"></div></div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-3">
+          <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]" x-text="streamOp.kind === 'rewind' ? 'Read again from' : 'Start position'"></label>
+            <select x-model="streamOp.startMode" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="op-start-mode">
+              <option x-show="streamOp.kind === 'move'" value="keep">Keep the current position (same topic and cluster)</option>
+              <option value="earliest">Earliest (start of the topic)</option><option value="latest">Latest (skip what is waiting)</option>
+              <option value="timestamp">A date and time (UTC)</option><option value="offsets">Offsets per partition</option></select></div>
+          <div x-show="streamOp.startMode === 'timestamp'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">UTC date and time</label><input type="datetime-local" x-model="streamOp.ts" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="op-ts"></div>
+          <div x-show="streamOp.startMode === 'offsets'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">partition=offset, one per line</label><textarea rows="3" x-model="streamOp.offsets" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="op-offsets" placeholder="0=1200&#10;1=800"></textarea></div>
+          <div x-show="streamOp.kind === 'rewind'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Rows already loaded</label>
+            <select x-model="streamOp.mode" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="op-mode"><option value="replace">Replace: delete rows at/after the new position</option><option value="keep">Keep: they are appended again (duplicates)</option></select></div>
+        </div>
+
+        <div class="flex items-center space-x-2">
+          <button type="button" @click="streamOpRun(true)" :disabled="streamOp.busy" data-testid="op-preview" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-50">Show what will happen</button>
+          <button type="button" @click="streamOpRun(false)" :disabled="streamOp.busy || !streamOp.plan" data-testid="op-apply" class="px-3 py-1.5 bg-dbx-orange text-white font-semibold rounded disabled:opacity-40" x-text="streamOp.kind === 'rewind' ? ('Rewind' + (streamOp.plan && streamOp.plan.delete_rows ? ' and delete ' + streamOp.plan.delete_rows + ' rows' : '')) : 'Move'"></button>
+          <button type="button" @click="streamOp.open = false" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded">Close</button>
+        </div>
+        <div x-show="streamOp.error" class="p-2.5 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="op-error" x-text="streamOp.error"></div>
+        <div x-show="streamOp.plan" class="border border-slate-200 dark:border-dbx-border rounded p-2 space-y-1" data-testid="op-plan">
+          <div x-show="streamOp.plan && streamOp.plan.changes" class="font-mono text-[11px]" x-text="streamOp.plan && streamOp.plan.changes ? ('Changes: ' + Object.entries(streamOp.plan.changes).map(kv => kv[0] + ' = ' + kv[1]).join(', ') + (streamOp.plan.keeps_offsets ? ' (position kept)' : ' (starts at the position below)')) : ''"></div>
+          <div x-show="streamOp.plan && streamOp.plan.duplicates_warning" class="text-amber-600">Rows already loaded stay, so the messages read again will be duplicated.</div>
+          <div x-show="streamOp.plan && streamOp.plan.delete_dead_letters" class="text-[11px]" x-text="streamOp.plan ? (streamOp.plan.delete_dead_letters + ' dead letter(s) will be deleted too and captured again.') : ''"></div>
+          <template x-for="n in (streamOp.plan ? (streamOp.plan.notes || []) : [])" :key="n"><div class="text-amber-600 text-[11px]" x-text="n"></div></template>
+          <table class="w-full text-left font-mono text-[10px]">
+            <thead class="text-slate-500"><tr><th>Partition</th><th>Now at</th><th>Will be at</th><th>Broker has</th><th x-show="streamOp.kind === 'rewind'" class="text-right">Rows deleted</th></tr></thead>
+            <tbody><template x-for="r in (streamOp.plan ? streamOp.plan.partitions : [])" :key="r.partition"><tr class="border-t border-slate-200 dark:border-dbx-border/50"><td x-text="r.partition"></td><td x-text="r.current === null || r.current === undefined ? '-' : r.current"></td><td x-text="r.target === null || r.target === undefined ? '-' : r.target"></td><td x-text="r.low + ' .. ' + r.high"></td><td x-show="streamOp.kind === 'rewind'" class="text-right" x-text="r.delete_rows"></td></tr></template></tbody>
+          </table>
+        </div>
       </div>
 
       <form x-show="streamForm.open" @submit.prevent="saveStream()" class="space-y-3" data-testid="stream-form">
@@ -17350,6 +17394,7 @@
         streamsList: [],
         streamTopics: [],
         streamPreview: {},
+        streamOp: { open: false, kind: '', st: null, busy: false, error: '', plan: null, mode: 'replace', startMode: 'earliest', ts: '', offsets: '', move: {} },
         streamsTimer: null,
         streamForm: { open: false, busy: false, error: '', id: '', name: '', connection: '', topic: '', target_catalog: 'warehouse', target_schema: 'dbo', target_table: '', format: 'json', starting_offsets: 'earliest', max_records: 5000, max_wait_seconds: 5, evolve_schema: false },
         connPreview: { busy: false, error: '', data: null },
@@ -26731,6 +26776,53 @@
         editStream(st) {
           this.streamPreview = {}; this.streamTopics = [];
           this.streamForm = { open: true, busy: false, error: '', id: st.id, name: st.name, connection: st.connection, topic: st.topic, target_catalog: st.target_catalog, target_schema: st.target_schema, target_table: st.target_table, format: st.format, starting_offsets: st.starting_offsets, max_records: st.max_records, max_wait_seconds: st.max_wait_seconds, evolve_schema: !!st.evolve_schema };
+        },
+
+        openStreamOp(st, kind) {
+          this.streamOp = { open: true, kind, st, busy: false, error: '', plan: null, mode: 'replace', startMode: kind === 'move' ? 'keep' : 'earliest', ts: '', offsets: '',
+            move: { connection: st.connection, topic: st.topic, target_catalog: st.target_catalog, target_schema: st.target_schema, target_table: st.target_table } };
+          this.loadStreamTopicsFor(st.connection);
+        },
+
+        async loadStreamTopicsFor(conn) {
+          this.streamTopics = [];
+          if (!conn) return;
+          try {
+            const res = await fetch('/api/streams/topics?connection=' + encodeURIComponent(conn));
+            if (res.ok) this.streamTopics = (await res.json()).topics || [];
+          } catch (e) { /* the topic can still be typed */ }
+        },
+
+        streamOpStart() {
+          const o = this.streamOp;
+          if (o.startMode === 'keep') return null;
+          if (o.startMode === 'timestamp') return { mode: 'timestamp', timestamp: (o.ts || '') + (o.ts && o.ts.length === 16 ? ':00Z' : 'Z') };
+          if (o.startMode === 'offsets') {
+            const offsets = {};
+            (o.offsets || '').split('\n').map(l => l.trim()).filter(Boolean).forEach(l => { const i = l.indexOf('='); if (i > 0) offsets[l.slice(0, i).trim()] = l.slice(i + 1).trim(); });
+            return { mode: 'offsets', offsets };
+          }
+          return { mode: o.startMode };
+        },
+
+        async streamOpRun(dry) {
+          const o = this.streamOp;
+          o.busy = true; o.error = '';
+          try {
+            let url, body;
+            if (o.kind === 'rewind') { url = `/api/streams/${o.st.id}/rewind`; body = { start: this.streamOpStart(), mode: o.mode, dry_run: dry }; }
+            else {
+              const changes = {}; ['connection', 'topic', 'target_catalog', 'target_schema', 'target_table'].forEach(k => { if (String(o.move[k]).trim() !== String(o.st[k])) changes[k] = String(o.move[k]).trim(); });
+              url = `/api/streams/${o.st.id}/move`; body = { ...changes, start: this.streamOpStart(), dry_run: dry };
+            }
+            const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            const d = await res.json();
+            if (!res.ok) { o.error = typeof d.detail === 'string' ? d.detail : 'The operation failed.'; if (!dry) o.plan = null; return; }
+            if (dry) { o.plan = d; return; }
+            this.showToast(o.kind === 'rewind' ? 'Rewound. Start the stream to read again.' : 'Moved. Start the stream to continue.', 'success');
+            o.open = false;
+            await this.loadStreams();
+          } catch (e) { o.error = 'Error: ' + e.message; } finally { o.busy = false; }
         },
 
         async loadStreamTopics() {
