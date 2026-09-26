@@ -11343,6 +11343,7 @@
             <template x-for="t in sh.tables" :key="t.schema_name + '.' + t.table_name">
               <div class="flex items-center justify-between px-2 py-1 rounded bg-slate-50 dark:bg-slate-900/60" data-testid="sharing-table-row">
                 <div><span class="font-mono font-semibold" x-text="t.schema_name + '.' + t.table_name"></span> <span class="text-slate-500 font-mono" x-text="'← ' + t.source"></span>
+                  <label class="ml-2 inline-flex items-center space-x-1" title="Older versions, time travel and the change feed can expose rows that were deleted since"><input type="checkbox" :checked="t.history" @change="setTableHistory(sh, t, $event.target.checked)" data-testid="sharing-table-history"><span>share history</span></label>
                   <span x-show="t.problem" class="ml-2 text-rose-500" data-testid="sharing-table-problem" :title="t.problem"><i class="ph ph-warning"></i> not shareable now: <span x-text="t.problem"></span></span></div>
                 <button @click="removeShareTable(sh, t)" class="text-slate-400 hover:text-rose-500">Remove</button>
               </div>
@@ -11350,6 +11351,7 @@
             <div x-show="!sh.tables.length" class="text-slate-500">No tables yet.</div>
             <div class="flex items-center space-x-2 pt-1">
               <input x-model="dsh.add[sh.name]" placeholder="catalog.schema.table" :data-testid="'sharing-add-source-' + sh.name" class="flex-1 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 font-mono">
+              <label class="flex items-center space-x-1 whitespace-nowrap" title="Also allow older versions, time travel and the change feed"><input type="checkbox" x-model="dsh.addHistory[sh.name]" :data-testid="'sharing-add-history-' + sh.name"><span>with history</span></label>
               <button @click="addShareTable(sh)" :data-testid="'sharing-add-table-' + sh.name" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-dbx-border rounded font-semibold">Add table</button>
             </div>
           </div>
@@ -11383,6 +11385,8 @@
               <div class="space-x-3"><button @click="rotateRecipient(r)" class="hover:underline">Rotate token</button><button x-show="r.state === 'active'" @click="revokeRecipient(r)" data-testid="sharing-recipient-revoke" class="text-amber-500 hover:underline">Revoke</button><button @click="deleteRecipient(r)" class="text-rose-500 hover:underline">Delete</button></div>
             </div>
             <div class="text-slate-500"><span x-text="r.expires_at ? 'expires ' + r.expires_at + ' UTC' : 'no expiry'"></span> · <span x-text="r.last_used_at ? 'last used ' + r.last_used_at + ' UTC' : 'never used'"></span> · <span x-text="(r.bytes_served / 1048576).toFixed(2) + ' MB downloaded'"></span></div>
+            <div class="flex items-center space-x-2"><span class="text-slate-400 uppercase text-[10px] font-semibold whitespace-nowrap">Allowed addresses</span>
+              <input :value="(r.allowed_cidrs || []).join(', ')" @change="setRecipientIps(r, $event.target.value)" :data-testid="'sharing-ips-' + r.name" placeholder="empty = any address; e.g. 203.0.113.0/24, 198.51.100.7" class="flex-1 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 font-mono"></div>
             <div class="flex flex-wrap gap-3"><template x-for="sh in dsh.data.shares" :key="sh.id"><label class="flex items-center space-x-1"><input type="checkbox" :checked="r.shares.includes(sh.name)" @change="toggleRecipientShare(r, sh.name, $event.target.checked)" :data-testid="'sharing-grant-' + r.name + '-' + sh.name"><span x-text="sh.name"></span></label></template></div>
           </div>
         </template>
@@ -17909,7 +17913,7 @@
         pipelineConn: { name: '', path: '', mode: 'file', records_path: '', params: '', pagination: 'none', page_param: 'page', size_param: '', page_size: 100, offset_param: 'offset', limit_param: 'limit', next_path: '', recursive: false, settle_seconds: 10 },
         showConnectionsModal: false,
         s3ev: { open: false, data: null, name: '', secret: '' },
-        dsh: { open: false, tab: 'shares', data: null, newShare: { name: '', comment: '' }, add: {}, newRecipient: { name: '', days: '', shares: [] }, secret: null },
+        dsh: { open: false, tab: 'shares', data: null, newShare: { name: '', comment: '' }, add: {}, addHistory: {}, newRecipient: { name: '', days: '', shares: [] }, secret: null },
         connectionsList: [],
         showStreamsModal: false,
         streamsList: [],
@@ -27573,8 +27577,16 @@
         },
 
         async addShareTable(sh) {
-          const d = await this.sharingCall('POST', `/api/sharing/shares/${encodeURIComponent(sh.name)}/tables`, { source: (this.dsh.add[sh.name] || '').trim() }, 'Table added');
-          if (d) this.dsh.add[sh.name] = '';
+          const d = await this.sharingCall('POST', `/api/sharing/shares/${encodeURIComponent(sh.name)}/tables`, { source: (this.dsh.add[sh.name] || '').trim(), history: !!this.dsh.addHistory[sh.name] }, 'Table added');
+          if (d) { this.dsh.add[sh.name] = ''; this.dsh.addHistory[sh.name] = false; }
+        },
+
+        async setTableHistory(sh, t, on) {
+          await this.sharingCall('PUT', `/api/sharing/shares/${encodeURIComponent(sh.name)}/tables/${encodeURIComponent(t.schema_name)}/${encodeURIComponent(t.table_name)}/history`, { history: on }, on ? 'History is shared for this table' : 'History is no longer shared');
+        },
+
+        async setRecipientIps(r, text) {
+          await this.sharingCall('PUT', `/api/sharing/recipients/${encodeURIComponent(r.id)}/ips`, { allowed_cidrs: text.split(/[\s,;]+/).filter(x => x) }, 'Allowed addresses saved');
         },
 
         async removeShareTable(sh, t) {

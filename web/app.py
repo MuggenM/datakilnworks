@@ -845,6 +845,7 @@ class SharePayload(BaseModel):
 
 class ShareTablePayload(BaseModel):
     source: str
+    history: bool = False
     schema_alias: Optional[str] = None
     table_alias: Optional[str] = None
 
@@ -858,6 +859,14 @@ class SharingRecipientPayload(BaseModel):
 
 class SharingSharesPayload(BaseModel):
     shares: List[str] = []
+
+
+class SharingHistoryPayload(BaseModel):
+    history: bool
+
+
+class SharingIpsPayload(BaseModel):
+    allowed_cidrs: List[str] = []
 
 
 class SharingRotatePayload(BaseModel):
@@ -895,13 +904,24 @@ async def delete_share_endpoint(name: str, current_user: Dict[str, Any] = Depend
 
 @app.post("/api/sharing/shares/{name}/tables")
 async def add_share_table_endpoint(name: str, payload: ShareTablePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    return await asyncio.to_thread(_sharing_call, delta_sharing_module.add_table, name, payload.source, current_user.get("username", "admin"), payload.schema_alias, payload.table_alias)
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.add_table, name, payload.source, current_user.get("username", "admin"), payload.schema_alias, payload.table_alias, payload.history)
 
 
 @app.delete("/api/sharing/shares/{name}/tables/{schema}/{table}")
 async def remove_share_table_endpoint(name: str, schema: str, table: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     await asyncio.to_thread(_sharing_call, delta_sharing_module.remove_table, name, schema, table, current_user.get("username", "admin"))
     return {"success": True}
+
+
+@app.put("/api/sharing/shares/{name}/tables/{schema}/{table}/history")
+async def set_share_table_history_endpoint(name: str, schema: str, table: str, payload: SharingHistoryPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.set_table_history, name, schema, table, payload.history, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.put("/api/sharing/recipients/{rid}/ips")
+async def set_recipient_ips_endpoint(rid: str, payload: SharingIpsPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.set_recipient_ips, rid, payload.allowed_cidrs, current_user.get("username", "admin"))
 
 
 def _with_profile(request: Request, res: Dict[str, Any]) -> Dict[str, Any]:
