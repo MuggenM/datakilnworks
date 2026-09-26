@@ -172,6 +172,13 @@ def _auth_headers(conn: Dict[str, Any]) -> Tuple[Dict[str, str], Any]:
     elif cfg.get("auth") == "basic":
         from requests.auth import HTTPBasicAuth
         auth = HTTPBasicAuth(cfg.get("username", ""), secret.get("password", ""))
+    elif cfg.get("auth") == "oauth2":
+        from web import oauth_client
+        try:
+            token, ttype = oauth_client.get_token(conn)
+        except oauth_client.OAuthError as exc:
+            raise SourceError(str(exc))
+        headers["Authorization"] = f"{ttype} {token}"
     return headers, auth
 
 
@@ -184,7 +191,8 @@ def _http(conn: Dict[str, Any], url: str, method: str = "GET", params: Optional[
     timeout = (min(10, cfg.get("timeout_seconds", 30)), cfg.get("timeout_seconds", 30))
     if _origin(url) != _origin(base) or not urlparse(url).path.startswith(urlparse(base).path):
         raise SourceError("The request would leave the connection's base URL.")
-    for _ in range(MAX_REDIRECTS + 1):
+    refreshed = False
+    for _ in range(MAX_REDIRECTS + 2):
         try:
             r = requests.request(method, url, params=params, headers=headers, auth=auth, timeout=timeout, stream=stream, allow_redirects=False)
         except requests.RequestException as exc:
@@ -195,6 +203,13 @@ def _http(conn: Dict[str, Any], url: str, method: str = "GET", params: Optional[
             if _origin(target) != _origin(base):
                 raise SourceError("The server redirects to another host; that is not followed.")
             url, params = target, None
+            continue
+        if r.status_code == 401 and cfg.get("auth") == "oauth2" and not refreshed:
+            r.close()                                            # the token was revoked or expired early: one fresh token, one retry
+            refreshed = True
+            from web import oauth_client
+            oauth_client.invalidate(conn)
+            headers, auth = _auth_headers(conn)
             continue
         if r.status_code in (401, 403):
             r.close()
@@ -502,10 +517,17 @@ def test_connection(conn: Dict[str, Any]) -> Dict[str, Any]:
     cfg = conn["config"]
     try:
         if conn["type"] == "http":
+            prefix = ""
+            if cfg.get("auth") == "oauth2":
+                from web import oauth_client
+                try:
+                    prefix = f"Token obtained (valid for {oauth_client.test(conn)['lifetime']} s). "
+                except oauth_client.OAuthError as exc:
+                    return {"ok": False, "message": str(exc)}
             r = _http(conn, cfg["base_url"], "GET", stream=True)
             code = r.status_code
             r.close()
-            return {"ok": True, "message": f"Reached {urlparse(cfg['base_url']).netloc} (HTTP {code})."}
+            return {"ok": True, "message": f"{prefix}Reached {urlparse(cfg['base_url']).netloc} (HTTP {code})."}
         if not cfg.get("host_key_sha256"):
             fp = discover_host_key(cfg["host"], int(cfg.get("port") or 22))
             return {"ok": False, "fingerprint": fp, "message": f"The server presents host key {fp}. Check it against the server, then save with this fingerprint."}
@@ -518,6 +540,8 @@ def test_connection(conn: Dict[str, Any]) -> Dict[str, Any]:
     except SourceError as exc:
         msg = str(exc)
         if conn["type"] == "http" and (msg.startswith("Not found") or msg.startswith("The server answered HTTP")):
+            if cfg.get("auth") == "oauth2":
+                msg = "The token was issued. " + msg
             # The server is there and did not refuse the login; an API's bare base URL often has no page of its own.
             return {"ok": True, "message": f"Reached {urlparse(cfg['base_url']).netloc}. {msg} (fine if the pipeline's path adds the resource)."}
         return {"ok": False, "message": msg}

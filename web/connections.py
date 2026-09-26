@@ -8,7 +8,8 @@ extend the connection's base URL / directory (see `autoloader_conn.safe_path`), 
 another host.
 
 Types
-  http  base_url (http/https), auth none | bearer | basic | header, timeout_seconds. Used for a file download or a REST/JSON API.
+  http  base_url (http/https), auth none | bearer | basic | header | oauth2, timeout_seconds. Used for a file download or a REST/JSON API. `oauth2` is the
+        client-credentials grant (web/oauth_client.py): token_url, client_id, scope, client_auth (basic | body), extra_params; the client_secret is the secret.
   kafka bootstrap_servers, security_protocol (PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL), SASL mechanism/user, optional CA certificate;
         the password is the secret. Read by streams (`web/streaming.py`), not by Auto-Loader pipelines.
   sftp  host, port, username, auth password | key, and `host_key_sha256`: the server's host key fingerprint, REQUIRED. It is
@@ -33,11 +34,11 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 TYPES = ("http", "sftp", "kafka")
 KAFKA_PROTOCOLS = ("PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL")
 KAFKA_MECHANISMS = ("PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512")
-HTTP_AUTH = ("none", "bearer", "basic", "header")
+HTTP_AUTH = ("none", "bearer", "basic", "header", "oauth2")
 SFTP_AUTH = ("password", "key")
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
 # Secret fields per type: accepted on write, stored encrypted, never read back.
-SECRET_FIELDS = {"http": ("token", "password", "header_value"), "sftp": ("password", "private_key", "passphrase"), "kafka": ("password", "registry_password")}
+SECRET_FIELDS = {"http": ("token", "password", "header_value", "client_secret"), "sftp": ("password", "private_key", "passphrase"), "kafka": ("password", "registry_password")}
 
 
 def _db_path() -> str:
@@ -94,7 +95,7 @@ def _validate_config(kind: str, cfg: Dict[str, Any], secret: Dict[str, Any], for
         insecure = bool(cfg.get("allow_insecure"))
         if auth != "none" and u.scheme == "http" and not insecure:
             raise ConnectionError_("Credentials over plain http:// are refused. Use https://, or tick 'allow insecure' for a trusted internal server.")
-        need = {"bearer": "token", "basic": "password", "header": "header_value"}.get(auth)
+        need = {"bearer": "token", "basic": "password", "header": "header_value", "oauth2": "client_secret"}.get(auth)
         if need and not secret.get(need):
             raise ConnectionError_(f"The {need.replace('_', ' ')} is required for '{auth}' authentication.")
         if auth == "basic" and not str(cfg.get("username") or "").strip():
@@ -102,12 +103,38 @@ def _validate_config(kind: str, cfg: Dict[str, Any], secret: Dict[str, Any], for
         header = str(cfg.get("header_name") or "").strip()
         if auth == "header" and not re.fullmatch(r"[A-Za-z0-9-]{1,64}", header):
             raise ConnectionError_("A header name (letters, digits, dashes) is required for header authentication.")
+        oauth: Dict[str, Any] = {}
+        if auth == "oauth2":
+            tu = urlparse(str(cfg.get("token_url") or "").strip())
+            if tu.scheme not in ("http", "https") or not tu.hostname or tu.username or tu.password or tu.fragment:
+                raise ConnectionError_("The token URL must be an http(s) URL without credentials or a fragment (e.g. https://login.example.com/oauth2/token).")
+            if tu.scheme == "http" and not insecure:
+                raise ConnectionError_("The client secret would be sent to the token endpoint over plain http://. Use https://, or tick 'allow insecure' for a trusted internal server.")
+            cid = str(cfg.get("client_id") or "").strip()
+            if not cid or len(cid) > 300 or re.search(r"[\s\x00-\x1f]", cid):
+                raise ConnectionError_("The client ID is required (no spaces).")
+            scope = str(cfg.get("scope") or "").strip()
+            if len(scope) > 500 or re.search(r"[\x00-\x1f\"\\]", scope):
+                raise ConnectionError_("The scope must be a plain space-separated list (max. 500 characters).")
+            method = cfg.get("client_auth") or "basic"
+            if method not in ("basic", "body"):
+                raise ConnectionError_("Client authentication must be 'basic' (HTTP Basic header) or 'body' (client_id / client_secret in the request).")
+            extra = cfg.get("extra_params") or {}
+            if not isinstance(extra, dict) or len(extra) > 10:
+                raise ConnectionError_("Extra token parameters are up to 10 name/value pairs.")
+            clean_extra = {}
+            for k, v in extra.items():
+                k, v = str(k).strip(), str(v).strip()
+                if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", k) or k in ("grant_type", "client_id", "client_secret", "scope") or len(v) > 500 or re.search(r"[\x00-\x1f]", v):
+                    raise ConnectionError_(f"'{k[:30]}' is not an allowed extra token parameter (grant_type, client_id, client_secret and scope have their own fields).")
+                clean_extra[k] = v
+            oauth = {"token_url": str(cfg["token_url"]).strip(), "client_id": cid, "scope": scope, "client_auth": method, "extra_params": clean_extra}
         try:
             timeout = max(1, min(int(cfg.get("timeout_seconds") or 30), 120))
         except (TypeError, ValueError):
             raise ConnectionError_("The timeout must be a number of seconds.")
         return {"base_url": url.rstrip("/") + "/", "auth": auth, "username": str(cfg.get("username") or "").strip(),
-                "header_name": header, "allow_insecure": insecure, "timeout_seconds": timeout}
+                "header_name": header, "allow_insecure": insecure, "timeout_seconds": timeout, **oauth}
     if kind == "sftp":
         host = str(cfg.get("host") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,253}", host):

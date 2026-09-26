@@ -11318,11 +11318,21 @@
             <p class="text-[10px] text-slate-500 mt-1">Pipelines can only add a path to this URL; the login is never sent anywhere else.</p></div>
           <div class="grid grid-cols-3 gap-3">
             <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Authentication</label>
-              <select x-model="connForm.auth" data-testid="conn-auth" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="none">None</option><option value="bearer">Bearer token</option><option value="basic">Basic (user + password)</option><option value="header">Custom header</option></select></div>
+              <select x-model="connForm.auth" data-testid="conn-auth" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="none">None</option><option value="bearer">Bearer token</option><option value="basic">Basic (user + password)</option><option value="header">Custom header</option><option value="oauth2">OAuth 2.0 client credentials</option></select></div>
             <div x-show="connForm.auth === 'basic'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">User name</label><input type="text" x-model="connForm.username" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
             <div x-show="connForm.auth === 'header'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Header name</label><input type="text" x-model="connForm.header_name" placeholder="X-Api-Key" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
-            <div x-show="connForm.auth !== 'none'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]" x-text="connForm.auth === 'bearer' ? 'Token' : (connForm.auth === 'basic' ? 'Password' : 'Header value')"></label>
+            <div x-show="connForm.auth !== 'none'"><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]" x-text="connForm.auth === 'bearer' ? 'Token' : (connForm.auth === 'basic' ? 'Password' : (connForm.auth === 'oauth2' ? 'Client secret' : 'Header value'))"></label>
               <input type="password" x-model="connForm.secret" autocomplete="new-password" :placeholder="connForm.id ? 'stored — leave empty to keep' : ''" data-testid="conn-secret" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+          </div>
+          <div x-show="connForm.auth === 'oauth2'" class="space-y-3 p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-lg" data-testid="conn-oauth">
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Token URL</label><input type="text" x-model="connForm.token_url" placeholder="https://login.example.com/oauth2/token" data-testid="conn-token-url" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+            <div class="grid grid-cols-3 gap-3">
+              <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Client ID</label><input type="text" x-model="connForm.client_id" autocomplete="off" data-testid="conn-client-id" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+              <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Scope (optional)</label><input type="text" x-model="connForm.scope" placeholder="api.read" data-testid="conn-scope" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></div>
+              <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Send the client credentials</label><select x-model="connForm.client_auth" data-testid="conn-client-auth" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"><option value="basic">as an HTTP Basic header (default)</option><option value="body">in the request body</option></select></div>
+            </div>
+            <div><label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Extra token parameters (optional, one name=value per line)</label><textarea rows="2" x-model="connForm.extra_text" placeholder="audience=https://api.example.com" spellcheck="false" data-testid="conn-extra" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange"></textarea></div>
+            <p class="text-[10px] text-slate-500">The studio fetches an access token itself (grant_type=client_credentials), keeps it in memory only, refreshes it before it expires and once more if the API rejects it. The client secret (the field above) goes to the token URL only; the token goes to this connection's base URL only.</p>
           </div>
           <div class="flex items-center space-x-4">
             <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="connForm.allow_insecure"><span>Allow credentials over plain http:// (trusted internal server only)</span></label>
@@ -17723,7 +17733,7 @@
         connPreview: { busy: false, error: '', data: null },
         pathPreview: { busy: false, error: '', data: null },
         connTest: {},
-        connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '', schema_registry_url: '', registry_username: '', registry_password: '' },
+        connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '', schema_registry_url: '', registry_username: '', registry_password: '', token_url: '', client_id: '', scope: '', client_auth: 'basic', extra_text: '' },
         autoloaderTargets: [{ id: 'warehouse', name: 'warehouse', kind: 'local' }],
         newPipelineForm: {
           name: '',
@@ -27342,7 +27352,7 @@
 
         newConnection() {
           this.connTest = {};
-          this.connForm = { open: true, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '', schema_registry_url: '', registry_username: '', registry_password: '' };
+          this.connForm = { open: true, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '', schema_registry_url: '', registry_username: '', registry_password: '', token_url: '', client_id: '', scope: '', client_auth: 'basic', extra_text: '' };
         },
 
         editConnection(c) {
@@ -27351,7 +27361,8 @@
           this.connForm = { open: true, busy: false, error: '', id: c.id, name: c.name, type: c.type, description: c.description || '', base_url: cfg.base_url || '', auth: c.type === 'http' ? (cfg.auth || 'none') : 'none',
             username: cfg.username || '', header_name: cfg.header_name || '', secret: '', allow_insecure: !!cfg.allow_insecure, timeout_seconds: cfg.timeout_seconds || 30,
             host: cfg.host || '', port: cfg.port || 22, sftp_auth: c.type === 'sftp' ? (cfg.auth || 'password') : 'password', private_key: '', passphrase: '', host_key_sha256: cfg.host_key_sha256 || '',
-            bootstrap_servers: cfg.bootstrap_servers || '', security_protocol: cfg.security_protocol || 'PLAINTEXT', sasl_mechanism: cfg.sasl_mechanism || 'PLAIN', ssl_ca_pem: cfg.ssl_ca_pem || '', schema_registry_url: cfg.schema_registry_url || '', registry_username: cfg.registry_username || '', registry_password: '' };
+            bootstrap_servers: cfg.bootstrap_servers || '', security_protocol: cfg.security_protocol || 'PLAINTEXT', sasl_mechanism: cfg.sasl_mechanism || 'PLAIN', ssl_ca_pem: cfg.ssl_ca_pem || '', schema_registry_url: cfg.schema_registry_url || '', registry_username: cfg.registry_username || '', registry_password: '', token_url: cfg.token_url || '', client_id: cfg.client_id || '', scope: cfg.scope || '', client_auth: cfg.client_auth || 'basic',
+            extra_text: Object.entries(cfg.extra_params || {}).map(([k, v]) => k + '=' + v).join('\n') };
           if (c.type === 'kafka') { this.connForm.allow_insecure = !!cfg.allow_insecure; }
         },
 
@@ -27502,9 +27513,14 @@
               config: { host: f.host, port: f.port, username: f.username, auth: f.sftp_auth, host_key_sha256: f.host_key_sha256 }, secret };
           }
           const secret = {};
-          if (f.secret) secret[f.auth === 'bearer' ? 'token' : (f.auth === 'basic' ? 'password' : 'header_value')] = f.secret;
-          return { id: f.id || null, name: f.name, type: 'http', description: f.description,
-            config: { base_url: f.base_url, auth: f.auth, username: f.username, header_name: f.header_name, allow_insecure: f.allow_insecure, timeout_seconds: f.timeout_seconds }, secret };
+          if (f.secret) secret[f.auth === 'bearer' ? 'token' : (f.auth === 'basic' ? 'password' : (f.auth === 'oauth2' ? 'client_secret' : 'header_value'))] = f.secret;
+          const config = { base_url: f.base_url, auth: f.auth, username: f.username, header_name: f.header_name, allow_insecure: f.allow_insecure, timeout_seconds: f.timeout_seconds };
+          if (f.auth === 'oauth2') {
+            const extra = {};
+            (f.extra_text || '').split('\n').map(l => l.trim()).filter(Boolean).forEach(l => { const i = l.indexOf('='); if (i > 0) extra[l.slice(0, i).trim()] = l.slice(i + 1).trim(); });
+            Object.assign(config, { token_url: f.token_url, client_id: f.client_id, scope: f.scope, client_auth: f.client_auth, extra_params: extra });
+          }
+          return { id: f.id || null, name: f.name, type: 'http', description: f.description, config, secret };
         },
 
         async testConnection() {
