@@ -14584,6 +14584,61 @@
         <button @click="iamTab = 'users'" :class="iamTab === 'users' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-users">Users</button>
         <button @click="iamTab = 'groups'; loadGroups()" :class="iamTab === 'groups' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-groups">Groups <span class="ml-1 text-[10px] font-mono px-1.5 rounded bg-slate-100 dark:bg-slate-800" x-text="groupsList.length"></span></button>
         <button @click="iamTab = 'mfa'; loadMfaPolicy()" :class="iamTab === 'mfa' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-mfa">Two-factor policy</button>
+        <button @click="iamTab = 'network'; loadIpAllow()" :class="iamTab === 'network' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-network">Network access</button>
+      </div>
+
+      <!-- Network access: IP allowlist (CIDR rules) with a trusted-proxy setting -->
+      <div x-show="iamTab === 'network'" class="flex-1 min-h-0 overflow-y-auto space-y-4 text-xs" data-testid="ip-panel">
+        <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-2" data-testid="ip-me">
+          <div class="text-[10px] uppercase text-slate-500">Your connection</div>
+          <div class="flex items-center space-x-3 flex-wrap gap-y-1">
+            <span>Address seen by the server: <b class="font-mono" data-testid="ip-me-address" x-text="ipAllow.me ? ipAllow.me.ip : '-'"></b></span>
+            <span x-show="ipAllow.me && ipAllow.me.via_proxy" class="px-2 py-0.5 rounded bg-sky-100 text-sky-800 border border-sky-300">via trusted proxy <span class="font-mono" x-text="ipAllow.me ? ipAllow.me.peer : ''"></span></span>
+            <span x-show="ipAllow.me" class="px-2 py-0.5 rounded border" :class="ipAllow.me && ipAllow.me.allowed ? 'bg-emerald-100 text-emerald-800 border-emerald-300' : 'bg-amber-100 text-amber-800 border-amber-300'" x-text="ipAllow.me ? (ipAllow.me.allowed ? 'matches the current rules' : 'not matched by the current rules') : ''"></span>
+            <button @click="ipAddRule(ipAllow.me.ip, 'my address when the rule was added')" x-show="ipAllow.me && ipAllow.me.ip" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="ip-add-mine">Add my address</button>
+          </div>
+          <div x-show="ipAllow.me && ipAllow.me.warning" class="p-2 rounded bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300" data-testid="ip-warning" x-text="ipAllow.me ? ipAllow.me.warning : ''"></div>
+        </div>
+
+        <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-3">
+          <div class="flex items-center space-x-4">
+            <span class="font-semibold text-sm text-slate-800 dark:text-slate-100">IP allowlist</span>
+            <select x-model="ipAllow.form.mode" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange max-w-xs" data-testid="ip-mode"><option value="off">Off (everyone)</option><option value="monitor">Monitor (allow, record what would be blocked)</option><option value="enforce">Enforce (block everything else)</option></select>
+            <span x-show="ipAllow.config && ipAllow.config.overridden" class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300" data-testid="ip-overridden">Suspended by IP_ALLOWLIST_OVERRIDE in the environment</span>
+            <button @click="saveIpAllow()" :disabled="ipAllow.busy" class="ml-auto px-3 py-1.5 bg-dbx-orange text-white font-semibold rounded disabled:opacity-50" data-testid="ip-save">Save</button>
+          </div>
+          <div class="grid grid-cols-2 gap-4">
+            <div class="space-y-2">
+              <div class="text-[10px] uppercase text-slate-500">Allowed addresses and ranges (CIDR)</div>
+              <template x-for="(r, i) in ipAllow.form.rules" :key="r.cidr"><div class="flex items-center space-x-2" data-testid="ip-rule"><span class="font-mono w-44" x-text="r.cidr"></span><span class="flex-1 text-slate-500 truncate" x-text="r.note"></span><button @click="ipAllow.form.rules.splice(i, 1)" class="text-slate-400 hover:text-red-500"><i class="ph ph-trash"></i></button></div></template>
+              <div x-show="!ipAllow.form.rules.length" class="text-slate-500">No rules yet.</div>
+              <div class="flex items-center space-x-2"><input type="text" x-model="ipAllow.newRule" placeholder="203.0.113.0/24 or 198.51.100.7 or 2001:db8::/32" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="ip-new-rule" @keydown.enter.prevent="ipAddRule(ipAllow.newRule, ipAllow.newNote); ipAllow.newRule = ''; ipAllow.newNote = ''"><input type="text" x-model="ipAllow.newNote" placeholder="note" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange w-40"><button @click="ipAddRule(ipAllow.newRule, ipAllow.newNote); ipAllow.newRule = ''; ipAllow.newNote = ''" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="ip-add-rule">Add</button></div>
+            </div>
+            <div class="space-y-2">
+              <div class="text-[10px] uppercase text-slate-500">Trusted proxies (their X-Forwarded-For is believed)</div>
+              <template x-for="(r, i) in ipAllow.form.trusted_proxies" :key="r.cidr"><div class="flex items-center space-x-2" data-testid="ip-proxy"><span class="font-mono w-44" x-text="r.cidr"></span><span class="flex-1 text-slate-500 truncate" x-text="r.note"></span><button @click="ipAllow.form.trusted_proxies.splice(i, 1)" class="text-slate-400 hover:text-red-500"><i class="ph ph-trash"></i></button></div></template>
+              <template x-for="c in (ipAllow.config ? ipAllow.config.env_trusted_proxies : [])" :key="c"><div class="flex items-center space-x-2 text-slate-500"><span class="font-mono w-44" x-text="c"></span><span>from TRUSTED_PROXIES (environment)</span></div></template>
+              <div x-show="!ipAllow.form.trusted_proxies.length && !(ipAllow.config && ipAllow.config.env_trusted_proxies.length)" class="text-slate-500">None: the connecting address is always the client (right unless a reverse proxy sits in front of the studio).</div>
+              <div class="flex items-center space-x-2"><input type="text" x-model="ipAllow.newProxy" placeholder="10.0.0.0/8 (your reverse proxy)" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="ip-new-proxy" @keydown.enter.prevent="ipAddProxy()"><button @click="ipAddProxy()" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="ip-add-proxy">Add</button></div>
+            </div>
+          </div>
+          <p class="text-[11px] text-slate-500">A request from an address outside every rule gets 403 before anything else runs (sign-in and SSO callbacks included). Loopback without forwarding headers (health checks, <span class="font-mono">docker exec</span>) and the notebook sandbox's own calls always pass. Start with <b>Monitor</b>, look at what would have been blocked below, then enforce. If you are locked out anyway, set <span class="font-mono">IP_ALLOWLIST_OVERRIDE=off</span> in the studio's environment and restart it.</p>
+          <div x-show="ipAllow.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="ip-error" x-text="ipAllow.error"></div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-2">
+            <div class="text-[10px] uppercase text-slate-500">Check an address against the saved rules</div>
+            <div class="flex items-center space-x-2"><input type="text" x-model="ipAllow.checkIp" placeholder="198.51.100.9" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="ip-check-input" @keydown.enter.prevent="ipCheck()"><button @click="ipCheck()" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="ip-check">Check</button></div>
+            <div x-show="ipAllow.checkResult" class="font-mono" data-testid="ip-check-result" x-text="ipAllow.checkResult ? (ipAllow.checkResult.ip + ': ' + (ipAllow.checkResult.allowed ? 'allowed by ' + ipAllow.checkResult.rule : 'not allowed')) : ''"></div>
+          </div>
+          <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-2">
+            <div class="flex items-center justify-between"><span class="text-[10px] uppercase text-slate-500">Refused / would be refused (since this process started)</span><button @click="loadIpAllow()" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="ip-refresh">Refresh</button></div>
+            <div x-show="!ipAllow.activity || !ipAllow.activity.top.length" class="text-slate-500">Nothing so far.</div>
+            <table x-show="ipAllow.activity && ipAllow.activity.top.length" class="w-full text-left font-mono text-[11px]"><thead class="text-slate-500"><tr><th>Address</th><th class="text-right">Blocked</th><th class="text-right">Would block</th><th>Last</th></tr></thead>
+              <tbody><template x-for="t in (ipAllow.activity ? ipAllow.activity.top : [])" :key="t.ip"><tr class="border-t border-slate-200 dark:border-dbx-border/50" data-testid="ip-activity-row"><td x-text="t.ip"></td><td class="text-right" x-text="t.blocked"></td><td class="text-right" x-text="t.would_block"></td><td x-text="new Date(t.last_at * 1000).toISOString().slice(11, 19)"></td></tr></template></tbody></table>
+          </div>
+        </div>
       </div>
 
       <!-- Two-factor policy: require MFA org-wide, grace period, statistics -->
@@ -17510,6 +17565,7 @@
         isAuthenticated: false,
         showLoginModal: false,
         loginForm: { username: '', password: '', error: null, loading: false, mfaToken: null, mfaCode: '' },
+        ipAllow: { form: { mode: 'off', rules: [], trusted_proxies: [] }, config: null, me: null, activity: null, error: '', busy: false, newRule: '', newNote: '', newProxy: '', checkIp: '', checkResult: null },
         mfaPolicy: { form: { enabled: false, roles: ['admin', 'power_user', 'user'], grace_days: 14 }, policy: null, stats: null, error: '', busy: false },
         mfa: { forced: false, graceDismissed: false, open: false, status: { enabled: false, pending: false, backup_codes_remaining: 0 }, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' },
 
@@ -18890,6 +18946,47 @@
         mfaEnrollmentRequired() {
           const p = this.currentUser && this.currentUser.mfa_policy;
           return !!(p && p.state === 'overdue');
+        },
+
+        async loadIpAllow() {
+          try {
+            const res = await fetch('/api/ip-allowlist');
+            if (!res.ok) return;
+            const d = await res.json();
+            this.ipAllow.config = d.config; this.ipAllow.me = d.me; this.ipAllow.activity = d.activity;
+            if (!this.ipAllow.dirty) this.ipAllow.form = { mode: d.config.stored_mode, rules: d.config.rules.map(r => ({ ...r })), trusted_proxies: d.config.trusted_proxies.map(r => ({ ...r })) };
+          } catch (e) { this.ipAllow.error = 'Could not load: ' + e.message; }
+        },
+
+        ipAddRule(cidr, note) {
+          cidr = (cidr || '').trim(); if (!cidr) return;
+          if (!this.ipAllow.form.rules.some(r => r.cidr === cidr || r.cidr === cidr + '/32' || r.cidr === cidr + '/128')) this.ipAllow.form.rules.push({ cidr, note: note || '' });
+          this.ipAllow.dirty = true;
+        },
+
+        ipAddProxy() {
+          const c = (this.ipAllow.newProxy || '').trim(); if (!c) return;
+          this.ipAllow.form.trusted_proxies.push({ cidr: c, note: '' }); this.ipAllow.newProxy = ''; this.ipAllow.dirty = true;
+        },
+
+        async saveIpAllow() {
+          this.ipAllow.busy = true; this.ipAllow.error = '';
+          try {
+            const res = await fetch('/api/ip-allowlist', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.ipAllow.form) });
+            const d = await res.json();
+            if (!res.ok) { this.ipAllow.error = typeof d.detail === 'string' ? d.detail : 'Could not save.'; return; }
+            this.ipAllow.dirty = false;
+            this.showToast('Network access saved.', 'success');
+            await this.loadIpAllow();
+          } catch (e) { this.ipAllow.error = 'Error: ' + e.message; } finally { this.ipAllow.busy = false; }
+        },
+
+        async ipCheck() {
+          this.ipAllow.checkResult = null; this.ipAllow.error = '';
+          const res = await fetch('/api/ip-allowlist/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ip: this.ipAllow.checkIp }) });
+          const d = await res.json();
+          if (!res.ok) { this.ipAllow.error = d.detail || 'Could not check.'; return; }
+          this.ipAllow.checkResult = d;
         },
 
         async loadMfaPolicy() {

@@ -24,4 +24,4 @@ COPY config/00_databricks_shim.py /root/.ipython/profile_default/startup/00_data
 
 EXPOSE 8000
 
-CMD ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

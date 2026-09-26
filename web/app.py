@@ -246,6 +246,31 @@ async def _mfa_policy_gate(request: Request, call_next):
                         "detail": "Your organisation requires two-factor authentication. Turn it on to continue.", "mfa_enrollment_required": True})
     return await call_next(request)
 
+@app.middleware("http")
+async def _ip_allowlist_gate(request: Request, call_next):
+    """
+    Per-deployment IP allowlist (web/ip_allowlist.py). Defined last of the gates so it runs first: an address outside the rules gets a 403 before
+    login, SSO callbacks, the UI shell or /docs are served. Off by default; `monitor` only records what would have been refused.
+    """
+    from web import ip_allowlist
+    try:
+        peer = request.client.host if request.client else None
+        verdict, client, why = ip_allowlist.check_request(peer, dict(request.headers), request.url.path,
+                                                          sandbox_peer=sandbox_client.is_sandbox_peer(peer))
+    except Exception as exc:                                   # a bug here must not lock everybody out; it is logged loudly
+        logger.error(f"IP allowlist check failed, letting the request through: {exc}", exc_info=True)
+        return await call_next(request)
+    if verdict == "allow":
+        return await call_next(request)
+    ip_allowlist.record(verdict, client, request.method, request.url.path)
+    if verdict == "would_block":
+        return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        return JSONResponse(status_code=403, content={"detail": "Access from your network address is not allowed.", "ip_blocked": True, "your_address": client["text"]})
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(status_code=403, content=f"<!doctype html><title>Access denied</title><body style='font-family:sans-serif;margin:3rem'><h2>Access denied</h2><p>This Data Kiln Works Studio only accepts connections from approved networks. Your address is <code>{client['text'] or 'unknown'}</code>.</p><p>Ask an administrator to add it.</p></body>")
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -661,6 +686,44 @@ class MfaExemptPayload(BaseModel):
 
 class MfaExtendPayload(BaseModel):
     days: int
+
+
+class IpAllowlistPayload(BaseModel):
+    mode: str
+    rules: List[Dict[str, Any]] = []
+    trusted_proxies: List[Dict[str, Any]] = []
+
+
+class IpCheckPayload(BaseModel):
+    ip: str
+
+
+@app.get("/api/ip-allowlist")
+async def get_ip_allowlist_endpoint(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The rules and proxy settings, who the server thinks YOU are (address, proxy, whether you would pass), and what was refused recently."""
+    from web import ip_allowlist
+    peer = request.client.host if request.client else None
+    return {"config": ip_allowlist.get_config(), "me": ip_allowlist.whoami(peer, dict(request.headers)), "activity": ip_allowlist.activity()}
+
+
+@app.put("/api/ip-allowlist")
+async def set_ip_allowlist_endpoint(payload: IpAllowlistPayload, request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Mode off | monitor | enforce, CIDR rules and trusted proxies. Refused when it would block the administrator making the change."""
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.set_config(payload.mode, payload.rules, payload.trusted_proxies, current_user.get("username", "admin"),
+                                       request.client.host if request.client else None, dict(request.headers))
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/ip-allowlist/check")
+async def check_ip_allowlist_endpoint(payload: IpCheckPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.check_address(payload.ip)
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/mfa/policy")

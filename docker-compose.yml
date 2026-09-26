@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     image: localspark-lakehouse-notebook
     container_name: local-datakilnworks-studio
-    command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--reload"]
     ports:
       - "${STUDIO_PORT:-8891}:8000"
     environment:
@@ -35,6 +35,11 @@ services:
       - NOTEBOOKS_GIT_TOKEN=${NOTEBOOKS_GIT_TOKEN:-}
       - NOTEBOOKS_GIT_MODE=${NOTEBOOKS_GIT_MODE:-direct}
       - NOTEBOOKS_GIT_API_URL=${NOTEBOOKS_GIT_API_URL:-}
+      # IP allowlist (Users & IAM > Network access). TRUSTED_PROXIES: CIDRs of reverse proxies whose X-Forwarded-For is believed (added to the setting).
+      # IP_ALLOWLIST_OVERRIDE=off suspends enforcement (break-glass); MFA_POLICY_OVERRIDE=off does the same for the required-MFA policy.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      - IP_ALLOWLIST_OVERRIDE=${IP_ALLOWLIST_OVERRIDE:-}
+      - MFA_POLICY_OVERRIDE=${MFA_POLICY_OVERRIDE:-}
     volumes:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse
