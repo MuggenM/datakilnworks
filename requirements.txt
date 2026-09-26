@@ -32,3 +32,4 @@ python3-saml>=1.16.0  # SAML 2.0 single sign-on (SP); xmlsec ships as a manylinu
 confluent-kafka
 fastavro
 grpcio-tools>=1.73,<1.77
+webauthn>=2.5,<4

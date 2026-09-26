@@ -114,7 +114,7 @@ def user_status(u: Dict[str, Any], policy: Optional[Dict[str, Any]] = None, now:
     optional mfa_exempt / mfa_deadline_override columns)."""
     policy = policy or get_policy()
     now = time.time() if now is None else now
-    enrolled = bool(u.get("totp_enabled") or u.get("mfa_enabled"))
+    enrolled = bool(u.get("totp_enabled") or u.get("mfa_enabled") or u.get("webauthn_count"))
     source = u.get("auth_source") or "local"
     base = {"required": False, "enrolled": enrolled, "deadline": None, "days_left": None, "exempt": bool(u.get("mfa_exempt")),
             "exempt_reason": u.get("mfa_exempt_reason") or ""}
@@ -139,8 +139,8 @@ def user_status(u: Dict[str, Any], policy: Optional[Dict[str, Any]] = None, now:
 def status_for_user_id(user_id: str) -> Dict[str, Any]:
     conn = _conn()
     try:
-        r = conn.execute("SELECT id, role, auth_source, created_at, is_active, deleted_at, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override "
-                         "FROM users WHERE id = ?", (user_id,)).fetchone()
+        r = conn.execute("SELECT id, role, auth_source, created_at, is_active, deleted_at, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override, "
+                         "(SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users WHERE id = ?", (user_id,)).fetchone()
     finally:
         conn.close()
     if not r:
@@ -246,17 +246,21 @@ def stats(now: Optional[float] = None) -> Dict[str, Any]:
     try:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, username, display_name, role, auth_source, created_at, is_active, totp_enabled, totp_enrolled_at, mfa_exempt, mfa_exempt_reason, "
-            "mfa_deadline_override, last_login_at FROM users WHERE deleted_at IS NULL AND is_active = 1")]
+            "mfa_deadline_override, last_login_at, (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count "
+            "FROM users WHERE deleted_at IS NULL AND is_active = 1")]
     finally:
         conn.close()
     states = {"compliant": 0, "grace": 0, "overdue": 0, "exempt": 0}
     by_role = {r: {"total": 0, "enrolled": 0, "grace": 0, "overdue": 0, "exempt": 0} for r in ALL_ROLES}
     attention: List[Dict[str, Any]] = []
     sso = enrolled_all = 0
+    methods = {"totp": 0, "passkey": 0, "both": 0, "none": 0}          # which second factor the active accounts use
     weekly = [0] * 8
     for u in rows:
         st = user_status(u, policy, now)
-        if u["totp_enabled"]:
+        has_totp, has_key = bool(u["totp_enabled"]), bool(u["webauthn_count"])
+        methods["both" if has_totp and has_key else "totp" if has_totp else "passkey" if has_key else "none"] += 1
+        if has_totp or has_key:
             enrolled_all += 1
             e = u.get("totp_enrolled_at")
             if e and now - e < 8 * 7 * DAY:
@@ -280,6 +284,6 @@ def stats(now: Optional[float] = None) -> Dict[str, Any]:
                               "exempt_reason": st["exempt_reason"], "last_login_at": u["last_login_at"]})
     covered = sum(states.values())
     attention.sort(key=lambda a: ({"overdue": 0, "grace": 1, "exempt": 2}[a["state"]], a["deadline"] or 0))
-    return {"policy": policy, "covered": covered, **states, "sso_accounts": sso, "enrolled_total": enrolled_all, "users_total": len(rows),
+    return {"policy": policy, "covered": covered, **states, "sso_accounts": sso, "enrolled_total": enrolled_all, "methods": methods, "users_total": len(rows),
             "coverage_percent": round(100 * states["compliant"] / covered, 1) if covered else None,
             "by_role": by_role, "enrolled_per_week": weekly, "attention": attention, "as_of": int(now)}

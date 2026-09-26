@@ -123,6 +123,11 @@ def init_auth_db():
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             if "deleted_at" not in existing:
                 conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+            # WebAuthn passkeys / security keys (web/webauthn_auth.py): the public key of each credential, and the single-use challenges of sign-ins in progress.
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, public_key TEXT NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
+                name TEXT NOT NULL, transports TEXT, device_type TEXT, backed_up INTEGER NOT NULL DEFAULT 0, uv INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(user_id)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_challenges (id TEXT PRIMARY KEY, challenge TEXT NOT NULL, purpose TEXT NOT NULL, user_id TEXT, expires INTEGER NOT NULL)""")
             # `must_change_password`: set when a password was provided by someone other than the account holder
             # (the INIT_ADMIN_* bootstrap, or an admin's reset) rather than chosen by them -- cleared the moment
             # they successfully change it themselves (see reset_user_password).
@@ -263,7 +268,9 @@ def _public_user(u: Dict[str, Any]) -> Dict[str, Any]:
     u.pop("password_hash", None)
     for col in _MFA_SECRET_COLUMNS:
         u.pop(col, None)
-    u["mfa_enabled"] = bool(u.pop("totp_enabled", 0))
+    passkeys = int(u.pop("webauthn_count", 0) or 0)
+    u["mfa_enabled"] = bool(u.pop("totp_enabled", 0)) or passkeys > 0          # any second factor: an authenticator app or a passkey / security key
+    u["passkey_count"] = passkeys
     return u
 
 
@@ -271,7 +278,7 @@ def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     """Fetches user record by ID."""
     conn = get_db_connection()
     try:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute("SELECT *, (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users WHERE id = ?", (user_id,)).fetchone()
         if row:
             return _public_user(dict(row))
         return None
@@ -283,7 +290,7 @@ def get_user_by_username(username: str, include_password_hash: bool = False) -> 
     """Fetches user record by username."""
     conn = get_db_connection()
     try:
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username.strip().lower(),)).fetchone()
+        row = conn.execute("SELECT *, (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users WHERE username = ?", (username.strip().lower(),)).fetchone()
         if row:
             u = _public_user(dict(row))
             if include_password_hash:
@@ -301,11 +308,14 @@ def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         rows = conn.execute(
             f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at, "
-            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override, scim_managed FROM users {where} ORDER BY created_at ASC").fetchall()
+            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override, scim_managed, "
+            f"(SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
-            d["mfa_enabled"] = bool(d.pop("totp_enabled", 0))
+            passkeys = int(d.pop("webauthn_count", 0) or 0)
+            d["mfa_enabled"] = bool(d.pop("totp_enabled", 0)) or passkeys > 0
+            d["passkey_count"] = passkeys
             d["full_name"] = d.get("display_name") or d["username"]
             d["email"] = f"{d['username']}@localspark.lakehouse"
             result.append(d)

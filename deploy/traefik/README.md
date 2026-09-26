@@ -14,6 +14,7 @@ docker compose --profile proxy up -d
   `TRAEFIK_HTTP_PORT=80` / `TRAEFIK_HTTPS_PORT=443` on a host that is reachable from the internet under that name (HTTP-01 challenge; the certificate is
   kept in the `traefik-acme` volume). The Let's Encrypt path is configured but was not exercised in the tests (it needs a public name).
 * **Delta Sharing**: set `DELTA_SHARING_ENDPOINT=https://<your domain>[:port]/delta-sharing` so profiles and file links carry the public https address.
+* **Passkeys**: WebAuthn takes the relying-party id and origin from the request host, and Traefik keeps the `Host` header, so passkeys work behind it without settings (over https).
 * **Client addresses**: without further setup the studio sees Traefik's address for every request, which makes the IP allowlist and per-recipient address
   rules useless. Tell it that Traefik is a trusted proxy: `docker network inspect <project>_proxy-net -f '{{(index .IPAM.Config 0).Subnet}}'` (project =
   the folder name, usually `datakilnworks`) and put that subnet into `TRUSTED_PROXIES` in `.env`. The studio then believes `X-Forwarded-For` only from that

@@ -4356,7 +4356,7 @@
                         <!-- Cell stats badge for notebook -->
                         <template x-if="workspaceFileDetail && selectedWorkspaceItem.type === 'notebook'">
                           <span class="px-2 py-0.5 bg-purple-500/15 border border-purple-500/30 text-purple-300 rounded text-[10px] font-mono">
-                            <span x-text="workspaceFileDetail.cell_count + ' cells (' + workspaceFileDetail.code_cell_count + ' code, ' + workspaceFileDetail.md_cell_count + ' markdown)'"></span>
+                            <span x-text="workspaceFileDetail?.cell_count + ' cells (' + workspaceFileDetail?.code_cell_count + ' code, ' + workspaceFileDetail?.md_cell_count + ' markdown)'"></span>
                           </span>
                         </template>
                       </div>
@@ -4365,12 +4365,12 @@
                         <template x-if="workspaceFileDetail">
                           <span class="flex items-center space-x-2">
                             <span>•</span>
-                            <span x-text="((workspaceFileDetail.size_bytes / 1024).toFixed(1)) + ' KB'"></span>
+                            <span x-text="((workspaceFileDetail?.size_bytes / 1024).toFixed(1)) + ' KB'"></span>
                             <span>•</span>
-                            <span x-text="workspaceFileDetail.modified_at"></span>
-                            <template x-if="workspaceFileDetail.kernel">
+                            <span x-text="workspaceFileDetail?.modified_at"></span>
+                            <template x-if="workspaceFileDetail?.kernel">
                               <span>•</span>
-                              <span class="text-emerald-400" x-text="workspaceFileDetail.kernel"></span>
+                              <span class="text-emerald-400" x-text="workspaceFileDetail?.kernel"></span>
                             </template>
                           </span>
                         </template>
@@ -4467,7 +4467,7 @@
                       </div>
 
                       <!-- Notebook Cells Loop -->
-                      <template x-for="cell in workspaceFileDetail.cells" :key="cell.index">
+                      <template x-for="cell in (workspaceFileDetail?.cells || [])" :key="cell.index">
                         <div class="rounded-lg border overflow-hidden shadow-sm transition group"
                              :class="cell.type === 'code' ? 'border-dbx-border bg-dbx-panel/80' : 'border-slate-800/80 bg-slate-900/40'">
                           
@@ -4652,7 +4652,7 @@
                             }"></i>
                             <span class="font-semibold text-slate-900 dark:text-white" x-text="selectedWorkspaceItem.name"></span>
                             <span class="px-2 py-0.5 rounded text-[10px] font-mono font-semibold uppercase bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-300/70 dark:border-slate-700" x-text="getWorkspaceFileLanguage(selectedWorkspaceItem.name, selectedWorkspaceItem.type)"></span>
-                            <span class="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-200/60 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400" x-text="(workspaceFileDetail.lines || (workspaceFileDetail.content ? workspaceFileDetail.content.split('\n').length : 0)) + ' lines'"></span>
+                            <span class="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-200/60 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400" x-text="(workspaceFileDetail?.lines || (workspaceFileDetail?.content ? workspaceFileDetail?.content.split('\n').length : 0)) + ' lines'"></span>
                           </div>
                           <div class="flex items-center space-x-2">
                             <template x-if="selectedWorkspaceItem.type === 'sql'">
@@ -4668,7 +4668,7 @@
                           </div>
                         </div>
                         <div class="workspace-code-viewer p-3.5 overflow-x-auto text-xs font-mono select-text">
-                          <div class="table w-full border-collapse" x-html="highlightWorkspaceCode(workspaceFileDetail.content, selectedWorkspaceItem.name, selectedWorkspaceItem.type)"></div>
+                          <div class="table w-full border-collapse" x-html="highlightWorkspaceCode(workspaceFileDetail?.content, selectedWorkspaceItem.name, selectedWorkspaceItem.type)"></div>
                         </div>
                       </div>
                     </div>
@@ -15128,15 +15128,20 @@
           </button>
         </div>
       </form>
-      <!-- Second step: authenticator code -->
+      <div x-show="!loginForm.mfaToken && passkeyLoginAvailable" x-cloak class="space-y-2 text-xs pt-1" data-testid="passkey-login-block">
+        <div class="flex items-center space-x-2 text-[10px] uppercase text-slate-400"><span class="flex-1 border-t border-slate-200 dark:border-dbx-border"></span><span>or</span><span class="flex-1 border-t border-slate-200 dark:border-dbx-border"></span></div>
+        <button type="button" @click="loginWithPasskey()" :disabled="loginForm.loading" data-testid="passkey-login" class="w-full px-4 py-2 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-300 dark:border-dbx-border text-slate-800 dark:text-slate-100 font-semibold rounded-lg flex items-center justify-center space-x-2 transition"><i class="ph ph-fingerprint text-base"></i><span>Sign in with a passkey</span></button>
+      </div>
+      <!-- Second step: authenticator code and / or passkey -->
       <form x-show="loginForm.mfaToken" x-cloak @submit.prevent="loginMfa()" class="space-y-3.5 text-xs">
-        <p class="text-slate-600 dark:text-slate-300">Enter the 6-digit code from your authenticator app, or one of your backup codes.</p>
-        <input type="text" x-model="loginForm.mfaCode" x-effect="if (loginForm.mfaToken) $nextTick(() => $el.focus())" required autocomplete="one-time-code" inputmode="text" placeholder="123456"
+        <p class="text-slate-600 dark:text-slate-300" x-text="loginForm.mfaMethods.includes('totp') ? (loginForm.mfaMethods.includes('webauthn') ? 'Use your passkey or security key, or enter the 6-digit code from your authenticator app or a backup code.' : 'Enter the 6-digit code from your authenticator app, or one of your backup codes.') : 'Use your passkey or security key to finish signing in.'"></p>
+        <button type="button" x-show="loginForm.mfaMethods.includes('webauthn')" @click="loginWithSecurityKey()" :disabled="loginForm.loading" data-testid="mfa-use-passkey" class="w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg flex items-center justify-center space-x-2 transition"><i class="ph ph-fingerprint text-base"></i><span>Use passkey or security key</span></button>
+        <input type="text" x-show="loginForm.mfaMethods.includes('totp')" :required="loginForm.mfaMethods.includes('totp')" x-model="loginForm.mfaCode" x-effect="if (loginForm.mfaToken && loginForm.mfaMethods.includes('totp')) $nextTick(() => $el.focus())" autocomplete="one-time-code" inputmode="text" placeholder="123456"
                class="w-full px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white font-mono tracking-widest text-center text-base focus:outline-none focus:border-sky-500 transition">
         <div x-show="loginForm.error" class="p-2.5 bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 rounded-lg text-rose-600 dark:text-rose-300 text-[11px]" x-text="loginForm.error"></div>
         <div class="flex items-center justify-end space-x-2 pt-2 border-t border-slate-200 dark:border-dbx-border">
           <button type="button" @click="cancelMfaLogin()" class="px-3.5 py-2 bg-slate-100 dark:bg-slate-900 hover:bg-slate-200 dark:hover:bg-dbx-hover border border-slate-300 dark:border-dbx-border text-slate-700 dark:text-slate-300 rounded-lg font-medium transition">Back</button>
-          <button type="submit" :disabled="loginForm.loading || !loginForm.mfaCode" class="px-5 py-2 bg-dbx-orange hover:bg-dbx-orange/90 disabled:opacity-50 text-white font-semibold rounded-lg shadow transition">Verify</button>
+          <button type="submit" x-show="loginForm.mfaMethods.includes('totp')" :disabled="loginForm.loading || !loginForm.mfaCode" class="px-5 py-2 bg-dbx-orange hover:bg-dbx-orange/90 disabled:opacity-50 text-white font-semibold rounded-lg shadow transition">Verify</button>
         </div>
       </form>
       <div x-show="!loginForm.mfaToken && ssoProviders.oidc && ssoProviders.oidc.enabled" class="space-y-3 text-xs">
@@ -15334,6 +15339,7 @@
               <div class="text-[10px] uppercase text-slate-500 mb-2">Enrolments per week (last 8 weeks, oldest first)</div>
               <div class="flex items-end space-x-1 h-16" data-testid="mfa-weekly"><template x-for="(n, i) in (mfaPolicy.stats ? mfaPolicy.stats.enrolled_per_week : [])" :key="i"><div class="flex-1 flex flex-col items-center justify-end"><span class="text-[10px] font-mono" x-text="n"></span><div class="w-full bg-indigo-500 rounded-t" :style="'height:' + Math.max(2, n * 8) + 'px'"></div></div></template></div>
               <div class="text-[10px] text-slate-500 mt-1" x-text="mfaPolicy.stats ? (mfaPolicy.stats.enrolled_total + ' of ' + mfaPolicy.stats.users_total + ' active accounts have two-factor authentication on') : ''"></div>
+              <div class="text-[10px] text-slate-500" data-testid="mfa-methods" x-show="mfaPolicy.stats && mfaPolicy.stats.methods" x-text="mfaPolicy.stats && mfaPolicy.stats.methods ? ('Second factor in use: authenticator app ' + mfaPolicy.stats.methods.totp + ' · passkey or security key ' + mfaPolicy.stats.methods.passkey + ' · both ' + mfaPolicy.stats.methods.both) : ''"></div>
             </div>
           </div>
           <div class="border border-slate-200 dark:border-dbx-border rounded-xl">
@@ -15560,7 +15566,7 @@
                       <button @click="openResetPasswordModal(u)" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 rounded text-slate-700 dark:text-slate-200 transition text-[11px] font-medium" title="Reset Password">
                         <i class="ph ph-key"></i>
                       </button>
-                      <button x-show="u.mfa_enabled && u.id !== currentUser.id" @click="resetUserMfa(u)" class="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900 dark:text-sky-300 dark:border-sky-800 rounded transition text-[11px] font-medium" title="Turn off two-factor authentication (lost device)">
+                      <button x-show="u.mfa_enabled && u.id !== currentUser.id" @click="resetUserMfa(u)" class="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900 dark:text-sky-300 dark:border-sky-800 rounded transition text-[11px] font-medium" title="Turn off two-factor authentication and remove passkeys (lost device)">
                         <i class="ph ph-shield-slash"></i>
                       </button>
                       <button x-show="u.username !== 'admin'" @click="toggleUserActive(u)" class="px-2 py-1 rounded transition text-[11px] font-medium border"
@@ -17406,7 +17412,7 @@
         <div class="space-y-3">
           <!-- Off -->
           <div x-show="!mfa.status.enabled && !mfa.setup" class="space-y-3">
-            <p class="text-slate-600 dark:text-slate-300">Two-factor authentication is <strong>off</strong>. Turn it on to require a code from an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, 1Password, ...) in addition to your password.</p>
+            <p class="text-slate-600 dark:text-slate-300">The <strong>authenticator app</strong> is <strong>off</strong>. Turn it on to require a code from an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, 1Password, ...) in addition to your password.</p>
             <div class="flex justify-end"><button type="button" @click="mfaStartSetup()" :disabled="mfa.busy" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg">Set up</button></div>
           </div>
           <!-- Enrolling -->
@@ -17422,7 +17428,7 @@
           </div>
           <!-- On -->
           <div x-show="mfa.status.enabled" class="space-y-3">
-            <p class="text-slate-600 dark:text-slate-300">Two-factor authentication is <strong class="text-emerald-600">on</strong>. Backup codes left: <strong x-text="mfa.status.backup_codes_remaining"></strong>.</p>
+            <p class="text-slate-600 dark:text-slate-300">The <strong>authenticator app</strong> is <strong class="text-emerald-600">on</strong>. Backup codes left: <strong x-text="mfa.status.backup_codes_remaining"></strong>.</p>
             <div x-show="!mfa.action" class="flex justify-end space-x-2">
               <button type="button" @click="mfa.action = 'regen'; mfa.error = ''" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">New backup codes</button>
               <button type="button" @click="mfa.action = 'disable'; mfa.error = ''" class="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:text-rose-300 dark:border-rose-800 rounded-lg">Turn off</button>
@@ -17438,6 +17444,34 @@
             </form>
           </div>
           <p class="text-[11px] text-rose-500" x-show="!!mfa.error" x-text="mfa.error"></p>
+          <!-- Passkeys and security keys (WebAuthn) -->
+          <div class="pt-3 border-t border-slate-200 dark:border-dbx-border space-y-2" data-testid="passkeys-section">
+            <div class="flex items-center justify-between"><h5 class="font-bold text-slate-900 dark:text-white flex items-center space-x-1.5"><i class="ph ph-fingerprint text-indigo-500"></i><span>Passkeys and security keys</span></h5>
+              <button type="button" x-show="pk.supported && pk.available && pk.eligible && !pk.addOpen" @click="pk.addOpen = true; pk.name = ''; pk.password = ''; pk.error = ''" data-testid="passkey-add" class="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg">Add</button></div>
+            <p class="text-slate-500 dark:text-slate-400" x-show="!pk.supported">This browser does not support passkeys.</p>
+            <p class="text-slate-500 dark:text-slate-400" x-show="pk.supported && !pk.available">Passkeys are not available on this server.</p>
+            <p class="text-slate-500 dark:text-slate-400" x-show="pk.supported && pk.available && !pk.creds.length && !pk.addOpen">Sign in with your fingerprint, face or a security key: as a second factor after your password, or instead of it.</p>
+            <template x-for="c in pk.creds" :key="c.id">
+              <div class="p-2.5 border border-slate-200 dark:border-dbx-border rounded-lg space-y-1.5" data-testid="passkey-row">
+                <div class="flex items-center justify-between"><div><span class="font-semibold text-slate-900 dark:text-white" x-text="c.name" data-testid="passkey-name"></span>
+                  <span class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-300" x-text="c.device_type === 'multi_device' ? 'synced passkey' : 'this device / key'"></span></div>
+                  <div class="space-x-2"><button type="button" @click="pkRename(c)" class="text-slate-500 hover:text-indigo-500">Rename</button><button type="button" @click="pk.removeId = c.id; pk.removePassword = ''; pk.error = ''" data-testid="passkey-remove" class="text-slate-500 hover:text-rose-500">Remove</button></div></div>
+                <div class="text-[10px] text-slate-500" x-text="'Added ' + new Date(c.created_at * 1000).toLocaleDateString() + (c.last_used_at ? ' · last used ' + new Date(c.last_used_at * 1000).toLocaleDateString() : ' · never used')"></div>
+                <form x-show="pk.removeId === c.id" @submit.prevent="pkRemove(c)" class="flex items-center space-x-2 pt-1">
+                  <input type="password" x-model="pk.removePassword" autocomplete="current-password" placeholder="Password to confirm" data-testid="passkey-remove-password" class="flex-1 px-2 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
+                  <button type="submit" :disabled="pk.busy || !pk.removePassword" data-testid="passkey-remove-confirm" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-semibold rounded-lg">Remove</button>
+                  <button type="button" @click="pk.removeId = ''" class="px-2 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">Cancel</button></form>
+              </div>
+            </template>
+            <form x-show="pk.addOpen" @submit.prevent="pkAdd()" class="space-y-2 p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-dbx-border rounded-lg">
+              <p class="text-slate-600 dark:text-slate-300">Confirm with your password, then follow your browser's prompt.</p>
+              <input type="text" x-model="pk.name" maxlength="60" placeholder="Name, e.g. Work laptop or YubiKey" data-testid="passkey-name-input" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
+              <input type="password" x-model="pk.password" autocomplete="current-password" placeholder="Password" data-testid="passkey-password" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
+              <div class="flex justify-end space-x-2"><button type="button" @click="pk.addOpen = false" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">Cancel</button>
+                <button type="submit" :disabled="pk.busy || !pk.password" data-testid="passkey-create" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg">Create passkey</button></div>
+            </form>
+            <p class="text-[11px] text-rose-500" x-show="!!pk.error" x-text="pk.error" data-testid="passkey-error"></p>
+          </div>
         </div>
       </template>
     </div>
@@ -18235,7 +18269,9 @@
         currentUser: null,
         isAuthenticated: false,
         showLoginModal: false,
-        loginForm: { username: '', password: '', error: null, loading: false, mfaToken: null, mfaCode: '' },
+        loginForm: { username: '', password: '', error: null, loading: false, mfaToken: null, mfaCode: '', mfaMethods: [] },
+        passkeyLoginAvailable: false,
+        pk: { supported: false, creds: [], available: true, eligible: true, busy: false, error: '', addOpen: false, name: '', password: '', removeId: '', removePassword: '' },
         scim: { form: { enabled: false, login_source: 'oidc', default_role: 'user', max_role: 'power_user', use_roles_attribute: false, group_roles: [], base_url: '' }, data: null, error: '', busy: false, newTokenName: '', newTokenDays: null, secret: '' },
         gitReview: { open: false, kind: 'dbt', tab: 'changes', scope: 'pending', status: null, summary: null, sel: null, diff: null, merge: { in_progress: false, conflicts: [], resolved: [] }, csel: null, cfile: null,
           choices: [], fullEdit: false, fullText: '', message: '', busy: false, error: '', note: '', rows: [] },
@@ -19531,6 +19567,7 @@
         async checkAuth() {
           try {
             fetch('/api/auth/sso').then(r => r.ok ? r.json() : null).then(d => { if (d) this.ssoProviders = d; }).catch(() => {});
+            fetch('/api/auth/passkey/status').then(r => r.ok ? r.json() : null).then(d => { this.passkeyLoginAvailable = !!(d && d.available && window.PublicKeyCredential); }).catch(() => {});
             const ssoError = new URLSearchParams(window.location.search).get('sso_error');
             if (ssoError) {
               this.loginForm.error = ssoError;
@@ -19588,6 +19625,7 @@
           this.loginForm.username = '';
           this.loginForm.password = '';
           this.loginForm.mfaToken = null;
+          this.loginForm.mfaMethods = [];
           this.loginForm.mfaCode = '';
           this.loginForm.error = null;
           this.showToast(`Logged in as ${this.currentUser.full_name || this.currentUser.username} (${this.currentUser.role.toUpperCase()})`, 'success');
@@ -19621,6 +19659,7 @@
 
         cancelMfaLogin(message) {
           this.loginForm.mfaToken = null;
+          this.loginForm.mfaMethods = [];
           this.loginForm.mfaCode = '';
           this.loginForm.password = '';
           this.loginForm.error = message || null;
@@ -19869,7 +19908,108 @@
           await this.loadMfaPolicy();
         },
 
+        // ---------------- passkeys and security keys (WebAuthn) ----------------
+        pkB64uToBuf(str) { const b = atob(str.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(str.length / 4) * 4, '=')); const u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u.buffer; },
+        pkBufToB64u(buf) { const u = new Uint8Array(buf); let s = ''; for (const c of u) s += String.fromCharCode(c); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); },
+
+        pkErrorText(e) { return (e && e.name === 'NotAllowedError') ? 'The passkey prompt was cancelled or timed out.' : (e && e.name === 'InvalidStateError') ? 'This authenticator is already registered.' : ('Passkey error: ' + ((e && e.message) || e)); },
+
+        async pkCreate(publicKey) {
+          const o = { ...publicKey, challenge: this.pkB64uToBuf(publicKey.challenge), user: { ...publicKey.user, id: this.pkB64uToBuf(publicKey.user.id) },
+                      excludeCredentials: (publicKey.excludeCredentials || []).map(c => ({ ...c, id: this.pkB64uToBuf(c.id) })) };
+          const cred = await navigator.credentials.create({ publicKey: o });
+          return { id: cred.id, rawId: this.pkBufToB64u(cred.rawId), type: cred.type, clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+                   response: { clientDataJSON: this.pkBufToB64u(cred.response.clientDataJSON), attestationObject: this.pkBufToB64u(cred.response.attestationObject),
+                               transports: cred.response.getTransports ? cred.response.getTransports() : [] } };
+        },
+
+        async pkGet(publicKey) {
+          const o = { ...publicKey, challenge: this.pkB64uToBuf(publicKey.challenge), allowCredentials: (publicKey.allowCredentials || []).map(c => ({ ...c, id: this.pkB64uToBuf(c.id) })) };
+          const cred = await navigator.credentials.get({ publicKey: o });
+          return { id: cred.id, rawId: this.pkBufToB64u(cred.rawId), type: cred.type, clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+                   response: { clientDataJSON: this.pkBufToB64u(cred.response.clientDataJSON), authenticatorData: this.pkBufToB64u(cred.response.authenticatorData),
+                               signature: this.pkBufToB64u(cred.response.signature), userHandle: cred.response.userHandle ? this.pkBufToB64u(cred.response.userHandle) : null } };
+        },
+
+        async postJson(url, body) {
+          const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+          const data = await res.json().catch(() => ({}));
+          return { ok: res.ok, status: res.status, data };
+        },
+
+        async loginWithPasskey() {
+          if (this.loginForm.loading) return;
+          this.loginForm.loading = true; this.loginForm.error = null;
+          try {
+            const o = await this.postJson('/api/auth/passkey/options');
+            if (!o.ok) { this.loginForm.error = o.data.detail || 'Passkey sign-in is not available.'; return; }
+            const cred = await this.pkGet(o.data.options);
+            const r = await this.postJson('/api/auth/passkey/login', { challenge_id: o.data.challenge_id, credential: cred });
+            if (!r.ok) { this.loginForm.error = r.data.detail || 'The passkey was not accepted.'; return; }
+            await this.finishLogin(r.data);
+          } catch (e) { this.loginForm.error = this.pkErrorText(e); } finally { this.loginForm.loading = false; }
+        },
+
+        async loginWithSecurityKey() {
+          if (this.loginForm.loading) return;
+          this.loginForm.loading = true; this.loginForm.error = null;
+          try {
+            const o = await this.postJson('/api/auth/login/webauthn/options', { mfa_token: this.loginForm.mfaToken });
+            if (!o.ok) { this.loginForm.error = o.data.detail || 'Could not start the passkey check.'; if (o.status === 401) this.cancelMfaLogin(o.data.detail); return; }
+            const cred = await this.pkGet(o.data.options);
+            const r = await this.postJson('/api/auth/login/webauthn', { mfa_token: this.loginForm.mfaToken, challenge_id: o.data.challenge_id, credential: cred });
+            if (!r.ok) { this.loginForm.error = r.data.detail || 'The passkey was not accepted.'; if (r.status === 401 && /expired/i.test(r.data.detail || '')) this.cancelMfaLogin(r.data.detail); return; }
+            await this.finishLogin(r.data);
+          } catch (e) { this.loginForm.error = this.pkErrorText(e); } finally { this.loginForm.loading = false; }
+        },
+
+        async pkLoad() {
+          this.pk.supported = !!window.PublicKeyCredential;
+          try {
+            const res = await fetch('/api/auth/webauthn/status');
+            if (res.ok) { const d = await res.json(); this.pk.creds = d.credentials || []; this.pk.available = !!d.available; this.pk.eligible = d.eligible !== false; }
+          } catch (e) { /* the section stays empty */ }
+        },
+
+        async pkAdd() {
+          if (this.pk.busy) return;
+          this.pk.busy = true; this.pk.error = '';
+          try {
+            const o = await this.postJson('/api/auth/webauthn/register/options', { password: this.pk.password });
+            if (!o.ok) { this.pk.error = o.data.detail || 'Could not start.'; return; }
+            const cred = await this.pkCreate(o.data.options);
+            const r = await this.postJson('/api/auth/webauthn/register/verify', { challenge_id: o.data.challenge_id, credential: cred, name: this.pk.name.trim() || 'Passkey' });
+            if (!r.ok) { this.pk.error = r.data.detail || 'The passkey could not be saved.'; return; }
+            this.pk.addOpen = false; this.pk.password = ''; this.pk.name = '';
+            await this.pkLoad();
+            this.showToast('Passkey added', 'success');
+            if (this.currentUser && this.currentUser.mfa_policy) this.currentUser.mfa_policy = { ...this.currentUser.mfa_policy, state: 'compliant', enrolled: true };
+            if (this.mfa.forced) { this.mfa.forced = false; this.mfa.open = false; await this.onUserChanged(); }
+          } catch (e) { this.pk.error = this.pkErrorText(e); } finally { this.pk.busy = false; this.pk.password = ''; }
+        },
+
+        async pkRename(c) {
+          const name = prompt('Name for this passkey', c.name);
+          if (name === null || !name.trim()) return;
+          const res = await fetch('/api/auth/webauthn/credentials/' + encodeURIComponent(c.id), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() }) });
+          if (res.ok) await this.pkLoad(); else this.pk.error = (await res.json().catch(() => ({}))).detail || 'Could not rename.';
+        },
+
+        async pkRemove(c) {
+          if (this.pk.busy) return;
+          this.pk.busy = true; this.pk.error = '';
+          try {
+            const r = await this.postJson('/api/auth/webauthn/credentials/' + encodeURIComponent(c.id) + '/delete', { password: this.pk.removePassword });
+            if (!r.ok) { this.pk.error = r.data.detail || 'Could not remove it.'; return; }
+            this.pk.removeId = ''; this.pk.removePassword = '';
+            await this.pkLoad();
+            this.showToast('Passkey removed', 'success');
+          } finally { this.pk.busy = false; }
+        },
+
         async openMfa(forced = false) {
+          this.pk = { ...this.pk, addOpen: false, removeId: '', error: '', password: '', removePassword: '' };
+          this.pkLoad();
           this.mfa = { ...this.mfa, forced: !!forced, open: true, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' };
           try {
             const res = await fetch('/api/auth/mfa/status');
@@ -19960,8 +20100,10 @@
             }
             if (data.mfa_required) {
               this.loginForm.mfaToken = data.mfa_token;
+              this.loginForm.mfaMethods = data.mfa_methods || ['totp'];
               this.loginForm.mfaCode = '';
               this.loginForm.password = '';
+              if (this.loginForm.mfaMethods.length === 1 && this.loginForm.mfaMethods[0] === 'webauthn') this.$nextTick(() => this.loginWithSecurityKey());     // nothing else to type: ask the browser at once
               return;
             }
             await this.finishLogin(data);
