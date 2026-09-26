@@ -51,7 +51,7 @@ not been recomputed since (see 1b, last row).
 
 | Area | Caveat |
 | --- | --- |
-| High availability | The Helm chart passes `helm lint`, `helm template` and kubeconform, and a GitHub Actions workflow now installs it on a kind cluster (sign-in, SQL on the compute node, pod restart with data kept, upgrade, a broken-config install failing in the init container). That workflow was written on a machine that cannot run a local cluster, so **its first real run is on GitHub**; until it is green the chart counts as untested on a cluster. The studio is one replica (SQLite metadata and a ReadWriteOnce volume); there is no autoscaler and no multi-zone story. This is deployable, not a tested HA design. |
+| High availability | The Helm chart passes `helm lint`, `helm template` and kubeconform, and a GitHub Actions job installs it on a kind cluster and passed there (sign-in, SQL on the compute node, pod restart with data kept, upgrade with the compute token kept, a broken-config install failing in the init container, uninstall keeping the volumes). That is one replica on a single-node cluster: the studio is one replica (SQLite metadata and a ReadWriteOnce volume), and there is no autoscaler, no multi-node scheduling test and no multi-zone story. Deployable and smoke-tested, not a tested HA design. |
 | TLS with Let's Encrypt (Traefik profile) | Configured, but not exercised: it needs a public host name. Self-signed and bring-your-own certificates are tested. |
 | GitHub and GitLab pull requests | Verified against in-process mock servers of their APIs; only Gitea was run for real. |
 | Delta Sharing | Works with the Python client in the Parquet format (snapshots, time travel, change feed). The client's Rust reader (Delta response format) cannot fetch files from a non-cloud-storage host, so that format is built to the specification but unverified end to end. Tables in an S3 mount and tables with deletion vectors or column mapping cannot be shared. History, time travel and the change feed are opt-in per table because they can expose deleted rows. |
@@ -89,7 +89,7 @@ the cluster-wide, cloud-provider-integrated variant.
 
 Ordered by how much they would change the honest picture. None needs a new engine.
 
-1. ~~**Prove the deployment claims.**~~ *(Written: `.github/workflows/ci.yml`, `ci/`.)* CI runs 38 test scripts in the built image, 7 browser tests, the static checks and a kind smoke test of the chart. Still to do: watch it go green on GitHub, and add the integration tier (tests that need Gitea, Redpanda, MinIO, lldap, Keycloak) as a scheduled job.
+1. ~~**Prove the deployment claims.**~~ *(Done: `.github/workflows/ci.yml`, `ci/`.)* CI runs 38 test scripts in the built image, 7 browser tests, the static checks and a kind smoke test of the chart. Still to do: the integration tier (tests that need Gitea, Redpanda, MinIO, lldap, Keycloak) as a scheduled job.
 2. **Parallel workflow tasks.** Run independent branches of a DAG concurrently (bounded by a per-workflow limit). The graph
    and run page already show branches; the engine is the missing part.
 3. **More Auto-Loader sources.** Azure Blob / ADLS and GCS as file-arrival sources (listing + credentials from mounts,

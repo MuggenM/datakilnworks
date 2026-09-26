@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S3 bucket events end to end (run on the HOST with /usr/bin/python3; needs Playwright, docker, the studio image and minio/minio). It builds a throwaway
+"""S3 bucket events end to end (run on the HOST with /usr/bin/python3; needs Playwright, docker, the studio image and cgr.dev/chainguard/minio (env MINIO_IMAGE overrides; MinIO no longer publishes images on Docker Hub or quay.io)). It builds a throwaway
 network `s3evnet`, a studio `s3evui` (port 8117) and a real MinIO `s3evminio` that POSTs its bucket notifications to the studio's receiver with a token
 created through the UI/API. A pipeline is created in the dialog with 'S3 events' and a one-hour rescan; an upload must be ingested within seconds
 (the rescan cannot explain it). Everything is removed at the end."""
@@ -68,7 +68,7 @@ def main():
             page.screenshot(path="/tmp/s3ev_modal.png"); page.keyboard.press("Escape")
             # a real MinIO that posts to the studio
             mr = sh("docker", "run", "-d", "--name", MINIO, "--network", NET, "-e", "MINIO_NOTIFY_WEBHOOK_ENABLE_dkw=on", "-e", f"MINIO_NOTIFY_WEBHOOK_ENDPOINT_dkw=http://{UI}:8891/hooks/s3-events",
-               "-e", f"MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_dkw={token}", "minio/minio", "server", "/data")
+               "-e", f"MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_dkw={token}", os.getenv("MINIO_IMAGE", "cgr.dev/chainguard/minio"), "server", "/data")
             print("minio docker run:", mr.returncode, mr.stdout.strip()[:20], mr.stderr.strip()[-600:])
             for _ in range(4):
                 r = ex(NOTIFY)
@@ -91,7 +91,12 @@ def main():
             pipe = page.evaluate("() => Alpine.$data(document.body).autoloaderPipelines.find(p => p.name === 'Events demo')")
             check("it is stored with s3_events, no cron and no file watch", pipe["s3_events"] and not pipe["cron_schedule"] and not pipe["watch_enabled"] and pipe["watch_sweep_seconds"] == 3600, pipe)
             def rows():
-                act("await d.fetchAutoloaderPipelines();"); return page.evaluate("() => Alpine.$data(document.body).autoloaderPipelines.find(p => p.name === 'Events demo').total_rows_ingested") or 0
+                for _ in range(5):                   # the page may be navigating for a moment (Playwright: execution context destroyed)
+                    try:
+                        act("await d.fetchAutoloaderPipelines();"); return page.evaluate("() => Alpine.$data(document.body).autoloaderPipelines.find(p => p.name === 'Events demo').total_rows_ingested") or 0
+                    except Exception:
+                        time.sleep(1)
+                return 0
             dl = time.time() + 30                    # the first cycle after creation loads the seed; the uploads below must arrive by event
             while time.time() < dl and rows() < 1: time.sleep(1)
             base = rows(); t0 = time.time()

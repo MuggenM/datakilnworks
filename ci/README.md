@@ -29,7 +29,7 @@ Creates a kind cluster, loads the image, installs `deploy/helm/datakilnworks` wi
 On failure it prints the pods, events and logs. Needs docker, kind, kubectl, helm and python3; `IMAGE=<tag>` tests another image, `KEEP_CLUSTER=1` keeps the
 cluster, `USE_CURRENT_CONTEXT=1 IMAGE_LOADER=<cmd>` uses another cluster (k3s, minikube, ...).
 
-**Status of this test:** the HTTP part (`ci/smoke_api.py`) was run against real containers laid out like the chart (studio + compute node on a shared
-volume, restarted in between). The manifests render, pass kubeconform, and both releases were rendered. The kind cluster itself could not be started on the
-machine this was written on (rootless Docker without cgroup delegation and an exhausted inotify limit), so the first real cluster run is the first run
-of the `kind` job on GitHub: expect to fix small things there.
+**Status of this test:** it passed on a real kind cluster on GitHub Actions on its first run (September 2026), so the chart has been installed, signed in to, queried, restarted, upgraded and uninstalled on a real cluster there. It cannot be run on the machine it was written on (rootless Docker without cgroup delegation, exhausted inotify limit), so it was never run locally; the HTTP part (`ci/smoke_api.py`) was also run against real containers laid out like the chart. It covers one replica on a single-node kind cluster, not a multi-node or multi-zone setup.
+
+
+**MinIO in tests:** MinIO no longer publishes images on Docker Hub or quay.io, so `scratch/verify_s3_events_ui.py` uses `cgr.dev/chainguard/minio` (env `MINIO_IMAGE` overrides).

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Preview of local-folder and s3:// Auto-Loader sources (web/autoloader_preview.py) against a throwaway warehouse and a THROWAWAY MinIO (a real S3):
-  docker network create pvnet; docker run -d --name pvminio --network pvnet -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+  docker network create pvnet; docker run -d --name pvminio --network pvnet -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin cgr.dev/chainguard/minio server /data
   docker run --rm --network pvnet -e S3_ENDPOINT=pvminio:9000 -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook python /workspace/scratch/test_autoloader_preview.py"""
 import io, json, os, shutil, sys, tempfile, time
 TMP = tempfile.mkdtemp(prefix="alpv_"); os.environ["WAREHOUSE_DIR"] = TMP
