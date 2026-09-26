@@ -1,0 +1,69 @@
+/* DKWDag canvas (see dag.js). Light and dark via the app's `.dark` class on <html>. */
+.dkw-dag {
+  --dag-bg: #f8fafc; --dag-dot: #cbd5e1; --dag-node: #ffffff; --dag-border: #cbd5e1; --dag-text: #0f172a; --dag-muted: #64748b;
+  --dag-edge: #94a3b8; --dag-ok: #16a34a; --dag-fail: #dc2626; --dag-run: #2563eb; --dag-skip: #94a3b8; --dag-sel: #f59e0b;
+  position: relative; overflow: hidden; background-color: var(--dag-bg); outline: none; user-select: none; touch-action: none;
+  background-image: radial-gradient(var(--dag-dot) 1px, transparent 1px); background-size: 24px 24px; cursor: grab;
+}
+.dark .dkw-dag {
+  --dag-bg: #0b1220; --dag-dot: #1f2a3d; --dag-node: #111a2b; --dag-border: #2a3a55; --dag-text: #e2e8f0; --dag-muted: #8ea0bd;
+  --dag-edge: #4b5d7a; --dag-ok: #34d399; --dag-fail: #f87171; --dag-run: #60a5fa; --dag-skip: #64748b;
+}
+.dkw-dag.panning { cursor: grabbing; }
+.dkw-dag.connecting, .dkw-dag.connecting * { cursor: crosshair !important; }
+.dag-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.dag-edges { position: absolute; left: 0; top: 0; width: 1px; height: 1px; overflow: visible; pointer-events: none; }
+.dag-nodes { position: absolute; left: 0; top: 0; }
+
+.dag-edge { fill: none; stroke: var(--dag-edge); stroke-width: 1.8; }
+.dag-edge.ok { stroke: var(--dag-ok); }
+.dag-edge.fail { stroke: var(--dag-fail); }
+.dag-edge.selected { stroke: var(--dag-sel); stroke-width: 2.6; }
+.dag-edge-temp { stroke: var(--dag-sel); stroke-dasharray: 6 5; stroke-width: 2; }
+.dag-edge-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
+.dkw-dag:not(.dag-editable) .dag-edge-hit { pointer-events: none; }
+.dag-arrowhead { fill: var(--dag-edge); } .dag-arrowhead-ok { fill: var(--dag-ok); } .dag-arrowhead-fail { fill: var(--dag-fail); } .dag-arrowhead-sel { fill: var(--dag-sel); }
+.dag-edge-del { position: absolute; width: 20px; height: 20px; margin: -10px 0 0 -10px; border-radius: 999px; border: 1px solid var(--dag-sel);
+  background: var(--dag-node); color: var(--dag-sel); font-size: 14px; line-height: 16px; text-align: center; cursor: pointer; padding: 0; }
+
+.dag-node { position: absolute; box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 0 12px 0 10px; border-radius: 10px;
+  background: var(--dag-node); border: 1.5px solid var(--dag-border); border-left: 4px solid var(--accent, #38bdf8); color: var(--dag-text);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, .12); cursor: pointer; }
+.dkw-dag.dag-editable .dag-node { cursor: move; }
+.dag-node:hover { border-color: var(--accent, #38bdf8); }
+.dag-node.selected { border-color: var(--dag-sel); box-shadow: 0 0 0 3px rgba(245, 158, 11, .28); }
+.dag-node-icon { flex: 0 0 auto; width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 16px;
+  color: var(--accent, #38bdf8); background: color-mix(in srgb, var(--accent, #38bdf8) 16%, transparent); }
+.dag-node-body { min-width: 0; flex: 1 1 auto; }
+.dag-node-title { font-size: 12px; font-weight: 700; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dag-node-sub { font-size: 10px; color: var(--dag-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.dag-node-status { flex: 0 0 auto; font-size: 17px; line-height: 1; display: flex; }
+.dag-node-status.ok { color: var(--dag-ok); } .dag-node-status.fail { color: var(--dag-fail); } .dag-node-status.run { color: var(--dag-run); }
+.dag-node-status.skip { color: var(--dag-skip); } .dag-node-status.pend { color: var(--dag-skip); }
+.dag-node.st-ok { border-top-color: var(--dag-ok); border-right-color: var(--dag-ok); border-bottom-color: var(--dag-ok); }
+.dag-node.st-fail { border-top-color: var(--dag-fail); border-right-color: var(--dag-fail); border-bottom-color: var(--dag-fail); background: color-mix(in srgb, var(--dag-fail) 7%, var(--dag-node)); }
+.dag-node.st-run { border-top-color: var(--dag-run); border-right-color: var(--dag-run); border-bottom-color: var(--dag-run); animation: dag-pulse 1.6s ease-in-out infinite; }
+.dag-node.st-skip { opacity: .72; border-style: dashed; }
+.dag-node.st-pend { opacity: .6; }
+.dag-node.selected.st-run, .dag-node.selected.st-ok, .dag-node.selected.st-fail { border-color: var(--dag-sel); }
+@keyframes dag-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, .45); } 50% { box-shadow: 0 0 0 6px rgba(37, 99, 235, 0); } }
+.dag-spin { animation: dag-rot 1s linear infinite; }
+@keyframes dag-rot { to { transform: rotate(360deg); } }
+
+.dag-port { position: absolute; top: 50%; width: 12px; height: 12px; margin-top: -6px; border-radius: 999px; background: var(--dag-node);
+  border: 2px solid var(--dag-edge); display: none; cursor: crosshair; z-index: 2; }
+.dag-port-in { left: -9px; } .dag-port-out { right: -9px; }
+.dkw-dag.dag-editable .dag-port { display: block; }
+.dkw-dag.dag-editable .dag-port:hover { border-color: var(--dag-sel); background: var(--dag-sel); transform: scale(1.25); }
+.dag-node.dag-target-ok { box-shadow: 0 0 0 3px rgba(34, 197, 94, .35); }
+.dag-node.dag-target-hover { box-shadow: 0 0 0 4px rgba(34, 197, 94, .8); }
+
+.dag-toolbar { position: absolute; right: 12px; bottom: 122px; display: flex; flex-direction: column; gap: 4px; z-index: 5; }
+.dag-tool { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--dag-border); background: var(--dag-node); color: var(--dag-text);
+  display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: pointer; }
+.dag-tool:hover { border-color: var(--dag-sel); color: var(--dag-sel); }
+.dag-mini { position: absolute; right: 12px; bottom: 12px; width: 160px; height: 100px; border: 1px solid var(--dag-border); border-radius: 8px;
+  background: color-mix(in srgb, var(--dag-node) 88%, transparent); z-index: 5; overflow: hidden; cursor: pointer; }
+.dag-mini-node { fill: var(--dag-edge); } .dag-mini-node.ok { fill: var(--dag-ok); } .dag-mini-node.fail { fill: var(--dag-fail); }
+.dag-mini-node.run { fill: var(--dag-run); } .dag-mini-node.skip, .dag-mini-node.pend { fill: var(--dag-skip); opacity: .6; }
+.dag-mini-view { fill: rgba(245, 158, 11, .10); stroke: var(--dag-sel); stroke-width: 1; }

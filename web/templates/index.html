@@ -98,6 +98,7 @@
   </script>
   <!-- Chart.js and Apache ECharts for Lakeview Dashboards (loaded before Monaco AMD loader) -->
   <script src="/static/qrcode.js"></script>
+  <script src="/static/dag.js"></script>
   <script src="/static/chart.min.js"></script>
   <script src="/static/echarts.min.js"></script>
   <!-- Monaco Editor loader -->
@@ -106,6 +107,7 @@
   <link rel="stylesheet" href="/static/phosphor-regular.css">
   <link rel="stylesheet" href="/static/phosphor-bold.css">
   <link rel="stylesheet" href="/static/phosphor-fill.css">
+  <link rel="stylesheet" href="/static/dag.css">
   <!-- Theme initializer (prevent FOUC) -->
   <script>
     (function() {
@@ -7198,12 +7200,107 @@
             </div>
 
             <!-- Tab 1: Tasks (DAG Flow) -->
-            <div x-show="activeJobTab === 'tasks'" class="flex-1 overflow-y-auto p-6 space-y-4">
-              <div class="flex items-center justify-between">
-                <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">DAG Task Flow Execution Order</h4>
-                <span class="text-[11px] text-slate-500">Tasks execute topologically based on depends_on</span>
+            <div x-show="activeJobTab === 'tasks'" class="flex-1 flex flex-col overflow-hidden">
+              <div class="px-6 py-2.5 border-b border-dbx-border/60 flex items-center justify-between shrink-0 gap-3">
+                <div class="flex items-center space-x-3">
+                  <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider" x-text="jobView === 'graph' ? 'Task graph' : 'DAG Task Flow Execution Order'"></h4>
+                  <div class="flex space-x-0.5 bg-slate-900 p-0.5 rounded border border-dbx-border" data-testid="jobview-toggle">
+                    <button @click="setJobView('graph')" data-testid="jobview-graph" :class="jobView === 'graph' ? 'bg-dbx-panel text-white font-semibold' : 'text-slate-400 hover:text-slate-200'" class="px-2.5 py-0.5 rounded text-[11px] transition flex items-center space-x-1"><i class="ph ph-graph"></i><span>Graph</span></button>
+                    <button @click="setJobView('list')" data-testid="jobview-list" :class="jobView === 'list' ? 'bg-dbx-panel text-white font-semibold' : 'text-slate-400 hover:text-slate-200'" class="px-2.5 py-0.5 rounded text-[11px] transition flex items-center space-x-1"><i class="ph ph-list-bullets"></i><span>List</span></button>
+                  </div>
+                </div>
+                <div x-show="jobView === 'graph'" class="flex items-center space-x-2 text-[11px]">
+                  <span class="text-slate-500">Add task</span>
+                  <template x-for="tt in [['sql','SQL','ph-database'],['notebook','Notebook','ph-notebook'],['ingest','Ingest','ph-download-simple'],['optimize','Optimize','ph-broom'],['dbt','dbt','ph-cube']]" :key="tt[0]">
+                    <button @click="addGraphTask(tt[0])" :data-testid="'graph-add-' + tt[0]" class="px-2 py-1 bg-slate-900 hover:bg-dbx-hover border border-dbx-border rounded text-slate-300 flex items-center space-x-1" :title="'Add a ' + tt[1] + ' task'"><i class="ph" :class="tt[2]"></i><span x-text="tt[1]"></span></button>
+                  </template>
+                  <span x-show="graphDirty" data-testid="graph-dirty" class="px-2 py-0.5 rounded bg-amber-950 text-amber-400 border border-amber-800 font-semibold">unsaved changes</span>
+                  <button x-show="graphDirty" @click="discardGraph()" data-testid="graph-discard" class="px-2.5 py-1 bg-slate-900 hover:bg-dbx-hover border border-dbx-border rounded text-slate-300">Discard</button>
+                  <button @click="saveGraph()" :disabled="!graphDirty || graphSaving" data-testid="graph-save" class="px-3 py-1 bg-dbx-orange hover:bg-dbx-orange/90 disabled:opacity-40 text-white rounded font-semibold flex items-center space-x-1"><i class="ph ph-floppy-disk"></i><span>Save</span></button>
+                </div>
+                <span x-show="jobView === 'list'" class="text-[11px] text-slate-500">Tasks execute topologically based on depends_on</span>
+              </div>
+              <div x-show="jobView === 'graph' && graphError" data-testid="graph-error" class="px-6 py-2 text-[11px] text-red-300 bg-red-950/40 border-b border-red-900" x-text="graphError"></div>
+
+              <!-- Graph editor: canvas + task panel -->
+              <div x-show="jobView === 'graph'" class="flex-1 flex overflow-hidden" data-testid="graph-editor">
+                <div class="flex-1 relative min-w-0">
+                  <div class="absolute inset-0" x-init="initDagEditor($el)" data-testid="dag-editor"></div>
+                  <div x-show="!graphDraft.length" class="absolute inset-0 flex items-center justify-center pointer-events-none text-xs text-slate-500">No tasks yet. Use "Add task" above.</div>
+                </div>
+                <div class="w-[22rem] shrink-0 border-l border-dbx-border bg-slate-950/40 overflow-y-auto" data-testid="graph-panel">
+                  <template x-if="!graphHasTask">
+                    <div class="p-5 space-y-3 text-[11px] text-slate-400 leading-relaxed">
+                      <div class="text-xs font-bold text-slate-200 flex items-center space-x-2"><i class="ph ph-cursor-click text-cyan-400"></i><span>Edit the workflow visually</span></div>
+                      <p><span class="text-slate-200 font-semibold">Move</span> a task by dragging it. <span class="text-slate-200 font-semibold">Connect</span> tasks by dragging from the dot on a task's right edge onto another task (that task then runs after it). <span class="text-slate-200 font-semibold">Remove</span> a dependency by clicking its line and pressing Delete, or the x on it.</p>
+                      <p>Click a task to edit it here. Changes are kept until you press <span class="text-slate-200 font-semibold">Save</span>. Scroll to zoom, drag the background to pan.</p>
+                    </div>
+                  </template>
+                  <template x-if="graphHasTask">
+                    <div class="p-4 space-y-3 text-xs" data-testid="graph-task-panel">
+                      <div class="flex items-center justify-between">
+                        <div class="text-xs font-bold text-white flex items-center space-x-2"><i class="ph text-cyan-400" :class="({sql:'ph-database',notebook:'ph-notebook',ingest:'ph-download-simple',optimize:'ph-broom',dbt:'ph-cube'})[graphTask.type] || 'ph-database'"></i><span>Task</span></div>
+                        <button @click="deleteGraphTask(graphTask.id)" data-testid="graph-task-delete" class="text-slate-500 hover:text-red-400 flex items-center space-x-1" title="Delete this task"><i class="ph ph-trash"></i><span>Delete</span></button>
+                      </div>
+                      <div class="grid grid-cols-2 gap-2">
+                        <div><label class="block text-[10px] text-slate-500 mb-0.5">Name</label><input type="text" x-model="graphTask.name" data-testid="graph-task-name" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 text-white font-semibold"></div>
+                        <div><label class="block text-[10px] text-slate-500 mb-0.5">Task ID</label><input type="text" :value="graphTask.id" @change="renameGraphTaskId(graphTask, $event)" data-testid="graph-task-id" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                      </div>
+                      <div><label class="block text-[10px] text-slate-500 mb-0.5">Type</label>
+                        <select x-model="graphTask.type" @change="setGraphTaskType(graphTask)" data-testid="graph-task-type" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 text-cyan-300 font-mono">
+                          <option value="sql">SQL Query</option><option value="optimize">Delta Optimize / Vacuum</option><option value="notebook">Papermill Notebook</option><option value="ingest">File Ingestion</option><option value="dbt">dbt</option>
+                        </select></div>
+                      <div>
+                        <label class="block text-[10px] text-slate-500 mb-0.5">Runs after</label>
+                        <div class="flex flex-wrap gap-1.5" data-testid="graph-task-deps">
+                          <template x-for="d in (graphTask.depends_on || [])" :key="d"><span class="px-2 py-0.5 bg-slate-900 border border-dbx-border rounded font-mono text-cyan-300 flex items-center space-x-1"><span x-text="d"></span><button @click="graphRemoveDep(graphTask, d)" class="text-slate-500 hover:text-red-400" title="Remove this dependency">×</button></span></template>
+                          <span x-show="!(graphTask.depends_on || []).length" class="text-slate-500 italic">nothing (a root task, starts immediately)</span>
+                        </div>
+                      </div>
+                      <div class="pt-2 border-t border-dbx-border/60 space-y-2">
+                        <div x-show="graphTask.type === 'sql'"><label class="block text-[10px] text-slate-500 mb-0.5">SQL statement</label><textarea x-model="graphTask.parameters.query" rows="5" data-testid="graph-task-query" class="w-full bg-slate-950 border border-dbx-border rounded p-2 font-mono text-amber-200"></textarea></div>
+                        <div x-show="graphTask.type === 'optimize'" class="grid grid-cols-2 gap-2">
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Target Delta table</label><input type="text" x-model="graphTask.parameters.target_table" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-amber-300"></div>
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Vacuum retention (h)</label><input type="number" x-model.number="graphTask.parameters.vacuum_retention_hours" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                        </div>
+                        <div x-show="graphTask.type === 'ingest'" class="grid grid-cols-2 gap-2">
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Source file</label><input type="text" x-model="graphTask.parameters.source_file" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Target Delta table</label><input type="text" x-model="graphTask.parameters.target_table" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-emerald-300"></div>
+                        </div>
+                        <div x-show="graphTask.type === 'dbt'" class="grid grid-cols-2 gap-2">
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Command</label><select x-model="graphTask.parameters.action" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 text-cyan-300 font-mono"><option value="run">run</option><option value="test">test</option><option value="build">build</option><option value="seed">seed</option><option value="compile">compile</option></select></div>
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Select</label><input type="text" x-model="graphTask.parameters.select" placeholder="model+ or tag:x" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Target</label><input type="text" x-model="graphTask.parameters.target" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                          <label class="flex items-center space-x-2 pt-4 text-slate-300"><input type="checkbox" x-model="graphTask.parameters.full_refresh"><span>Full refresh</span></label>
+                        </div>
+                        <div x-show="graphTask.type === 'notebook'" class="space-y-2">
+                          <div><label class="block text-[10px] text-slate-500 mb-0.5">Notebook path (.ipynb)</label><input type="text" x-model="graphTask.parameters.notebook_path" list="notebook-options-list" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-purple-300"></div>
+                          <div class="space-y-1">
+                            <div class="flex items-center justify-between"><span class="text-[10px] text-slate-500">Notebook parameters</span><button @click="graphTask.parameters.param_list.push({ key: '', value: '' })" class="text-[11px] text-cyan-400 hover:text-cyan-300">+ variable</button></div>
+                            <template x-for="(pr, pi) in (graphTask.parameters.param_list || [])" :key="pi">
+                              <div class="flex items-center space-x-1"><input x-model="pr.key" placeholder="name" class="w-2/5 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-purple-300"><input x-model="pr.value" placeholder="value" class="flex-1 bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-amber-200"><button @click="graphTask.parameters.param_list.splice(pi, 1)" class="text-slate-500 hover:text-red-400"><i class="ph ph-trash"></i></button></div>
+                            </template>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="pt-2 border-t border-dbx-border/60 grid grid-cols-2 gap-2" data-testid="graph-task-resilience">
+                        <div><label class="block text-[10px] text-slate-500 mb-0.5">Retries</label><input type="number" min="0" max="10" x-model.number="graphTask.retries" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                        <div><label class="block text-[10px] text-slate-500 mb-0.5">Retry delay (s)</label><input type="number" min="0" max="3600" x-model.number="graphTask.retry_delay_seconds" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                        <div><label class="block text-[10px] text-slate-500 mb-0.5">Backoff x</label><input type="number" min="1" max="10" step="0.5" x-model.number="graphTask.retry_backoff" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                        <div><label class="block text-[10px] text-slate-500 mb-0.5">Timeout (s, 0 = none)</label><input type="number" min="0" x-model.number="graphTask.timeout_seconds" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+                        <div class="col-span-2"><label class="block text-[10px] text-slate-500 mb-0.5">Run if</label>
+                          <select x-model="graphTask.run_if" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-cyan-300">
+                            <option value="all_success">all succeeded</option><option value="none_failed">none failed</option><option value="all_done">all finished</option>
+                            <option value="at_least_one_success">one succeeded</option><option value="at_least_one_failed">one failed</option><option value="all_failed">all failed</option>
+                          </select></div>
+                      </div>
+                      <p class="text-[10px] text-slate-500">Schedule, parameters, triggers and alerts of the workflow are under <button @click="editJob(selectedJob)" class="text-cyan-400 hover:underline">Edit</button>.</p>
+                    </div>
+                  </template>
+                </div>
               </div>
 
+              <div x-show="jobView === 'list'" class="flex-1 overflow-y-auto p-6 space-y-4">
               <div class="space-y-3">
                 <template x-for="(task, index) in (selectedJob ? selectedJob.tasks : [])" :key="task.id">
                   <div class="relative">
@@ -7273,10 +7370,73 @@
                   </div>
                 </template>
               </div>
+              </div>
             </div>
 
             <!-- Tab 2: Run History -->
-            <div x-show="activeJobTab === 'runs'" class="flex-1 overflow-y-auto p-6 space-y-4">
+            <div x-show="activeJobTab === 'runs'" class="flex-1 flex flex-col overflow-hidden">
+              <!-- Run page: graph coloured by result, details, task table (graph mode) -->
+              <div x-show="runView" class="flex-1 flex flex-col overflow-hidden" data-testid="run-view">
+                <div class="px-6 py-3 border-b border-dbx-border/60 flex items-center justify-between shrink-0 gap-3 flex-wrap">
+                  <div class="flex items-center space-x-3 text-xs">
+                    <button @click="closeRunView()" data-testid="run-back" class="text-cyan-400 hover:text-cyan-300 flex items-center space-x-1"><i class="ph ph-arrow-left"></i><span>All runs</span></button>
+                    <span class="text-slate-500">Run:</span>
+                    <select @change="openRunView($event.target.value)" data-testid="run-select" class="bg-slate-900 border border-dbx-border rounded px-2 py-1 text-slate-200 font-mono text-[11px]">
+                      <template x-for="r in jobRuns" :key="r.run_id"><option :value="r.run_id" :selected="runView && r.run_id === runView.run.run_id" x-text="r.started_at + ' · ' + (runView && r.run_id === runView.run.run_id ? runView.run.status : r.status)"></option></template>
+                    </select>
+                    <span x-show="runView" class="px-2 py-0.5 rounded text-[10px] font-bold border inline-flex items-center space-x-1" data-testid="run-status" :class="runStatusClass(runView && runView.run.status)"><i class="ph" :class="runView && runView.run.status === 'RUNNING' ? 'ph-spinner animate-spin' : (runView && runView.run.status === 'SUCCESS' ? 'ph-check' : 'ph-x')"></i><span x-text="runView ? runView.run.status : ''"></span></span>
+                    <span class="text-slate-400 font-mono" x-text="runView ? ((runView.run.trigger || '') + ' · ' + fmtDur(runView.run.duration_sec)) : ''"></span>
+                  </div>
+                  <div class="flex items-center space-x-2 text-xs">
+                    <button x-show="runView && runView.run.status === 'RUNNING'" @click="cancelRun(runView.run.run_id)" data-testid="run-cancel" class="px-3 py-1 bg-red-950 hover:bg-red-900 border border-red-800 text-red-300 rounded flex items-center space-x-1"><i class="ph ph-stop-circle"></i><span>Cancel run</span></button>
+                    <button x-show="runView && ['FAILED','CANCELLED','TIMEOUT'].includes(runView.run.status)" @click="repairRun(runView.run.run_id)" data-testid="run-repair" class="px-3 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded font-semibold flex items-center space-x-1"><i class="ph ph-wrench"></i><span>Repair run</span></button>
+                  </div>
+                </div>
+                <div class="flex-1 flex overflow-hidden min-h-0">
+                  <div class="flex-1 relative min-w-0 min-h-[220px]"><div class="absolute inset-0" x-init="initDagRun($el)" data-testid="dag-run"></div></div>
+                  <div class="w-80 shrink-0 border-l border-dbx-border bg-slate-950/40 overflow-y-auto p-4 space-y-3 text-xs" data-testid="run-panel">
+                    <template x-if="runView && !runViewHasTask">
+                      <div class="space-y-2">
+                        <div class="text-xs font-bold text-slate-200">Run details</div>
+                        <template x-for="row in runViewDetails()" :key="row[0]"><div class="flex justify-between gap-3"><span class="text-slate-500" x-text="row[0]"></span><span class="text-slate-200 font-mono text-right break-all" x-text="row[1]"></span></div></template>
+                        <div x-show="runViewParams().length" class="pt-2 border-t border-dbx-border/60 space-y-1"><div class="text-[10px] uppercase text-slate-500">Parameters</div>
+                          <template x-for="pr in runViewParams()" :key="pr[0]"><div class="flex justify-between gap-3"><span class="text-purple-300 font-mono" x-text="pr[0]"></span><span class="text-amber-200 font-mono" x-text="pr[1]"></span></div></template></div>
+                        <p class="text-[10px] text-slate-500 pt-2">Click a task in the graph or in the table below to see its log.</p>
+                      </div>
+                    </template>
+                    <template x-if="runView && runViewHasTask">
+                      <div class="space-y-2" data-testid="run-task-detail">
+                        <div class="flex items-center justify-between"><div class="text-xs font-bold text-white" x-text="runViewTask.name"></div><button @click="runView.selTask = null; dagRunSelect(null)" class="text-slate-500 hover:text-white"><i class="ph ph-x"></i></button></div>
+                        <div class="flex items-center space-x-2"><span class="px-2 py-0.5 rounded text-[10px] font-bold border" :class="runStatusClass(runViewTask.status)" x-text="runViewTask.status"></span><span class="text-slate-400 font-mono" x-text="fmtDur(runViewTask.duration_sec)"></span><span class="text-slate-500" x-text="runViewTask.type"></span></div>
+                        <div class="text-slate-500" x-show="runViewTask.started_at">Started <span class="text-slate-300 font-mono" x-text="runViewTask.started_at"></span></div>
+                        <div x-show="runViewTask.reused_from" class="text-[11px] text-amber-300">Reused from run <span class="font-mono" x-text="runViewTask.reused_from"></span> (repair)</div>
+                        <div x-show="(runViewTask.attempts || []).length > 1" class="space-y-1"><div class="text-[10px] uppercase text-slate-500">Attempts</div>
+                          <template x-for="a in runViewTask.attempts" :key="a.attempt"><div class="flex justify-between font-mono text-[11px]"><span class="text-slate-400" x-text="'#' + a.attempt"></span><span :class="a.status === 'SUCCESS' ? 'text-emerald-400' : 'text-red-400'" x-text="a.status"></span><span class="text-slate-400" x-text="fmtDur(a.duration_sec)"></span></div></template></div>
+                        <div class="space-y-1"><div class="text-[10px] uppercase text-slate-500" x-text="runViewTask.status === 'FAILED' ? 'Error' : 'Output'"></div>
+                          <pre class="bg-slate-950 border border-dbx-border rounded p-2 font-mono text-[11px] whitespace-pre-wrap break-words max-h-64 overflow-y-auto" :class="runViewTask.status === 'FAILED' ? 'text-red-300' : 'text-slate-300'" data-testid="run-task-log" x-text="runViewTask.output_log || '(no output)'"></pre></div>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+                <div class="h-52 shrink-0 border-t border-dbx-border overflow-y-auto" data-testid="run-task-table">
+                  <table class="w-full text-left text-xs border-collapse">
+                    <thead class="bg-slate-900/90 text-slate-400 text-[10px] uppercase font-mono sticky top-0 border-b border-dbx-border"><tr><th class="px-4 py-2">Task</th><th class="px-4 py-2">Type</th><th class="px-4 py-2">Status</th><th class="px-4 py-2">Duration</th><th class="px-4 py-2">Attempts</th><th class="px-4 py-2">Started</th></tr></thead>
+                    <tbody class="divide-y divide-dbx-border/40 font-mono text-[11px]">
+                      <template x-for="row in runViewRows()" :key="row.id">
+                        <tr @click="runView.selTask = row.id; dagRunSelect(row.id)" :class="runView.selTask === row.id ? 'bg-dbx-hover' : 'hover:bg-dbx-hover/60'" class="cursor-pointer" data-testid="run-task-row">
+                          <td class="px-4 py-1.5 text-white font-semibold" x-text="row.name"></td>
+                          <td class="px-4 py-1.5 text-slate-400" x-text="row.type"></td>
+                          <td class="px-4 py-1.5"><span class="px-1.5 py-0.5 rounded text-[10px] font-bold border" :class="runStatusClass(row.status)" x-text="row.status"></span></td>
+                          <td class="px-4 py-1.5 text-slate-300" x-text="row.status === 'PENDING' ? '-' : fmtDur(row.duration_sec)"></td>
+                          <td class="px-4 py-1.5 text-slate-300" x-text="row.attempts || '-'"></td>
+                          <td class="px-4 py-1.5 text-slate-500" x-text="row.started_at || '-'"></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div x-show="!runView" class="flex-1 overflow-y-auto p-6 space-y-4">
               <div class="flex items-center justify-between">
                 <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">Execution Runs & Audit Trail</h4>
                 <button @click="fetchJobRuns(selectedJob.id)" class="text-xs text-cyan-400 hover:text-cyan-300 flex items-center space-x-1">
@@ -7302,7 +7462,7 @@
                   </thead>
                   <tbody class="divide-y divide-dbx-border/40 font-mono text-[11px]">
                     <template x-for="run in jobRuns" :key="run.run_id">
-                      <tr class="hover:bg-dbx-hover/60 transition cursor-pointer" @click="openRunDetail(run.run_id)">
+                      <tr class="hover:bg-dbx-hover/60 transition cursor-pointer" @click="openRun(run.run_id)">
                         <td class="px-4 py-2 text-cyan-400 font-bold" x-text="run.run_id"></td>
                         <td class="px-4 py-2">
                           <span x-show="run.status === 'SUCCESS'" class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-800 inline-flex items-center space-x-1">
@@ -7323,7 +7483,7 @@
                         <td class="px-4 py-2 text-slate-300" x-text="run.duration_sec + 's'"></td>
                         <td class="px-4 py-2 text-slate-400" x-text="run.started_at"></td>
                         <td class="px-4 py-2 text-right">
-                          <button @click.stop="openRunDetail(run.run_id)" class="px-2 py-1 bg-slate-900 hover:bg-dbx-hover border border-dbx-border rounded text-[10px] text-slate-300 font-sans">
+                          <button @click.stop="openRun(run.run_id)" class="px-2 py-1 bg-slate-900 hover:bg-dbx-hover border border-dbx-border rounded text-[10px] text-slate-300 font-sans">
                             Inspect Logs
                           </button>
                         </td>
@@ -7331,6 +7491,7 @@
                     </template>
                   </tbody>
                 </table>
+              </div>
               </div>
             </div>
           </div>
@@ -19126,6 +19287,10 @@
         jobs: [],
         selectedJob: null,
         activeJobTab: 'tasks',
+        // graph editor + run page (canvas objects live in window.__dkwDag, not here: Alpine must not proxy DOM-bound objects)
+        jobView: (function () { try { return localStorage.getItem('dkwJobView') === 'list' ? 'list' : 'graph'; } catch (e) { return 'graph'; } })(),
+        graphDraft: [], graphOrig: '[]', graphSel: null, graphError: '', graphSaving: false, graphTick: 0,
+        runView: null,
         jobRuns: [],
         isRunningJob: false,
         showJobModal: false,
@@ -26579,8 +26744,289 @@
           }
         },
 
+        // ---------------- Jobs: graph editor ----------------
+        // never null: Alpine can re-evaluate the panel's expressions for a moment after the selection went away (the panel is shown only while graphHasTask)
+        get graphHasTask() { return !!(this.graphSel && this.graphDraft.some(t => t.id === this.graphSel)); },
+        get graphTask() { return (this.graphSel && this.graphDraft.find(t => t.id === this.graphSel)) || { id: '', name: '', type: 'sql', depends_on: [], parameters: { param_list: [] } }; },
+        get graphDirty() { this.graphTick; return JSON.stringify(this.graphDraft.map(t => this.taskPayload(t))) !== this.graphOrig; },
+
+        defaultTaskParams(type) {
+          return ({
+            sql: { query: 'SELECT 1' }, optimize: { target_table: '', vacuum_retention_hours: 168 }, ingest: { source_file: '', target_table: '' },
+            notebook: { notebook_path: '', param_list: [] }, dbt: { action: 'run', select: '', full_refresh: false, target: 'dev' }
+          })[type] || {};
+        },
+
+        taskToDraft(t) {
+          const d = JSON.parse(JSON.stringify(t));
+          d.parameters = d.parameters || {};
+          d.depends_on = d.depends_on || [];
+          if (d.retries == null) d.retries = 0;
+          if (d.retry_delay_seconds == null) d.retry_delay_seconds = 30;
+          if (d.retry_backoff == null) d.retry_backoff = 2;
+          if (d.timeout_seconds == null) d.timeout_seconds = 0;
+          if (!d.run_if) d.run_if = 'all_success';
+          if (d.type === 'notebook') {
+            d.parameters.param_list = Object.entries(d.parameters.parameters || {}).map(([k, v]) => ({ key: k, value: typeof v === 'object' ? JSON.stringify(v) : String(v) }));
+          }
+          return d;
+        },
+
+        // a draft task as the server stores it (notebook variables back into a map, editor-only fields dropped)
+        taskPayload(t) {
+          const o = JSON.parse(JSON.stringify(t));
+          o.parameters = o.parameters || {};
+          if (o.type === 'notebook') {
+            const m = {};
+            for (const item of (o.parameters.param_list || [])) {
+              const k = (item.key || '').trim();
+              if (!k) continue;
+              let v = typeof item.value === 'string' ? item.value.trim() : item.value;
+              if (v === 'true') v = true; else if (v === 'false') v = false;
+              else if (v !== '' && !isNaN(Number(v))) v = Number(v);
+              else if (typeof v === 'string' && ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']')))) { try { v = JSON.parse(v); } catch (e) {} }
+              m[k] = v;
+            }
+            o.parameters.parameters = m;
+          }
+          delete o.parameters.param_list;
+          return o;
+        },
+
+        loadGraphDraft() {
+          const job = this.selectedJob;
+          this.graphDraft = job ? (job.tasks || []).map(t => this.taskToDraft(t)) : [];
+          this.graphOrig = JSON.stringify(this.graphDraft.map(t => this.taskPayload(t)));
+          this.graphSel = null; this.graphError = '';
+          this.$nextTick(() => this.dagEditorSync(true));
+        },
+
+        dagEditorSync(fit) {
+          const ed = window.__dkwDag && window.__dkwDag.editor;
+          if (!ed) return;
+          ed.selected = this.graphSel;
+          ed.setTasks(this.graphDraft, { fit: !!fit });
+        },
+
+        initDagEditor(el) {
+          const self = this, g = window.__dkwDag = window.__dkwDag || {};
+          g.editor = new DKWDag(el, {
+            uid: 'ed', editable: true,
+            onSelect: id => { self.graphSel = id; },
+            onChange: () => { self.graphTick++; },
+            onDeleteRequest: id => self.deleteGraphTask(id),
+            onRefuse: msg => self.showToast(msg, 'error')
+          });
+          g.editor.setEditable(true);
+          this.$watch('graphDraft', () => { const ed = window.__dkwDag.editor; if (ed) ed.refresh(); }, { deep: true });
+          this.$watch('graphSel', v => { const ed = window.__dkwDag.editor; if (ed && ed.selected !== v) { ed.selected = v; ed.refresh(); } });
+          this.$watch('activeJobTab', () => this.$nextTick(() => this.dagVisible()));
+          this.$watch('jobView', () => this.$nextTick(() => this.dagVisible()));
+          this.$watch('currentView', () => this.$nextTick(() => this.dagVisible()));
+        },
+
+        dagVisible() {                       // a canvas created while hidden has no size: fit it once it is shown
+          const g = window.__dkwDag || {};
+          if (g.editor && g.editor.root.offsetParent && g.editor._pendingFit) { g.editor._pendingFit = false; g.editor.fit(); }
+          if (g.run && g.run.root.offsetParent && g.run._pendingFit) { g.run._pendingFit = false; g.run.fit(); }
+        },
+
+        setJobView(v) {
+          if (v === this.jobView) return;
+          if (v === 'list' && this.graphDirty && !confirm('Discard the unsaved changes to the task graph?')) return;
+          if (v === 'list') this.loadGraphDraft();
+          this.jobView = v;
+          try { localStorage.setItem('dkwJobView', v); } catch (e) {}
+          if (v === 'graph') this.$nextTick(() => this.dagEditorSync(true));
+        },
+
+        addGraphTask(type) {
+          const ids = new Set(this.graphDraft.map(t => t.id));
+          let n = this.graphDraft.length + 1;
+          while (ids.has('task_' + n)) n++;
+          const ed = window.__dkwDag && window.__dkwDag.editor, c = ed ? ed.viewCenter() : { x: 0, y: 0 };
+          const label = ({ sql: 'SQL task', notebook: 'Notebook task', ingest: 'Ingest task', optimize: 'Optimize task', dbt: 'dbt task' })[type] || 'Task';
+          const jitter = (this.graphDraft.length % 5) * 24;
+          this.graphDraft.push({
+            id: 'task_' + n, name: label + ' ' + n, type, depends_on: [], retries: 0, retry_delay_seconds: 30, retry_backoff: 2, timeout_seconds: 0, run_if: 'all_success',
+            parameters: this.defaultTaskParams(type), position: { x: Math.round((c.x + jitter) / 4) * 4, y: Math.round((c.y + jitter) / 4) * 4 }
+          });
+          this.graphTick++;
+          this.graphSel = 'task_' + n;
+          this.$nextTick(() => this.dagEditorSync(false));
+        },
+
+        setGraphTaskType(task) {
+          task.parameters = this.defaultTaskParams(task.type);
+        },
+
+        deleteGraphTask(id) {
+          const t = this.graphDraft.find(x => x.id === id);
+          if (!t || !confirm(`Delete the task "${t.name}"? Tasks that ran after it will no longer wait for it.`)) return;
+          this.graphDraft = this.graphDraft.filter(x => x.id !== id);
+          this.graphDraft.forEach(x => { x.depends_on = (x.depends_on || []).filter(d => d !== id); });
+          if (this.graphSel === id) this.graphSel = null;
+          this.graphTick++;
+          this.$nextTick(() => this.dagEditorSync(false));
+        },
+
+        graphRemoveDep(task, dep) {
+          task.depends_on = (task.depends_on || []).filter(d => d !== dep);
+          this.graphTick++;
+        },
+
+        renameGraphTaskId(task, ev) {
+          const nid = ev.target.value.trim(), old = task.id;
+          if (nid === old) return;
+          if (!/^[A-Za-z0-9_-]{1,64}$/.test(nid) || this.graphDraft.some(t => t !== task && t.id === nid)) {
+            ev.target.value = old;
+            this.showToast('A task id is letters, digits, _ or - (at most 64) and unique in the workflow.', 'error');
+            return;
+          }
+          this.graphDraft.forEach(t => { t.depends_on = (t.depends_on || []).map(d => d === old ? nid : d); });
+          task.id = nid;
+          this.graphSel = nid;
+          this.graphTick++;
+        },
+
+        discardGraph() {
+          if (this.graphDirty && !confirm('Discard the unsaved changes to the task graph?')) return;
+          this.loadGraphDraft();
+        },
+
+        async saveGraph() {
+          if (!this.selectedJob || this.graphSaving) return;
+          const job = this.jobs.find(j => j.id === this.selectedJob.id) || this.selectedJob;
+          const payload = JSON.parse(JSON.stringify(job));
+          delete payload.last_run;
+          payload.tasks = this.graphDraft.map(t => this.taskPayload(t));
+          this.graphSaving = true; this.graphError = '';
+          try {
+            const res = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { this.graphError = 'Could not save: ' + (data.detail || data.error || res.status); return; }
+            await this.fetchJobs();
+            const found = this.jobs.find(j => j.id === data.id);
+            if (found) this.selectedJob = found;
+            const keep = this.graphSel;
+            this.loadGraphDraft();
+            if (keep && this.graphDraft.some(t => t.id === keep)) this.graphSel = keep;
+            this.showToast('Workflow saved', 'success');
+          } catch (e) {
+            this.graphError = 'Could not save: ' + e.message;
+          } finally {
+            this.graphSaving = false;
+          }
+        },
+
+        // ---------------- Jobs: the run page ----------------
+        fmtDur(s) { return DKWDag.fmtDuration(s); },
+
+        runStatusClass(st) {
+          return ({ SUCCESS: 'bg-emerald-950 text-emerald-400 border-emerald-800', FAILED: 'bg-red-950 text-red-400 border-red-800', RUNNING: 'bg-blue-950 text-blue-400 border-blue-800',
+                    PENDING: 'bg-slate-900 text-slate-400 border-slate-700' })[st] || 'bg-amber-950 text-amber-400 border-amber-800';
+        },
+
+        openRun(runId) { return this.jobView === 'graph' ? this.openRunView(runId) : this.openRunDetail(runId); },
+
+        async openRunView(runId) {
+          if (!runId) return;
+          try {
+            const res = await fetch(`/api/jobs/runs/${runId}`);
+            if (!res.ok) return;
+            const run = await res.json();
+            const same = this.runView && this.runView.run.run_id === runId;
+            this.runView = { run, selTask: same ? this.runView.selTask : null };
+            this.activeJobTab = 'runs';
+            this.$nextTick(() => this.dagRunSync(!same));
+            const g = window.__dkwDag = window.__dkwDag || {};
+            g.polls = g.polls || {};
+            if (run.status === 'RUNNING' && !g.polls[runId]) { g.polls[runId] = true; this.pollRun(runId, run.job_id).finally(() => { delete g.polls[runId]; }); }
+          } catch (e) { console.error('Failed to open the run:', e); }
+        },
+
+        closeRunView() { this.runView = null; },
+
+        runViewGraph() {
+          const r = this.runView && this.runView.run;
+          if (!r) return [];
+          if (r.graph && r.graph.length) return r.graph;
+          const job = this.jobs.find(j => j.id === r.job_id);
+          return job ? (job.tasks || []).map(t => ({ id: t.id, name: t.name || t.id, type: t.type, depends_on: t.depends_on || [], position: t.position })) : [];
+        },
+
+        runViewStatusMap() {
+          const r = this.runView && this.runView.run, out = {};
+          if (!r) return out;
+          const finished = r.status !== 'RUNNING';
+          for (const g of this.runViewGraph()) out[g.id] = { status: finished ? 'SKIPPED' : 'PENDING', duration_sec: 0, attempts: 0 };
+          for (const t of (r.tasks_summary || [])) out[t.id] = { status: t.status, duration_sec: t.duration_sec, attempts: t.attempts };
+          for (const t of (r.tasks_detail || [])) out[t.task_id] = { status: t.status, duration_sec: t.duration_sec, attempts: t.attempt_count || 1 };
+          return out;
+        },
+
+        runViewRows() {
+          const r = this.runView && this.runView.run;
+          if (!r) return [];
+          const st = this.runViewStatusMap(), det = {};
+          for (const t of (r.tasks_detail || [])) det[t.task_id] = t;
+          const running = {};
+          for (const t of (r.tasks_summary || [])) if (t.status === 'RUNNING') running[t.id] = t;
+          return this.runViewGraph().map(g => ({ id: g.id, name: g.name, type: g.type, status: st[g.id].status, duration_sec: st[g.id].duration_sec, attempts: st[g.id].attempts,
+                                                 started_at: (det[g.id] || running[g.id] || {}).started_at || '' }));
+        },
+
+        get runViewHasTask() { return !!(this.runView && this.runView.selTask && this.runViewGraph().some(x => x.id === this.runView.selTask)); },
+        get runViewTask() {
+          const none = { id: '', name: '', type: '', status: 'PENDING', duration_sec: 0, started_at: '', output_log: '', attempts: [], reused_from: '' };
+          const r = this.runView && this.runView.run, id = this.runView && this.runView.selTask;
+          if (!r || !id) return none;
+          const g = this.runViewGraph().find(x => x.id === id);
+          const d = (r.tasks_detail || []).find(t => t.task_id === id);
+          const st = this.runViewStatusMap()[id] || { status: 'PENDING' };
+          if (!g) return none;
+          return { id, name: g.name, type: g.type, status: st.status, duration_sec: st.duration_sec, started_at: d ? d.started_at : '', output_log: d ? (d.output_log || d.output) : (st.status === 'RUNNING' ? 'Running...' : ''),
+                   attempts: d ? d.attempts : [], reused_from: d ? d.reused_from : '' };
+        },
+
+        runViewDetails() {
+          const r = this.runView && this.runView.run;
+          if (!r) return [];
+          return [['Run ID', r.run_id], ['Status', r.status], ['Trigger', r.trigger || ''], ['Started', r.started_at || ''], ['Finished', r.finished_at || (r.status === 'RUNNING' ? 'running' : '')],
+                  ['Duration', this.fmtDur(r.duration_sec)], ...(r.parent_run_id ? [['Repair of', r.parent_run_id]] : [])];
+        },
+
+        runViewParams() {
+          const r = this.runView && this.runView.run;
+          if (!r || !r.run_params) return [];
+          try { return Object.entries(typeof r.run_params === 'string' ? JSON.parse(r.run_params) : r.run_params); } catch (e) { return []; }
+        },
+
+        initDagRun(el) {
+          const self = this, g = window.__dkwDag = window.__dkwDag || {};
+          g.run = new DKWDag(el, { uid: 'rn', editable: false, onSelect: id => { if (self.runView) self.runView.selTask = id; } });
+          g.run.setEditable(false);
+        },
+
+        dagRunSync(fit) {
+          const g = window.__dkwDag, rd = g && g.run;
+          if (!rd || !this.runView) return;
+          rd.selected = this.runView.selTask;
+          rd.statuses = this.runViewStatusMap();
+          rd.setTasks(this.runViewGraph().map(t => ({ ...t })), { fit: !!fit });
+          this.dagVisible();
+        },
+
+        dagRunSelect(id) {
+          const rd = window.__dkwDag && window.__dkwDag.run;
+          if (rd) { rd.selected = id; rd.refresh(); }
+        },
+
         async selectJob(job) {
+          if (this.selectedJob && job && this.selectedJob.id !== job.id && this.jobView === 'graph' && this.graphDirty && !confirm('Discard the unsaved changes to the task graph of the current workflow?')) return;
+          this.runView = null;
           this.selectedJob = job;
+          this.loadGraphDraft();
           await this.fetchJobRuns(job.id);
           if (job) {
             this.recordRecent('job', job.id, job.name, `${job.tasks?.length || 0} tasks`, { id: job.id, name: job.name });
@@ -26634,7 +27080,7 @@
             }
             const started = await res.json();
             await this.fetchJobRuns(jobId);
-            await this.openRunDetail(started.run_id);
+            await this.openRun(started.run_id);
             this.pollRun(started.run_id, jobId);
           } catch (e) {
             alert('Failed to trigger job run: ' + e.message);
@@ -26652,6 +27098,7 @@
               if (!res.ok) return;
               const d = await res.json();
               if (this.showRunDetailModal && this.selectedRunDetail && this.selectedRunDetail.run_id === runId) this.selectedRunDetail = d;
+              if (this.runView && this.runView.run.run_id === runId) { this.runView.run = d; this.dagRunSync(false); }
               if (d.status !== 'RUNNING') break;
             } catch (e) { return; }
           }
@@ -26668,15 +27115,15 @@
         async cancelRun(runId) {
           const res = await fetch(`/api/jobs/runs/${runId}/cancel`, { method: 'POST' });
           if (!res.ok) { const err = await res.json().catch(() => ({})); alert('Cancel failed: ' + (err.detail || 'Unknown error')); return; }
-          await this.openRunDetail(runId);
+          await this.openRun(runId);
         },
 
         async repairRun(runId) {
           const res = await fetch(`/api/jobs/runs/${runId}/repair`, { method: 'POST' });
           const d = await res.json().catch(() => ({}));
           if (!res.ok) { alert('Repair failed: ' + (d.detail || 'Unknown error')); return; }
-          const jobId = this.selectedRunDetail ? this.selectedRunDetail.job_id : null;
-          await this.openRunDetail(d.run_id);
+          const jobId = (this.runView && this.runView.run ? this.runView.run.job_id : null) || (this.selectedRunDetail ? this.selectedRunDetail.job_id : null);
+          await this.openRun(d.run_id);
           if (jobId) { await this.fetchJobRuns(jobId); this.pollRun(d.run_id, jobId); }
         },
 

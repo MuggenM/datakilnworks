@@ -126,7 +126,7 @@ def init_runs_db():
                     tasks_detail TEXT
                 );
             """)
-            for col in ("run_params", "parent_run_id", "trigger_detail", "notifications"):      # added with orchestration v2
+            for col in ("run_params", "parent_run_id", "trigger_detail", "notifications", "graph"):      # v2; `graph` = the job's task graph when the run started
                 if col not in {r[1] for r in conn.execute("PRAGMA table_info(job_runs)")}:
                     conn.execute(f"ALTER TABLE job_runs ADD COLUMN {col} TEXT")
             conn.execute("""
@@ -545,6 +545,17 @@ def validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
         t["run_if"] = str(t.get("run_if") or "all_success").lower()
         if t["run_if"] not in RUN_IF:
             raise JobValidationError(f"{who}: run_if must be one of {', '.join(RUN_IF)}.")
+        pos = t.get("position")                                     # where the task sits on the graph canvas (optional, cosmetic)
+        if pos is None:
+            t.pop("position", None)
+        else:
+            try:
+                x, y = float(pos["x"]), float(pos["y"])
+            except (TypeError, KeyError, ValueError):
+                raise JobValidationError(f"{who}: position must be {{x, y}} numbers.")
+            if not (abs(x) <= 100000 and abs(y) <= 100000):
+                raise JobValidationError(f"{who}: position is out of range.")
+            t["position"] = {"x": round(x, 1), "y": round(y, 1)}
     if _has_cycle(tasks):
         raise JobValidationError("The tasks depend on each other in a circle.")
     cron = str(job.get("schedule_cron") or "").strip()
@@ -717,6 +728,26 @@ def _task_result(task: Dict[str, Any], status: str, message: str, started: Optio
 
 _active: Dict[str, Dict[str, Any]] = {}
 _active_lock = threading.Lock()
+
+
+def graph_snapshot(job: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The task graph as it was when a run started (a job can be edited later): id, name, type, depends_on, position."""
+    return [{"id": t["id"], "name": t.get("name", t["id"]), "type": t.get("type", "sql"), "depends_on": list(t.get("depends_on") or []),
+             **({"position": t["position"]} if t.get("position") else {})} for t in job.get("tasks", [])]
+
+
+def _save_progress(run_id: str, task_runs: List[Dict[str, Any]], current: Optional[Dict[str, Any]] = None) -> None:
+    """Writes the finished tasks (and the one that is running now) into the run row, so a live view sees a run advance instead of only its end."""
+    summary = [{"id": tr["task_id"], "name": tr["task_name"], "type": tr["task_type"], "status": tr["status"], "duration_sec": tr["duration_sec"],
+                "attempts": tr.get("attempt_count", 1)} for tr in task_runs]
+    if current:
+        summary.append({"id": current["id"], "name": current.get("name", current["id"]), "type": current.get("type", "sql"), "status": "RUNNING",
+                        "started_at": _now(), "duration_sec": 0, "attempts": 0})
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0) as sconn:
+            sconn.execute("UPDATE job_runs SET tasks_summary = ?, tasks_detail = ? WHERE run_id = ? AND status = 'RUNNING'", (json.dumps(summary), json.dumps(task_runs), run_id))
+    except Exception as exc:
+        logger.warning(f"could not save the progress of {run_id}: {exc}")
 
 
 def running_count(job_id: str) -> int:
@@ -896,10 +927,10 @@ def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None, principal=None
     with sqlite3.connect(DB_PATH) as sconn:
         sconn.execute("""
             INSERT INTO job_runs (run_id, job_id, job_name, trigger, status, started_at, finished_at, duration_sec, tasks_summary, tasks_detail,
-                                  run_params, parent_run_id, trigger_detail)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  run_params, parent_run_id, trigger_detail, graph)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (run_id, job["id"], job["name"], trigger.upper(), "RUNNING", started_at, None, 0.0, "[]", "[]", json.dumps(run_params), repair_of,
-              json.dumps({"depth": ctx["depth"], "chain": ctx["chain"]}) if ctx["depth"] else None))
+              json.dumps({"depth": ctx["depth"], "chain": ctx["chain"]}) if ctx["depth"] else None, json.dumps(graph_snapshot(job))))
     deadline = time.time() + int(job["timeout_seconds"]) if job.get("timeout_seconds") else None
     results: Dict[str, Dict[str, Any]] = {}
     task_runs: List[Dict[str, Any]] = []
@@ -922,6 +953,7 @@ def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None, principal=None
                 dep_desc = ", ".join(f"{d}={results[d]['status']}" for d in deps if d in results)
                 res = _task_result(task, "SKIPPED", f"Skipped: run_if '{raw.get('run_if', 'all_success')}' is not met ({dep_desc}).")
             else:
+                _save_progress(run_id, task_runs, task)
                 res = _execute_with_retries(task, conn, principal, cancel, deadline)
                 if cancel.is_set() and res["status"] != "SUCCESS":
                     res["status"] = "CANCELLED"
@@ -929,6 +961,7 @@ def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None, principal=None
                     job_timed_out = True
             results[raw["id"]] = res
             task_runs.append(res)
+            _save_progress(run_id, task_runs)
     except Exception as exc:                                    # an engine error must not leave the run RUNNING forever
         logger.error(f"Run {run_id} of {job_id} failed in the engine: {exc}", exc_info=True)
         task_runs.append(_task_result({"id": "_engine", "name": "Engine"}, "FAILED", f"Internal error: {exc}"))
@@ -1101,7 +1134,7 @@ def get_run_detail(run_id: str) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         d = dict(row)
-        for key, default in (("tasks_summary", []), ("tasks_detail", []), ("notifications", [])):
+        for key, default in (("tasks_summary", []), ("tasks_detail", []), ("notifications", []), ("graph", [])):
             try:
                 d[key] = json.loads(d.get(key) or json.dumps(default))
             except Exception:
