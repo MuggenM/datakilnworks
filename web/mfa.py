@@ -180,8 +180,8 @@ def confirm_setup(user_id: str, code: str) -> List[str]:
     try:
         with conn:
             conn.execute("UPDATE users SET totp_secret = ?, totp_pending = NULL, totp_enabled = 1, totp_last_step = ?, totp_backup = ?, "
-                         "totp_failures = 0, totp_locked_until = 0 WHERE id = ?",
-                         (_encrypt(secret), step, json.dumps([_backup_hash(_normalize_backup(c)) for c in codes]), user_id))
+                         "totp_failures = 0, totp_locked_until = 0, totp_enrolled_at = ? WHERE id = ?",
+                         (_encrypt(secret), step, json.dumps([_backup_hash(_normalize_backup(c)) for c in codes]), int(time.time()), user_id))
     finally:
         conn.close()
     return codes

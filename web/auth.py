@@ -113,6 +113,10 @@ def init_auth_db():
                              ("totp_failures", "INTEGER NOT NULL DEFAULT 0"), ("totp_locked_until", "INTEGER NOT NULL DEFAULT 0")):
                 if col not in existing:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+            # Organisation-wide MFA policy (web/mfa_policy.py): when the account enrolled, an administrator's exemption (with reason) and an extended deadline.
+            for col, ddl in (("totp_enrolled_at", "INTEGER"), ("mfa_exempt", "INTEGER NOT NULL DEFAULT 0"), ("mfa_exempt_reason", "TEXT"), ("mfa_deadline_override", "INTEGER")):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             if "deleted_at" not in existing:
                 conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
             # `must_change_password`: set when a password was provided by someone other than the account holder
@@ -246,7 +250,7 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
 # USER CRUD OPERATIONS
 # ==============================================================================
 
-_MFA_SECRET_COLUMNS = ("totp_secret", "totp_pending", "totp_last_step", "totp_backup", "totp_failures", "totp_locked_until")
+_MFA_SECRET_COLUMNS = ("totp_secret", "totp_pending", "totp_last_step", "totp_backup", "totp_failures", "totp_locked_until", "totp_enrolled_at")
 
 
 def _public_user(u: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,7 +297,7 @@ def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         rows = conn.execute(
             f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at, "
-            f"must_change_password, totp_enabled FROM users {where} ORDER BY created_at ASC").fetchall()
+            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)

@@ -14583,6 +14583,62 @@
       <div class="flex items-center space-x-1 shrink-0 border-b border-slate-200 dark:border-dbx-border -mt-2" data-testid="iam-tabs">
         <button @click="iamTab = 'users'" :class="iamTab === 'users' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-users">Users</button>
         <button @click="iamTab = 'groups'; loadGroups()" :class="iamTab === 'groups' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-groups">Groups <span class="ml-1 text-[10px] font-mono px-1.5 rounded bg-slate-100 dark:bg-slate-800" x-text="groupsList.length"></span></button>
+        <button @click="iamTab = 'mfa'; loadMfaPolicy()" :class="iamTab === 'mfa' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-mfa">Two-factor policy</button>
+      </div>
+
+      <!-- Two-factor policy: require MFA org-wide, grace period, statistics -->
+      <div x-show="iamTab === 'mfa'" class="flex-1 min-h-0 overflow-y-auto space-y-4 text-xs" data-testid="mfa-policy-panel">
+        <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-3">
+          <div class="flex items-center justify-between">
+            <label class="flex items-center space-x-2 font-semibold text-sm text-slate-800 dark:text-slate-100"><input type="checkbox" x-model="mfaPolicy.form.enabled" data-testid="mfa-policy-enabled"><span>Require two-factor authentication</span></label>
+            <span x-show="mfaPolicy.policy && mfaPolicy.policy.overridden" class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300" data-testid="mfa-policy-overridden">Suspended by MFA_POLICY_OVERRIDE in the environment</span>
+          </div>
+          <div class="flex items-center space-x-5 flex-wrap gap-y-2">
+            <span class="text-slate-500">Applies to</span>
+            <template x-for="r in ['admin', 'power_user', 'user']" :key="r"><label class="flex items-center space-x-1"><input type="checkbox" :checked="mfaPolicy.form.roles.includes(r)" @change="mfaPolicy.form.roles = $event.target.checked ? [...mfaPolicy.form.roles, r] : mfaPolicy.form.roles.filter(x => x !== r)" :data-testid="'mfa-role-' + r"><span x-text="r === 'power_user' ? 'power users' : (r === 'admin' ? 'administrators' : 'users')"></span></label></template>
+            <label class="flex items-center space-x-1.5 ml-4"><span class="text-slate-500">Grace period</span><input type="number" min="0" max="365" x-model.number="mfaPolicy.form.grace_days" class="w-16 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="mfa-grace-days"><span class="text-slate-500">days</span></label>
+            <button @click="saveMfaPolicy()" :disabled="mfaPolicy.busy" class="ml-auto px-3 py-1.5 bg-dbx-orange text-white font-semibold rounded disabled:opacity-50" data-testid="mfa-policy-save">Save policy</button>
+          </div>
+          <p class="text-[11px] text-slate-500">Covers accounts whose password this studio checks (local and LDAP). Accounts that sign in through OIDC or SAML are not asked here: their identity provider owns that. The grace period starts when the policy is turned on (or when an account is created, if later); afterwards an account without two-factor authentication can only enrol. Turn on your own first. If every administrator is ever locked out, set <span class="font-mono">MFA_POLICY_OVERRIDE=off</span> in the studio's environment and restart it.</p>
+          <div x-show="mfaPolicy.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="mfa-policy-error" x-text="mfaPolicy.error"></div>
+        </div>
+
+        <div x-show="mfaPolicy.stats" class="space-y-3" data-testid="mfa-stats">
+          <div class="grid grid-cols-6 gap-3">
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3"><div class="text-[10px] uppercase text-slate-500">Covered accounts</div><div class="text-xl font-bold" data-testid="mfa-stat-covered" x-text="mfaPolicy.stats ? mfaPolicy.stats.covered : 0"></div></div>
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3"><div class="text-[10px] uppercase text-slate-500">Enrolled</div><div class="text-xl font-bold text-emerald-600" data-testid="mfa-stat-enrolled" x-text="mfaPolicy.stats ? (mfaPolicy.stats.compliant + (mfaPolicy.stats.coverage_percent !== null ? ' (' + mfaPolicy.stats.coverage_percent + '%)' : '')) : ''"></div></div>
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3"><div class="text-[10px] uppercase text-slate-500">In grace period</div><div class="text-xl font-bold text-amber-600" data-testid="mfa-stat-grace" x-text="mfaPolicy.stats ? mfaPolicy.stats.grace : 0"></div></div>
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3"><div class="text-[10px] uppercase text-slate-500">Overdue (blocked)</div><div class="text-xl font-bold text-rose-600" data-testid="mfa-stat-overdue" x-text="mfaPolicy.stats ? mfaPolicy.stats.overdue : 0"></div></div>
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3"><div class="text-[10px] uppercase text-slate-500">Exempt</div><div class="text-xl font-bold" data-testid="mfa-stat-exempt" x-text="mfaPolicy.stats ? mfaPolicy.stats.exempt : 0"></div></div>
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3" title="Signed in through OIDC or SAML: their identity provider owns two-factor authentication"><div class="text-[10px] uppercase text-slate-500">SSO accounts (not covered)</div><div class="text-xl font-bold" data-testid="mfa-stat-sso" x-text="mfaPolicy.stats ? mfaPolicy.stats.sso_accounts : 0"></div></div>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3">
+              <div class="text-[10px] uppercase text-slate-500 mb-2">By role</div>
+              <table class="w-full text-left"><thead class="text-[10px] text-slate-500"><tr><th>Role</th><th class="text-right">Covered</th><th class="text-right">Enrolled</th><th class="text-right">Grace</th><th class="text-right">Overdue</th><th class="text-right">Exempt</th></tr></thead>
+                <tbody><template x-for="r in ['admin', 'power_user', 'user']" :key="r"><tr class="border-t border-slate-200 dark:border-dbx-border/50 font-mono"><td x-text="r"></td><td class="text-right" x-text="mfaPolicy.stats ? mfaPolicy.stats.by_role[r].total : 0"></td><td class="text-right" x-text="mfaPolicy.stats ? mfaPolicy.stats.by_role[r].enrolled : 0"></td><td class="text-right" x-text="mfaPolicy.stats ? mfaPolicy.stats.by_role[r].grace : 0"></td><td class="text-right" x-text="mfaPolicy.stats ? mfaPolicy.stats.by_role[r].overdue : 0"></td><td class="text-right" x-text="mfaPolicy.stats ? mfaPolicy.stats.by_role[r].exempt : 0"></td></tr></template></tbody></table>
+            </div>
+            <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3">
+              <div class="text-[10px] uppercase text-slate-500 mb-2">Enrolments per week (last 8 weeks, oldest first)</div>
+              <div class="flex items-end space-x-1 h-16" data-testid="mfa-weekly"><template x-for="(n, i) in (mfaPolicy.stats ? mfaPolicy.stats.enrolled_per_week : [])" :key="i"><div class="flex-1 flex flex-col items-center justify-end"><span class="text-[10px] font-mono" x-text="n"></span><div class="w-full bg-indigo-500 rounded-t" :style="'height:' + Math.max(2, n * 8) + 'px'"></div></div></template></div>
+              <div class="text-[10px] text-slate-500 mt-1" x-text="mfaPolicy.stats ? (mfaPolicy.stats.enrolled_total + ' of ' + mfaPolicy.stats.users_total + ' active accounts have two-factor authentication on') : ''"></div>
+            </div>
+          </div>
+          <div class="border border-slate-200 dark:border-dbx-border rounded-xl">
+            <div class="px-3 py-2 text-[10px] uppercase text-slate-500 border-b border-slate-200 dark:border-dbx-border">Needs attention</div>
+            <div x-show="!mfaPolicy.stats || !mfaPolicy.stats.attention.length" class="p-4 text-slate-500 text-center">Nobody: every covered account has two-factor authentication on.</div>
+            <table x-show="mfaPolicy.stats && mfaPolicy.stats.attention.length" class="w-full text-left"><thead class="text-[10px] text-slate-500"><tr><th class="px-3 py-1.5">User</th><th>Role</th><th>Source</th><th>State</th><th>Deadline</th><th class="text-right px-3">Actions</th></tr></thead>
+              <tbody><template x-for="a in (mfaPolicy.stats ? mfaPolicy.stats.attention : [])" :key="a.id"><tr class="border-t border-slate-200 dark:border-dbx-border/50" data-testid="mfa-attention-row">
+                <td class="px-3 py-1.5 font-mono" x-text="a.username"></td><td x-text="a.role"></td><td x-text="a.auth_source"></td>
+                <td><span class="px-2 py-0.5 rounded text-[10px] font-bold border" :class="a.state === 'overdue' ? 'bg-rose-100 text-rose-800 border-rose-300' : (a.state === 'grace' ? 'bg-amber-100 text-amber-800 border-amber-300' : 'bg-slate-100 text-slate-700 border-slate-300')" x-text="a.state === 'overdue' ? 'overdue - blocked' : (a.state === 'exempt' ? 'exempt' : ('grace: ' + a.days_left + ' day(s) left'))"></span><div x-show="a.exempt_reason" class="text-[10px] text-slate-500" x-text="a.exempt_reason"></div></td>
+                <td class="font-mono" x-text="a.deadline ? new Date(a.deadline * 1000).toISOString().slice(0, 10) + (a.extended ? ' (extended)' : '') : '-'"></td>
+                <td class="text-right px-3 space-x-1 whitespace-nowrap">
+                  <button x-show="a.state !== 'exempt'" @click="mfaExtend(a)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="mfa-extend">Extend</button>
+                  <button x-show="a.state !== 'exempt'" @click="mfaExempt(a, true)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="mfa-exempt">Exempt</button>
+                  <button x-show="a.state === 'exempt'" @click="mfaExempt(a, false)" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="mfa-unexempt">Remove exemption</button>
+                </td></tr></template></tbody></table>
+          </div>
+        </div>
       </div>
 
       <!-- Groups: named sets of users (local or external accounts). Grant access to a group instead of to each person. -->
@@ -16594,11 +16650,19 @@
   </div>
 
   <!-- Modal: Two-factor authentication (self-service) -->
-  <div x-show="mfa.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="mfa.open = false">
-    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-md shadow-2xl p-5 space-y-4 text-xs max-h-[90vh] overflow-y-auto" @click.outside="mfa.open = false">
+  <!-- Two-factor policy: reminder during the grace period, and the forced-enrolment notice -->
+  <div x-show="isAuthenticated && currentUser && currentUser.mfa_policy && currentUser.mfa_policy.state === 'grace' && !mfa.graceDismissed && !mfa.open" x-cloak class="fixed bottom-4 right-4 z-40 max-w-sm bg-amber-50 dark:bg-amber-950/80 border border-amber-300 dark:border-amber-800 rounded-xl shadow-xl p-3 text-xs space-y-2" data-testid="mfa-grace-banner">
+    <div class="font-semibold text-amber-900 dark:text-amber-200"><i class="ph ph-shield-warning"></i> Two-factor authentication is required</div>
+    <p class="text-amber-800 dark:text-amber-300" x-text="currentUser && currentUser.mfa_policy ? ('Your organisation requires it. Set it up within ' + currentUser.mfa_policy.days_left + ' day(s) (by ' + new Date(currentUser.mfa_policy.deadline * 1000).toISOString().slice(0, 10) + '); after that you can only do this until it is on.') : ''"></p>
+    <div class="flex justify-end space-x-2"><button @click="mfa.graceDismissed = true" class="px-2.5 py-1 rounded border border-amber-300">Later</button><button @click="openMfa()" class="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded" data-testid="mfa-grace-setup">Set it up now</button></div>
+  </div>
+
+  <div x-show="mfa.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="if (!mfa.forced) mfa.open = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-md shadow-2xl p-5 space-y-4 text-xs max-h-[90vh] overflow-y-auto" @click.outside="if (!mfa.forced) mfa.open = false" data-testid="mfa-modal">
+      <div x-show="mfa.forced" class="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-[11px] text-amber-800 dark:text-amber-300" data-testid="mfa-forced-note">Your organisation requires two-factor authentication and the time to set it up has passed. Turn it on to continue.</div>
       <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
         <h4 class="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-1.5"><i class="ph ph-shield-check text-emerald-500"></i><span>Two-factor authentication</span></h4>
-        <button type="button" @click="mfa.open = false" class="text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm"><i class="ph ph-x"></i></button>
+        <button x-show="!mfa.forced" type="button" @click="mfa.open = false" class="text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm"><i class="ph ph-x"></i></button>
       </div>
 
       <!-- Backup codes (shown once) -->
@@ -16610,7 +16674,7 @@
           </div>
           <div class="flex justify-end space-x-2">
             <button type="button" @click="navigator.clipboard.writeText(mfa.backupCodes.join('\n')); showToast('Backup codes copied', 'success')" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">Copy</button>
-            <button type="button" @click="mfa.backupCodes = null" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg">I have saved them</button>
+            <button type="button" @click="mfaBackupsSaved()" data-testid="mfa-backups-saved" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg">I have saved them</button>
           </div>
         </div>
       </template>
@@ -17446,7 +17510,8 @@
         isAuthenticated: false,
         showLoginModal: false,
         loginForm: { username: '', password: '', error: null, loading: false, mfaToken: null, mfaCode: '' },
-        mfa: { open: false, status: { enabled: false, pending: false, backup_codes_remaining: 0 }, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' },
+        mfaPolicy: { form: { enabled: false, roles: ['admin', 'power_user', 'user'], grace_days: 14 }, policy: null, stats: null, error: '', busy: false },
+        mfa: { forced: false, graceDismissed: false, open: false, status: { enabled: false, pending: false, backup_codes_remaining: 0 }, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' },
 
         // IAM Multi-User Administration State
         showIamModal: false,
@@ -18745,11 +18810,13 @@
                   email: u.email || `${u.username || 'admin'}@localspark.lakehouse`,
                   role: u.role || 'admin',
                   auth_source: u.auth_source || 'local',
-                  must_change_password: !!u.must_change_password
+                  must_change_password: !!u.must_change_password,
+                  mfa_policy: u.mfa_policy || null
                 };
                 this.isAuthenticated = true;
                 this.showLoginModal = false;
                 if (this.currentUser.must_change_password) this.openChangePassword(true);
+                else if (this.mfaEnrollmentRequired()) this.openMfa(true);
                 return;
               }
             }
@@ -18774,7 +18841,8 @@
             email: u.email || `${u.username}@localspark.lakehouse`,
             role: u.role || 'user',
             auth_source: u.auth_source || 'local',
-            must_change_password: !!u.must_change_password
+            must_change_password: !!u.must_change_password,
+            mfa_policy: u.mfa_policy || null
           };
           this.isAuthenticated = true;
           this.showLoginModal = false;
@@ -18785,6 +18853,7 @@
           this.loginForm.error = null;
           this.showToast(`Logged in as ${this.currentUser.full_name || this.currentUser.username} (${this.currentUser.role.toUpperCase()})`, 'success');
           if (this.currentUser.must_change_password) { this.openChangePassword(true); return; }   // the server refuses everything else until then; data loads after the change
+          if (this.mfaEnrollmentRequired()) { this.openMfa(true); return; }                      // same for a required second factor whose deadline has passed
           await this.onUserChanged();
         },
 
@@ -18818,8 +18887,49 @@
           this.loginForm.error = message || null;
         },
 
-        async openMfa() {
-          this.mfa = { ...this.mfa, open: true, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' };
+        mfaEnrollmentRequired() {
+          const p = this.currentUser && this.currentUser.mfa_policy;
+          return !!(p && p.state === 'overdue');
+        },
+
+        async loadMfaPolicy() {
+          this.mfaPolicy.error = '';
+          try {
+            const [p, st] = await Promise.all([fetch('/api/mfa/policy'), fetch('/api/mfa/stats')]);
+            if (p.ok) { this.mfaPolicy.policy = await p.json(); this.mfaPolicy.form = { enabled: this.mfaPolicy.policy.stored_enabled, roles: [...this.mfaPolicy.policy.roles], grace_days: this.mfaPolicy.policy.grace_days }; }
+            if (st.ok) this.mfaPolicy.stats = await st.json();
+          } catch (e) { this.mfaPolicy.error = 'Could not load the policy: ' + e.message; }
+        },
+
+        async saveMfaPolicy() {
+          this.mfaPolicy.busy = true; this.mfaPolicy.error = '';
+          try {
+            const res = await fetch('/api/mfa/policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.mfaPolicy.form) });
+            const d = await res.json();
+            if (!res.ok) { this.mfaPolicy.error = typeof d.detail === 'string' ? d.detail : 'Could not save the policy.'; return; }
+            this.showToast('Two-factor policy saved.', 'success');
+            await this.loadMfaPolicy();
+          } catch (e) { this.mfaPolicy.error = 'Error: ' + e.message; } finally { this.mfaPolicy.busy = false; }
+        },
+
+        async mfaExtend(a) {
+          const days = prompt(`Give ${a.username} more time: how many days from today? (0 removes an extension)`, '7');
+          if (days === null) return;
+          const res = await fetch(`/api/users/${a.id}/mfa/extend`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days: parseInt(days, 10) }) });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.mfaPolicy.error = d.detail || 'Could not extend.'; return; }
+          await this.loadMfaPolicy();
+        },
+
+        async mfaExempt(a, exempt) {
+          let reason = '';
+          if (exempt) { reason = prompt(`Why is ${a.username} exempt from two-factor authentication? (shown to administrators, audited)`, ''); if (reason === null) return; }
+          const res = await fetch(`/api/users/${a.id}/mfa/exempt`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ exempt, reason }) });
+          if (!res.ok) { const d = await res.json().catch(() => ({})); this.mfaPolicy.error = d.detail || 'Could not change the exemption.'; return; }
+          await this.loadMfaPolicy();
+        },
+
+        async openMfa(forced = false) {
+          this.mfa = { ...this.mfa, forced: !!forced, open: true, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' };
           try {
             const res = await fetch('/api/auth/mfa/status');
             if (res.ok) this.mfa.status = await res.json();
@@ -18855,6 +18965,15 @@
           if (!data) return;
           this.mfa.backupCodes = data.backup_codes; this.mfa.setup = null; this.mfa.code = '';
           this.mfa.status = { enabled: true, pending: false, backup_codes_remaining: data.backup_codes.length };
+          if (this.currentUser && this.currentUser.mfa_policy) this.currentUser.mfa_policy = { ...this.currentUser.mfa_policy, state: 'compliant', enrolled: true };
+        },
+
+        async mfaBackupsSaved() {
+          this.mfa.backupCodes = null;
+          if (this.mfa.forced) {                       // the block is lifted: close the notice and load what the sign-in postponed
+            this.mfa.forced = false; this.mfa.open = false;
+            await this.onUserChanged();
+          }
         },
 
         async mfaDisable() {

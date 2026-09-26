@@ -217,6 +217,35 @@ async def _must_change_password_gate(request: Request, call_next):
                     "must_change_password": True})
     return await call_next(request)
 
+# What a user who has to enrol in two-factor authentication (organisation policy, deadline passed) may still call.
+_MFA_ENROLLMENT_ALLOWED = {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me", "/api/auth/login", "/api/auth/login/mfa",
+                           "/api/auth/mfa/status", "/api/auth/mfa/setup", "/api/auth/mfa/enable"}
+
+
+@app.middleware("http")
+async def _mfa_policy_gate(request: Request, call_next):
+    """
+    The organisation may require two-factor authentication (web/mfa_policy.py). A covered account that has not enrolled by its deadline can only
+    enrol: every other /api/* call is refused here, so it cannot be skipped from outside the UI (same shape as the forced password change,
+    including the staleness check of resolve_principal).
+    """
+    path = request.url.path
+    if not path.startswith("/api/") or path in _MFA_ENROLLMENT_ALLOWED or path.startswith("/api/sandbox/"):
+        return await call_next(request)
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        payload = decode_access_token(token)
+        if payload and "sub" in payload:
+            user = get_user_by_id(payload["sub"])
+            changed = user.get("password_changed_at") if user else None
+            stale = bool(changed and int(payload.get("iat", 0)) < int(changed))
+            if user and user.get("is_active", 1) == 1 and not user.get("deleted_at") and not stale:
+                from web import mfa_policy
+                if mfa_policy.is_blocked(user):
+                    return JSONResponse(status_code=403, content={
+                        "detail": "Your organisation requires two-factor authentication. Turn it on to continue.", "mfa_enrollment_required": True})
+    return await call_next(request)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -476,6 +505,16 @@ async def login_endpoint(payload: LoginRequest):
     return _session_response(u)
 
 
+def _mfa_policy_view(u: Dict[str, Any]) -> Dict[str, Any]:
+    """What the UI needs about the organisation's two-factor policy for this user."""
+    try:
+        from web import mfa_policy
+        st = mfa_policy.user_status(u)
+        return {"required": st["required"], "state": st["state"], "deadline": st["deadline"], "days_left": st["days_left"], "enrolled": st["enrolled"]}
+    except Exception:
+        return {"required": False, "state": "off", "deadline": None, "days_left": None, "enrolled": bool(u.get("mfa_enabled"))}
+
+
 def _session_response(u: Dict[str, Any]) -> JSONResponse:
     """Records the login and returns the session (cookie + user), shared by every password-based sign-in path."""
     record_user_login(u["id"])
@@ -491,7 +530,8 @@ def _session_response(u: Dict[str, Any]) -> JSONResponse:
         "last_login_at": u["last_login_at"],
         "must_change_password": bool(u.get("must_change_password")),
         "auth_source": u.get("auth_source") or "local",
-        "mfa_enabled": bool(u.get("mfa_enabled"))
+        "mfa_enabled": bool(u.get("mfa_enabled")),
+        "mfa_policy": _mfa_policy_view(u)
     }
     resp = JSONResponse(content={"success": True, "token": token, "user": safe_user})
     resp.set_cookie(
@@ -540,7 +580,7 @@ async def mfa_setup(request: Request):
     """Starts enrolment: returns the secret and otpauth:// URI for the authenticator app (nothing is enabled yet)."""
     from web import mfa
     user = await get_current_user(request)
-    if (user.get("auth_source") or "local") == "oidc":
+    if (user.get("auth_source") or "local") in ("oidc", "saml"):
         raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
     try:
         return mfa.begin_setup(user["id"], user["username"])
@@ -581,6 +621,9 @@ async def _require_second_factor(request: Request, payload: MfaCodeRequest) -> D
 async def mfa_disable(payload: MfaCodeRequest, request: Request):
     from web import mfa
     user = await _require_second_factor(request, payload)
+    from web import mfa_policy
+    if not mfa_policy.may_disable_own_mfa(get_user_by_id(user["id"]) or user):
+        raise HTTPException(status_code=409, detail="Your organisation requires two-factor authentication, so it cannot be turned off. Ask an administrator for an exemption if you need to.")
     mfa.disable(user["id"])
     return {"success": True}
 
@@ -603,6 +646,69 @@ async def admin_reset_mfa(user_id: str, current_user: Dict[str, Any] = Depends(r
         raise HTTPException(status_code=404, detail="User not found")
     logger.warning(f"MFA reset for user {user_id} by admin {current_user['username']}")
     return {"success": True}
+
+
+class MfaPolicyPayload(BaseModel):
+    enabled: bool
+    roles: List[str] = ["admin", "power_user", "user"]
+    grace_days: int = 14
+
+
+class MfaExemptPayload(BaseModel):
+    exempt: bool
+    reason: str = ""
+
+
+class MfaExtendPayload(BaseModel):
+    days: int
+
+
+@app.get("/api/mfa/policy")
+async def get_mfa_policy_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import mfa_policy
+    return mfa_policy.get_policy()
+
+
+@app.put("/api/mfa/policy")
+async def set_mfa_policy_endpoint(payload: MfaPolicyPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Require two-factor authentication for the chosen roles (accounts checked by this studio: local and LDAP), with a grace period in days.
+    Refused while you are covered and have not enrolled yourself."""
+    from web import mfa_policy
+    try:
+        return mfa_policy.set_policy(payload.enabled, payload.roles, payload.grace_days, get_user_by_id(current_user["id"]) or current_user)
+    except mfa_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/mfa/stats")
+async def mfa_stats_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Coverage numbers, per-role breakdown, enrolment per week and the users that need attention (overdue, in grace, exempt)."""
+    from web import mfa_policy
+    return await asyncio.to_thread(mfa_policy.stats)
+
+
+@app.post("/api/users/{user_id}/mfa/exempt")
+async def mfa_exempt_endpoint(user_id: str, payload: MfaExemptPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import mfa_policy
+    try:
+        mfa_policy.set_exempt(user_id, payload.exempt, payload.reason, current_user)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except mfa_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"success": True}
+
+
+@app.post("/api/users/{user_id}/mfa/extend")
+async def mfa_extend_endpoint(user_id: str, payload: MfaExtendPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Gives one user more time: their deadline becomes `days` from now (0 removes an extension)."""
+    from web import mfa_policy
+    try:
+        return {"success": True, "deadline": mfa_policy.extend_deadline(user_id, payload.days, current_user)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except mfa_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def _oidc_redirect_uri(cfg: Dict[str, Any], request: Request) -> str:
@@ -769,6 +875,7 @@ async def get_current_user_profile(request: Request):
                 current_user["full_name"] = current_user.get("display_name") or current_user.get("username", "admin")
             if "email" not in current_user or not current_user["email"]:
                 current_user["email"] = f"{current_user.get('username', 'admin')}@localspark.lakehouse"
+            current_user["mfa_policy"] = _mfa_policy_view(current_user)
             return {
                 "authenticated": True,
                 "user": current_user,
