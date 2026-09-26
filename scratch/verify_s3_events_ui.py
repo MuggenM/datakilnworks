@@ -67,9 +67,9 @@ def main():
             check("a token is shown once and listed", token.startswith("dkw_s3ev_") and page.locator("[data-testid=s3events-token-row]").count() == 1)
             page.screenshot(path="/tmp/s3ev_modal.png"); page.keyboard.press("Escape")
             # a real MinIO that posts to the studio
-            sh("docker", "run", "-d", "--name", MINIO, "--network", NET, "-e", "MINIO_NOTIFY_WEBHOOK_ENABLE_dkw=on", "-e", f"MINIO_NOTIFY_WEBHOOK_ENDPOINT_dkw=http://{UI}:8891/hooks/s3-events",
+            mr = sh("docker", "run", "-d", "--name", MINIO, "--network", NET, "-e", "MINIO_NOTIFY_WEBHOOK_ENABLE_dkw=on", "-e", f"MINIO_NOTIFY_WEBHOOK_ENDPOINT_dkw=http://{UI}:8891/hooks/s3-events",
                "-e", f"MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_dkw={token}", "minio/minio", "server", "/data")
-            print(sh("docker", "inspect", "-f", "{{.Config.Image}} {{.State.Status}}", MINIO).stdout.strip())
+            print("minio docker run:", mr.returncode, mr.stdout.strip()[:20], mr.stderr.strip()[-600:])
             for _ in range(4):
                 r = ex(NOTIFY)
                 if "configured" in r.stdout: break

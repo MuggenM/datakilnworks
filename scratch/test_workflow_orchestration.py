@@ -231,4 +231,6 @@ with sqlite3.connect(wf.DB_PATH) as c: c.execute("INSERT INTO job_runs (run_id, 
 check("a run left RUNNING by a dead process is marked FAILED at startup", wf.mark_orphaned_runs() >= 1 and wf.get_run_detail("run_orphan")["status"] == "FAILED")
 
 shutil.rmtree(TMP, ignore_errors=True)
-print("FAILED: " + ", ".join(FAIL) if FAIL else "ALL PASS"); sys.exit(1 if FAIL else 0)
+print("FAILED: " + ", ".join(FAIL) if FAIL else "ALL PASS", flush=True)
+# leave without interpreter teardown: a worker thread of the engine aborted (exit 134) at shutdown on a slow runner after every check had passed
+sys.stdout.flush(); os._exit(1 if FAIL else 0)
