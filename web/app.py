@@ -197,6 +197,8 @@ from web import sandbox_client, sandbox_gateway
 from web.governance import routes as governance_routes
 app.include_router(governance_routes.router)
 app.include_router(sandbox_gateway.router)
+from web import s3_events as s3_events_module
+app.include_router(s3_events_module.router)               # POST /hooks/s3-events : bearer-token receiver for S3 bucket notifications (web/s3_events.py)
 from web import scim as scim_module
 app.include_router(scim_module.router)                    # /scim/v2/* : authenticated by SCIM bearer tokens only (web/scim.py)
 
@@ -796,6 +798,39 @@ async def create_scim_token_endpoint(payload: ScimTokenPayload, current_user: Di
 async def revoke_scim_token_endpoint(token_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     try:
         await asyncio.to_thread(scim_module.revoke_token, token_id, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"success": True}
+
+
+class S3EventTokenPayload(BaseModel):
+    name: str
+
+
+@app.get("/api/autoloader/s3-events")
+async def get_s3_events_endpoint(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The receiver URL, its tokens (never the secret again), what the pipelines received and which pipelines use S3 events."""
+    from web import autoloader
+    root = str(request.base_url).rstrip("/")
+    st = s3_events_module.status()
+    pipes = [{"id": p["id"], "name": p["name"], "source_volume_path": p["source_volume_path"], "enabled": bool(p.get("enabled", 1)), "sweep_seconds": p.get("watch_sweep_seconds"),
+              **(st["pipelines"].get(p["id"]) or {"events": 0, "last_event_at": None, "last_run_at": None})}
+             for p in await asyncio.to_thread(autoloader.list_pipelines) if p.get("s3_events")]
+    return {"receiver_url": root + "/hooks/s3-events", "tokens": await asyncio.to_thread(s3_events_module.list_tokens), "pipelines": pipes, "recent": st["recent"]}
+
+
+@app.post("/api/autoloader/s3-events/tokens")
+async def create_s3_events_token_endpoint(payload: S3EventTokenPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        return await asyncio.to_thread(s3_events_module.create_token, payload.name, current_user.get("username", "admin"))
+    except s3_events_module.EventError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/autoloader/s3-events/tokens/{token_id}")
+async def revoke_s3_events_token_endpoint(token_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        await asyncio.to_thread(s3_events_module.revoke_token, token_id, current_user.get("username", "admin"))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {"success": True}

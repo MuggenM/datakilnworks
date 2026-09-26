@@ -92,6 +92,8 @@ def init_autoloader_db():
         cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN source_mount_id TEXT")
     if "watch_enabled" not in existing_cols:
         cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN watch_enabled INTEGER DEFAULT 0")
+    if "s3_events" not in existing_cols:                # woken by S3 bucket notifications (web/s3_events.py); watch_sweep_seconds is its safety-net rescan
+        cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN s3_events INTEGER DEFAULT 0")
     if "watch_sweep_seconds" not in existing_cols:
         cursor.execute("ALTER TABLE autoloader_pipelines ADD COLUMN watch_sweep_seconds INTEGER DEFAULT 300")
     if "source_options" not in existing_cols:                # conn:// sources: JSON (REST mode, pagination, sftp recursion, ...)
@@ -160,6 +162,7 @@ def _with_watch_status(pipe: Dict[str, Any]) -> Dict[str, Any]:
     except ValueError:
         pipe["source_options"] = {}
     pipe["watch_enabled"] = bool(pipe.get("watch_enabled"))
+    pipe["s3_events"] = bool(pipe.get("s3_events"))
     if _watch_manager is not None or pipe["watch_enabled"]:
         try:
             pipe["watch"] = get_watch_manager().status(pipe)
@@ -223,6 +226,17 @@ def _normalize_sweep(value) -> int:
         raise ValueError("watch_sweep_seconds must be a number of seconds.")
 
 
+def _validate_s3_events(source_vol: str, s3_events: int, watch_enabled: int, cron_schedule: Optional[str]) -> None:
+    if not s3_events:
+        return
+    if not autoloader_s3.is_s3_path(source_vol):
+        raise ValueError("S3 event notifications only apply to s3:// sources.")
+    if watch_enabled:
+        raise ValueError("File watching and S3 events are alternatives; choose one trigger.")
+    if cron_schedule:
+        raise ValueError("A cron schedule and S3 events are alternatives; choose one trigger.")
+
+
 def _validate_conn_source(source_vol: str, watch_enabled: int, source_mount_id: Optional[str], options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """A `conn://` source (HTTP file / REST API / SFTP through a Connection): polled, like S3. Returns the cleaned source options."""
     if watch_enabled:
@@ -280,6 +294,7 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
     _validate_pipeline_mode(ingest_mode, merge_keys)
     cron_schedule = normalize_cron(data.get("cron_schedule"))
     watch_enabled = 1 if data.get("watch_enabled") else 0
+    s3_events = 1 if data.get("s3_events") else 0
     watch_sweep = _normalize_sweep(data.get("watch_sweep_seconds"))
     if watch_enabled and cron_schedule:
         raise ValueError("File watching and a cron schedule are alternatives; choose one trigger.")
@@ -287,6 +302,7 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
         raise ValueError("Source volume path is required (e.g. /Volumes/warehouse/raw/iot_stream or s3://bucket/prefix/).")
     source_mount_id = (data.get("source_mount_id") or "").strip() or None
     source_vol = _validate_source(source_vol, watch_enabled, source_mount_id)
+    _validate_s3_events(source_vol, s3_events, watch_enabled, cron_schedule)
     source_options = _validate_conn_source(source_vol, watch_enabled, source_mount_id, data.get("source_options")) if autoloader_conn.is_conn_path(source_vol) else None
     if not target_tbl:
         raise ValueError("Target Delta table name is required.")
@@ -301,14 +317,14 @@ def create_pipeline(data: Dict[str, Any], created_by: str = "admin") -> Dict[str
             target_catalog, target_schema, target_table, ingest_mode,
             merge_keys, schema_evolution, poll_interval_seconds, enabled,
             status, created_by, created_at, last_run_at, total_files_ingested, total_rows_ingested, cron_schedule,
-            watch_enabled, watch_sweep_seconds, source_mount_id, source_options
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?, ?, ?, ?, ?)
+            watch_enabled, watch_sweep_seconds, source_mount_id, source_options, s3_events
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?, NULL, 0, 0, ?, ?, ?, ?, ?, ?)
     """, (
         pipeline_id, name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
         created_by, now_iso, cron_schedule, watch_enabled, watch_sweep, source_mount_id,
-        json.dumps(source_options) if source_options is not None else None
+        json.dumps(source_options) if source_options is not None else None, s3_events
     ))
     conn.commit()
     conn.close()
@@ -343,12 +359,18 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     cron_schedule = normalize_cron(data["cron_schedule"]) if "cron_schedule" in data else pipe.get("cron_schedule")
     watch_enabled = (1 if data["watch_enabled"] else 0) if "watch_enabled" in data else (1 if pipe.get("watch_enabled") else 0)
     watch_sweep = _normalize_sweep(data.get("watch_sweep_seconds", pipe.get("watch_sweep_seconds")))
+    s3_events = (1 if data["s3_events"] else 0) if "s3_events" in data else (1 if pipe.get("s3_events") else 0)
     if "cron_schedule" in data and cron_schedule and "watch_enabled" not in data:
         watch_enabled = 0                    # choosing a schedule switches file watching off (they are alternatives)
+    if "cron_schedule" in data and cron_schedule and "s3_events" not in data:
+        s3_events = 0
+    if watch_enabled and "s3_events" not in data:
+        s3_events = 0
     if watch_enabled and cron_schedule:
         raise ValueError("File watching and a cron schedule are alternatives; choose one trigger.")
     source_mount_id = ((data.get("source_mount_id") or "").strip() or None) if "source_mount_id" in data else pipe.get("source_mount_id")
     source_vol = _validate_source(source_vol, watch_enabled, source_mount_id)
+    _validate_s3_events(source_vol, s3_events, watch_enabled, cron_schedule)
     source_options = pipe.get("source_options") or None
     if autoloader_conn.is_conn_path(source_vol):
         source_options = _validate_conn_source(source_vol, watch_enabled, source_mount_id, data.get("source_options", source_options))
@@ -363,14 +385,14 @@ def update_pipeline(pipeline_id: str, data: Dict[str, Any]) -> Optional[Dict[str
             name = ?, description = ?, source_volume_path = ?, file_pattern = ?,
             target_catalog = ?, target_schema = ?, target_table = ?, ingest_mode = ?,
             merge_keys = ?, schema_evolution = ?, poll_interval_seconds = ?, enabled = ?,
-            cron_schedule = ?, watch_enabled = ?, watch_sweep_seconds = ?, source_mount_id = ?, source_options = ?
+            cron_schedule = ?, watch_enabled = ?, watch_sweep_seconds = ?, source_mount_id = ?, source_options = ?, s3_events = ?
         WHERE id = ?
     """, (
         name, desc, source_vol, pattern,
         target_cat, target_sch, target_tbl, ingest_mode,
         merge_keys, schema_evol, poll_sec, enabled,
         cron_schedule, watch_enabled, watch_sweep, source_mount_id,
-        json.dumps(source_options) if source_options is not None else None, pipeline_id
+        json.dumps(source_options) if source_options is not None else None, s3_events, pipeline_id
     ))
     conn.commit()
     conn.close()
@@ -1165,6 +1187,10 @@ async def autoloader_daemon_loop():
                 if p.get("watch_enabled") and not cron_expr and get_watch_manager().is_watching(p_id):
                     # Events start cycles; this is only the low-frequency safety-net rescan (missed events, hard links,
                     # filesystems that emit none).
+                    from web.autoloader_watch import sweep_seconds
+                    due = (now - last_run_map.setdefault(p_id, now)) >= sweep_seconds(p)
+                elif p.get("s3_events") and not cron_expr:
+                    # Bucket notifications wake the pipeline (web/s3_events.py); this is only the safety-net rescan for events that were lost.
                     from web.autoloader_watch import sweep_seconds
                     due = (now - last_run_map.setdefault(p_id, now)) >= sweep_seconds(p)
                 elif cron_expr:

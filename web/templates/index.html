@@ -1916,6 +1916,10 @@
               <i class="ph ph-folder-plus text-sm text-sky-400"></i>
               <span>New Volume</span>
             </button>
+            <button x-show="currentUser && currentUser.role === 'admin'" @click="openS3Events()" data-testid="open-s3events" class="flex items-center space-x-1.5 px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded text-xs font-semibold shadow-sm transition" title="Wake pipelines from bucket event notifications">
+              <i class="ph ph-lightning text-sm"></i>
+              <span>S3 events</span>
+            </button>
             <button x-show="currentUser && ['admin', 'power_user'].includes(currentUser.role)" @click="openConnections()" data-testid="open-connections" class="flex items-center space-x-1.5 px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded text-xs font-semibold shadow-sm transition" title="Saved logins for HTTP(S) / REST and SFTP sources">
               <i class="ph ph-plugs-connected text-sm"></i>
               <span>Connections</span>
@@ -2088,7 +2092,8 @@
                       <span class="text-slate-400"> • </span>
                       <span x-show="p.watch && p.watch.mode === 'watching'" class="text-emerald-500" :title="'inotify: ' + p.watch.directories + ' folder(s), ' + p.watch.events + ' event(s) seen; rescan every ' + p.watch.sweep_seconds + 's'"><i class="ph ph-eye"></i> watching</span>
                       <span x-show="p.watch && p.watch.mode === 'fallback'" class="text-amber-500" :title="p.watch.detail"><i class="ph ph-warning"></i> watch unavailable, polling <span x-text="p.poll_interval_seconds + 's'"></span></span>
-                      <span x-show="!p.watch_enabled" x-text="p.cron_schedule ? ('cron ' + p.cron_schedule + ' UTC') : (p.poll_interval_seconds + 's interval')"></span>
+                      <span x-show="p.s3_events" class="text-emerald-500" data-testid="s3events-badge" title="Started by bucket events; the bucket is listed now and then as a safety net"><i class="ph ph-lightning"></i> S3 events, rescan <span x-text="p.watch_sweep_seconds + 's'"></span></span>
+                      <span x-show="!p.watch_enabled && !p.s3_events" x-text="p.cron_schedule ? ('cron ' + p.cron_schedule + ' UTC') : (p.poll_interval_seconds + 's interval')"></span>
                     </div>
                   </div>
                 </div>
@@ -11271,6 +11276,59 @@
   </div>
 
   <!-- Modal: Connections (HTTP(S)/REST and SFTP sources for Auto-Loader) -->
+  <div x-show="s3ev.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="s3ev.open = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-3xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" data-testid="s3events-modal">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-3">
+        <div>
+          <h3 class="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-lightning text-dbx-orange"></i><span>S3 bucket events</span></h3>
+          <p class="text-[11px] text-slate-500 mt-0.5">The bucket tells Data Kiln Works about new objects, and the pipeline runs at once instead of polling. An event only wakes a pipeline; the data still comes from listing the bucket.</p>
+        </div>
+        <button @click="s3ev.open = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+      <div class="space-y-1">
+        <div class="text-slate-400 uppercase text-[10px] font-semibold">Receiver URL</div>
+        <div class="flex items-center space-x-2"><span class="font-mono px-2 py-1 bg-slate-100 dark:bg-slate-900 rounded select-all" data-testid="s3events-url" x-text="s3ev.data ? s3ev.data.receiver_url : ''"></span><button @click="navigator.clipboard.writeText(s3ev.data.receiver_url); showToast('URL copied', 'success')" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded">Copy</button></div>
+        <p class="text-[10px] text-slate-500">The server must be able to reach this address (inside Docker or Kubernetes use the studio's service name and port). With an IP allowlist, allow the bucket server's address.</p>
+      </div>
+      <div class="space-y-2">
+        <div class="flex items-center justify-between"><div class="text-slate-400 uppercase text-[10px] font-semibold">Access tokens</div>
+          <div class="flex items-center space-x-2"><input x-model="s3ev.name" placeholder="Name, e.g. MinIO prod" data-testid="s3events-token-name" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1"><button @click="createS3EventsToken()" data-testid="s3events-token-create" class="px-2.5 py-1 bg-dbx-orange text-white rounded font-semibold">Create token</button></div></div>
+        <div x-show="s3ev.secret" class="p-2 rounded border border-amber-500/50 bg-amber-500/10 space-y-1" data-testid="s3events-secret-box">
+          <div class="text-amber-600 dark:text-amber-400 font-semibold">Copy this token now, it is not shown again.</div>
+          <div class="flex items-center space-x-2"><span class="font-mono select-all break-all" data-testid="s3events-secret" x-text="s3ev.secret"></span><button @click="navigator.clipboard.writeText(s3ev.secret); showToast('Token copied', 'success')" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded">Copy</button></div>
+        </div>
+        <template x-for="t in (s3ev.data ? s3ev.data.tokens : [])" :key="t.id">
+          <div class="flex items-center justify-between px-2 py-1.5 rounded border border-slate-200 dark:border-dbx-border" data-testid="s3events-token-row">
+            <div><span class="font-semibold" x-text="t.name"></span> <span class="font-mono text-slate-500" x-text="t.prefix + '…'"></span> <span class="text-slate-500" x-text="t.revoked_at ? 'revoked' : (t.last_used_at ? 'last used ' + new Date(t.last_used_at * 1000).toLocaleString() : 'never used')"></span></div>
+            <button x-show="!t.revoked_at" @click="revokeS3EventsToken(t)" class="text-rose-500 hover:underline">Revoke</button>
+          </div>
+        </template>
+        <div x-show="s3ev.data && !s3ev.data.tokens.length" class="text-slate-500">No token yet. Create one, then give it to the bucket server.</div>
+      </div>
+      <div class="space-y-1">
+        <div class="text-slate-400 uppercase text-[10px] font-semibold">Set up MinIO</div>
+        <pre class="p-2 bg-slate-100 dark:bg-slate-900 rounded font-mono text-[11px] whitespace-pre-wrap select-all" x-text="s3ev.data ? ('mc admin config set ALIAS notify_webhook:dkw endpoint=' + s3ev.data.receiver_url + ' auth_token=<token>\nmc admin service restart ALIAS\nmc event add ALIAS/BUCKET arn:minio:sqs::dkw:webhook --event put') : ''"></pre>
+        <p class="text-[10px] text-slate-500">Garage and other S3-compatible servers work too when they can POST S3 event JSON with an <span class="font-mono">Authorization: Bearer &lt;token&gt;</span> header. Then pick <b>S3 events</b> as the polling interval of an s3:// pipeline.</p>
+      </div>
+      <div class="space-y-1">
+        <div class="text-slate-400 uppercase text-[10px] font-semibold">Pipelines using events</div>
+        <template x-for="p in (s3ev.data ? s3ev.data.pipelines : [])" :key="p.id">
+          <div class="flex items-center justify-between px-2 py-1.5 rounded border border-slate-200 dark:border-dbx-border" data-testid="s3events-pipeline-row">
+            <div><span class="font-semibold" x-text="p.name"></span> <span class="font-mono text-slate-500" x-text="p.source_volume_path"></span></div>
+            <div class="text-slate-500"><span x-text="p.events + ' wake(s)'"></span> · last event <span x-text="p.last_event_at ? new Date(p.last_event_at * 1000).toLocaleTimeString() : 'never'"></span> · last run <span x-text="p.last_run_at ? new Date(p.last_run_at * 1000).toLocaleTimeString() : 'never'"></span></div>
+          </div>
+        </template>
+        <div x-show="s3ev.data && !s3ev.data.pipelines.length" class="text-slate-500">No pipeline uses S3 events yet.</div>
+      </div>
+      <div class="space-y-1" x-show="s3ev.data && s3ev.data.recent.length">
+        <div class="text-slate-400 uppercase text-[10px] font-semibold">Recent notifications (since the last restart)</div>
+        <template x-for="(r, i) in (s3ev.data ? s3ev.data.recent.slice(0, 10) : [])" :key="i">
+          <div class="text-slate-500" data-testid="s3events-recent-row"><span x-text="new Date(r.at * 1000).toLocaleTimeString()"></span> · <span x-text="r.events + ' event(s) from ' + r.token"></span> · <span x-text="r.woke.length ? ('woke ' + r.woke.length + ' pipeline(s)') : 'no pipeline matched'"></span></div>
+        </template>
+      </div>
+    </div>
+  </div>
+
   <div x-show="showConnectionsModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showConnectionsModal = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-3xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" @click.outside="showConnectionsModal = false" data-testid="connections-modal">
       <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-3">
@@ -11796,12 +11854,17 @@
               <option value="30">30 seconds</option>
               <option value="60">1 minute</option>
               <option value="watch" x-show="pipelineSourceKind === 'volume'">File events (instant, watches the folder)</option>
+              <option value="s3events" x-show="pipelineSourceKind === 'volume' && newPipelineForm.source_volume_path.trim().toLowerCase().startsWith('s3://')" data-testid="opt-s3events">S3 events (instant, bucket webhook)</option>
               <option value="cron">Scheduled (Cron, UTC)</option>
             </select>
           </div>
         </div>
 
-        <div x-show="newPipelineForm.poll_interval_seconds === 'watch'" class="space-y-1.5">
+        <div x-show="newPipelineForm.poll_interval_seconds === 's3events'" class="space-y-1.5 text-[10px] text-slate-500" data-testid="s3events-hint">
+          <p>The bucket (MinIO, Garage or any S3-compatible server) tells Data Kiln Works when an object is created, and the pipeline runs at once. Set the webhook up once under <b>S3 events</b> at the top of this page. Events only wake the pipeline; what it loads still comes from listing the bucket.</p>
+        </div>
+
+        <div x-show="newPipelineForm.poll_interval_seconds === 'watch' || newPipelineForm.poll_interval_seconds === 's3events'" class="space-y-1.5">
           <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Safety-net rescan</label>
           <select x-model="newPipelineForm.watch_sweep_seconds" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-medium focus:outline-none focus:border-dbx-orange">
             <option value="60">Every minute</option>
@@ -11809,7 +11872,8 @@
             <option value="900">Every 15 minutes</option>
             <option value="3600">Every hour</option>
           </select>
-          <p class="text-[10px] text-slate-500">The pipeline starts the moment a file is fully written or renamed into the folder (a half-written file is never loaded). The rescan only catches what events can miss, such as network filesystems. Without Linux inotify it falls back to polling automatically.</p>
+          <p x-show="newPipelineForm.poll_interval_seconds === 's3events'" class="text-[10px] text-slate-500">The rescan lists the bucket now and then to catch events that were lost (a restart, a network problem).</p>
+          <p x-show="newPipelineForm.poll_interval_seconds === 'watch'" class="text-[10px] text-slate-500">The pipeline starts the moment a file is fully written or renamed into the folder (a half-written file is never loaded). The rescan only catches what events can miss, such as network filesystems. Without Linux inotify it falls back to polling automatically.</p>
         </div>
 
         <div x-show="newPipelineForm.poll_interval_seconds === 'cron'" class="space-y-1.5">
@@ -17722,6 +17786,7 @@
         pipelineSourceKind: 'volume',
         pipelineConn: { name: '', path: '', mode: 'file', records_path: '', params: '', pagination: 'none', page_param: 'page', size_param: '', page_size: 100, offset_param: 'offset', limit_param: 'limit', next_path: '', recursive: false, settle_seconds: 10 },
         showConnectionsModal: false,
+        s3ev: { open: false, data: null, name: '', secret: '' },
         connectionsList: [],
         showStreamsModal: false,
         streamsList: [],
@@ -27343,6 +27408,36 @@
           } catch (e) { /* the list stays as it was */ }
         },
 
+        async openS3Events() {
+          this.s3ev.open = true;
+          this.s3ev.secret = '';
+          await this.loadS3Events();
+        },
+
+        async loadS3Events() {
+          try {
+            const res = await fetch('/api/autoloader/s3-events');
+            if (res.ok) this.s3ev.data = await res.json();
+          } catch (e) { /* the view stays as it was */ }
+        },
+
+        async createS3EventsToken() {
+          if (!this.s3ev.name.trim()) { this.showToast('Give the token a name.', 'error'); return; }
+          const res = await fetch('/api/autoloader/s3-events/tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: this.s3ev.name.trim() }) });
+          const data = await res.json();
+          if (!res.ok) { this.showToast(data.detail || 'Could not create the token', 'error'); return; }
+          this.s3ev.secret = data.token;
+          this.s3ev.name = '';
+          await this.loadS3Events();
+        },
+
+        async revokeS3EventsToken(t) {
+          if (!confirm(`Revoke the token '${t.name}'? The bucket server can no longer send events with it.`)) return;
+          const res = await fetch('/api/autoloader/s3-events/tokens/' + encodeURIComponent(t.id), { method: 'DELETE' });
+          if (!res.ok) { this.showToast('Could not revoke the token', 'error'); return; }
+          await this.loadS3Events();
+        },
+
         async openConnections() {
           this.showConnectionsModal = true;
           this.connForm.open = false;
@@ -27603,6 +27698,10 @@
             this.showToast('File events watch local volumes only. Pick a poll interval or a cron schedule for this source.', 'error');
             return;
           }
+          if (!isS3 && this.newPipelineForm.poll_interval_seconds === 's3events') {
+            this.showToast('S3 events apply to s3:// sources only.', 'error');
+            return;
+          }
           const base = { ...this.newPipelineForm, ...connSource };
           if (isConn && this.connType() === 'http') base.file_pattern = '*';
           try {
@@ -27613,7 +27712,9 @@
                 ? { ...base, poll_interval_seconds: 10, watch_enabled: false }
                 : this.newPipelineForm.poll_interval_seconds === 'watch'
                   ? { ...base, poll_interval_seconds: 10, cron_schedule: '', watch_enabled: true, watch_sweep_seconds: Number(this.newPipelineForm.watch_sweep_seconds) }
-                  : { ...base, cron_schedule: '', watch_enabled: false })
+                  : this.newPipelineForm.poll_interval_seconds === 's3events'
+                    ? { ...base, poll_interval_seconds: 10, cron_schedule: '', watch_enabled: false, s3_events: true, watch_sweep_seconds: Number(this.newPipelineForm.watch_sweep_seconds) }
+                    : { ...base, cron_schedule: '', watch_enabled: false })
             });
             const data = await res.json();
             if (res.ok) {
