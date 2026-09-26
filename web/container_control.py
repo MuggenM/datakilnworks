@@ -39,7 +39,10 @@ def token() -> Optional[str]:
         return None
 
 
-def suspend_mode() -> str:
+def suspend_mode(override: Optional[str] = None) -> str:
+    """`stop` or `pause`. A warehouse's own setting (`pause` / `stop`) wins over the deployment default WAREHOUSE_SUSPEND_MODE."""
+    if override in ("stop", "pause"):
+        return override
     return "pause" if os.getenv("WAREHOUSE_SUSPEND_MODE", "stop").strip().lower() == "pause" else "stop"
 
 

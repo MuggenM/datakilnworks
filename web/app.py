@@ -1778,7 +1778,8 @@ async def create_sql_warehouse_endpoint(payload: Dict[str, Any]):
         auto_stop_mins=auto_stop,
         is_default=is_def,
         endpoint=endpoint,
-        ray_workers=ray_workers
+        ray_workers=ray_workers,
+        standby={k: payload[k] for k in ("standby_mode", "warm_hold_mins", "warm_tables") if k in payload}
     )
     return wh
 
@@ -1793,7 +1794,10 @@ async def get_sql_warehouse_endpoint(wh_id: str):
 
 @app.put("/api/sql-warehouses/{wh_id}")
 async def update_sql_warehouse_endpoint(wh_id: str, payload: Dict[str, Any]):
-    wh = update_sql_warehouse(wh_id, payload)
+    try:
+        wh = update_sql_warehouse(wh_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not wh:
         raise HTTPException(status_code=404, detail="Warehouse not found")
     return wh
@@ -1813,7 +1817,7 @@ async def start_sql_warehouse_endpoint(wh_id: str, current_user: Dict[str, Any] 
             logger.warning(f"Could not autoscale Ray pool for {wh_id}: {e}")
     active_pool = ray_manager.actor_pools.get(wh_id, []) if RAY_INSTALLED else []
     wh["active_ray_workers"] = len(active_pool)
-    return {"success": True, "warehouse": wh, "container": res.get("container", False), "resume_ms": res.get("resume_ms"), "warning": res.get("warning")}
+    return {"success": True, "warehouse": wh, "container": res.get("container", False), "resume_ms": res.get("resume_ms"), "resume_kind": res.get("resume_kind"), "warning": res.get("warning")}
 
 @app.post("/api/sql-warehouses/{wh_id}/stop")
 async def stop_sql_warehouse_endpoint(wh_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
@@ -2936,6 +2940,8 @@ def _resume_fields(info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if info.get("error"):
         return {"warehouse_resume_error": info["error"]}
     out = {"warehouse_resumed_ms": info["resume_ms"]}
+    if info.get("resume_kind"):
+        out["warehouse_resume_kind"] = info["resume_kind"]
     if info.get("warning"):
         out["warehouse_resume_warning"] = info["warning"]
     return out

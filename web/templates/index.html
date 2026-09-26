@@ -4907,7 +4907,7 @@
                     <div x-show="wh.state !== 'RUNNING' && wh.suspend_reason" class="text-[10px] text-slate-500 mt-1" :title="wh.suspended_at">
                       suspended (<span x-text="wh.suspend_reason"></span>)<span x-show="wh.container && wh.container.container_state" x-text="' · container ' + (wh.container ? wh.container.container_state : '')"></span>
                     </div>
-                    <div x-show="wh.state === 'RUNNING' && wh.last_resume_ms" class="text-[10px] text-slate-500 mt-1" x-text="'last resume ' + ((wh.last_resume_ms || 0) / 1000).toFixed(1) + ' s'"></div>
+                    <div x-show="wh.state === 'RUNNING' && wh.last_resume_ms" class="text-[10px] text-slate-500 mt-1" x-text="'last resume ' + ((wh.last_resume_ms || 0) / 1000).toFixed(1) + ' s' + (wh.last_resume_kind === 'warm' ? ' (warm)' : wh.last_resume_kind === 'cold' ? ' (cold start)' : '')" data-testid="wh-last-resume"></div>
                   </td>
                   <td class="py-3.5 px-4 font-sans font-medium text-slate-300" x-text="wh.cluster_size"></td>
                   <td class="py-3.5 px-4 font-sans">
@@ -4949,6 +4949,7 @@
                   <td class="py-3.5 px-4 font-sans text-slate-400">
                     <span x-text="wh.auto_stop_mins ? wh.auto_stop_mins + ' mins' : 'Never'"></span>
                     <span x-show="wh.auto_stop_mins && wh.container && wh.container.controllable" class="ml-1 text-emerald-400 text-[10px] whitespace-nowrap" title="Idle warehouses really stop their compute-node container and resume on the next query"><i class="ph ph-power"></i> enforced</span>
+                    <span x-show="wh.auto_stop_mins && wh.container && wh.container.controllable" class="ml-1 text-[10px] whitespace-nowrap" :class="wh.container.suspend_mode === 'pause' ? 'text-sky-400' : 'text-slate-500'" data-testid="wh-standby-badge" :title="wh.container.suspend_mode === 'pause' ? 'Idle: the node is frozen, the next query resumes in milliseconds' + (wh.warm_hold_mins ? ' (stopped after ' + wh.warm_hold_mins + ' min)' : '') : 'Idle: the node is stopped, the next query starts it'"><i class="ph" :class="wh.container.suspend_mode === 'pause' ? 'ph-fire' : 'ph-snowflake'"></i> <span x-text="wh.container.suspend_mode === 'pause' ? 'warm' : 'cold'"></span></span>
                     <span x-show="wh.auto_stop_mins && !(wh.container && wh.container.controllable)" class="ml-1 text-amber-400 text-[10px] whitespace-nowrap" title="No managed container behind this warehouse's endpoint: the timeout is only a setting"><i class="ph ph-warning"></i> not enforced</span>
                   </td>
                   <td class="py-3.5 px-4 text-slate-300 font-mono" x-text="wh.query_count || 0"></td>
@@ -11003,6 +11004,31 @@
             <option :value="60">1 Hour</option>
             <option :value="0">Never (Always Active)</option>
           </select>
+        </div>
+        <div class="space-y-2" data-testid="warm-start-settings">
+          <div>
+            <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">When idle, the compute node</label>
+            <select x-model="warehouseForm.standby_mode" data-testid="wh-standby-mode" class="w-full bg-slate-900 border border-dbx-border rounded px-3 py-2 text-white font-medium focus:outline-none focus:border-dbx-orange">
+              <option value="">Follows the deployment default</option>
+              <option value="stop">Stops (frees memory, next query is a cold start of a few seconds)</option>
+              <option value="pause">Stays warm (frozen, next query resumes in milliseconds, memory stays allocated)</option>
+            </select>
+          </div>
+          <div x-show="warehouseForm.standby_mode === 'pause'">
+            <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Hold warm for</label>
+            <select x-model.number="warehouseForm.warm_hold_mins" data-testid="wh-warm-hold" class="w-full bg-slate-900 border border-dbx-border rounded px-3 py-2 text-white font-medium focus:outline-none focus:border-dbx-orange">
+              <option :value="0">As long as it is paused</option>
+              <option :value="30">30 minutes, then stop it</option>
+              <option :value="120">2 hours, then stop it</option>
+              <option :value="480">8 hours, then stop it</option>
+              <option :value="1440">24 hours, then stop it</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Warm-up tables after a cold start (optional)</label>
+            <input type="text" x-model="warehouseForm.warm_tables" data-testid="wh-warm-tables" placeholder="warehouse.sales.orders, warehouse.sales.customers" class="w-full bg-slate-900 border border-dbx-border rounded px-3 py-2 text-white font-mono text-xs focus:outline-none focus:border-dbx-orange">
+            <p class="text-[10px] text-slate-500 mt-1">After a node was really started (not unpaused) these tables (catalog.schema.table, at most 10) are read once, so the first query does not pay for it. Nothing is returned to anyone.</p>
+          </div>
         </div>
         <div>
           <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Compute Worker Endpoint (Clustered Container)</label>
@@ -18682,6 +18708,9 @@
           max_memory: '4GB',
           endpoint: '',
           auto_stop_mins: 10,
+          standby_mode: '',
+          warm_hold_mins: 0,
+          warm_tables: '',
           is_default: false
         },
         showCreateCatalogModal: false,
@@ -22466,6 +22495,9 @@
             max_memory: '4GB',
             endpoint: '',
             auto_stop_mins: 10,
+            standby_mode: '',
+            warm_hold_mins: 0,
+            warm_tables: '',
             is_default: false
           };
           this.onClusterSizeChange();
@@ -22482,6 +22514,9 @@
             max_memory: wh.max_memory,
             endpoint: wh.endpoint || '',
             auto_stop_mins: wh.auto_stop_mins ?? 10,
+            standby_mode: wh.standby_mode || '',
+            warm_hold_mins: wh.warm_hold_mins || 0,
+            warm_tables: (wh.warm_tables || []).join(', '),
             is_default: wh.is_default || false
           };
           this.showWarehouseModal = true;

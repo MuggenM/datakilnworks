@@ -13,6 +13,11 @@ container behind them (through the container controller, see controller/controll
 A warehouse whose endpoint the controller does not manage (a custom endpoint, or no controller running) keeps the old
 flag-only behaviour and is reported as not controllable, so nothing pretends to be enforced that is not.
 
+Warm start (per warehouse: `standby_mode`, `warm_hold_mins`, `warm_tables`): `pause` freezes the container instead of stopping it, so the
+next query resumes in milliseconds (memory stays allocated); with `warm_hold_mins` > 0 the pause escalates to a real stop after that
+long, freeing the memory (the next query is then a cold start). After a COLD start the worker is warmed up: the `warm_tables` are read
+once (Delta log + first data pages, result discarded) so the first user query does not pay for it.
+
 AUTOSUSPEND_INTERVAL_SECONDS   check period (default 30)
 AUTOSUSPEND_TIME_SCALE         multiplies the idle timeout (default 1.0; tests use 0.05 so "1 minute" is 3 seconds)
 WAREHOUSE_RESUME_TIMEOUT       seconds to wait for a resumed worker to answer (default 60)
@@ -53,6 +58,11 @@ def service_of(wh: Dict[str, Any]) -> Optional[str]:
     return container_control.service_for_endpoint(wh.get("endpoint"))
 
 
+def mode_of(wh: Dict[str, Any]) -> str:
+    """pause | stop: the warehouse's own standby mode, else the deployment default."""
+    return container_control.suspend_mode(wh.get("standby_mode") or None)
+
+
 def describe(wh: Dict[str, Any]) -> Dict[str, Any]:
     """What the UI shows about a warehouse's container: whether auto-stop / start / stop are real for it."""
     service = service_of(wh)
@@ -62,7 +72,7 @@ def describe(wh: Dict[str, Any]) -> Dict[str, Any]:
             state = next((c.get("state") for c in container_control.list_containers() if c["service"] == service), None)
         except container_control.ControllerError:
             pass
-    return {"controllable": bool(service), "service": service, "container_state": state, "suspend_mode": container_control.suspend_mode()}
+    return {"controllable": bool(service), "service": service, "container_state": state, "suspend_mode": mode_of(wh)}
 
 
 def _scale_ray(wh_id: str, workers: int):
@@ -79,8 +89,8 @@ def _suspend_locked(wh_id: str, reason: str) -> Dict[str, Any]:
     if not wh:
         return {"ok": False, "error": "Warehouse not found"}
     service = service_of(wh)
+    mode = mode_of(wh)
     if service:
-        mode = container_control.suspend_mode()
         try:
             container_control.act(service, "pause" if mode == "pause" else "stop")
         except container_control.ControllerError as exc:
@@ -88,7 +98,7 @@ def _suspend_locked(wh_id: str, reason: str) -> Dict[str, Any]:
             return {"ok": False, "error": str(exc), "warehouse": wh}
     _scale_ray(wh_id, 0)
     updated = warehouses.mutate_sql_warehouse(wh_id, {"state": "STOPPED", "suspended_at": _now(), "suspend_reason": reason,
-                                                      "suspend_mode": container_control.suspend_mode() if service else None})
+                                                      "suspend_mode": mode if service else None})
     logger.info(f"Warehouse {wh_id} suspended ({reason}){' via container ' + service if service else ' (flag only)'}")
     return {"ok": True, "container": bool(service), "warehouse": updated}
 
@@ -101,27 +111,48 @@ def suspend(wh_id: str, reason: str = "manual") -> Dict[str, Any]:
 
 def _resume_locked(wh: Dict[str, Any]) -> Dict[str, Any]:
     wh_id, service, started = wh["id"], service_of(wh), time.time()
-    warning = None
+    warning, kind = None, "flag"
     if service:
         try:
             st = container_control.status(service)
             if st.get("state") == "paused":
                 container_control.act(service, "unpause")
+                kind = "warm"                                   # instant: the process never went away
             elif st.get("state") != "running":
                 container_control.act(service, "start")
+                kind = "cold"
+            else:
+                kind = "running"
             if wh.get("endpoint") and not container_control.wait_healthy(wh["endpoint"], RESUME_TIMEOUT):
                 warning = f"the worker did not answer within {int(RESUME_TIMEOUT)}s"
+            elif kind == "cold" and wh.get("warm_tables"):
+                warning = _warm_up(wh)
         except container_control.ControllerError as exc:
             logger.error(f"Could not resume warehouse {wh_id} ({service}): {exc}")
             return {"ok": False, "error": str(exc)}
     ms = round((time.time() - started) * 1000)
     updated = warehouses.mutate_sql_warehouse(wh_id, {"state": "RUNNING", "last_active_at": _now(), "suspended_at": None,
-                                                      "suspend_reason": None, "last_resume_ms": ms})
+                                                      "suspend_reason": None, "last_resume_ms": ms, "last_resume_kind": kind})
     if warning:
         logger.warning(f"Warehouse {wh_id} resumed but {warning}")
     else:
         logger.info(f"Warehouse {wh_id} resumed in {ms} ms")
-    return {"ok": True, "container": bool(service), "resume_ms": ms, "warning": warning, "warehouse": updated}
+    return {"ok": True, "container": bool(service), "resume_ms": ms, "resume_kind": kind, "warning": warning, "warehouse": updated}
+
+
+def _warm_up(wh: Dict[str, Any]) -> Optional[str]:
+    """Asks a freshly started worker to read the warehouse's warm tables. Best effort: a failure is a warning, never a failed resume."""
+    try:
+        import httpx
+        from web.compute_auth import compute_headers
+        r = httpx.post(f"{wh['endpoint'].rstrip('/')}/api/compute/warmup", json={"tables": list(wh.get("warm_tables") or [])},
+                       headers=compute_headers(), timeout=30.0)
+        if r.status_code != 200:
+            return f"warm-up was refused ({r.status_code})"
+        failed = [t for t, res in (r.json().get("tables") or {}).items() if res != "ok"]
+        return f"warm-up could not read: {', '.join(failed)}" if failed else None
+    except Exception as exc:
+        return f"warm-up failed: {str(exc)[:120]}"
 
 
 def resume(wh_id: str) -> Dict[str, Any]:
@@ -146,7 +177,7 @@ def ensure_running(warehouse_id: Optional[str]) -> Optional[Dict[str, Any]]:
                 warehouses.mark_sql_warehouse_active(wh["id"])   # the idle clock restarts now, so a tick cannot suspend it under this query
                 return None
             res = _resume_locked(wh)
-        return {"resume_ms": res["resume_ms"], "warning": res.get("warning")} if res["ok"] else {"error": res["error"]}
+        return {"resume_ms": res["resume_ms"], "resume_kind": res.get("resume_kind"), "warning": res.get("warning")} if res["ok"] else {"error": res["error"]}
     except Exception as exc:
         logger.error(f"ensure_running failed: {exc}")
         return {"error": str(exc)}
@@ -174,6 +205,34 @@ def reconcile() -> List[str]:
     return changed
 
 
+def escalate_tick(now: Optional[float] = None) -> List[str]:
+    """A warehouse held warm (paused) for its `warm_hold_mins` gets its container stopped, freeing the memory."""
+    stopped: List[str] = []
+    for wh in warehouses.load_sql_warehouses():
+        hold = int(wh.get("warm_hold_mins") or 0)
+        if hold <= 0 or wh.get("state") != "STOPPED" or wh.get("suspend_mode") != "pause" or not service_of(wh):
+            continue
+        try:
+            since = datetime.datetime.strptime(wh.get("suspended_at") or "", _TS).timestamp()
+        except ValueError:
+            continue
+        if (time.time() if now is None else now) - since < hold * 60 * TIME_SCALE:
+            continue
+        with _lock(wh["id"]):
+            fresh = warehouses.get_sql_warehouse(wh["id"]) or wh
+            if fresh.get("state") != "STOPPED" or fresh.get("suspend_mode") != "pause":
+                continue
+            try:
+                if container_control.status(service_of(fresh)).get("state") == "paused":
+                    container_control.act(service_of(fresh), "stop")
+                warehouses.mutate_sql_warehouse(wh["id"], {"suspend_mode": "stop", "suspend_reason": "warm hold ended"})
+                stopped.append(wh["id"])
+                logger.info(f"Warehouse {wh['id']} was held warm for {hold} min and is now stopped")
+            except container_control.ControllerError as exc:
+                logger.error(f"Could not stop the warm warehouse {wh['id']}: {exc}")
+    return stopped
+
+
 def _idle_seconds(wh: Dict[str, Any], now: Optional[float] = None) -> float:
     try:
         last = datetime.datetime.strptime(wh.get("last_active_at") or "", _TS).timestamp()
@@ -197,6 +256,7 @@ def autosuspend_tick(busy_check: Callable[[str], bool] = lambda _id: False, now:
     """One pass: reconcile, then suspend every managed, running warehouse idle for its `auto_stop_mins`."""
     suspended: List[str] = []
     reconcile()
+    escalate_tick(now)
     for wh in warehouses.load_sql_warehouses():
         mins = int(wh.get("auto_stop_mins") or 0)
         if wh.get("state") != "RUNNING" or mins <= 0 or not service_of(wh):

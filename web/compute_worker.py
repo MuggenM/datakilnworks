@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import math
@@ -372,6 +373,31 @@ def cancel_worker_query(execution_id: str):
             logger.warning(f"Error interrupting query {execution_id}: {e}")
             return {"success": False, "error": str(e)}
     return {"success": True, "message": "Marked cancelled"}
+
+class WarmupRequest(BaseModel):
+    tables: List[str] = []
+
+
+_WARM_TABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@app.post("/api/compute/warmup")
+def warmup(req: WarmupRequest):
+    """After a cold start: loads the engine and reads the given tables once (Delta log + a first scan) so the first user query does not
+    pay for extension loading and cold metadata. The results are discarded and never returned; only ok / error per table."""
+    out: Dict[str, str] = {}
+    conn = get_worker_conn()
+    for t in req.tables[:10]:
+        if not _WARM_TABLE.match(t):
+            out[t] = "not a catalog.schema.table name"
+            continue
+        try:
+            conn.sql(f"SELECT count(*) FROM {t}").fetchall()
+            out[t] = "ok"
+        except Exception as exc:
+            out[t] = str(exc)[:200]
+    return {"success": True, "node_id": NODE_ID, "tables": out}
+
 
 @app.post("/api/compute/refresh")
 def refresh_catalogs():

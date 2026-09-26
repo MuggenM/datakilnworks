@@ -32,6 +32,7 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | app.py::normalize_uploaded_file | uploaded-file | Repairs an uploaded parquet file |
 | compute_worker.py::execute_query | executor | Executes SQL the studio already rewrote (worker requires the compute token) |
 | compute_worker.py::get_worker_conn | setup | Worker connection setup |
+| compute_worker.py::warmup | executor | Reads operator-listed tables once after a cold start (count(*), result discarded, never returned); no user data leaves the worker |
 | copilot.py::get_autocomplete_metadata | metadata | `SHOW ALL TABLES`: names and types only |
 | dbt_service.py::preview_cte_step | guarded-at-endpoint | The endpoint refuses principals subject to masking |
 | dbt_service.py::preview_dbt_model_data | guarded-at-endpoint | The endpoint refuses principals subject to masking |

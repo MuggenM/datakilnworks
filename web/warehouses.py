@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import uuid
@@ -171,6 +172,45 @@ def save_sql_warehouses(warehouses: List[Dict[str, Any]]):
     except Exception as e:
         logger.error(f"Failed to save sql_warehouses.json: {e}")
 
+_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def clean_standby(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Validates the warm-start settings of a warehouse (only the keys present are returned).
+    standby_mode   "" (deployment default) | "stop" (frees memory, cold resume) | "pause" (frozen, memory kept, instant resume)
+    warm_hold_mins minutes a paused warehouse is held warm before its container is stopped after all (0 = hold while it is paused)
+    warm_tables    up to 10 `catalog.schema.table` names read once after a cold start so the first query finds them warm"""
+    out: Dict[str, Any] = {}
+    if "standby_mode" in values:
+        mode = str(values["standby_mode"] or "").strip().lower()
+        if mode not in ("", "stop", "pause"):
+            raise ValueError("standby_mode must be empty (deployment default), 'stop' or 'pause'.")
+        out["standby_mode"] = mode
+    if "warm_hold_mins" in values:
+        try:
+            n = int(values["warm_hold_mins"] or 0)
+        except (TypeError, ValueError):
+            raise ValueError("warm_hold_mins must be a whole number of minutes.")
+        if not 0 <= n <= 10080:
+            raise ValueError("warm_hold_mins must be between 0 and 10080.")
+        out["warm_hold_mins"] = n
+    if "warm_tables" in values:
+        raw = values["warm_tables"] or []
+        if isinstance(raw, str):
+            raw = [x for x in re.split(r"[\s,;]+", raw) if x]
+        if not isinstance(raw, list) or len(raw) > 10:
+            raise ValueError("warm_tables takes at most 10 table names.")
+        names = []
+        for t in raw:
+            t = str(t).strip()
+            if not _TABLE_RE.match(t):
+                raise ValueError(f"'{t}' is not a catalog.schema.table name.")
+            if t not in names:
+                names.append(t)
+        out["warm_tables"] = names
+    return out
+
+
 def get_sql_warehouse(wh_id: str) -> Optional[Dict[str, Any]]:
     warehouses = load_sql_warehouses()
     return next((w for w in warehouses if w["id"] == wh_id), None)
@@ -185,8 +225,10 @@ def create_sql_warehouse(
     endpoint: Optional[str] = None,
     ray_workers: int = 1,
     min_workers: int = 0,
-    max_workers: int = 16
+    max_workers: int = 16,
+    standby: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    extra = clean_standby(standby or {})
     warehouses = load_sql_warehouses()
     preset = CLUSTER_SIZES.get(cluster_size, CLUSTER_SIZES["Small"])
     
@@ -215,7 +257,8 @@ def create_sql_warehouse(
         "min_workers": int(min_workers),
         "max_workers": int(max_workers),
         "created_at": now_str,
-        "last_active_at": now_str
+        "last_active_at": now_str,
+        **extra
     }
     warehouses.append(new_wh)
     save_sql_warehouses(warehouses)
@@ -246,6 +289,7 @@ def update_sql_warehouse(wh_id: str, updates: Dict[str, Any]) -> Optional[Dict[s
             target["max_memory"] = str(updates["max_memory"])
         if "auto_stop_mins" in updates:
             target["auto_stop_mins"] = int(updates["auto_stop_mins"])
+        target.update(clean_standby(updates))
         if "endpoint" in updates:
             target["endpoint"] = str(updates["endpoint"]).strip() if updates["endpoint"] else ""
         if "ray_workers" in updates and updates["ray_workers"] is not None:
