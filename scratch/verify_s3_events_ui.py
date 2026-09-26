@@ -69,11 +69,15 @@ def main():
             # a real MinIO that posts to the studio
             sh("docker", "run", "-d", "--name", MINIO, "--network", NET, "-e", "MINIO_NOTIFY_WEBHOOK_ENABLE_dkw=on", "-e", f"MINIO_NOTIFY_WEBHOOK_ENDPOINT_dkw=http://{UI}:8891/hooks/s3-events",
                "-e", f"MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_dkw={token}", "minio/minio", "server", "/data")
-            for _ in range(30):
+            print(sh("docker", "inspect", "-f", "{{.Config.Image}} {{.State.Status}}", MINIO).stdout.strip())
+            for _ in range(4):
                 r = ex(NOTIFY)
                 if "configured" in r.stdout: break
                 time.sleep(2)
+            if "configured" not in r.stdout:
+                print(sh("docker", "ps", "-a").stdout[-800:]); print(sh("docker", "logs", "--tail", "25", MINIO).stderr[-1500:]); print(r.stderr[-600:])
             check("MinIO is configured to notify the studio", "configured" in r.stdout, r.stderr[-400:])
+            if "configured" not in r.stdout: raise SystemExit("MinIO could not be configured; the rest of the test cannot run")
             ex(UPLOAD("in/seed.csv", "id,val\n1,a\n"))
             # the pipeline is created in the dialog
             page.click("button:has-text('New Pipeline'):visible"); page.wait_for_selector("text=Create Auto-Loader Pipeline >> visible=true")
