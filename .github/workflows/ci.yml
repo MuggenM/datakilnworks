@@ -15,6 +15,10 @@ concurrency:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   IMAGE: localspark-lakehouse-notebook
 
@@ -89,7 +93,10 @@ jobs:
           cache-from: type=gha,scope=image
           cache-to: type=gha,scope=image,mode=max
       - name: Run the test inside the image
-        run: ci/run_test.sh "${{ matrix.test.name }}" "${{ matrix.test.extras }}"
+        run: ci/run_test.sh "${{ matrix.test.name }}" "${{ matrix.test.extras }}" 2>&1 | tee /tmp/out.txt
+      - name: Show why it failed
+        if: failure()
+        run: python3 ci/annotate.py /tmp/out.txt "test_${{ matrix.test.name }}"
 
   ui:
     name: browser ${{ matrix.ui.name }}
@@ -119,7 +126,12 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
       - name: Run the browser test (it starts and removes its own throwaway containers)
-        run: python "scratch/verify_${{ matrix.ui.name }}.py"
+        env:
+          NODE_OPTIONS: --dns-result-order=ipv4first        # Playwright's request client does not fall back from ::1 to 127.0.0.1 on runners without IPv6 loopback
+        run: python "scratch/verify_${{ matrix.ui.name }}.py" 2>&1 | tee /tmp/out.txt
+      - name: Show why it failed
+        if: failure()
+        run: python3 ci/annotate.py /tmp/out.txt "browser ${{ matrix.ui.name }}"
 
   kind:
     name: Helm chart on a real cluster (kind)
@@ -141,4 +153,7 @@ jobs:
         with:
           install_only: true
       - name: Install the chart, sign in, run SQL on the compute node, restart, upgrade, misconfigure, uninstall
-        run: ci/kind-smoke.sh
+        run: ci/kind-smoke.sh 2>&1 | tee /tmp/out.txt
+      - name: Show why it failed
+        if: failure()
+        run: python3 ci/annotate.py /tmp/out.txt "kind smoke test"
