@@ -51,7 +51,7 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | warehouses.py::sync_catalogs_with_duckrun | setup | ATTACH / DETACH of catalogs |
 | workflow.py::init_runs_db | sqlite | Job-run store (SQLite) |
 | workflow.py::_state_get | sqlite | Scheduler bookkeeping (last cron look, table versions) in the run store |
-| app.py::readyz | sqlite | Readiness probe: `SELECT 1 FROM users LIMIT 1` on the accounts database, no user data returned
-| init.py::step_bootstrap_and_databases | sqlite | Initialisation step: counts accounts (`SELECT COUNT(*) FROM users`) to report the state; no user data
+| app.py::readyz | sqlite | Readiness probe: `SELECT 1 FROM users LIMIT 1` on the accounts database, no user data returned |
+| init.py::step_bootstrap_and_databases | sqlite | Initialisation step: counts accounts (`SELECT COUNT(*) FROM users`) to report the state; no user data |
 | workflow.py::_state_set | sqlite | Scheduler bookkeeping (last cron look, table versions) in the run store |
 | workflow.py::mark_orphaned_runs | sqlite | Marks runs left RUNNING by a dead process as FAILED (metadata only, no user data) |
