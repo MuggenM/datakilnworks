@@ -312,6 +312,8 @@ def set_mapping(group_id: str, source: str, external_ref: str, actor: str) -> Di
     source = (source or "local").strip().lower()
     if source not in SOURCES:
         raise GroupError(f"The source must be one of {', '.join(SOURCES)}.")
+    if cur["source"] == "scim":
+        raise GroupError("This group is provisioned by SCIM; its members and name come from the identity provider.")
     label = (external_ref or "").strip()
     ref = normalise_ref(source, label)
     if source != "local" and not ref:

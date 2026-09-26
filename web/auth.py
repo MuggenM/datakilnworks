@@ -117,6 +117,10 @@ def init_auth_db():
             for col, ddl in (("totp_enrolled_at", "INTEGER"), ("mfa_exempt", "INTEGER NOT NULL DEFAULT 0"), ("mfa_exempt_reason", "TEXT"), ("mfa_deadline_override", "INTEGER")):
                 if col not in existing:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+            # SCIM 2.0 provisioning (web/scim.py): only accounts SCIM created (scim_managed = 1) are visible to and changeable by a SCIM client.
+            for col, ddl in (("scim_managed", "INTEGER NOT NULL DEFAULT 0"), ("scim_external_id", "TEXT"), ("scim_extra", "TEXT"), ("scim_modified_at", "TEXT")):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             if "deleted_at" not in existing:
                 conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
             # `must_change_password`: set when a password was provided by someone other than the account holder
@@ -297,7 +301,7 @@ def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         rows = conn.execute(
             f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at, "
-            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override FROM users {where} ORDER BY created_at ASC").fetchall()
+            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override, scim_managed FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
@@ -409,6 +413,10 @@ def upsert_external_user(username: str, display_name: str, role: str, auth_sourc
                 # An admin's deletion is a deliberate decision; directory activity (a login, a sync) must never
                 # silently undo it. An admin has to restore_user() the account first.
                 raise ValueError(f"'{clean_username}' was deleted; an administrator must restore it before it can sign in again.")
+            if existing["scim_managed"]:
+                # SCIM is authoritative for its accounts: a sign-in through the identity provider must not change their role or name
+                # (or reactivate a deactivated one; the login modules refuse inactive accounts before they get here).
+                return get_user_by_id(existing["id"])
             with conn:
                 conn.execute("UPDATE users SET display_name = ?, role = ?, is_active = 1, auth_source = ? WHERE id = ?",
                             (display_name.strip() or clean_username, role, auth_source, existing["id"]))

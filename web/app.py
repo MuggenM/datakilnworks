@@ -174,6 +174,8 @@ from web import sandbox_client, sandbox_gateway
 from web.governance import routes as governance_routes
 app.include_router(governance_routes.router)
 app.include_router(sandbox_gateway.router)
+from web import scim as scim_module
+app.include_router(scim_module.router)                    # /scim/v2/* : authenticated by SCIM bearer tokens only (web/scim.py)
 
 
 @app.middleware("http")
@@ -724,6 +726,56 @@ async def check_ip_allowlist_endpoint(payload: IpCheckPayload, current_user: Dic
         return ip_allowlist.check_address(payload.ip)
     except ip_allowlist.AllowlistError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ScimConfigPayload(BaseModel):
+    enabled: Optional[bool] = None
+    login_source: Optional[str] = None
+    default_role: Optional[str] = None
+    max_role: Optional[str] = None
+    use_roles_attribute: Optional[bool] = None
+    group_roles: Optional[Dict[str, str]] = None
+    base_url: Optional[str] = None
+
+
+class ScimTokenPayload(BaseModel):
+    name: str
+    expires_days: Optional[int] = None
+
+
+@app.get("/api/scim")
+async def get_scim_endpoint(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """SCIM provisioning settings, the URL to give the identity provider, its tokens (never the secret again), counts and recent requests."""
+    cfg = scim_module.get_config()
+    root = cfg["base_url"] or str(request.base_url).rstrip("/")
+    return {"config": cfg, "base_url": root.rstrip("/") + ("" if root.rstrip("/").endswith("/scim/v2") else "/scim/v2"),
+            "tokens": await asyncio.to_thread(scim_module.list_tokens), "status": await asyncio.to_thread(scim_module.status_summary)}
+
+
+@app.put("/api/scim/config")
+async def put_scim_config_endpoint(payload: ScimConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        return await asyncio.to_thread(scim_module.set_config, payload.dict(exclude_none=True), current_user.get("username", "admin"))
+    except scim_module.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/scim/tokens")
+async def create_scim_token_endpoint(payload: ScimTokenPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Creates a bearer token for the identity provider. The secret is in this response only; the studio keeps just a hash."""
+    try:
+        return await asyncio.to_thread(scim_module.create_token, payload.name, payload.expires_days, current_user.get("username", "admin"))
+    except scim_module.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/scim/tokens/{token_id}")
+async def revoke_scim_token_endpoint(token_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        await asyncio.to_thread(scim_module.revoke_token, token_id, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"success": True}
 
 
 @app.get("/api/mfa/policy")
