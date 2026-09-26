@@ -37,7 +37,8 @@ RP_NAME = "Data Kiln Works"
 CHALLENGE_TTL = 300
 MAX_CREDENTIALS = 10
 MAX_OPEN_CHALLENGES = 2000
-_PURPOSES = ("register", "second_factor", "passwordless")
+_PURPOSES = ("register", "enroll", "second_factor", "passwordless", "reauth")
+ENROLL_TTL_HOURS = float(os.getenv("WEBAUTHN_ENROLL_TTL_HOURS", "24"))
 
 
 class WebAuthnError(Exception):
@@ -286,7 +287,7 @@ def pol_mode() -> str:
         return "none"
 
 
-def registration_options(user: Dict[str, Any], headers: Dict[str, str], require_uv: bool = False) -> Dict[str, Any]:
+def registration_options(user: Dict[str, Any], headers: Dict[str, str], require_uv: bool = False, purpose: str = "register") -> Dict[str, Any]:
     if not available():
         raise WebAuthnError("Passkeys are not available on this server (the webauthn package is not installed).")
     from webauthn import generate_registration_options, options_to_json
@@ -296,7 +297,7 @@ def registration_options(user: Dict[str, Any], headers: Dict[str, str], require_
     rp_id, _ = relying_party(headers)
     if not rp_id or rp_id.replace(".", "").isdigit():
         raise WebAuthnError("Passkeys need the studio to be opened by a host name (not an IP address).")
-    cid, challenge = _new_challenge("register", user["id"])
+    cid, challenge = _new_challenge(purpose, user["id"])
     opts = generate_registration_options(
         rp_id=rp_id, rp_name=RP_NAME, user_id=user["id"].encode(), user_name=user["username"], user_display_name=user.get("display_name") or user["username"],
         challenge=challenge, exclude_credentials=_descriptors(user["id"]),
@@ -379,7 +380,7 @@ def finish_registration(user: Dict[str, Any], challenge_id: str, credential: Dic
 
 # ---------------------------------------------------------------- authentication
 
-def authentication_options(headers: Dict[str, str], user_id: Optional[str] = None) -> Dict[str, Any]:
+def authentication_options(headers: Dict[str, str], user_id: Optional[str] = None, reauth: bool = False) -> Dict[str, Any]:
     """user_id given = second factor for that account (its credentials are named); None = passwordless (discoverable credentials, UV required)."""
     if not available():
         raise WebAuthnError("Passkeys are not available on this server.")
@@ -388,17 +389,17 @@ def authentication_options(headers: Dict[str, str], user_id: Optional[str] = Non
     rp_id, _ = relying_party(headers)
     if user_id is None and not passwordless_enabled():
         raise WebAuthnError("Signing in with a passkey is switched off on this server.")
-    cid, challenge = _new_challenge("second_factor" if user_id else "passwordless", user_id)
+    cid, challenge = _new_challenge("reauth" if reauth else "second_factor" if user_id else "passwordless", user_id)
     opts = generate_authentication_options(rp_id=rp_id, challenge=challenge, allow_credentials=_descriptors(user_id) if user_id else None,
-                                           user_verification=UserVerificationRequirement.PREFERRED if user_id else UserVerificationRequirement.REQUIRED)
+                                           user_verification=UserVerificationRequirement.PREFERRED if (user_id and not reauth) else UserVerificationRequirement.REQUIRED)
     return {"challenge_id": cid, "options": json.loads(options_to_json(opts))}
 
 
-def finish_authentication(challenge_id: str, credential: Dict[str, Any], headers: Dict[str, str], user_id: Optional[str] = None) -> str:
+def finish_authentication(challenge_id: str, credential: Dict[str, Any], headers: Dict[str, str], user_id: Optional[str] = None, reauth: bool = False) -> str:
     """Verifies an assertion and returns the id of the account it proves. `user_id` (second factor) pins the account; without it (passwordless) the
     account is the credential's owner and the response's user handle must name it."""
     from webauthn import verify_authentication_response
-    purpose = "second_factor" if user_id else "passwordless"
+    purpose = "reauth" if reauth else "second_factor" if user_id else "passwordless"
     expected = _take_challenge(challenge_id, purpose, user_id)
     try:
         raw_id = str(credential.get("id") or credential.get("rawId") or "")
@@ -419,7 +420,7 @@ def finish_authentication(challenge_id: str, credential: Dict[str, Any], headers
     try:
         v = verify_authentication_response(credential=credential, expected_challenge=expected, expected_rp_id=rp_id, expected_origin=origins,
                                            credential_public_key=_unb64u(row["public_key"]), credential_current_sign_count=int(row["sign_count"] or 0),
-                                           require_user_verification=not user_id)
+                                           require_user_verification=(not user_id) or reauth)
     except Exception as exc:
         logger.info(f"passkey assertion refused ({purpose}): {exc}")
         raise WebAuthnError("The passkey could not be verified." + (" Its signature counter went backwards: it may have been cloned." if "sign count" in str(exc).lower() else ""))
@@ -431,3 +432,57 @@ def finish_authentication(challenge_id: str, credential: Dict[str, Any], headers
     finally:
         c.close()
     return row["user_id"]
+
+
+# ---------------------------------------------------------------- enrolment links (passkey-only accounts)
+
+def _hash_token(token: str) -> str:
+    import hashlib
+    return hashlib.sha256((token or "").encode()).hexdigest()
+
+
+def issue_enrollment(user_id: str, actor: str) -> Dict[str, Any]:
+    """A single-use link token that lets the owner of a passkey-only account register a passkey. Only its SHA-256 is stored; the token is returned once.
+    A new token replaces the earlier unused one of the same account."""
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    c = _conn()
+    try:
+        with c:
+            u = c.execute("SELECT passwordless, is_active, deleted_at, auth_source FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not u or not u["passwordless"] or u["deleted_at"] or (u["auth_source"] or "local") != "local":
+                raise WebAuthnError("Enrolment links are for passkey-only accounts.")
+            c.execute("DELETE FROM webauthn_enrollments WHERE user_id = ? AND used_at IS NULL", (user_id,))
+            c.execute("DELETE FROM webauthn_enrollments WHERE expires < ?", (now - 86400,))
+            c.execute("INSERT INTO webauthn_enrollments (id, user_id, expires, created_by, created_at) VALUES (?,?,?,?,?)", (_hash_token(token), user_id, now + int(ENROLL_TTL_HOURS * 3600), actor, now))
+    finally:
+        c.close()
+    return {"token": token, "expires_at": now + int(ENROLL_TTL_HOURS * 3600), "ttl_hours": ENROLL_TTL_HOURS}
+
+
+def enrollment_user(token: str) -> Dict[str, Any]:
+    """The account an unused, unexpired enrolment token belongs to (it must still be an active passkey-only account), else WebAuthnError."""
+    c = _conn()
+    try:
+        r = c.execute("SELECT user_id, expires, used_at FROM webauthn_enrollments WHERE id = ?", (_hash_token(token),)).fetchone()
+    finally:
+        c.close()
+    bad = WebAuthnError("This link is not valid any more (used, expired or replaced). Ask an administrator for a new one.")
+    if not r or r["used_at"] or r["expires"] < _now():
+        raise bad
+    from web.auth import get_user_by_id
+    u = get_user_by_id(r["user_id"])
+    if not u or not u.get("passwordless") or u.get("is_active", 1) != 1 or u.get("deleted_at") or (u.get("auth_source") or "local") != "local":
+        raise bad
+    return u
+
+
+def consume_enrollment(token: str) -> None:
+    c = _conn()
+    try:
+        with c:
+            n = c.execute("UPDATE webauthn_enrollments SET used_at = ? WHERE id = ? AND used_at IS NULL", (_now(), _hash_token(token))).rowcount
+    finally:
+        c.close()
+    if not n:
+        raise WebAuthnError("This link was already used.")

@@ -1035,7 +1035,7 @@
 
             <div class="p-1 space-y-0.5">
               <!-- Local accounts only: change own password -->
-              <button x-show="(currentUser.auth_source || 'local') === 'local'"
+              <button x-show="(currentUser.auth_source || 'local') === 'local' && !currentUser.passwordless"
                       @click="userMenuOpen = false; openChangePassword()"
                       class="w-full flex items-center space-x-2 px-3 py-2 rounded text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-dbx-hover transition text-left">
                 <i class="ph ph-key text-sm text-indigo-500"></i>
@@ -15180,6 +15180,7 @@
           </div>
         </div>
         <div class="flex items-center space-x-2">
+          <button x-show="iamTab === 'users'" @click="pkUser = { open: !pkUser.open, username: '', display_name: '', role: 'user', busy: false, error: '', result: null }" data-testid="new-passkey-user" class="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded-lg text-xs font-semibold flex items-center space-x-1.5 mr-2"><i class="ph ph-fingerprint"></i><span>Passkey-only user</span></button>
           <button x-show="iamTab === 'users'" @click="showCreateUserCard = !showCreateUserCard" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs">
             <i class="ph" :class="showCreateUserCard ? 'ph-minus' : 'ph-plus'"></i>
             <span x-text="showCreateUserCard ? 'Close Form' : 'New User'"></span>
@@ -15476,6 +15477,22 @@
         </div>
       </div>
 
+      <!-- Passkey-only user: no password, a single-use enrolment link instead -->
+      <div x-show="iamTab === 'users' && pkUser.open" class="p-4 bg-indigo-50/60 dark:bg-indigo-950/20 border border-indigo-200 dark:border-indigo-900 rounded-xl space-y-3 shrink-0" data-testid="passkey-user-card">
+        <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider block">New passkey-only user (no password)</span>
+        <form x-show="!pkUser.result" @submit.prevent="createPasskeyUser()" class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+          <div><label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Username</label><input type="text" x-model="pkUser.username" required data-testid="pkuser-username" placeholder="e.g. erin" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"></div>
+          <div><label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Display name</label><input type="text" x-model="pkUser.display_name" placeholder="Erin Example" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"></div>
+          <div><label class="block text-slate-500 uppercase text-[10px] font-semibold mb-1">Role</label><select x-model="pkUser.role" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"><option value="user">user</option><option value="power_user">power_user</option><option value="admin">admin</option></select></div>
+          <div class="flex items-end space-x-2"><button type="submit" :disabled="pkUser.busy" data-testid="pkuser-create" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded disabled:opacity-50">Create and get the link</button><button type="button" @click="pkUser.open = false" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded">Cancel</button></div>
+        </form>
+        <div x-show="pkUser.result" class="space-y-2 text-xs" data-testid="passkey-user-result">
+          <p class="text-slate-700 dark:text-slate-300">Send this link to <b x-text="pkUser.result ? pkUser.result.username : ''"></b>. It can be used <b>once</b>, expires at <span class="font-mono" x-text="pkUser.result ? pkUser.result.expires : ''"></span> and is <b>not shown again</b>. Whoever opens it first registers the passkey for this account, so send it over a channel you trust.</p>
+          <div class="flex items-center space-x-2"><input type="text" readonly :value="pkUser.result ? pkUser.result.link : ''" data-testid="passkey-user-link" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-[11px] text-slate-900 dark:text-white select-all"><button type="button" @click="copyText(pkUser.result.link)" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded">Copy</button><button type="button" @click="pkUser.open = false; pkUser.result = null" class="px-3 py-1.5 bg-indigo-600 text-white rounded font-semibold">Done</button></div>
+        </div>
+        <p class="text-[11px] text-rose-500" x-show="pkUser.error" x-text="pkUser.error" data-testid="pkuser-error"></p>
+      </div>
+
       <!-- Collapsible Add User Card -->
       <div x-show="iamTab === 'users' && showCreateUserCard" class="p-4 bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-dbx-border rounded-xl space-y-3 shrink-0">
         <span class="text-[11px] font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider block">Provision New User Account</span>
@@ -15569,6 +15586,8 @@
                   <span class="text-[10px] font-mono px-2 py-0.5 rounded font-semibold uppercase"
                         :class="(u.auth_source || 'local') === 'local' ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300 border border-slate-300 dark:border-slate-700' : 'bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-300 border border-violet-300 dark:border-violet-800'"
                         x-text="u.auth_source || 'local'"></span>
+                  <span x-show="u.passwordless" data-testid="passkey-only-badge" class="ml-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300 border border-indigo-300 dark:border-indigo-800" title="No password: signs in with passkeys">passkey-only</span>
+                  <span x-show="u.passkey_count > 0 && !u.passwordless" class="ml-1 text-[10px] font-mono text-slate-500" x-text="u.passkey_count + ' passkey' + (u.passkey_count > 1 ? 's' : '')"></span>
                   <span x-show="u.scim_managed" class="ml-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-100 text-cyan-800 dark:bg-cyan-950 dark:text-cyan-300 border border-cyan-300 dark:border-cyan-800" title="Provisioned by SCIM: role and name come from the identity provider" data-testid="user-scim-badge">SCIM</span>
                 </td>
                 <td class="py-3 px-4">
@@ -15588,6 +15607,8 @@
                       <button @click="openResetPasswordModal(u)" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 rounded text-slate-700 dark:text-slate-200 transition text-[11px] font-medium" title="Reset Password">
                         <i class="ph ph-key"></i>
                       </button>
+                      <button x-show="u.passwordless" @click="issueEnrollmentLink(u)" data-testid="user-enroll-link" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Issue a new enrolment link (first sign-in, or recovery after every passkey was lost)"><i class="ph ph-link"></i></button>
+                      <button x-show="!u.passwordless && (u.auth_source || 'local') === 'local' && u.passkey_count >= 2 && u.id !== currentUser.id" @click="removeUserPassword(u)" data-testid="user-remove-password" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Remove the password: the account signs in with passkeys only"><i class="ph ph-password"></i></button>
                       <button x-show="u.mfa_enabled && u.id !== currentUser.id" @click="resetUserMfa(u)" class="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900 dark:text-sky-300 dark:border-sky-800 rounded transition text-[11px] font-medium" title="Turn off two-factor authentication and remove passkeys (lost device)">
                         <i class="ph ph-shield-slash"></i>
                       </button>
@@ -17408,6 +17429,21 @@
     <div class="flex justify-end space-x-2"><button @click="mfa.graceDismissed = true" class="px-2.5 py-1 rounded border border-amber-300">Later</button><button @click="openMfa()" class="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded" data-testid="mfa-grace-setup">Set it up now</button></div>
   </div>
 
+  <!-- Enrolment page: opened by an administrator's single-use link (/?enroll=...), registers the first passkey of a passkey-only account -->
+  <div x-show="enroll.open" x-cloak class="fixed inset-0 bg-slate-950/90 backdrop-blur-sm z-[70] flex items-center justify-center p-4" data-testid="enroll-modal">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-md shadow-2xl p-6 space-y-4 text-xs">
+      <div class="flex items-center space-x-2"><i class="ph ph-fingerprint text-2xl text-indigo-500"></i><div><h4 class="font-bold text-slate-900 dark:text-white text-base">Set up your passkey</h4><p class="text-slate-500" x-text="enroll.username ? ('Welcome, ' + enroll.display_name + ' (' + enroll.username + ')') : ''" data-testid="enroll-welcome"></p></div></div>
+      <div x-show="!enroll.failed" class="space-y-3">
+        <p class="text-slate-600 dark:text-slate-300">Your account has no password. You will sign in with a <b>passkey</b>: your fingerprint, your face or a security key. Your browser will ask you to confirm with your device.</p>
+        <input type="text" x-model="enroll.name" maxlength="60" placeholder="Name this passkey, e.g. Work laptop" data-testid="enroll-name" class="w-full px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
+        <button type="button" @click="enrollCreate()" :disabled="enroll.busy" data-testid="enroll-create" class="w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg flex items-center justify-center space-x-2"><i class="ph" :class="enroll.busy ? 'ph-spinner animate-spin' : 'ph-fingerprint'"></i><span>Create passkey and sign in</span></button>
+        <p class="text-[11px] text-slate-500">Tip: create a second passkey later (on your phone or a security key) so losing one device does not lock you out.</p>
+      </div>
+      <div x-show="enroll.failed" class="space-y-3"><button type="button" @click="enroll.open = false; showLoginModal = true" class="px-4 py-2 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">Go to sign-in</button></div>
+      <p class="text-[11px] text-rose-500" x-show="enroll.error" x-text="enroll.error" data-testid="enroll-error"></p>
+    </div>
+  </div>
+
   <div x-show="mfa.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="if (!mfa.forced) mfa.open = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-md shadow-2xl p-5 space-y-4 text-xs max-h-[90vh] overflow-y-auto" @click.outside="if (!mfa.forced) mfa.open = false" data-testid="mfa-modal">
       <div x-show="mfa.forced" class="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-[11px] text-amber-800 dark:text-amber-300" data-testid="mfa-forced-note">Your organisation requires two-factor authentication and the time to set it up has passed. Turn it on to continue.</div>
@@ -17433,12 +17469,12 @@
       <template x-if="!mfa.backupCodes">
         <div class="space-y-3">
           <!-- Off -->
-          <div x-show="!mfa.status.enabled && !mfa.setup" class="space-y-3">
+          <div x-show="!currentUser?.passwordless && !mfa.status.enabled && !mfa.setup" class="space-y-3">
             <p class="text-slate-600 dark:text-slate-300">The <strong>authenticator app</strong> is <strong>off</strong>. Turn it on to require a code from an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, 1Password, ...) in addition to your password.</p>
             <div class="flex justify-end"><button type="button" @click="mfaStartSetup()" :disabled="mfa.busy" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg">Set up</button></div>
           </div>
           <!-- Enrolling -->
-          <div x-show="mfa.setup" class="space-y-3">
+          <div x-show="!currentUser?.passwordless && mfa.setup" class="space-y-3">
             <p class="text-slate-600 dark:text-slate-300">1. Scan this QR code with your authenticator app.</p>
             <div x-ref="mfaQr" class="mx-auto w-44 h-44 bg-white p-2 rounded-lg border border-slate-200"></div>
             <p class="text-slate-500">Can't scan? Enter this key manually: <span class="font-mono text-slate-800 dark:text-slate-100 select-all break-all" x-text="mfa.setup && mfa.setup.secret"></span></p>
@@ -17449,7 +17485,7 @@
             </form>
           </div>
           <!-- On -->
-          <div x-show="mfa.status.enabled" class="space-y-3">
+          <div x-show="!currentUser?.passwordless && mfa.status.enabled" class="space-y-3">
             <p class="text-slate-600 dark:text-slate-300">The <strong>authenticator app</strong> is <strong class="text-emerald-600">on</strong>. Backup codes left: <strong x-text="mfa.status.backup_codes_remaining"></strong>.</p>
             <div x-show="!mfa.action" class="flex justify-end space-x-2">
               <button type="button" @click="mfa.action = 'regen'; mfa.error = ''" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">New backup codes</button>
@@ -17482,17 +17518,17 @@
                   <div class="space-x-2"><button type="button" @click="pkRename(c)" class="text-slate-500 hover:text-indigo-500">Rename</button><button type="button" @click="pk.removeId = c.id; pk.removePassword = ''; pk.error = ''" data-testid="passkey-remove" class="text-slate-500 hover:text-rose-500">Remove</button></div></div>
                 <div class="text-[10px] text-slate-500" x-text="'Added ' + new Date(c.created_at * 1000).toLocaleDateString() + (c.last_used_at ? ' · last used ' + new Date(c.last_used_at * 1000).toLocaleDateString() : ' · never used')"></div>
                 <form x-show="pk.removeId === c.id" @submit.prevent="pkRemove(c)" class="flex items-center space-x-2 pt-1">
-                  <input type="password" x-model="pk.removePassword" autocomplete="current-password" placeholder="Password to confirm" data-testid="passkey-remove-password" class="flex-1 px-2 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
-                  <button type="submit" :disabled="pk.busy || !pk.removePassword" data-testid="passkey-remove-confirm" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-semibold rounded-lg">Remove</button>
+                  <input type="password" x-show="!currentUser?.passwordless" x-model="pk.removePassword" autocomplete="current-password" placeholder="Password to confirm" data-testid="passkey-remove-password" class="flex-1 px-2 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
+                  <button type="submit" :disabled="pk.busy || (!currentUser?.passwordless && !pk.removePassword)" data-testid="passkey-remove-confirm" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-semibold rounded-lg">Remove</button>
                   <button type="button" @click="pk.removeId = ''" class="px-2 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">Cancel</button></form>
               </div>
             </template>
             <form x-show="pk.addOpen" @submit.prevent="pkAdd()" class="space-y-2 p-3 bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-dbx-border rounded-lg">
-              <p class="text-slate-600 dark:text-slate-300">Confirm with your password, then follow your browser's prompt.</p>
+              <p class="text-slate-600 dark:text-slate-300" x-text="currentUser?.passwordless ? 'You will be asked to confirm with one of your passkeys first, then to create the new one.' : 'Confirm with your password, then follow your browser\'s prompt.'"></p>
               <input type="text" x-model="pk.name" maxlength="60" placeholder="Name, e.g. Work laptop or YubiKey" data-testid="passkey-name-input" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
-              <input type="password" x-model="pk.password" autocomplete="current-password" placeholder="Password" data-testid="passkey-password" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
+              <input type="password" x-show="!currentUser?.passwordless" x-model="pk.password" autocomplete="current-password" placeholder="Password" data-testid="passkey-password" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white">
               <div class="flex justify-end space-x-2"><button type="button" @click="pk.addOpen = false" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg">Cancel</button>
-                <button type="submit" :disabled="pk.busy || !pk.password" data-testid="passkey-create" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg">Create passkey</button></div>
+                <button type="submit" :disabled="pk.busy || (!currentUser?.passwordless && !pk.password)" data-testid="passkey-create" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-lg">Create passkey</button></div>
             </form>
             <p class="text-[11px] text-rose-500" x-show="!!pk.error" x-text="pk.error" data-testid="passkey-error"></p>
           </div>
@@ -18295,6 +18331,8 @@
         showLoginModal: false,
         loginForm: { username: '', password: '', error: null, loading: false, mfaToken: null, mfaCode: '', mfaMethods: [] },
         passkeyLoginAvailable: false,
+        enroll: { open: false, token: '', username: '', display_name: '', name: '', busy: false, error: '', failed: false, options: null },
+        pkUser: { open: false, username: '', display_name: '', role: 'user', busy: false, error: '', result: null },
         pk: { supported: false, creds: [], available: true, eligible: true, busy: false, error: '', addOpen: false, name: '', password: '', removeId: '', removePassword: '' },
         scim: { form: { enabled: false, login_source: 'oidc', default_role: 'user', max_role: 'power_user', use_roles_attribute: false, group_roles: [], base_url: '' }, data: null, error: '', busy: false, newTokenName: '', newTokenDays: null, secret: '' },
         gitReview: { open: false, kind: 'dbt', tab: 'changes', scope: 'pending', status: null, summary: null, sel: null, diff: null, merge: { in_progress: false, conflicts: [], resolved: [] }, csel: null, cfile: null,
@@ -19612,7 +19650,8 @@
                   role: u.role || 'admin',
                   auth_source: u.auth_source || 'local',
                   must_change_password: !!u.must_change_password,
-                  mfa_policy: u.mfa_policy || null
+                  passwordless: !!u.passwordless,
+            mfa_policy: u.mfa_policy || null
                 };
                 this.isAuthenticated = true;
                 this.showLoginModal = false;
@@ -19643,6 +19682,7 @@
             role: u.role || 'user',
             auth_source: u.auth_source || 'local',
             must_change_password: !!u.must_change_password,
+            passwordless: !!u.passwordless,
             mfa_policy: u.mfa_policy || null
           };
           this.isAuthenticated = true;
@@ -20045,6 +20085,62 @@
           } catch (e) { this.loginForm.error = this.pkErrorText(e); } finally { this.loginForm.loading = false; }
         },
 
+        // ---- enrolment link (/?enroll=<token>): the first passkey of a passkey-only account
+        async startEnrollment(token) {
+          this.stopConditionalPasskey();
+          this.showLoginModal = false;
+          this.enroll = { open: true, token, username: '', display_name: '', name: 'My passkey', busy: false, error: '', failed: false, options: null };
+          const o = await this.postJson('/api/auth/enroll/options', { token });
+          if (!o.ok) { this.enroll.failed = true; this.enroll.error = o.data.detail || 'This link is not valid.'; return; }
+          this.enroll.options = o.data; this.enroll.username = o.data.username; this.enroll.display_name = o.data.display_name;
+        },
+
+        async enrollCreate() {
+          if (this.enroll.busy || !this.enroll.options) return;
+          this.enroll.busy = true; this.enroll.error = '';
+          try {
+            const cred = await this.pkCreate(this.enroll.options.options);
+            const r = await this.postJson('/api/auth/enroll/verify', { token: this.enroll.token, challenge_id: this.enroll.options.challenge_id, credential: cred, name: this.enroll.name.trim() || 'My passkey' });
+            if (!r.ok) {
+              this.enroll.error = r.data.detail || 'The passkey could not be saved.';
+              const o = await this.postJson('/api/auth/enroll/options', { token: this.enroll.token });       // a fresh challenge for another try (the link itself may still be valid)
+              if (o.ok) this.enroll.options = o.data; else this.enroll.failed = true;
+              return;
+            }
+            this.enroll.open = false;
+            await this.finishLogin(r.data);
+          } catch (e) { this.enroll.error = this.pkErrorText(e); } finally { this.enroll.busy = false; }
+        },
+
+        async createPasskeyUser() {
+          this.pkUser.busy = true; this.pkUser.error = '';
+          try {
+            const r = await this.postJson('/api/users/passkey-only', { username: this.pkUser.username, display_name: this.pkUser.display_name, role: this.pkUser.role });
+            if (!r.ok) { this.pkUser.error = r.data.detail || 'Could not create the user.'; return; }
+            this.pkUser.result = this.enrollmentResult(r.data.user.username, r.data.enrollment);
+            await this.fetchUsers();
+          } finally { this.pkUser.busy = false; }
+        },
+
+        enrollmentResult(username, enr) {
+          return { username, link: location.origin + '/?enroll=' + enr.token, expires: new Date(enr.expires_at * 1000).toLocaleString() };
+        },
+
+        async issueEnrollmentLink(u) {
+          if (!confirm(`Issue a new enrolment link for ${u.username}? An unused earlier link stops working.`)) return;
+          const r = await this.postJson('/api/users/' + encodeURIComponent(u.id) + '/passkey-enrollment');
+          if (!r.ok) { this.showToast(r.data.detail || 'Could not issue a link', 'error'); return; }
+          this.pkUser = { open: true, username: '', display_name: '', role: 'user', busy: false, error: '', result: this.enrollmentResult(u.username, r.data.enrollment) };
+        },
+
+        async removeUserPassword(u) {
+          if (!confirm(`Remove the password of ${u.username}? The account will sign in with passkeys only (${u.passkey_count} registered).`)) return;
+          const r = await this.postJson('/api/users/' + encodeURIComponent(u.id) + '/remove-password');
+          if (!r.ok) { this.showToast(r.data.detail || 'Could not remove the password', 'error'); return; }
+          this.showToast(`${u.username} is passkey-only now`, 'success');
+          await this.fetchUsers();
+        },
+
         async pkLoad() {
           this.pk.supported = !!window.PublicKeyCredential;
           try {
@@ -20053,11 +20149,19 @@
           } catch (e) { /* the section stays empty */ }
         },
 
+        // What confirms an add / remove: the password, or for a passkey-only account (no password) a fresh assertion of one of its passkeys.
+        async pkConfirmation(password) {
+          if (!(this.currentUser && this.currentUser.passwordless)) return { password };
+          const o = await this.postJson('/api/auth/webauthn/reauth/options');
+          if (!o.ok) throw new Error(o.data.detail || 'Could not start the confirmation.');
+          return { challenge_id: o.data.challenge_id, credential: await this.pkGet(o.data.options) };
+        },
+
         async pkAdd() {
           if (this.pk.busy) return;
           this.pk.busy = true; this.pk.error = '';
           try {
-            const o = await this.postJson('/api/auth/webauthn/register/options', { password: this.pk.password });
+            const o = await this.postJson('/api/auth/webauthn/register/options', await this.pkConfirmation(this.pk.password));
             if (!o.ok) { this.pk.error = o.data.detail || 'Could not start.'; return; }
             const cred = await this.pkCreate(o.data.options);
             const r = await this.postJson('/api/auth/webauthn/register/verify', { challenge_id: o.data.challenge_id, credential: cred, name: this.pk.name.trim() || 'Passkey' });
@@ -20081,12 +20185,12 @@
           if (this.pk.busy) return;
           this.pk.busy = true; this.pk.error = '';
           try {
-            const r = await this.postJson('/api/auth/webauthn/credentials/' + encodeURIComponent(c.id) + '/delete', { password: this.pk.removePassword });
+            const r = await this.postJson('/api/auth/webauthn/credentials/' + encodeURIComponent(c.id) + '/delete', await this.pkConfirmation(this.pk.removePassword));
             if (!r.ok) { this.pk.error = r.data.detail || 'Could not remove it.'; return; }
             this.pk.removeId = ''; this.pk.removePassword = '';
             await this.pkLoad();
             this.showToast('Passkey removed', 'success');
-          } finally { this.pk.busy = false; }
+          } catch (e) { this.pk.error = this.pkErrorText(e); } finally { this.pk.busy = false; }
         },
 
         async openMfa(forced = false) {
@@ -21722,7 +21826,11 @@
           this.applyTheme(this.isDarkMode);
           this.$watch('showLoginModal', (open) => { if (open) this.$nextTick(() => this.startConditionalPasskey()); else this.stopConditionalPasskey(); });
           this.$watch('passkeyLoginAvailable', () => { if (this.showLoginModal) this.$nextTick(() => this.startConditionalPasskey()); });
-          if (this.showLoginModal) this.$nextTick(() => this.startConditionalPasskey());
+          const enrollToken = new URLSearchParams(window.location.search).get('enroll');
+          if (enrollToken) {
+            history.replaceState({}, '', window.location.pathname);          // the token must not stay in the address bar, history or a Referer
+            await this.startEnrollment(enrollToken);
+          } else if (this.showLoginModal) this.$nextTick(() => this.startConditionalPasskey());
           this.$watch('currentView', (val) => {
             if (val) localStorage.setItem('dbx_current_view', val);
             if (val === 'sql') {

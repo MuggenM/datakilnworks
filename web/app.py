@@ -531,6 +531,8 @@ class CatalogPermissionRequest(BaseModel):
 async def login_endpoint(payload: LoginRequest):
     u = get_user_by_username(payload.username, include_password_hash=True)
     source = (u.get("auth_source") or "local") if u else None
+    if u and u.get("passwordless"):
+        raise HTTPException(status_code=401, detail="Invalid username or password")        # a passkey-only account has no password to try (same answer as a wrong one)
     if u and source != "ldap":
         # Every account except an LDAP-provisioned one authenticates against its own stored hash (unchanged from
         # before LDAP support existed). LDAP accounts never have a usable hash by design (see
@@ -584,6 +586,7 @@ def _session_response(u: Dict[str, Any]) -> JSONResponse:
         "created_at": u["created_at"],
         "last_login_at": u["last_login_at"],
         "must_change_password": bool(u.get("must_change_password")),
+        "passwordless": bool(u.get("passwordless")),
         "auth_source": u.get("auth_source") or "local",
         "mfa_enabled": bool(u.get("mfa_enabled")),
         "mfa_policy": _mfa_policy_view(u)
@@ -627,6 +630,25 @@ async def login_mfa_endpoint(payload: MfaLoginRequest):
 
 class PasskeyPasswordPayload(BaseModel):
     password: Optional[str] = None
+    challenge_id: Optional[str] = None               # a passkey-only account confirms with a fresh passkey assertion instead of a password
+    credential: Optional[Dict[str, Any]] = None
+
+
+class PasskeyOnlyUserPayload(BaseModel):
+    username: str
+    display_name: Optional[str] = None
+    role: str = "user"
+
+
+class EnrollOptionsPayload(BaseModel):
+    token: str
+
+
+class EnrollVerifyPayload(BaseModel):
+    token: str
+    challenge_id: str
+    credential: Dict[str, Any]
+    name: str = ""
 
 
 class PasskeyRegisterPayload(BaseModel):
@@ -664,12 +686,22 @@ def _webauthn_error(exc) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
-async def _verify_reauth(user: Dict[str, Any], password: Optional[str]) -> None:
-    """Adding or removing a passkey needs the account's password, so a stolen session cannot plant or drop a second factor."""
+async def _verify_reauth(user: Dict[str, Any], password: Optional[str], payload: Optional[PasskeyPasswordPayload] = None, headers: Optional[Dict[str, str]] = None) -> None:
+    """Adding or removing a passkey needs the account's password, so a stolen session cannot plant or drop a second factor.
+    A passkey-only account has no password: it confirms with a fresh passkey assertion (user verification required)."""
     from web.auth import verify_password
     source = user.get("auth_source") or "local"
     if source in ("oidc", "saml"):
         raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
+    if user.get("passwordless"):
+        from web import webauthn_auth
+        if not (payload and payload.challenge_id and payload.credential):
+            raise HTTPException(status_code=403, detail="Confirm with your passkey.")
+        try:
+            await asyncio.to_thread(webauthn_auth.finish_authentication, payload.challenge_id, payload.credential, headers or {}, user["id"], True)
+        except webauthn_auth.WebAuthnError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        return
     if not password:
         raise HTTPException(status_code=403, detail="Enter your password to confirm.")
     if source == "local":
@@ -696,7 +728,7 @@ async def webauthn_status(request: Request):
     user = await get_current_user(request)
     rp_id, origins = webauthn_auth.relying_party(dict(request.headers))
     return {"available": webauthn_auth.available(), "passwordless": webauthn_auth.passwordless_enabled(), "rp_id": rp_id, "origins": origins,
-            "attestation_mode": webauthn_auth.pol_mode(), "eligible": (user.get("auth_source") or "local") not in ("oidc", "saml"), "credentials": webauthn_auth.list_credentials(user["id"]), "totp": mfa.is_enabled(user["id"])}
+            "attestation_mode": webauthn_auth.pol_mode(), "passwordless_account": bool(user.get("passwordless")), "eligible": (user.get("auth_source") or "local") not in ("oidc", "saml"), "credentials": webauthn_auth.list_credentials(user["id"]), "totp": mfa.is_enabled(user["id"])}
 
 
 @app.get("/api/webauthn/policy")
@@ -721,9 +753,9 @@ async def set_webauthn_policy(payload: WebauthnPolicyPayload, current_user: Dict
 async def webauthn_register_options(payload: PasskeyPasswordPayload, request: Request):
     from web import webauthn_auth
     user = await get_current_user(request)
-    await _verify_reauth(user, payload.password)
+    await _verify_reauth(user, payload.password, payload, dict(request.headers))
     try:
-        return await asyncio.to_thread(webauthn_auth.registration_options, user, dict(request.headers))
+        return await asyncio.to_thread(webauthn_auth.registration_options, user, dict(request.headers), bool(user.get("passwordless")))
     except webauthn_auth.WebAuthnError as exc:
         raise _webauthn_error(exc)
 
@@ -735,7 +767,7 @@ async def webauthn_register_verify(payload: PasskeyRegisterPayload, request: Req
     if (user.get("auth_source") or "local") in ("oidc", "saml"):
         raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
     try:
-        cred = await asyncio.to_thread(webauthn_auth.finish_registration, user, payload.challenge_id, payload.credential, payload.name, dict(request.headers))
+        cred = await asyncio.to_thread(webauthn_auth.finish_registration, user, payload.challenge_id, payload.credential, payload.name, dict(request.headers), bool(user.get("passwordless")))
     except webauthn_auth.WebAuthnError as exc:
         raise _webauthn_error(exc)
     mfa_policy._audit(user["username"], "PASSKEY_ADD", f"user:{user['username']}", {"credential": cred["id"][:12], "name": cred["name"]})
@@ -757,15 +789,110 @@ async def webauthn_rename(credential_id: str, payload: PasskeyRenamePayload, req
 async def webauthn_delete(credential_id: str, payload: PasskeyPasswordPayload, request: Request):
     from web import webauthn_auth, mfa, mfa_policy
     user = await get_current_user(request)
-    await _verify_reauth(user, payload.password)
+    await _verify_reauth(user, payload.password, payload, dict(request.headers))
     if credential_id not in [c["id"] for c in webauthn_auth.list_credentials(user["id"])]:
         raise HTTPException(status_code=404, detail="That passkey does not exist.")
+    if user.get("passwordless") and webauthn_auth.count(user["id"]) == 1:
+        raise HTTPException(status_code=409, detail="This is your only passkey and your account has no password, so removing it would lock you out. Add another passkey first.")
     last_factor = webauthn_auth.count(user["id"]) == 1 and not mfa.is_enabled(user["id"])
     if last_factor and not mfa_policy.may_disable_own_mfa(get_user_by_id(user["id"]) or user):
         raise HTTPException(status_code=409, detail="This is your only second factor and your organisation requires one. Add another passkey or turn on an authenticator app first.")
     webauthn_auth.delete(user["id"], credential_id)
     mfa_policy._audit(user["username"], "PASSKEY_REMOVE", f"user:{user['username']}", {"credential": credential_id[:12]})
     return {"success": True}
+
+
+@app.post("/api/auth/webauthn/reauth/options")
+async def webauthn_reauth_options(request: Request):
+    """A passkey-only account confirms an add / remove with a fresh assertion: the options for it (user verification required)."""
+    from web import webauthn_auth
+    user = await get_current_user(request)
+    if not user.get("passwordless"):
+        raise HTTPException(status_code=400, detail="Confirm with your password instead.")
+    try:
+        return await asyncio.to_thread(webauthn_auth.authentication_options, dict(request.headers), user["id"], True)
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+
+
+# ---- passkey-only accounts: created by an administrator, entered through a single-use enrolment link
+
+@app.post("/api/users/passkey-only")
+async def create_passkey_only_user(payload: PasskeyOnlyUserPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """A local account with no password. The answer carries the enrolment token ONCE (build the link <origin>/?enroll=<token>)."""
+    from web import webauthn_auth, mfa_policy
+    from web.auth import create_passwordless_user
+    if not webauthn_auth.available():
+        raise HTTPException(status_code=400, detail="Passkeys are not available on this server (the webauthn package is not installed).")
+    try:
+        u = await asyncio.to_thread(create_passwordless_user, payload.username, payload.display_name or "", payload.role)
+        enr = await asyncio.to_thread(webauthn_auth.issue_enrollment, u["id"], current_user["username"])
+    except (ValueError, webauthn_auth.WebAuthnError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    mfa_policy._audit(current_user["username"], "PASSKEY_ONLY_USER_CREATE", f"user:{u['username']}", {"role": u["role"]})
+    return {"success": True, "user": u, "enrollment": enr}
+
+
+@app.post("/api/users/{user_id}/passkey-enrollment")
+async def issue_passkey_enrollment(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """A new enrolment link for a passkey-only account (first sign-in, or recovery after every passkey was lost); it replaces an unused earlier one."""
+    from web import webauthn_auth, mfa_policy
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        enr = await asyncio.to_thread(webauthn_auth.issue_enrollment, user_id, current_user["username"])
+    except webauthn_auth.WebAuthnError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    mfa_policy._audit(current_user["username"], "PASSKEY_ENROLL_ISSUE", f"user:{target['username']}", {"expires_at": enr["expires_at"]})
+    return {"success": True, "enrollment": enr}
+
+
+@app.post("/api/users/{user_id}/remove-password")
+async def remove_user_password(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Makes an account passkey-only. Refused unless it already has two passkeys (one lost device must not lock the account out)."""
+    from web import webauthn_auth, mfa_policy
+    from web.auth import set_passwordless
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if (target.get("auth_source") or "local") != "local":
+        raise HTTPException(status_code=400, detail="Only local accounts can be made passkey-only.")
+    if target.get("passwordless"):
+        raise HTTPException(status_code=400, detail="This account is already passkey-only.")
+    if webauthn_auth.count(user_id) < 2:
+        raise HTTPException(status_code=409, detail="The account needs at least two registered passkeys first, so losing one device does not lock it out.")
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Use another administrator to remove your own password.")
+    await asyncio.to_thread(set_passwordless, user_id, True)
+    mfa_policy._audit(current_user["username"], "USER_PASSWORD_REMOVED", f"user:{target['username']}", {"passkeys": webauthn_auth.count(user_id)})
+    return {"success": True}
+
+
+@app.post("/api/auth/enroll/options")
+async def enroll_options(payload: EnrollOptionsPayload, request: Request):
+    """Public (the token is the credential): the registration options for the account an enrolment link belongs to."""
+    from web import webauthn_auth
+    try:
+        u = await asyncio.to_thread(webauthn_auth.enrollment_user, payload.token)
+        out = await asyncio.to_thread(webauthn_auth.registration_options, u, dict(request.headers), True, "enroll")
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    return {**out, "username": u["username"], "display_name": u.get("display_name") or u["username"]}
+
+
+@app.post("/api/auth/enroll/verify")
+async def enroll_verify(payload: EnrollVerifyPayload, request: Request):
+    """Registers the first passkey of a passkey-only account (user verification required), uses up the link and signs the owner in."""
+    from web import webauthn_auth, mfa_policy
+    try:
+        u = await asyncio.to_thread(webauthn_auth.enrollment_user, payload.token)
+        await asyncio.to_thread(webauthn_auth.finish_registration, u, payload.challenge_id, payload.credential, payload.name, dict(request.headers), True, "enroll")
+        await asyncio.to_thread(webauthn_auth.consume_enrollment, payload.token)
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    mfa_policy._audit(u["username"], "PASSKEY_ENROLL_USED", f"user:{u['username']}", {})
+    return _session_response(get_user_by_id(u["id"]))
 
 
 @app.post("/api/auth/login/webauthn/options")
@@ -834,6 +961,8 @@ async def mfa_setup(request: Request):
     user = await get_current_user(request)
     if (user.get("auth_source") or "local") in ("oidc", "saml"):
         raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
+    if user.get("passwordless"):
+        raise HTTPException(status_code=400, detail="A passkey-only account signs in with passkeys; an authenticator app is not used.")
     try:
         return mfa.begin_setup(user["id"], user["username"])
     except ValueError as exc:

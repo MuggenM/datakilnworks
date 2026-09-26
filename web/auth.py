@@ -127,6 +127,9 @@ def init_auth_db():
             conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, public_key TEXT NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL, transports TEXT, device_type TEXT, backed_up INTEGER NOT NULL DEFAULT 0, uv INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(user_id)")
+            if "passwordless" not in existing:                     # passkey-only account: no usable password (web/webauthn_auth.py enrolment links)
+                conn.execute("ALTER TABLE users ADD COLUMN passwordless INTEGER NOT NULL DEFAULT 0")
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_enrollments (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires INTEGER NOT NULL, created_by TEXT, created_at INTEGER NOT NULL, used_at INTEGER)""")
             for col, ddl in (("aaguid", "TEXT"), ("attestation_fmt", "TEXT"), ("attested", "INTEGER NOT NULL DEFAULT 0")):        # authenticator model / attestation (webauthn_policy)
                 if col not in {r[1] for r in conn.execute("PRAGMA table_info(webauthn_credentials)").fetchall()}:
                     conn.execute(f"ALTER TABLE webauthn_credentials ADD COLUMN {col} {ddl}")
@@ -274,6 +277,7 @@ def _public_user(u: Dict[str, Any]) -> Dict[str, Any]:
     u.pop("password_hash", None)
     for col in _MFA_SECRET_COLUMNS:
         u.pop(col, None)
+    u["passwordless"] = bool(u.get("passwordless"))
     passkeys = int(u.pop("webauthn_count", 0) or 0)
     u["mfa_enabled"] = bool(u.pop("totp_enabled", 0)) or passkeys > 0          # any second factor: an authenticator app or a passkey / security key
     u["passkey_count"] = passkeys
@@ -314,11 +318,12 @@ def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         rows = conn.execute(
             f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at, "
-            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override, scim_managed, "
+            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override, scim_managed, passwordless, "
             f"(SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
+            d["passwordless"] = bool(d.get("passwordless"))
             passkeys = int(d.pop("webauthn_count", 0) or 0)
             d["mfa_enabled"] = bool(d.pop("totp_enabled", 0)) or passkeys > 0
             d["passkey_count"] = passkeys
@@ -406,6 +411,41 @@ def update_user(user_id: str, display_name: Optional[str] = None, role: Optional
         conn.close()
 
 
+def create_passwordless_user(username: str, display_name: str, role: str = "user") -> Dict[str, Any]:
+    """A local account WITHOUT a usable password: it signs in with passkeys only. The hash is random and nobody knows it; the account gets in through an
+    enrolment link (web/webauthn_auth.py) that lets its owner register the first passkey."""
+    clean_username = username.strip().lower()
+    if not clean_username or not all(ch.isalnum() or ch in "._-@" for ch in clean_username):
+        raise ValueError("A username has letters, digits and . _ - @ only.")
+    if role not in ("admin", "power_user", "user"):
+        raise ValueError(f"Invalid role '{role}'. Allowed roles: admin, power_user, user")
+    conn = get_db_connection()
+    try:
+        if conn.execute("SELECT id FROM users WHERE username = ?", (clean_username,)).fetchone():
+            raise ValueError(f"Username '{clean_username}' is already taken.")
+        user_id = f"u_{clean_username}_{secrets.token_hex(4)}"
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with conn:
+            conn.execute("INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at, must_change_password, passwordless) VALUES (?, ?, ?, ?, ?, 1, ?, 0, 1)",
+                         (user_id, clean_username, hash_password(secrets.token_hex(32)), (display_name or "").strip() or clean_username, role, now_str))
+    finally:
+        conn.close()
+    return get_user_by_id(user_id)
+
+
+def set_passwordless(user_id: str, on: bool) -> bool:
+    """Turns an account passkey-only (the password becomes unusable) or, with `on` False, only flags it as having a password again (reset_user_password does that too)."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            if on:
+                return conn.execute("UPDATE users SET passwordless = 1, password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE id = ? AND COALESCE(auth_source, 'local') = 'local'",
+                                    (hash_password(secrets.token_hex(32)), int(time.time()), user_id)).rowcount > 0
+            return conn.execute("UPDATE users SET passwordless = 0 WHERE id = ?", (user_id,)).rowcount > 0
+    finally:
+        conn.close()
+
+
 def upsert_external_user(username: str, display_name: str, role: str, auth_source: str) -> Dict[str, Any]:
     """
     Creates or updates the local record of an account whose password lives with an external identity provider
@@ -462,7 +502,7 @@ def reset_user_password(user_id: str, new_password: str, chosen_by_self: bool = 
         pw_hash = hash_password(new_password)
         with conn:
             res = conn.execute(
-                "UPDATE users SET password_hash = ?, password_changed_at = ?, must_change_password = ? WHERE id = ?",
+                "UPDATE users SET password_hash = ?, password_changed_at = ?, must_change_password = ?, passwordless = 0 WHERE id = ?",
                 (pw_hash, int(time.time()), 0 if chosen_by_self else 1, user_id))
             return res.rowcount > 0
     finally:
@@ -470,6 +510,15 @@ def reset_user_password(user_id: str, new_password: str, chosen_by_self: bool = 
 
 
 MIN_SELF_PASSWORD_LENGTH = 6
+
+
+def _passwordless_row(user_id: str) -> bool:
+    conn = get_db_connection()
+    try:
+        r = conn.execute("SELECT passwordless FROM users WHERE id = ?", (user_id,)).fetchone()
+        return bool(r and r["passwordless"])
+    finally:
+        conn.close()
 
 
 def change_own_password(user_id: str, current_password: str, new_password: str) -> None:
@@ -487,6 +536,8 @@ def change_own_password(user_id: str, current_password: str, new_password: str) 
         raise PermissionError("Account not found or deactivated.")
     if (row["auth_source"] or "local") != "local":
         raise PermissionError("This account signs in through an external identity provider; change the password there.")
+    if _passwordless_row(user_id):
+        raise PermissionError("This account has no password: it signs in with passkeys. Ask an administrator if you need a password.")
     if not verify_password(current_password, row["password_hash"]):
         raise PermissionError("The current password is incorrect.")
     if len(new_password) < MIN_SELF_PASSWORD_LENGTH:
