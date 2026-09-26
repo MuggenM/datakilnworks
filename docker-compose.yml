@@ -69,12 +69,50 @@ services:
       - default
       - sandbox-net
       - control-net
+      - proxy-net
     deploy:
       resources:
         limits:
           memory: 4G
         reservations:
           memory: 1G
+    restart: unless-stopped
+
+  # Optional TLS reverse proxy: `docker compose --profile proxy up -d` (see deploy/traefik/README.md). File provider only: Traefik never gets the Docker
+  # socket. Set DELTA_SHARING_ENDPOINT to the public https address so Delta Sharing profiles and file links use it.
+  traefik:
+    image: traefik:v3.0
+    container_name: local-traefik
+    profiles: ["proxy"]
+    depends_on:
+      - datakilnworks-studio
+    command:
+      - --global.checknewversion=false
+      - --global.sendanonymoususage=false
+      - --api=false
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=:${TRAEFIK_HTTPS_PORT:-8443}
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      # Let's Encrypt (HTTP-01), used only when TRAEFIK_CERT_RESOLVER=le and TRAEFIK_DOMAIN is set; otherwise the certificate comes from
+      # dynamic/certs.yml or Traefik's built-in self-signed one.
+      - --certificatesresolvers.le.acme.email=${TRAEFIK_ACME_EMAIL:-admin@example.com}
+      - --certificatesresolvers.le.acme.storage=/acme/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      - --entrypoints.websecure.http.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-}
+      - --entrypoints.websecure.http.tls.domains[0].main=${TRAEFIK_DOMAIN:-localhost}
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-8080}:80"
+      - "${TRAEFIK_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./deploy/traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./deploy/traefik/certs:/certs:ro
+      - traefik-acme:/acme
+    networks:
+      - proxy-net
     restart: unless-stopped
 
   # One-shot initialisation (python -m web.init), same image: validates the bootstrap-admin settings, creates / migrates every database, seeds
@@ -253,12 +291,16 @@ services:
     restart: unless-stopped
 
 networks:
+  # Shared by the studio and the optional Traefik proxy. No fixed subnet on purpose (a fixed one collides with other Docker networks on many
+  # machines and would break the whole stack): set TRUSTED_PROXIES to this network's subnet, see deploy/traefik/README.md.
+  proxy-net:
   sandbox-net:
     internal: true
   control-net:
     internal: true
 
 volumes:
+  traefik-acme:
   controller-secret:
   sandbox-secret:
   sandbox-state:

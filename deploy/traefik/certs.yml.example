@@ -1,0 +1,6 @@
+# Your own certificate: copy this file to deploy/traefik/dynamic/certs.yml and put the PEM files in deploy/traefik/certs/ (mounted read-only at /certs).
+# Without it Traefik serves its built-in self-signed certificate (fine for a first look; browsers and API clients will not trust it).
+tls:
+  certificates:
+    - certFile: /certs/fullchain.pem
+      keyFile: /certs/privkey.pem

@@ -1,0 +1,15 @@
+# Traefik dynamic configuration for the optional `proxy` profile (docker compose --profile proxy up -d).
+# One router sends every request to the studio. TLS is terminated here; the studio itself stays plain http on the compose network.
+# Other files in this directory are read too: drop a `certs.yml` next to this file to serve your own certificate (see README in this folder).
+http:
+  routers:
+    studio:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [websecure]
+      service: studio
+      tls: {}
+  services:
+    studio:
+      loadBalancer:
+        servers:
+          - url: "http://datakilnworks-studio:8000"
