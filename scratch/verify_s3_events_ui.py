@@ -59,7 +59,8 @@ def main():
             act = lambda code: page.evaluate(f"async () => {{ const d = Alpine.$data(document.body); {code} }}")
             act("d.currentView = 'autoloader'; await d.initAutoLoader();")
             page.click("[data-testid=open-s3events]"); page.wait_for_selector("[data-testid=s3events-modal]", state="visible")
-            time.sleep(1); check("the modal shows the receiver URL", page.locator("[data-testid=s3events-url]").inner_text().endswith("/hooks/s3-events"))
+            page.wait_for_function("() => (document.querySelector('[data-testid=s3events-url]').innerText || '').trim().length > 0", timeout=30000)
+            check("the modal shows the receiver URL", page.locator("[data-testid=s3events-url]").inner_text().endswith("/hooks/s3-events"))
             page.fill("[data-testid=s3events-token-name]", "MinIO test"); page.click("[data-testid=s3events-token-create]")
             page.wait_for_selector("[data-testid=s3events-secret]", state="visible")
             token = page.locator("[data-testid=s3events-secret]").inner_text().strip()
@@ -68,7 +69,11 @@ def main():
             # a real MinIO that posts to the studio
             sh("docker", "run", "-d", "--name", MINIO, "--network", NET, "-e", "MINIO_NOTIFY_WEBHOOK_ENABLE_dkw=on", "-e", f"MINIO_NOTIFY_WEBHOOK_ENDPOINT_dkw=http://{UI}:8891/hooks/s3-events",
                "-e", f"MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_dkw={token}", "minio/minio", "server", "/data")
-            r = ex(NOTIFY); check("MinIO is configured to notify the studio", "configured" in r.stdout, r.stderr[-400:])
+            for _ in range(30):
+                r = ex(NOTIFY)
+                if "configured" in r.stdout: break
+                time.sleep(2)
+            check("MinIO is configured to notify the studio", "configured" in r.stdout, r.stderr[-400:])
             ex(UPLOAD("in/seed.csv", "id,val\n1,a\n"))
             # the pipeline is created in the dialog
             page.click("button:has-text('New Pipeline'):visible"); page.wait_for_selector("text=Create Auto-Loader Pipeline >> visible=true")

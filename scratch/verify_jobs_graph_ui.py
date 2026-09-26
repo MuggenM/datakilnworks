@@ -180,7 +180,12 @@ try:
         page.wait_for_function("() => document.querySelector('[data-testid=run-status]').innerText.trim() === 'CANCELLED'", timeout=30000)
         stt = {t: rn(t).get_attribute("data-status") for t in ("first", "slow", "last")}
         check("after Cancel the run page shows the outcome", stt["first"] == "SUCCESS" and stt["slow"] == "CANCELLED" and stt["last"] == "CANCELLED", stt)
-        page.locator("[data-testid=run-back]").click(); page.wait_for_timeout(300)
+        page.locator("[data-testid=run-back]").click()
+        try:
+            page.wait_for_selector("[data-testid=run-view]", state="hidden", timeout=20000)
+            page.wait_for_selector("tr:visible:has-text('CANCELLED')", timeout=20000)
+        except Exception:
+            pass
         check("'All runs' returns to the list", page.locator("tr:visible:has-text('CANCELLED')").first.is_visible() and not page.locator("[data-testid=run-view]").is_visible())
 
         print("list mode keeps the old run dialog")

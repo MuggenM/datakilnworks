@@ -32,6 +32,7 @@ try:
         check("logged in", ctx.request.post(f"{BASE}/api/auth/login", data={"username": "admin", "password": "adminpassword123"}).ok)
         page.goto(BASE, wait_until="networkidle"); time.sleep(1)
         page.evaluate("() => { Alpine.$data(document.body).currentView = 'catalog'; }"); page.wait_for_timeout(500); page.click("[data-testid=open-sharing]"); page.wait_for_selector("[data-testid=sharing-modal]", state="visible"); page.wait_for_timeout(500)
+        page.wait_for_function("() => (document.querySelector('[data-testid=sharing-endpoint]').innerText || '').trim().length > 0", timeout=30000)
         check("the modal shows the endpoint", page.locator("[data-testid=sharing-endpoint]").inner_text().endswith("/delta-sharing"))
         page.fill("[data-testid=sharing-share-name]", "acme_orders"); page.click("[data-testid=sharing-share-create]"); page.wait_for_selector("[data-testid=sharing-share]")
         check("a share is created", page.locator("[data-testid=sharing-share]").count() == 1)
