@@ -52,6 +52,9 @@ services:
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       - IP_ALLOWLIST_OVERRIDE=${IP_ALLOWLIST_OVERRIDE:-}
       - MFA_POLICY_OVERRIDE=${MFA_POLICY_OVERRIDE:-}
+      # Delta Sharing: the public address of the protocol in recipient profiles (blank = the request's origin), and the on/off switch.
+      - DELTA_SHARING_ENDPOINT=${DELTA_SHARING_ENDPOINT:-}
+      - DELTA_SHARING=${DELTA_SHARING:-on}
     volumes:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse

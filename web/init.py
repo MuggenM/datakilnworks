@@ -114,7 +114,7 @@ def _lock(timeout: float):
 
 def _database_steps() -> List[tuple]:
     """(label, importable callable path). Each creates or migrates its tables; all are idempotent."""
-    return [("governance (tags, policies, audit)", "web.governance.store:init_governance_db"), ("query history", "web.audit:init_history_db"),
+    return [("governance (tags, policies, audit)", "web.governance.store:init_governance_db"), ("query history", "web.audit:init_history_db"), ("delta sharing", "web.delta_sharing:init_sharing_db"),
             ("alerts", "web.alerts:init_alerts_db"), ("experiments", "web.experiments:init_experiments_db"), ("prompt playground", "web.playground:init_playground_db"),
             ("lineage", "web.lineage:init_lineage_db"), ("recent items", "web.recents:init_recents_db"), ("model serving", "web.serving:init_serving_db"),
             ("job runs", "web.workflow:init_runs_db"), ("MFA policy", "web.mfa_policy:init_policy_db"), ("IP allowlist", "web.ip_allowlist:init_db"),

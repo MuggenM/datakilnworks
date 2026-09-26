@@ -198,6 +198,8 @@ from web.governance import routes as governance_routes
 app.include_router(governance_routes.router)
 app.include_router(sandbox_gateway.router)
 from web import s3_events as s3_events_module
+from web import delta_sharing as delta_sharing_module
+app.include_router(delta_sharing_module.router)             # /delta-sharing/* : the Delta Sharing protocol for outside recipients (web/delta_sharing.py)
 app.include_router(s3_events_module.router)               # POST /hooks/s3-events : bearer-token receiver for S3 bucket notifications (web/s3_events.py)
 from web import scim as scim_module
 app.include_router(scim_module.router)                    # /scim/v2/* : authenticated by SCIM bearer tokens only (web/scim.py)
@@ -833,6 +835,107 @@ async def revoke_s3_events_token_endpoint(token_id: str, current_user: Dict[str,
         await asyncio.to_thread(s3_events_module.revoke_token, token_id, current_user.get("username", "admin"))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    return {"success": True}
+
+
+class SharePayload(BaseModel):
+    name: str
+    comment: str = ""
+
+
+class ShareTablePayload(BaseModel):
+    source: str
+    schema_alias: Optional[str] = None
+    table_alias: Optional[str] = None
+
+
+class SharingRecipientPayload(BaseModel):
+    name: str
+    comment: str = ""
+    shares: List[str] = []
+    expires_in_days: Optional[int] = None
+
+
+class SharingSharesPayload(BaseModel):
+    shares: List[str] = []
+
+
+class SharingRotatePayload(BaseModel):
+    expires_in_days: Optional[int] = None
+
+
+def _sharing_call(fn, *args):
+    try:
+        return fn(*args)
+    except delta_sharing_module.SharingError as exc:
+        raise HTTPException(status_code=exc.status if exc.status != 401 else 400, detail=str(exc))
+
+
+@app.get("/api/sharing")
+async def get_sharing_overview(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Delta Sharing: shares with their tables and recipients, recipients with their state, the profile endpoint and the recent activity."""
+    shares = await asyncio.to_thread(delta_sharing_module.list_shares)
+    for s in shares:                                            # a table whose governance changed since it was added is flagged, not hidden
+        for t in s["tables"]:
+            t["problem"] = await asyncio.to_thread(delta_sharing_module.governance_problem, t["source"])
+    return {"enabled": delta_sharing_module.enabled(), "endpoint": delta_sharing_module.endpoint_for(request), "url_ttl_seconds": delta_sharing_module.URL_TTL,
+            "shares": shares, "recipients": await asyncio.to_thread(delta_sharing_module.list_recipients), "log": await asyncio.to_thread(delta_sharing_module.recent_log, 100)}
+
+
+@app.post("/api/sharing/shares")
+async def create_share_endpoint(payload: SharePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.create_share, payload.name, payload.comment, current_user.get("username", "admin"))
+
+
+@app.delete("/api/sharing/shares/{name}")
+async def delete_share_endpoint(name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.delete_share, name, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.post("/api/sharing/shares/{name}/tables")
+async def add_share_table_endpoint(name: str, payload: ShareTablePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.add_table, name, payload.source, current_user.get("username", "admin"), payload.schema_alias, payload.table_alias)
+
+
+@app.delete("/api/sharing/shares/{name}/tables/{schema}/{table}")
+async def remove_share_table_endpoint(name: str, schema: str, table: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.remove_table, name, schema, table, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+def _with_profile(request: Request, res: Dict[str, Any]) -> Dict[str, Any]:
+    res["profile"] = delta_sharing_module.profile(delta_sharing_module.endpoint_for(request), res["token"], res.get("expiration_time"))
+    return res
+
+
+@app.post("/api/sharing/recipients")
+async def create_recipient_endpoint(payload: SharingRecipientPayload, request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Creates a recipient; the token (and the profile file containing it) is in this answer only."""
+    res = await asyncio.to_thread(_sharing_call, delta_sharing_module.create_recipient, payload.name, payload.comment, payload.shares, payload.expires_in_days, current_user.get("username", "admin"))
+    return _with_profile(request, res)
+
+
+@app.post("/api/sharing/recipients/{rid}/rotate")
+async def rotate_recipient_endpoint(rid: str, payload: SharingRotatePayload, request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    res = await asyncio.to_thread(_sharing_call, delta_sharing_module.rotate_token, rid, payload.expires_in_days, current_user.get("username", "admin"))
+    return _with_profile(request, res)
+
+
+@app.put("/api/sharing/recipients/{rid}/shares")
+async def set_recipient_shares_endpoint(rid: str, payload: SharingSharesPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.set_recipient_shares, rid, payload.shares, current_user.get("username", "admin"))
+
+
+@app.post("/api/sharing/recipients/{rid}/revoke")
+async def revoke_recipient_endpoint(rid: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.revoke_recipient, rid, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.delete("/api/sharing/recipients/{rid}")
+async def delete_recipient_endpoint(rid: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.delete_recipient, rid, current_user.get("username", "admin"))
     return {"success": True}
 
 

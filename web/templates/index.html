@@ -2242,6 +2242,10 @@
               <button @click="toggleAllSchemas()" class="text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white text-xs p-1 rounded hover:bg-slate-100 dark:hover:bg-dbx-hover transition" :title="allSchemasExpanded ? 'Collapse All Schemas' : 'Expand All Schemas'">
                 <i class="ph" :class="allSchemasExpanded ? 'ph-arrows-in-line-vertical' : 'ph-arrows-out-line-vertical'"></i>
               </button>
+              <button x-show="currentUser?.role === 'admin'" @click="openSharing()" data-testid="open-sharing" class="text-[11px] px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-emerald-300 dark:border-slate-700 rounded flex items-center space-x-1 transition font-medium" title="Delta Sharing: share tables with outside organisations">
+                <i class="ph ph-share-network text-[10px]"></i>
+                <span>Share</span>
+              </button>
               <button x-show="currentUser?.role === 'admin' || currentUser?.role === 'power_user'" @click="openMountModal()" class="text-[11px] px-2 py-0.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:hover:bg-indigo-900 dark:text-indigo-300 dark:border-indigo-700/60 rounded flex items-center space-x-1 transition font-medium" title="Mount External Storage (PostgreSQL, S3, SQLite)">
                 <i class="ph ph-plug text-[10px]"></i>
                 <span>Mount</span>
@@ -11302,6 +11306,98 @@
   </div>
 
   <!-- Modal: Connections (HTTP(S)/REST and SFTP sources for Auto-Loader) -->
+  <div x-show="dsh.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="dsh.open = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-4xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" data-testid="sharing-modal">
+      <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-3">
+        <div>
+          <h3 class="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-share-network text-dbx-orange"></i><span>Delta Sharing</span></h3>
+          <p class="text-[11px] text-slate-500 mt-0.5">Share tables with outside organisations over the open Delta Sharing protocol. A recipient gets a profile file and reads the shared tables with any Delta Sharing client (Python, Spark, Power BI, Databricks ...). Recipients receive the raw files, so a table with a masking or row filter policy cannot be shared.</p>
+        </div>
+        <button @click="dsh.open = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+      <div x-show="dsh.data && !dsh.data.enabled" class="p-2 rounded border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400">The protocol endpoint is switched off (<span class="font-mono">DELTA_SHARING=off</span>).</div>
+      <div class="space-y-1">
+        <div class="text-slate-400 uppercase text-[10px] font-semibold">Endpoint</div>
+        <span class="font-mono px-2 py-1 bg-slate-100 dark:bg-slate-900 rounded select-all" data-testid="sharing-endpoint" x-text="dsh.data ? dsh.data.endpoint : ''"></span>
+        <p class="text-[10px] text-slate-500">The address written into every profile. Recipients must be able to reach it (behind a reverse proxy set <span class="font-mono">DELTA_SHARING_ENDPOINT</span>), and with an IP allowlist their addresses must be allowed.</p>
+      </div>
+      <div class="flex space-x-1 border-b border-slate-200 dark:border-dbx-border">
+        <template x-for="t in [['shares','Shares'],['recipients','Recipients'],['activity','Activity']]" :key="t[0]">
+          <button @click="dsh.tab = t[0]" :data-testid="'sharing-tab-' + t[0]" class="px-3 py-1.5 -mb-px border-b-2 font-semibold" :class="dsh.tab === t[0] ? 'border-dbx-orange text-dbx-orange' : 'border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white'" x-text="t[1]"></button>
+        </template>
+      </div>
+
+      <div x-show="dsh.tab === 'shares'" class="space-y-3">
+        <div class="flex items-center space-x-2">
+          <input x-model="dsh.newShare.name" placeholder="New share name, e.g. acme_orders" data-testid="sharing-share-name" class="flex-1 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono">
+          <input x-model="dsh.newShare.comment" placeholder="Comment (optional)" class="flex-1 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5">
+          <button @click="createShare()" data-testid="sharing-share-create" class="px-3 py-1.5 bg-dbx-orange text-white rounded font-semibold">Create share</button>
+        </div>
+        <template x-for="sh in (dsh.data ? dsh.data.shares : [])" :key="sh.id">
+          <div class="rounded border border-slate-200 dark:border-dbx-border p-3 space-y-2" data-testid="sharing-share">
+            <div class="flex items-center justify-between">
+              <div><span class="font-bold text-sm" x-text="sh.name"></span> <span class="text-slate-500" x-text="sh.comment"></span>
+                <span class="text-slate-500"> · shared with </span><span x-text="sh.recipients.length ? sh.recipients.join(', ') : 'nobody yet'"></span></div>
+              <button @click="deleteShare(sh)" class="text-rose-500 hover:underline">Delete share</button>
+            </div>
+            <template x-for="t in sh.tables" :key="t.schema_name + '.' + t.table_name">
+              <div class="flex items-center justify-between px-2 py-1 rounded bg-slate-50 dark:bg-slate-900/60" data-testid="sharing-table-row">
+                <div><span class="font-mono font-semibold" x-text="t.schema_name + '.' + t.table_name"></span> <span class="text-slate-500 font-mono" x-text="'← ' + t.source"></span>
+                  <span x-show="t.problem" class="ml-2 text-rose-500" data-testid="sharing-table-problem" :title="t.problem"><i class="ph ph-warning"></i> not shareable now: <span x-text="t.problem"></span></span></div>
+                <button @click="removeShareTable(sh, t)" class="text-slate-400 hover:text-rose-500">Remove</button>
+              </div>
+            </template>
+            <div x-show="!sh.tables.length" class="text-slate-500">No tables yet.</div>
+            <div class="flex items-center space-x-2 pt-1">
+              <input x-model="dsh.add[sh.name]" placeholder="catalog.schema.table" :data-testid="'sharing-add-source-' + sh.name" class="flex-1 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1 font-mono">
+              <button @click="addShareTable(sh)" :data-testid="'sharing-add-table-' + sh.name" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-dbx-border rounded font-semibold">Add table</button>
+            </div>
+          </div>
+        </template>
+        <div x-show="dsh.data && !dsh.data.shares.length" class="text-slate-500">No share yet.</div>
+      </div>
+
+      <div x-show="dsh.tab === 'recipients'" class="space-y-3">
+        <div x-show="dsh.secret" class="p-3 rounded border border-amber-500/50 bg-amber-500/10 space-y-2" data-testid="sharing-secret-box">
+          <div class="text-amber-600 dark:text-amber-400 font-semibold">Send this profile to <span x-text="dsh.secret ? dsh.secret.recipient.name : ''"></span> now. It contains the token and is not shown again.</div>
+          <pre class="font-mono text-[11px] whitespace-pre-wrap break-all select-all" data-testid="sharing-profile" x-text="dsh.secret ? JSON.stringify(dsh.secret.profile, null, 2) : ''"></pre>
+          <button @click="downloadProfile()" data-testid="sharing-profile-download" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded font-semibold">Download profile file (.share)</button>
+        </div>
+        <div class="rounded border border-slate-200 dark:border-dbx-border p-3 space-y-2">
+          <div class="text-slate-400 uppercase text-[10px] font-semibold">New recipient</div>
+          <div class="flex items-center space-x-2">
+            <input x-model="dsh.newRecipient.name" placeholder="Name, e.g. ACME Corp" data-testid="sharing-recipient-name" class="flex-1 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5">
+            <select x-model="dsh.newRecipient.days" data-testid="sharing-recipient-days" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5">
+              <option value="">Token never expires</option><option value="30">Expires in 30 days</option><option value="90">Expires in 90 days</option><option value="365">Expires in 1 year</option>
+            </select>
+            <button @click="createRecipient()" data-testid="sharing-recipient-create" class="px-3 py-1.5 bg-dbx-orange text-white rounded font-semibold">Create recipient</button>
+          </div>
+          <div class="flex flex-wrap gap-3"><template x-for="sh in (dsh.data ? dsh.data.shares : [])" :key="sh.id"><label class="flex items-center space-x-1"><input type="checkbox" :value="sh.name" x-model="dsh.newRecipient.shares"><span x-text="sh.name"></span></label></template></div>
+        </div>
+        <template x-for="r in (dsh.data ? dsh.data.recipients : [])" :key="r.id">
+          <div class="rounded border border-slate-200 dark:border-dbx-border p-3 space-y-2" data-testid="sharing-recipient">
+            <div class="flex items-center justify-between">
+              <div><span class="font-bold text-sm" x-text="r.name"></span>
+                <span class="ml-1 px-1.5 py-0.5 rounded text-[10px] font-semibold" data-testid="sharing-recipient-state" :class="r.state === 'active' ? 'bg-emerald-500/15 text-emerald-500' : 'bg-rose-500/15 text-rose-500'" x-text="r.state"></span>
+                <span class="font-mono text-slate-500" x-text="r.prefix + '…'"></span></div>
+              <div class="space-x-3"><button @click="rotateRecipient(r)" class="hover:underline">Rotate token</button><button x-show="r.state === 'active'" @click="revokeRecipient(r)" data-testid="sharing-recipient-revoke" class="text-amber-500 hover:underline">Revoke</button><button @click="deleteRecipient(r)" class="text-rose-500 hover:underline">Delete</button></div>
+            </div>
+            <div class="text-slate-500"><span x-text="r.expires_at ? 'expires ' + r.expires_at + ' UTC' : 'no expiry'"></span> · <span x-text="r.last_used_at ? 'last used ' + r.last_used_at + ' UTC' : 'never used'"></span> · <span x-text="(r.bytes_served / 1048576).toFixed(2) + ' MB downloaded'"></span></div>
+            <div class="flex flex-wrap gap-3"><template x-for="sh in dsh.data.shares" :key="sh.id"><label class="flex items-center space-x-1"><input type="checkbox" :checked="r.shares.includes(sh.name)" @change="toggleRecipientShare(r, sh.name, $event.target.checked)" :data-testid="'sharing-grant-' + r.name + '-' + sh.name"><span x-text="sh.name"></span></label></template></div>
+          </div>
+        </template>
+        <div x-show="dsh.data && !dsh.data.recipients.length" class="text-slate-500">No recipient yet.</div>
+      </div>
+
+      <div x-show="dsh.tab === 'activity'" class="space-y-1">
+        <template x-for="(l, i) in (dsh.data ? dsh.data.log : [])" :key="i">
+          <div class="text-slate-500" data-testid="sharing-log-row"><span x-text="l.at + ' UTC'"></span> · <span class="font-semibold" x-text="l.recipient"></span> · <span x-text="l.action"></span> <span class="font-mono" x-text="l.share + (l.tbl ? '.' + l.tbl : '')"></span> <span x-text="l.detail"></span></div>
+        </template>
+        <div x-show="dsh.data && !dsh.data.log.length" class="text-slate-500">No recipient activity yet.</div>
+      </div>
+    </div>
+  </div>
+
   <div x-show="s3ev.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="s3ev.open = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-3xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" data-testid="s3events-modal">
       <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-3">
@@ -17813,6 +17909,7 @@
         pipelineConn: { name: '', path: '', mode: 'file', records_path: '', params: '', pagination: 'none', page_param: 'page', size_param: '', page_size: 100, offset_param: 'offset', limit_param: 'limit', next_path: '', recursive: false, settle_seconds: 10 },
         showConnectionsModal: false,
         s3ev: { open: false, data: null, name: '', secret: '' },
+        dsh: { open: false, tab: 'shares', data: null, newShare: { name: '', comment: '' }, add: {}, newRecipient: { name: '', days: '', shares: [] }, secret: null },
         connectionsList: [],
         showStreamsModal: false,
         streamsList: [],
@@ -27441,6 +27538,83 @@
             const res = await fetch('/api/connections');
             if (res.ok) this.connectionsList = (await res.json()).connections || [];
           } catch (e) { /* the list stays as it was */ }
+        },
+
+        async openSharing() {
+          this.dsh.open = true;
+          this.dsh.secret = null;
+          await this.loadSharing();
+        },
+
+        async loadSharing() {
+          try {
+            const res = await fetch('/api/sharing');
+            if (res.ok) this.dsh.data = await res.json();
+          } catch (e) { /* the view stays as it was */ }
+        },
+
+        async sharingCall(method, url, body, okMsg) {
+          const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { this.showToast(data.detail || 'The request failed', 'error'); return null; }
+          if (okMsg) this.showToast(okMsg, 'success');
+          await this.loadSharing();
+          return data;
+        },
+
+        async createShare() {
+          const d = await this.sharingCall('POST', '/api/sharing/shares', { name: this.dsh.newShare.name, comment: this.dsh.newShare.comment }, 'Share created');
+          if (d) this.dsh.newShare = { name: '', comment: '' };
+        },
+
+        async deleteShare(sh) {
+          if (!confirm(`Delete the share '${sh.name}'? Recipients lose access to its tables at once.`)) return;
+          await this.sharingCall('DELETE', '/api/sharing/shares/' + encodeURIComponent(sh.name), undefined, 'Share deleted');
+        },
+
+        async addShareTable(sh) {
+          const d = await this.sharingCall('POST', `/api/sharing/shares/${encodeURIComponent(sh.name)}/tables`, { source: (this.dsh.add[sh.name] || '').trim() }, 'Table added');
+          if (d) this.dsh.add[sh.name] = '';
+        },
+
+        async removeShareTable(sh, t) {
+          await this.sharingCall('DELETE', `/api/sharing/shares/${encodeURIComponent(sh.name)}/tables/${encodeURIComponent(t.schema_name)}/${encodeURIComponent(t.table_name)}`, undefined, 'Table removed');
+        },
+
+        async createRecipient() {
+          const n = this.dsh.newRecipient;
+          const d = await this.sharingCall('POST', '/api/sharing/recipients', { name: n.name, shares: n.shares, expires_in_days: n.days ? Number(n.days) : null });
+          if (d) { this.dsh.secret = d; this.dsh.newRecipient = { name: '', days: '', shares: [] }; }
+        },
+
+        async rotateRecipient(r) {
+          if (!confirm(`Rotate the token of '${r.name}'? The old token stops working at once.`)) return;
+          const d = await this.sharingCall('POST', `/api/sharing/recipients/${encodeURIComponent(r.id)}/rotate`, {});
+          if (d) this.dsh.secret = d;
+        },
+
+        async toggleRecipientShare(r, share, on) {
+          const shares = on ? [...r.shares, share] : r.shares.filter(x => x !== share);
+          await this.sharingCall('PUT', `/api/sharing/recipients/${encodeURIComponent(r.id)}/shares`, { shares });
+        },
+
+        async revokeRecipient(r) {
+          if (!confirm(`Revoke '${r.name}'? Its token and every file link stop working at once.`)) return;
+          await this.sharingCall('POST', `/api/sharing/recipients/${encodeURIComponent(r.id)}/revoke`, undefined, 'Recipient revoked');
+        },
+
+        async deleteRecipient(r) {
+          if (!confirm(`Delete the recipient '${r.name}'?`)) return;
+          await this.sharingCall('DELETE', `/api/sharing/recipients/${encodeURIComponent(r.id)}`, undefined, 'Recipient deleted');
+        },
+
+        downloadProfile() {
+          const blob = new Blob([JSON.stringify(this.dsh.secret.profile, null, 2)], { type: 'application/json' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = this.dsh.secret.recipient.name.replace(/[^A-Za-z0-9_-]+/g, '_') + '.share';
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
         },
 
         async openS3Events() {
