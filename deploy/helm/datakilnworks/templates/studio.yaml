@@ -1,0 +1,114 @@
+{{- define "dkw.studioVolumes" -}}
+- name: warehouse
+  persistentVolumeClaim: {claimName: {{ include "dkw.claim" (dict "root" . "key" "warehouse") }}}
+- name: notebooks
+  persistentVolumeClaim: {claimName: {{ include "dkw.claim" (dict "root" . "key" "notebooks") }}}
+- name: dbt-project
+  persistentVolumeClaim: {claimName: {{ include "dkw.claim" (dict "root" . "key" "dbtProject") }}}
+{{- end -}}
+{{- define "dkw.studioMounts" -}}
+- {name: warehouse, mountPath: /workspace/warehouse}
+- {name: notebooks, mountPath: /workspace/notebooks}
+- {name: dbt-project, mountPath: /workspace/dbt_project}
+{{- end -}}
+{{- define "dkw.studioEnv" -}}
+- {name: WAREHOUSE_DIR, value: /workspace/warehouse}
+- {name: NOTEBOOKS_DIR, value: /workspace/notebooks}
+- {name: DBT_PROJECT_DIR, value: /workspace/dbt_project}
+- {name: INIT_ADMIN_USERNAME, value: {{ .Values.secrets.initAdminUsername | quote }}}
+- {name: CONTROLLER_URL, value: ""}           # the Docker-socket controller is not part of this chart: no container auto-suspend
+{{- range .Values.computeNodes }}
+- {name: {{ .endpointEnv }}, value: "http://{{ include "dkw.fullname" $ }}-{{ .name }}:{{ .port }}"}
+{{- end }}
+{{- range $k, $v := .Values.studio.env }}
+- {name: {{ $k }}, value: {{ $v | quote }}}
+{{- end }}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dkw.fullname" . }}-studio
+  labels: {{- include "dkw.labels" . | nindent 4 }}
+spec:
+  replicas: 1                      # one pod by design: SQLite metadata, one Git working tree, one runner per Kafka stream
+  strategy:
+    type: Recreate                 # the old pod must release the volumes before the new one starts
+  selector:
+    matchLabels: {{- include "dkw.studioSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "dkw.studioSelector" . | nindent 8 }}
+      {{- with .Values.studio.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.studio.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.init.enabled }}
+      initContainers:
+        - name: init
+          image: {{ include "dkw.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "web.init"]
+          env:
+            {{- include "dkw.studioEnv" . | nindent 12 }}
+            {{- if .Values.init.waitFor }}
+            - {name: INIT_WAIT_FOR, value: {{ join "," .Values.init.waitFor | quote }}}
+            - {name: INIT_WAIT_TIMEOUT, value: {{ .Values.init.waitTimeoutSeconds | quote }}}
+            {{- end }}
+          envFrom:
+            - secretRef: {name: {{ include "dkw.secretName" . }}}
+          resources: {{- toYaml .Values.init.resources | nindent 12 }}
+          volumeMounts: {{- include "dkw.studioMounts" . | nindent 12 }}
+      {{- end }}
+      containers:
+        - name: studio
+          image: {{ include "dkw.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # --no-proxy-headers: the studio judges the connecting address itself (IP allowlist, trusted proxies), see Users & IAM > Network access
+          command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "{{ .Values.studio.port }}", "--no-proxy-headers"]
+          ports:
+            - {name: http, containerPort: {{ .Values.studio.port }}}
+          env:
+            {{- include "dkw.studioEnv" . | nindent 12 }}
+          envFrom:
+            - secretRef: {name: {{ include "dkw.secretName" . }}}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            {{- toYaml .Values.studio.startupProbe | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources: {{- toYaml .Values.studio.resources | nindent 12 }}
+          volumeMounts: {{- include "dkw.studioMounts" . | nindent 12 }}
+      volumes: {{- include "dkw.studioVolumes" . | nindent 8 }}
+      {{- with .Values.studio.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.studio.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.studio.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dkw.fullname" . }}
+  labels: {{- include "dkw.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "dkw.studioSelector" . | nindent 4 }}
+  ports:
+    - {name: http, port: {{ .Values.service.port }}, targetPort: http}

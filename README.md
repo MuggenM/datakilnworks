@@ -58,6 +58,8 @@ cd /home/martin/volumes/datakilnworks
 docker compose up -d
 ```
 
+`docker compose up -d` first runs the one-shot `datakilnworks-init` service (`python -m web.init`: validates the bootstrap-admin settings, creates / migrates every database, seeds the dbt project, checks the volumes) and starts the studio only if it succeeds; on a misconfiguration read `docker compose logs datakilnworks-init`. On Kubernetes the same command is the init container of the Helm chart in [`deploy/helm/`](deploy/helm/README.md) (studio as one `Recreate` pod, compute nodes, PVCs, `/healthz` and `/readyz` probes).
+
 ### 2. Available Interfaces
 
 | Interface | URL | Credentials / Notes |

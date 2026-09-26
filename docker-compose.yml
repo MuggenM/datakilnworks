@@ -5,10 +5,19 @@ services:
       dockerfile: Dockerfile
     image: localspark-lakehouse-notebook
     container_name: local-datakilnworks-studio
+    depends_on:
+      datakilnworks-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--reload"]
     ports:
       - "${STUDIO_PORT:-8891}:8000"
-    environment:
+    environment: &studio-env
       - WAREHOUSE_DIR=/workspace/warehouse
       - WH_STARTER_ENDPOINT=http://compute-node-01:8001
       - WH_ANALYTICS_ENDPOINT=http://compute-node-02:8002
@@ -64,6 +73,25 @@ services:
         reservations:
           memory: 1G
     restart: unless-stopped
+
+  # One-shot initialisation (python -m web.init), same image: validates the bootstrap-admin settings, creates / migrates every database, seeds
+  # the dbt project and checks the volumes BEFORE the studio starts. A misconfiguration fails here with a readable message instead of putting the
+  # studio into a restart loop; on success the studio starts. Every step is idempotent (also run by the studio itself). In Kubernetes the same
+  # command runs as an initContainer (deploy/helm/datakilnworks). `docker compose logs datakilnworks-init` shows the result.
+  datakilnworks-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: localspark-lakehouse-notebook
+    container_name: local-datakilnworks-init
+    command: ["python", "-m", "web.init"]
+    environment: *studio-env
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./warehouse:/workspace/warehouse
+      - ./web:/workspace/web
+      - ${DBT_PROJECT_HOST_DIR:-./dbt_project}:/workspace/dbt_project
+    restart: "no"
 
   # Runs the notebook kernels of users a masking policy applies to. It has no warehouse mount, is alone with the studio on an
   # internal network (no internet, no compute nodes), and kernels read data only through the studio's governed endpoint.

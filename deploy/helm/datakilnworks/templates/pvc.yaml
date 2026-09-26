@@ -1,0 +1,21 @@
+{{- range $key := list "warehouse" "notebooks" "dbtProject" }}
+{{- $c := index $.Values.persistence $key }}
+{{- if not $c.existingClaim }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dkw.claim" (dict "root" $ "key" $key) }}
+  labels: {{- include "dkw.labels" $ | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep        # never delete the data with the release
+spec:
+  accessModes: [{{ $c.accessMode }}]
+  {{- if $c.storageClass }}
+  storageClassName: {{ $c.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $c.size }}
+{{- end }}
+{{- end }}

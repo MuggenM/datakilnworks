@@ -1,0 +1,98 @@
+# Data Kiln Works on Kubernetes. Written against the documented Kubernetes / Helm behaviour and checked with `helm lint`, `helm template` and
+# a client-side dry run; it has NOT been installed on a live cluster from here. Run `helm template` and review it for your cluster first.
+#
+#   kubectl create secret generic dkw-secrets -n dkw \
+#       --from-literal=INIT_ADMIN_PASSWORD_HASH="$(docker run --rm <image> python -m web.auth hash-password)"   # asks for the password
+#   helm upgrade --install dkw deploy/helm/datakilnworks -n dkw --create-namespace --set secrets.existingSecret=dkw-secrets
+#
+# The studio is deliberately ONE pod (strategy Recreate): it owns SQLite metadata files, one Git working tree behind an in-process lock and the
+# Kafka stream runners. Scale by giving it more memory / CPU, and the compute nodes (below) do the heavy scans.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: localspark-lakehouse-notebook      # build it from the Dockerfile (it contains web/ and docs/) and push it to your registry
+  tag: latest
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+studio:
+  port: 8000
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 4Gi}
+  env: {}                       # plain environment variables, e.g. GIT_REMOTE_URL, GIT_BRANCH, GIT_MODE, GIT_FORGE, TRUSTED_PROXIES, STUDIO_...
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  startupProbe: {failureThreshold: 60, periodSeconds: 5}         # up to 5 minutes for a first start (init already ran)
+  # The image runs as root. To run as another user build the image for it and set podSecurityContext (fsGroup makes the volumes writable for it).
+  podSecurityContext: {}
+
+# The one-shot initialisation (python -m web.init) as an initContainer: fails the pod with a readable message (Init:Error) instead of a crash loop
+# of the studio when the bootstrap admin or a volume is misconfigured; creates / migrates the databases and seeds the dbt project.
+init:
+  enabled: true
+  waitFor: []                   # URLs to wait for before the studio starts, e.g. ["http://gitea-http:3000/api/healthz"]
+  waitTimeoutSeconds: 120
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+
+# Secrets. Either point at an existing Secret (recommended; its keys become environment variables) or let the chart create one.
+#   required on the first install: INIT_ADMIN_PASSWORD_HASH        optional: COMPUTE_TOKEN, GIT_TOKEN, NOTEBOOKS_GIT_TOKEN, ...
+secrets:
+  existingSecret: ""
+  initAdminUsername: admin
+  initAdminPasswordHash: ""     # only for a chart-created Secret
+  computeToken: ""              # shared by the studio and the compute nodes; generated once (and kept on upgrades) when empty
+  extra: {}                     # more keys of a chart-created Secret, e.g. {GIT_TOKEN: "..."}
+
+persistence:
+  warehouse:                    # Delta tables, SQLite metadata, volumes; shared with the compute nodes
+    size: 50Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce   # with ReadWriteOnce the compute nodes are scheduled on the studio's node; use ReadWriteMany to spread them
+    existingClaim: ""
+  notebooks:
+    size: 5Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  dbtProject:                   # in production this holds a checkout of YOUR dbt project repository; an empty volume is seeded from the template
+    size: 1Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+
+# SQL warehouse compute nodes (one Deployment + Service each). The studio finds them through the WH_*_ENDPOINT variables and authenticates with
+# COMPUTE_TOKEN; they are never exposed outside the cluster. Set `computeNodes: []` to run every query inside the studio.
+computeNodes:
+  - {name: compute-node-01, warehouseId: wh_starter, endpointEnv: WH_STARTER_ENDPOINT, port: 8001, nodeName: "Compute Worker 01 (Starter Node)", maxMemory: 2GB, threads: 2,
+     resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 2Gi}}}
+  - {name: compute-node-02, warehouseId: wh_analytics_pro, endpointEnv: WH_ANALYTICS_ENDPOINT, port: 8002, nodeName: "Compute Worker 02 (Analytics Pro)", maxMemory: 6GB, threads: 4,
+     resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {memory: 6Gi}}}
+  - {name: compute-node-03, warehouseId: wh_etl_batch, endpointEnv: WH_ETL_ENDPOINT, port: 8003, nodeName: "Compute Worker 03 (ETL Batch)", maxMemory: 10GB, threads: 8,
+     resources: {requests: {cpu: 1000m, memory: 2Gi}, limits: {memory: 10Gi}}}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""                      # e.g. studio.example.org
+  tls: []                       # [{secretName: dkw-tls, hosts: [studio.example.org]}]
+  # Behind an ingress the studio sees the ingress controller's address, not the user's: declare it (studio.env.TRUSTED_PROXIES, or Users & IAM >
+  # Network access) before using the IP allowlist.
+
+networkPolicy:                  # needs a CNI that enforces NetworkPolicy
+  enabled: false
+  ingressNamespaceLabels: {kubernetes.io/metadata.name: ingress-nginx}      # who may reach the studio: the ingress controller's namespace
+
+# Not part of this chart: the notebook sandbox (kernels of users under a masking policy) and the container controller (Docker-socket based
+# auto-suspend of compute nodes). The controller is disabled here (CONTROLLER_URL is empty), so warehouses keep their flag-only auto_stop behaviour;
+# without the sandbox those users' notebooks are refused, never run unmasked.

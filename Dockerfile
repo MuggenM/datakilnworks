@@ -19,6 +19,11 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # Directory layout for lakehouse warehouse, notebooks, web app, and ipython startup hooks
 RUN mkdir -p /workspace/warehouse /workspace/notebooks /workspace/web /root/.ipython/profile_default/startup
 
+# The application itself, so the image runs on its own (Kubernetes: no bind mounts). docker-compose.yml still bind-mounts ./web and ./docs over
+# these for development, where edits apply without a rebuild (uvicorn --reload).
+COPY web/ /workspace/web/
+COPY docs/ /workspace/docs/
+
 # Copy IPython bootstrap shim (used by the in-Studio notebook kernels)
 COPY config/00_databricks_shim.py /root/.ipython/profile_default/startup/00_databricks_shim.py
 

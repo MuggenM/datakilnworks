@@ -1,0 +1,6 @@
+apiVersion: v2
+name: datakilnworks
+description: Data Kiln Works Studio - a local Databricks-style lakehouse (Delta Lake, DuckDB) with its compute nodes, initialised by an init container.
+type: application
+version: 0.1.0
+appVersion: "2.4.0"

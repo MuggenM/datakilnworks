@@ -11,7 +11,7 @@ request from an untrusted peer is judged by the peer, whatever headers it carrie
 `--no-proxy-headers` (the compose file does) so the ASGI peer is the real socket address and nothing rewrites it before this check.
 
 Always allowed (not configurable, and never a way around the list): loopback (127.0.0.0/8, ::1) when the request carries no forwarding headers, so
-`docker exec` health checks keep working, and the notebook sandbox's own calls to /api/sandbox/* (which another middleware confines to that path).
+`docker exec` health checks keep working, and the notebook sandbox's own calls to /api/sandbox/* (which another middleware confines to that path), and the two probe paths /healthz and /readyz (they answer only "ok").
 Loopback WITH forwarding headers is judged like anyone else: it means a reverse proxy on the same host that has not been declared trusted.
 
 Guards: a change that would block the administrator making it (judged with the new proxy settings, from their own request) is refused; rules of
@@ -204,6 +204,8 @@ def check_request(peer: Optional[str], headers: Dict[str, str], path: str, sandb
         return "allow", client, "off"
     if sandbox_peer and path.startswith("/api/sandbox/"):
         return "allow", client, "sandbox"
+    if path in ("/healthz", "/readyz"):                  # liveness / readiness probes (kubelet, load balancer): no data, no login
+        return "allow", client, "probe"
     ok, why = decide(client, cfg, path)
     if ok:
         return "allow", client, why

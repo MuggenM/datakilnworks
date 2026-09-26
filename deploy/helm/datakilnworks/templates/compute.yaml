@@ -1,0 +1,72 @@
+{{- range .Values.computeNodes }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dkw.fullname" $ }}-{{ .name }}
+  labels: {{- include "dkw.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: compute
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: datakilnworks-{{ .name }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: datakilnworks-{{ .name }}
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/component: compute
+    spec:
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if eq $.Values.persistence.warehouse.accessMode "ReadWriteOnce" }}
+      affinity:                    # a ReadWriteOnce volume can be shared by pods on the same node: stay next to the studio
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {{- include "dkw.studioSelector" $ | nindent 18 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "dkw.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: ["python", "-m", "uvicorn", "web.compute_worker:app", "--host", "0.0.0.0", "--port", "{{ .port }}"]
+          ports:
+            - {name: http, containerPort: {{ .port }}}
+          env:
+            - {name: WORKER_NODE_ID, value: {{ .name | quote }}}
+            - {name: WORKER_NODE_NAME, value: {{ .nodeName | default .name | quote }}}
+            - {name: ASSIGNED_WAREHOUSE_ID, value: {{ .warehouseId | quote }}}
+            - {name: WAREHOUSE_DIR, value: /workspace/warehouse}
+            - {name: MAX_MEMORY, value: {{ .maxMemory | quote }}}
+            - {name: THREADS, value: {{ .threads | quote }}}
+            - {name: WORKER_PORT, value: {{ .port | quote }}}
+            - name: COMPUTE_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "dkw.secretName" $ }}, key: COMPUTE_TOKEN}}
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 10
+          resources: {{- toYaml .resources | nindent 12 }}
+          volumeMounts:
+            - {name: warehouse, mountPath: /workspace/warehouse}
+      volumes:
+        - name: warehouse
+          persistentVolumeClaim: {claimName: {{ include "dkw.claim" (dict "root" $ "key" "warehouse") }}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dkw.fullname" $ }}-{{ .name }}
+  labels: {{- include "dkw.labels" $ | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: datakilnworks-{{ .name }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+  ports:
+    - {name: http, port: {{ .port }}, targetPort: http}
+{{- end }}

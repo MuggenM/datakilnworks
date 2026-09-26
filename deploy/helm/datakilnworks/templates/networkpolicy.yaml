@@ -1,0 +1,37 @@
+{{- if .Values.networkPolicy.enabled }}
+# The studio accepts traffic from the ingress controller's namespace; a compute node accepts traffic from the studio only (it runs arbitrary
+# SQL and is also token-protected).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dkw.fullname" . }}-studio
+  labels: {{- include "dkw.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "dkw.studioSelector" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.ingressNamespaceLabels | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: {{ .Values.studio.port }}}
+{{- if .Values.computeNodes }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dkw.fullname" . }}-compute
+  labels: {{- include "dkw.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: compute
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {{- include "dkw.studioSelector" . | nindent 14 }}
+{{- end }}
+{{- end }}

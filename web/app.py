@@ -111,6 +111,29 @@ def _log_security_posture():
                        "so column masking does not apply to it.")
 
 
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """Liveness: the process answers. No authentication, no data; exempt from the IP allowlist (a kubelet or load balancer probes it)."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz():
+    """Readiness: the accounts database can be read and the warehouse directory exists. No authentication, no details in the answer."""
+    ok = False
+    try:
+        from web.auth import get_db_connection
+        conn = get_db_connection()
+        try:
+            conn.execute("SELECT 1 FROM users LIMIT 1")
+        finally:
+            conn.close()
+        ok = os.path.isdir(WAREHOUSE_DIR)
+    except Exception:
+        ok = False
+    return JSONResponse(status_code=200 if ok else 503, content={"status": "ready" if ok else "not ready"})
+
+
 @app.on_event("startup")
 async def startup_event():
     _log_security_posture()
