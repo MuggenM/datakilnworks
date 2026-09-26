@@ -4202,7 +4202,7 @@
               <template x-if="selectedWorkspaceItem">
                 <div class="flex items-center space-x-1">
                   <span class="text-slate-600">/</span>
-                  <span class="text-slate-200 truncate max-w-xs" x-text="selectedWorkspaceItem.rel_path"></span>
+                  <span class="text-slate-200 truncate max-w-xs" x-text="selectedWorkspaceItem?.rel_path"></span>
                 </div>
               </template>
             </div>
@@ -4352,16 +4352,16 @@
                     }"></i>
                     <div class="min-w-0">
                       <div class="flex items-center space-x-2">
-                        <span class="font-semibold text-white text-sm font-mono truncate" x-text="selectedWorkspaceItem.name"></span>
+                        <span class="font-semibold text-white text-sm font-mono truncate" x-text="selectedWorkspaceItem?.name"></span>
                         <!-- Cell stats badge for notebook -->
-                        <template x-if="workspaceFileDetail && selectedWorkspaceItem.type === 'notebook'">
+                        <template x-if="workspaceFileDetail && selectedWorkspaceItem?.type === 'notebook'">
                           <span class="px-2 py-0.5 bg-purple-500/15 border border-purple-500/30 text-purple-300 rounded text-[10px] font-mono">
                             <span x-text="workspaceFileDetail?.cell_count + ' cells (' + workspaceFileDetail?.code_cell_count + ' code, ' + workspaceFileDetail?.md_cell_count + ' markdown)'"></span>
                           </span>
                         </template>
                       </div>
                       <div class="flex items-center space-x-2 text-[11px] text-slate-400 font-mono mt-0.5">
-                        <span x-text="selectedWorkspaceItem.rel_path"></span>
+                        <span x-text="selectedWorkspaceItem?.rel_path"></span>
                         <template x-if="workspaceFileDetail">
                           <span class="flex items-center space-x-2">
                             <span>•</span>
@@ -4382,7 +4382,7 @@
                   <div class="flex items-center space-x-2 shrink-0">
 
                     <!-- SQL-specific action: Query in SQL Editor -->
-                    <template x-if="selectedWorkspaceItem.type === 'sql' && workspaceFileDetail?.content">
+                    <template x-if="selectedWorkspaceItem?.type === 'sql' && workspaceFileDetail?.content">
                       <button @click="loadSqlInEditor(workspaceFileDetail.content)" class="px-3 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition">
                         <i class="ph ph-play-fill text-xs"></i>
                         <span>Query in SQL Editor</span>
@@ -4412,7 +4412,7 @@
                   </div>
 
                   <!-- 1. Notebook Interactive Workbench -->
-                  <template x-if="selectedWorkspaceItem.type === 'notebook' && workspaceFileDetail">
+                  <template x-if="selectedWorkspaceItem?.type === 'notebook' && workspaceFileDetail">
                     <div class="max-w-4xl mx-auto space-y-4 pb-12">
                       <template x-if="!notebookExecutionAllowed">
                         <div class="px-3 py-2 rounded-lg border border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs flex items-start space-x-2">
@@ -4637,7 +4637,7 @@
                   </template>
 
                   <!-- 2. Text / Python / SQL File Render View -->
-                  <template x-if="selectedWorkspaceItem.type !== 'notebook' && selectedWorkspaceItem.type !== 'directory' && workspaceFileDetail">
+                  <template x-if="selectedWorkspaceItem?.type !== 'notebook' && selectedWorkspaceItem?.type !== 'directory' && workspaceFileDetail">
                     <div class="max-w-5xl mx-auto space-y-4 pb-8">
                       <div class="rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-panel/80 overflow-hidden shadow-xs">
                         <div class="px-4 py-2.5 border-b border-slate-200 dark:border-dbx-border/80 bg-slate-100/90 dark:bg-slate-900/90 flex items-center justify-between text-xs">
@@ -4650,12 +4650,12 @@
                               'ph ph-file-text text-purple-600 dark:text-purple-400': selectedWorkspaceItem.name && selectedWorkspaceItem.name.endsWith('.md'),
                               'ph ph-file-code text-slate-500 dark:text-slate-400': !selectedWorkspaceItem.name?.match(/\.(py|sql|json|ya?ml|sh|bash|md)$/)
                             }"></i>
-                            <span class="font-semibold text-slate-900 dark:text-white" x-text="selectedWorkspaceItem.name"></span>
-                            <span class="px-2 py-0.5 rounded text-[10px] font-mono font-semibold uppercase bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-300/70 dark:border-slate-700" x-text="getWorkspaceFileLanguage(selectedWorkspaceItem.name, selectedWorkspaceItem.type)"></span>
+                            <span class="font-semibold text-slate-900 dark:text-white" x-text="selectedWorkspaceItem?.name"></span>
+                            <span class="px-2 py-0.5 rounded text-[10px] font-mono font-semibold uppercase bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-300/70 dark:border-slate-700" x-text="getWorkspaceFileLanguage(selectedWorkspaceItem?.name, selectedWorkspaceItem?.type)"></span>
                             <span class="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-200/60 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400" x-text="(workspaceFileDetail?.lines || (workspaceFileDetail?.content ? workspaceFileDetail?.content.split('\n').length : 0)) + ' lines'"></span>
                           </div>
                           <div class="flex items-center space-x-2">
-                            <template x-if="selectedWorkspaceItem.type === 'sql'">
+                            <template x-if="selectedWorkspaceItem?.type === 'sql'">
                               <button @click="loadSqlInEditor(workspaceFileDetail.content)" class="text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-dbx-border hover:bg-slate-50 dark:hover:bg-slate-700 transition text-[11px] shadow-xs">
                                 <i class="ph ph-play-fill text-xs text-emerald-500"></i>
                                 <span>Open in SQL Editor</span>
@@ -4668,21 +4668,21 @@
                           </div>
                         </div>
                         <div class="workspace-code-viewer p-3.5 overflow-x-auto text-xs font-mono select-text">
-                          <div class="table w-full border-collapse" x-html="highlightWorkspaceCode(workspaceFileDetail?.content, selectedWorkspaceItem.name, selectedWorkspaceItem.type)"></div>
+                          <div class="table w-full border-collapse" x-html="highlightWorkspaceCode(workspaceFileDetail?.content, selectedWorkspaceItem?.name, selectedWorkspaceItem?.type)"></div>
                         </div>
                       </div>
                     </div>
                   </template>
 
                   <!-- 3. Directory View -->
-                  <template x-if="selectedWorkspaceItem.type === 'directory'">
+                  <template x-if="selectedWorkspaceItem?.type === 'directory'">
                     <div class="max-w-2xl mx-auto py-8 text-center space-y-4">
                       <div class="w-12 h-12 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl flex items-center justify-center mx-auto text-2xl">
                         <i class="ph ph-folder"></i>
                       </div>
                       <div>
-                        <h3 class="text-base font-semibold text-white font-mono" x-text="selectedWorkspaceItem.name"></h3>
-                        <p class="text-xs text-slate-400 font-mono mt-1" x-text="'/workspace/notebooks/' + selectedWorkspaceItem.rel_path"></p>
+                        <h3 class="text-base font-semibold text-white font-mono" x-text="selectedWorkspaceItem?.name"></h3>
+                        <p class="text-xs text-slate-400 font-mono mt-1" x-text="'/workspace/notebooks/' + selectedWorkspaceItem?.rel_path"></p>
                       </div>
                       <div class="flex items-center justify-center space-x-3 pt-2">
                         <button @click="openWorkspaceCreateModal('notebook', selectedWorkspaceItem.rel_path)" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition">
@@ -15322,6 +15322,26 @@
           <div x-show="mfaPolicy.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="mfa-policy-error" x-text="mfaPolicy.error"></div>
         </div>
 
+        <!-- Passkey policy: which authenticators may be registered -->
+        <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-3" data-testid="passkey-policy-card">
+          <div class="flex items-center justify-between"><span class="font-semibold text-sm text-slate-800 dark:text-slate-100 flex items-center space-x-2"><i class="ph ph-fingerprint text-indigo-500"></i><span>Passkey policy</span></span>
+            <button @click="saveWebauthnPolicy()" :disabled="wpol.busy" data-testid="wpol-save" class="px-3 py-1.5 bg-dbx-orange text-white font-semibold rounded disabled:opacity-50">Save</button></div>
+          <div class="grid grid-cols-1 gap-2">
+            <label class="flex items-start space-x-2"><input type="radio" value="none" x-model="wpol.mode" data-testid="wpol-mode-none" class="mt-0.5"><span><b>Accept any authenticator</b> <span class="text-slate-500">(default): no proof of make or model is asked for, synced passkeys are welcome.</span></span></label>
+            <label class="flex items-start space-x-2"><input type="radio" value="record" x-model="wpol.mode" data-testid="wpol-mode-record" class="mt-0.5"><span><b>Record the model</b> <span class="text-slate-500">when the authenticator offers proof; nobody is turned away. Shown next to each passkey. Browsers may ask the user to allow this.</span></span></label>
+            <label class="flex items-start space-x-2"><input type="radio" value="require" x-model="wpol.mode" data-testid="wpol-mode-require" class="mt-0.5"><span><b>Require a verified authenticator</b> <span class="text-slate-500">(and, if a list is given, an approved model). Synced passkeys (Apple, Google, password managers) give no attestation, so they can no longer be added; existing passkeys keep working.</span></span></label>
+          </div>
+          <div x-show="wpol.mode !== 'none'" class="space-y-2">
+            <div><div class="text-[10px] uppercase text-slate-500 mb-0.5">Trust roots (PEM, one or more certificates, from the vendors you trust)</div>
+              <textarea x-model="wpol.roots_pem" rows="4" data-testid="wpol-roots" placeholder="-----BEGIN CERTIFICATE-----" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded p-2 font-mono text-[11px] text-slate-900 dark:text-white"></textarea>
+              <template x-for="r in wpol.roots" :key="r.sha256"><div class="text-[11px] font-mono text-slate-500" data-testid="wpol-root"><span x-text="r.subject"></span> · valid until <span x-text="r.not_after" :class="r.expired ? 'text-rose-500 font-bold' : ''"></span></div></template>
+              <p class="text-[10px] text-slate-500">An authenticator only counts as verified when its certificate chain leads to one of these. There is no built-in vendor list.</p></div>
+            <div><div class="text-[10px] uppercase text-slate-500 mb-0.5">Approved models (one per line: AAGUID, then a label; empty = any verified model)</div>
+              <textarea x-model="wpol.allowedText" rows="3" data-testid="wpol-allowed" placeholder="2fc0579f-8113-47ea-b116-bb5a8db9202a  YubiKey 5 NFC" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded p-2 font-mono text-[11px] text-slate-900 dark:text-white"></textarea></div>
+          </div>
+          <div x-show="wpol.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="wpol-error" x-text="wpol.error"></div>
+        </div>
+
         <div x-show="mfaPolicy.stats" class="space-y-3" data-testid="mfa-stats">
           <div class="grid grid-cols-6 gap-3">
             <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-3"><div class="text-[10px] uppercase text-slate-500">Covered accounts</div><div class="text-xl font-bold" data-testid="mfa-stat-covered" x-text="mfaPolicy.stats ? mfaPolicy.stats.covered : 0"></div></div>
@@ -17456,7 +17476,9 @@
             <template x-for="c in pk.creds" :key="c.id">
               <div class="p-2.5 border border-slate-200 dark:border-dbx-border rounded-lg space-y-1.5" data-testid="passkey-row">
                 <div class="flex items-center justify-between"><div><span class="font-semibold text-slate-900 dark:text-white" x-text="c.name" data-testid="passkey-name"></span>
-                  <span class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-300" x-text="c.device_type === 'multi_device' ? 'synced passkey' : 'this device / key'"></span></div>
+                  <span class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-300" x-text="c.device_type === 'multi_device' ? 'synced passkey' : 'this device / key'"></span>
+                  <span x-show="c.attested" class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400" data-testid="passkey-attested" :title="'Verified by attestation' + (c.aaguid ? ' (' + c.aaguid + ')' : '')" x-text="'verified' + (c.model ? ': ' + c.model : '')"></span>
+                  <span x-show="!c.attested && c.model" class="ml-1 text-[10px] text-slate-500" x-text="c.model"></span></div>
                   <div class="space-x-2"><button type="button" @click="pkRename(c)" class="text-slate-500 hover:text-indigo-500">Rename</button><button type="button" @click="pk.removeId = c.id; pk.removePassword = ''; pk.error = ''" data-testid="passkey-remove" class="text-slate-500 hover:text-rose-500">Remove</button></div></div>
                 <div class="text-[10px] text-slate-500" x-text="'Added ' + new Date(c.created_at * 1000).toLocaleDateString() + (c.last_used_at ? ' · last used ' + new Date(c.last_used_at * 1000).toLocaleDateString() : ' · never used')"></div>
                 <form x-show="pk.removeId === c.id" @submit.prevent="pkRemove(c)" class="flex items-center space-x-2 pt-1">
@@ -18278,6 +18300,7 @@
         gitReview: { open: false, kind: 'dbt', tab: 'changes', scope: 'pending', status: null, summary: null, sel: null, diff: null, merge: { in_progress: false, conflicts: [], resolved: [] }, csel: null, cfile: null,
           choices: [], fullEdit: false, fullText: '', message: '', busy: false, error: '', note: '', rows: [] },
         ipAllow: { form: { mode: 'off', rules: [], trusted_proxies: [] }, config: null, me: null, activity: null, error: '', busy: false, newRule: '', newNote: '', newProxy: '', checkIp: '', checkResult: null },
+        wpol: { mode: 'none', allowedText: '', roots_pem: '', roots: [], busy: false, error: '' },
         mfaPolicy: { form: { enabled: false, roles: ['admin', 'power_user', 'user'], grace_days: 14 }, policy: null, stats: null, error: '', busy: false },
         mfa: { forced: false, graceDismissed: false, open: false, status: { enabled: false, pending: false, backup_codes_remaining: 0 }, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' },
 
@@ -19881,7 +19904,28 @@
             const [p, st] = await Promise.all([fetch('/api/mfa/policy'), fetch('/api/mfa/stats')]);
             if (p.ok) { this.mfaPolicy.policy = await p.json(); this.mfaPolicy.form = { enabled: this.mfaPolicy.policy.stored_enabled, roles: [...this.mfaPolicy.policy.roles], grace_days: this.mfaPolicy.policy.grace_days }; }
             if (st.ok) this.mfaPolicy.stats = await st.json();
+            this.loadWebauthnPolicy();
           } catch (e) { this.mfaPolicy.error = 'Could not load the policy: ' + e.message; }
+        },
+
+        async loadWebauthnPolicy() {
+          try {
+            const res = await fetch('/api/webauthn/policy');
+            if (!res.ok) return;
+            const d = await res.json();
+            this.wpol = { ...this.wpol, mode: d.mode, allowedText: (d.allowed || []).map(m => m.aaguid + '  ' + m.label).join('\n'), roots_pem: d.roots_pem || '', roots: d.roots || [], error: '' };
+          } catch (e) { /* the card keeps its last values */ }
+        },
+
+        async saveWebauthnPolicy() {
+          this.wpol.busy = true; this.wpol.error = '';
+          try {
+            const res = await fetch('/api/webauthn/policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: this.wpol.mode, allowed: this.wpol.allowedText, roots_pem: this.wpol.roots_pem }) });
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) { this.wpol.error = typeof d.detail === 'string' ? d.detail : 'Could not save the passkey policy.'; return; }
+            this.showToast('Passkey policy saved.', 'success');
+            await this.loadWebauthnPolicy();
+          } catch (e) { this.wpol.error = 'Error: ' + e.message; } finally { this.wpol.busy = false; }
         },
 
         async saveMfaPolicy() {

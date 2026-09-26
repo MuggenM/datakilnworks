@@ -635,6 +635,12 @@ class PasskeyRegisterPayload(BaseModel):
     name: str = ""
 
 
+class WebauthnPolicyPayload(BaseModel):
+    mode: str = "none"
+    allowed: Any = []
+    roots_pem: str = ""
+
+
 class PasskeyRenamePayload(BaseModel):
     name: str
 
@@ -690,7 +696,25 @@ async def webauthn_status(request: Request):
     user = await get_current_user(request)
     rp_id, origins = webauthn_auth.relying_party(dict(request.headers))
     return {"available": webauthn_auth.available(), "passwordless": webauthn_auth.passwordless_enabled(), "rp_id": rp_id, "origins": origins,
-            "eligible": (user.get("auth_source") or "local") not in ("oidc", "saml"), "credentials": webauthn_auth.list_credentials(user["id"]), "totp": mfa.is_enabled(user["id"])}
+            "attestation_mode": webauthn_auth.pol_mode(), "eligible": (user.get("auth_source") or "local") not in ("oidc", "saml"), "credentials": webauthn_auth.list_credentials(user["id"]), "totp": mfa.is_enabled(user["id"])}
+
+
+@app.get("/api/webauthn/policy")
+async def get_webauthn_policy(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import webauthn_auth
+    return webauthn_auth.policy_view()
+
+
+@app.put("/api/webauthn/policy")
+async def set_webauthn_policy(payload: WebauthnPolicyPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Which authenticators may be registered: no attestation, record what they prove, or require a verified attestation (and optionally an approved model)."""
+    from web import webauthn_auth, mfa_policy
+    try:
+        out = await asyncio.to_thread(webauthn_auth.set_policy, payload.mode, payload.allowed, payload.roots_pem, current_user["username"])
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    mfa_policy._audit(current_user["username"], "WEBAUTHN_POLICY_UPDATE", "webauthn_policy", {"mode": out["mode"], "approved_models": len(out["allowed"]), "trust_roots": len(out["roots"])})
+    return out
 
 
 @app.post("/api/auth/webauthn/register/options")

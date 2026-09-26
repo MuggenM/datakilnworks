@@ -12,6 +12,12 @@ Verification is done by the `webauthn` package (py_webauthn): challenge, origin,
 does not: single-use server-side challenges, the relying-party / origin decision, storage, ownership checks (the user handle of a passwordless
 assertion must be the account that owns the credential), limits, and audit.
 
+Attestation policy (table `webauthn_policy`, administrators; `/api/webauthn/policy`): `none` (default; nothing is asked for), `record` (authenticators are asked for
+attestation; the model (AAGUID) and format are stored, and the certificate chain is verified against the trust roots the administrator pasted, if any),
+`require` (a registration must carry an attestation whose chain verifies against those roots and, when an allowlist of models is set, come from one of them).
+Only a chain that was verified against configured roots counts as "attested"; synced passkeys (Apple, Google, password managers) give no attestation,
+so `require` excludes them on purpose. There is no built-in vendor trust store and no FIDO MDS lookup: the roots are whatever you trust.
+
 RP id and origin: WEBAUTHN_RP_ID (default: the request's Host without the port) and WEBAUTHN_ORIGINS (comma list; default: the request's Origin,
 accepted only when it is the same host as the Host header, so it works behind a reverse proxy that keeps the Host). Browsers need https, except on
 localhost. WEBAUTHN_PASSWORDLESS=off keeps passkeys as a second factor but switches "Sign in with a passkey" off.
@@ -119,8 +125,90 @@ def _take_challenge(cid: str, purpose: str, user_id: Optional[str]) -> bytes:
 # ---------------------------------------------------------------- credentials
 
 def _view(r) -> Dict[str, Any]:
+    aaguid = r["aaguid"] if "aaguid" in r.keys() else None
+    model = None
+    if aaguid:
+        model = next((m["label"] for m in get_policy()["allowed"] if m["aaguid"] == aaguid), None)
     return {"id": r["id"], "name": r["name"], "created_at": r["created_at"], "last_used_at": r["last_used_at"], "transports": json.loads(r["transports"] or "[]"),
-            "device_type": r["device_type"], "backed_up": bool(r["backed_up"]), "user_verified": bool(r["uv"])}
+            "device_type": r["device_type"], "backed_up": bool(r["backed_up"]), "user_verified": bool(r["uv"]),
+            "aaguid": aaguid if aaguid and aaguid != _ZERO_AAGUID else None, "model": model, "attestation_fmt": r["attestation_fmt"], "attested": bool(r["attested"])}
+
+
+# ---------------------------------------------------------------- attestation policy
+
+_ZERO_AAGUID = "00000000-0000-0000-0000-000000000000"
+POLICY_MODES = ("none", "record", "require")
+_UUID = __import__("re").compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _parse_roots(pem: str) -> List[Any]:
+    from cryptography import x509
+    try:
+        return list(x509.load_pem_x509_certificates((pem or "").encode()))
+    except Exception:
+        raise WebAuthnError("The trust roots are not valid PEM certificates (-----BEGIN CERTIFICATE-----).")
+
+
+def _roots_summary(pem: str) -> List[Dict[str, Any]]:
+    from cryptography.hazmat.primitives import hashes
+    out = []
+    for c in (_parse_roots(pem) if (pem or "").strip() else []):
+        out.append({"subject": c.subject.rfc4514_string()[:160], "not_after": c.not_valid_after_utc.strftime("%Y-%m-%d"), "expired": c.not_valid_after_utc.timestamp() < time.time(),
+                    "sha256": c.fingerprint(hashes.SHA256()).hex()})
+    return out
+
+
+def get_policy() -> Dict[str, Any]:
+    c = _conn()
+    try:
+        r = c.execute("SELECT mode, allowed, roots_pem, updated_by, updated_at FROM webauthn_policy WHERE id = 1").fetchone()
+    finally:
+        c.close()
+    if not r:
+        return {"mode": "none", "allowed": [], "roots_pem": "", "updated_by": None, "updated_at": None}
+    return {"mode": r["mode"], "allowed": json.loads(r["allowed"] or "[]"), "roots_pem": r["roots_pem"] or "", "updated_by": r["updated_by"], "updated_at": r["updated_at"]}
+
+
+def policy_view() -> Dict[str, Any]:
+    p = get_policy()
+    return {"mode": p["mode"], "allowed": p["allowed"], "roots_pem": p["roots_pem"], "roots": _roots_summary(p["roots_pem"]), "updated_by": p["updated_by"], "updated_at": p["updated_at"]}
+
+
+def set_policy(mode: str, allowed: Any, roots_pem: str, actor: str) -> Dict[str, Any]:
+    mode = (mode or "none").strip().lower()
+    if mode not in POLICY_MODES:
+        raise WebAuthnError("The mode is none, record or require.")
+    models: List[Dict[str, str]] = []
+    if isinstance(allowed, str):
+        allowed = [{"aaguid": p[0], "label": " ".join(p[1:])} for p in (ln.split() for ln in allowed.splitlines()) if p]
+    if not isinstance(allowed, list) or len(allowed) > 200:
+        raise WebAuthnError("The list of approved models holds at most 200 entries.")
+    for m in allowed:
+        g = str((m or {}).get("aaguid") or "").strip().lower()
+        if not _UUID.match(g):
+            raise WebAuthnError(f"'{g}' is not an AAGUID (a UUID such as 2fc0579f-8113-47ea-b116-bb5a8db9202a).")
+        if g not in [x["aaguid"] for x in models]:
+            models.append({"aaguid": g, "label": str((m or {}).get("label") or "").strip()[:60] or g})
+    pem = (roots_pem or "").strip()
+    if len(pem) > 100_000:
+        raise WebAuthnError("The trust roots are too large (100 KB at most).")
+    certs = _parse_roots(pem) if pem else []
+    if pem and not certs:
+        raise WebAuthnError("The trust roots contain no certificate.")
+    if len(certs) > 30:
+        raise WebAuthnError("At most 30 trust root certificates.")
+    if mode == "require" and not certs:
+        raise WebAuthnError("'Require' needs trust roots: without them no authenticator could ever be verified and nobody could register a passkey.")
+    if pem:
+        from cryptography.hazmat.primitives import serialization
+        pem = "".join(c.public_bytes(serialization.Encoding.PEM).decode() for c in certs)
+    c = _conn()
+    try:
+        with c:
+            c.execute("UPDATE webauthn_policy SET mode = ?, allowed = ?, roots_pem = ?, updated_by = ?, updated_at = ? WHERE id = 1", (mode, json.dumps(models), pem, actor, _now()))
+    finally:
+        c.close()
+    return policy_view()
 
 
 def list_credentials(user_id: str) -> List[Dict[str, Any]]:
@@ -186,11 +274,23 @@ def _descriptors(user_id: str):
 
 # ---------------------------------------------------------------- registration
 
-def registration_options(user: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+def _enum_str(x) -> Optional[str]:
+    """The package returns some fields as enums and some as plain strings."""
+    return None if x is None else str(getattr(x, "value", x))
+
+
+def pol_mode() -> str:
+    try:
+        return get_policy()["mode"]
+    except Exception:
+        return "none"
+
+
+def registration_options(user: Dict[str, Any], headers: Dict[str, str], require_uv: bool = False) -> Dict[str, Any]:
     if not available():
         raise WebAuthnError("Passkeys are not available on this server (the webauthn package is not installed).")
     from webauthn import generate_registration_options, options_to_json
-    from webauthn.helpers.structs import AuthenticatorSelectionCriteria, ResidentKeyRequirement, UserVerificationRequirement
+    from webauthn.helpers.structs import AttestationConveyancePreference, AuthenticatorSelectionCriteria, ResidentKeyRequirement, UserVerificationRequirement
     if count(user["id"]) >= MAX_CREDENTIALS:
         raise WebAuthnError(f"An account can have at most {MAX_CREDENTIALS} passkeys or security keys.")
     rp_id, _ = relying_party(headers)
@@ -200,19 +300,59 @@ def registration_options(user: Dict[str, Any], headers: Dict[str, str]) -> Dict[
     opts = generate_registration_options(
         rp_id=rp_id, rp_name=RP_NAME, user_id=user["id"].encode(), user_name=user["username"], user_display_name=user.get("display_name") or user["username"],
         challenge=challenge, exclude_credentials=_descriptors(user["id"]),
-        authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED, user_verification=UserVerificationRequirement.PREFERRED))
+        attestation=AttestationConveyancePreference.NONE if get_policy()["mode"] == "none" else AttestationConveyancePreference.DIRECT,
+        authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,
+                                                               user_verification=UserVerificationRequirement.REQUIRED if require_uv else UserVerificationRequirement.PREFERRED))
     return {"challenge_id": cid, "options": json.loads(options_to_json(opts))}
 
 
-def finish_registration(user: Dict[str, Any], challenge_id: str, credential: Dict[str, Any], name: str, headers: Dict[str, str]) -> Dict[str, Any]:
+def _verify_registration(credential, expected, rp_id, origins, require_uv: bool):
+    """(verified, attested, policy): `attested` = a certificate chain was verified against the administrator's trust roots."""
     from webauthn import verify_registration_response
-    expected = _take_challenge(challenge_id, "register", user["id"])
+    from webauthn.helpers import parse_attestation_object
+    from webauthn.helpers.structs import AttestationFormat
+    pol = get_policy()
+    roots = [c for c in (_parse_roots(pol["roots_pem"]) if pol["roots_pem"].strip() else [])]
+    from cryptography.hazmat.primitives import serialization
+    pem_roots = [c.public_bytes(serialization.Encoding.PEM) for c in roots]
+    by_fmt = {f: pem_roots for f in (AttestationFormat.PACKED, AttestationFormat.TPM, AttestationFormat.APPLE, AttestationFormat.ANDROID_KEY,
+                                      AttestationFormat.ANDROID_SAFETYNET, AttestationFormat.FIDO_U2F)} if pem_roots else None
+    kw = dict(credential=credential, expected_challenge=expected, expected_rp_id=rp_id, expected_origin=origins, require_user_verification=require_uv)
+    verified = False
+    try:
+        v = verify_registration_response(**kw, pem_root_certs_bytes_by_fmt=by_fmt)
+        verified = True
+    except Exception as exc:
+        if pol["mode"] != "record" or not by_fmt:
+            raise
+        logger.info(f"attestation chain not trusted, recorded without trust: {exc}")
+        v = verify_registration_response(**kw)               # `record` never turns an authenticator away: what failed is stored as unattested
+    attested = False
+    if verified and by_fmt:
+        try:
+            att = parse_attestation_object(v.attestation_object)
+            attested = bool(getattr(att.att_stmt, "x5c", None))
+        except Exception:
+            attested = False
+    return v, attested, pol
+
+
+def finish_registration(user: Dict[str, Any], challenge_id: str, credential: Dict[str, Any], name: str, headers: Dict[str, str], require_uv: bool = False,
+                        purpose: str = "register") -> Dict[str, Any]:
+    expected = _take_challenge(challenge_id, purpose, user["id"])
     rp_id, origins = relying_party(headers)
     try:
-        v = verify_registration_response(credential=credential, expected_challenge=expected, expected_rp_id=rp_id, expected_origin=origins)
+        v, attested, pol = _verify_registration(credential, expected, rp_id, origins, require_uv)
     except Exception as exc:
         logger.info(f"passkey registration for {user.get('username')} refused: {exc}")
-        raise WebAuthnError("The passkey could not be verified. Try again, or use another authenticator.")
+        raise WebAuthnError("The passkey could not be verified. Try again, or use another authenticator." if pol_mode() != "require" else
+                            "This authenticator could not be verified. Your organisation only accepts authenticators that prove their make and model (attestation).")
+    aaguid = str(getattr(v, "aaguid", "") or "").lower()
+    if pol["mode"] == "require":
+        if not attested:
+            raise WebAuthnError("Your organisation only accepts authenticators that prove their make and model (attestation). This one did not: synced passkeys and some authenticators cannot. Use an approved security key.")
+        if pol["allowed"] and aaguid not in [m["aaguid"] for m in pol["allowed"]]:
+            raise WebAuthnError(f"This authenticator model ({aaguid}) is not approved by your administrator.")
     cid = _b64u(v.credential_id)
     if _get(cid):
         raise WebAuthnError("That passkey is already registered.")
@@ -223,13 +363,15 @@ def finish_registration(user: Dict[str, Any], challenge_id: str, credential: Dic
         transports = [str(t) for t in (credential.get("response", {}).get("transports") or [])][:8]
     except Exception:
         pass
-    device = getattr(getattr(v, "credential_device_type", None), "value", None) or "single_device"
+    device = _enum_str(getattr(v, "credential_device_type", None)) or "single_device"
     c = _conn()
     try:
         with c:
-            c.execute("INSERT INTO webauthn_credentials (id, user_id, public_key, sign_count, name, transports, device_type, backed_up, uv, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO webauthn_credentials (id, user_id, public_key, sign_count, name, transports, device_type, backed_up, uv, created_at, aaguid, attestation_fmt, attested) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       (cid, user["id"], _b64u(v.credential_public_key), int(v.sign_count), (name or "").strip()[:60] or "Passkey", json.dumps(transports), device,
-                       1 if getattr(v, "credential_backed_up", False) else 0, 1 if getattr(v, "user_verified", False) else 0, _now()))
+                       1 if getattr(v, "credential_backed_up", False) else 0, 1 if getattr(v, "user_verified", False) else 0, _now(),
+                       aaguid, _enum_str(getattr(v, "fmt", None)), 1 if attested else 0))
     finally:
         c.close()
     return next(x for x in list_credentials(user["id"]) if x["id"] == cid)

@@ -127,6 +127,12 @@ def init_auth_db():
             conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, public_key TEXT NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL, transports TEXT, device_type TEXT, backed_up INTEGER NOT NULL DEFAULT 0, uv INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(user_id)")
+            for col, ddl in (("aaguid", "TEXT"), ("attestation_fmt", "TEXT"), ("attested", "INTEGER NOT NULL DEFAULT 0")):        # authenticator model / attestation (webauthn_policy)
+                if col not in {r[1] for r in conn.execute("PRAGMA table_info(webauthn_credentials)").fetchall()}:
+                    conn.execute(f"ALTER TABLE webauthn_credentials ADD COLUMN {col} {ddl}")
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_policy (id INTEGER PRIMARY KEY CHECK (id = 1), mode TEXT NOT NULL DEFAULT 'none', allowed TEXT NOT NULL DEFAULT '[]',
+                roots_pem TEXT NOT NULL DEFAULT '', updated_by TEXT, updated_at INTEGER)""")
+            conn.execute("INSERT OR IGNORE INTO webauthn_policy (id, mode, allowed, roots_pem) VALUES (1, 'none', '[]', '')")
             conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_challenges (id TEXT PRIMARY KEY, challenge TEXT NOT NULL, purpose TEXT NOT NULL, user_id TEXT, expires INTEGER NOT NULL)""")
             # `must_change_password`: set when a password was provided by someone other than the account holder
             # (the INIT_ADMIN_* bootstrap, or an admin's reset) rather than chosen by them -- cleared the moment
