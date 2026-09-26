@@ -242,6 +242,15 @@ def _validate_source(source_vol: str, watch_enabled: int, source_mount_id: Optio
     if not autoloader_s3.is_s3_path(source_vol):
         if source_mount_id:
             raise ValueError("A storage mount only applies to s3:// sources.")
+        try:                                                # a hidden folder of the warehouse (.metadata holds credentials) is never a source
+            rel = os.path.relpath(os.path.realpath(resolve_volume_posix_path(source_vol)), os.path.realpath(WAREHOUSE_DIR))
+            if any(p.startswith(".") and p != "." for p in rel.split(os.sep)):
+                raise ValueError("Hidden folders (such as .metadata) cannot be a source.")
+        except ValueError as exc:
+            if "Hidden folders" in str(exc):
+                raise
+        except Exception:
+            pass                                            # an unresolvable path is reported when the pipeline runs, as before
         return source_vol
     if watch_enabled:
         raise ValueError("File events watch local volumes only. An S3 source is polled: use a poll interval or a cron schedule.")

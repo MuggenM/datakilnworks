@@ -11727,7 +11727,7 @@
 
         <div x-show="pipelineSourceKind === 'volume'">
           <label class="block text-slate-400 font-medium mb-1 uppercase text-[10px]">Source Volume Path</label>
-          <input type="text" x-model="newPipelineForm.source_volume_path" placeholder="/Volumes/warehouse/raw/iot_stream" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
+          <input type="text" x-model="newPipelineForm.source_volume_path" @input="pathPreview = { busy: false, error: '', data: null }" data-testid="pipe-source-path" placeholder="/Volumes/warehouse/raw/iot_stream" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-2 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange">
           <p class="text-[10px] text-slate-500 mt-1">A volume folder (<code class="text-sky-400">/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume&gt;</code>) or an S3 / S3-compatible location (<code class="text-sky-400">s3://bucket/prefix/</code>).</p>
         </div>
 
@@ -11740,6 +11740,28 @@
             </template>
           </select>
           <p class="text-[10px] text-slate-500">S3 sources are polled: pick an interval of 30 seconds or more (each poll lists the prefix) or a cron schedule. New objects are read in place, without downloading them; a malformed object is copied under <code>_quarantine/</code> and removed if the key may delete it.</p>
+        </div>
+
+        <div x-show="pipelineSourceKind === 'volume'" class="space-y-1.5" data-testid="path-preview-block">
+          <div class="flex items-center space-x-2">
+            <button type="button" @click="previewPathSource()" :disabled="pathPreview.busy || !(newPipelineForm.source_volume_path || '').trim()" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded font-semibold disabled:opacity-50" data-testid="path-preview"><i class="ph" :class="pathPreview.busy ? 'ph-spinner animate-spin' : 'ph-eye'"></i> Preview first rows</button>
+            <span class="text-[10px] text-slate-500">Reads the oldest matching file now, with this pipeline's file format; nothing is created or loaded.</span>
+          </div>
+          <div x-show="pathPreview.error" class="text-rose-600 dark:text-rose-400" x-text="pathPreview.error" data-testid="path-preview-error"></div>
+          <div x-show="pathPreview.data" class="space-y-1">
+            <div class="text-[10px] text-slate-500 space-y-0.5"><template x-for="n in (pathPreview.data ? pathPreview.data.notes : [])" :key="n"><div x-text="n"></div></template></div>
+            <div x-show="pathPreview.data && pathPreview.data.files.length > 1" class="flex flex-wrap gap-1" data-testid="path-preview-files">
+              <template x-for="f in (pathPreview.data ? pathPreview.data.files : [])" :key="f.path"><button type="button" @click="previewPathSource(f.path)" :class="pathPreview.data.sample === f.path ? 'bg-dbx-orange text-white border-dbx-orange' : (f.readable ? 'bg-slate-50 dark:bg-slate-900' : 'bg-slate-50 dark:bg-slate-900 opacity-50')" class="px-1.5 py-0.5 border border-slate-300 dark:border-slate-700 rounded font-mono text-[10px]" :title="f.readable ? 'Preview this file' : 'The loader does not read this format'" x-text="f.path"></button></template>
+              <span x-show="pathPreview.data && pathPreview.data.file_count > pathPreview.data.files.length" class="text-[10px] text-slate-500 self-center" x-text="pathPreview.data ? '… and ' + (pathPreview.data.file_count - pathPreview.data.files.length) + ' more' : ''"></span>
+            </div>
+            <div class="overflow-x-auto max-h-56 border border-slate-200 dark:border-slate-700 rounded" data-testid="path-preview-table">
+              <table class="w-full text-left font-mono text-[11px]">
+                <thead class="sticky top-0 bg-slate-100 dark:bg-slate-800"><tr><template x-for="c in (pathPreview.data ? pathPreview.data.columns : [])" :key="c.name"><th class="px-2 py-1 whitespace-nowrap"><span x-text="c.name"></span> <span class="font-normal text-slate-400" x-text="c.type"></span></th></template></tr></thead>
+                <tbody><template x-for="(row, ri) in (pathPreview.data ? pathPreview.data.rows : [])" :key="ri"><tr class="border-t border-slate-100 dark:border-slate-800"><template x-for="(v, ci) in row" :key="ci"><td class="px-2 py-1 whitespace-nowrap max-w-[220px] truncate" x-text="v === null ? '∅' : (typeof v === 'object' ? JSON.stringify(v) : String(v))"></td></template></tr></template></tbody>
+              </table>
+            </div>
+            <div class="text-[10px] text-slate-500" x-text="pathPreview.data ? (pathPreview.data.rows.length + ' row(s) shown' + (pathPreview.data.truncated ? ' — there are more' : '')) : ''"></div>
+          </div>
         </div>
 
         <div class="grid grid-cols-2 gap-3">
@@ -17699,6 +17721,7 @@
         streamsTimer: null,
         streamForm: { open: false, busy: false, error: '', id: '', name: '', connection: '', topic: '', target_catalog: 'warehouse', target_schema: 'dbo', target_table: '', format: 'json', starting_offsets: 'earliest', max_records: 5000, max_wait_seconds: 5, evolve_schema: false },
         connPreview: { busy: false, error: '', data: null },
+        pathPreview: { busy: false, error: '', data: null },
         connTest: {},
         connForm: { open: false, busy: false, error: '', id: '', name: '', type: 'http', description: '', base_url: '', auth: 'none', username: '', header_name: '', secret: '', allow_insecure: false, timeout_seconds: 30, host: '', port: 22, sftp_auth: 'password', private_key: '', passphrase: '', host_key_sha256: '', bootstrap_servers: '', security_protocol: 'PLAINTEXT', sasl_mechanism: 'PLAIN', ssl_ca_pem: '', schema_registry_url: '', registry_username: '', registry_password: '' },
         autoloaderTargets: [{ id: 'warehouse', name: 'warehouse', kind: 'local' }],
@@ -27263,6 +27286,22 @@
             console.error('Error loading history:', e);
           } finally {
             this.isLoadingPipelineHistory = false;
+          }
+        },
+
+        async previewPathSource(sampleFile = null) {
+          const p = this.pathPreview; p.busy = true; p.error = ''; if (!sampleFile) p.data = null;
+          try {
+            const f = this.newPipelineForm;
+            const res = await fetch('/api/autoloader/preview-source', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ source_volume_path: (f.source_volume_path || '').trim(), file_pattern: f.file_pattern || '*', source_mount_id: f.source_mount_id || null, sample_file: sampleFile }) });
+            const data = await res.json();
+            if (!res.ok) { p.error = typeof data.detail === 'string' ? data.detail : 'The preview failed.'; return; }
+            p.data = data;
+          } catch (e) {
+            p.error = 'Error: ' + e.message;
+          } finally {
+            p.busy = false;
           }
         },
 

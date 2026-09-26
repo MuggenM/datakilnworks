@@ -8773,17 +8773,20 @@ class SourcePreviewPayload(BaseModel):
     source_options: Optional[Dict[str, Any]] = None
     file_pattern: Optional[str] = "*"
     limit: Optional[int] = 10
+    source_mount_id: Optional[str] = None
+    sample_file: Optional[str] = None
 
 
 @app.post("/api/autoloader/preview-source")
 async def preview_autoloader_source_endpoint(payload: SourcePreviewPayload, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
-    """The first rows of a connection source (HTTP file, REST API first page, SFTP file) as the pipeline would read them. Nothing is stored."""
-    from web import autoloader_conn
-    if not autoloader_conn.is_conn_path(payload.source_volume_path):
-        raise HTTPException(status_code=400, detail="A preview needs a connection source (conn://<connection>/<path>).")
+    """The first rows of any source as the pipeline would read them, before it exists: a connection (HTTP file, REST API first page, SFTP file), a local
+    volume folder or an s3:// location. Nothing is created, checkpointed or loaded."""
+    from web import autoloader_conn, autoloader_preview
     try:
-        return await asyncio.to_thread(autoloader_conn.preview, payload.source_volume_path, payload.source_options, payload.file_pattern or "*", payload.limit or 10)
-    except autoloader_conn.SourceError as exc:
+        if autoloader_conn.is_conn_path(payload.source_volume_path):
+            return await asyncio.to_thread(autoloader_conn.preview, payload.source_volume_path, payload.source_options, payload.file_pattern or "*", payload.limit or 10)
+        return await asyncio.to_thread(autoloader_preview.preview, payload.source_volume_path, payload.file_pattern or "*", payload.source_mount_id, payload.sample_file, payload.limit or 10)
+    except (autoloader_conn.SourceError, autoloader_preview.PreviewError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
