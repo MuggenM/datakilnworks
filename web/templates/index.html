@@ -15096,6 +15096,8 @@
                    x-ref="loginUsernameInput" 
                    x-model="loginForm.username" 
                    required 
+                   autocomplete="username webauthn" 
+                   data-testid="login-username" 
                    placeholder="Enter username" 
                    class="w-full pl-9 pr-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg text-slate-900 dark:text-white font-medium focus:outline-none focus:border-sky-500 transition">
           </div>
@@ -19658,6 +19660,7 @@
         },
 
         cancelMfaLogin(message) {
+          this.$nextTick(() => this.startConditionalPasskey());
           this.loginForm.mfaToken = null;
           this.loginForm.mfaMethods = [];
           this.loginForm.mfaCode = '';
@@ -19923,9 +19926,12 @@
                                transports: cred.response.getTransports ? cred.response.getTransports() : [] } };
         },
 
-        async pkGet(publicKey) {
+        async pkGet(publicKey, opts = {}) {
           const o = { ...publicKey, challenge: this.pkB64uToBuf(publicKey.challenge), allowCredentials: (publicKey.allowCredentials || []).map(c => ({ ...c, id: this.pkB64uToBuf(c.id) })) };
-          const cred = await navigator.credentials.get({ publicKey: o });
+          const req = { publicKey: o };
+          if (opts.mediation) req.mediation = opts.mediation;
+          if (opts.signal) req.signal = opts.signal;
+          const cred = await navigator.credentials.get(req);
           return { id: cred.id, rawId: this.pkBufToB64u(cred.rawId), type: cred.type, clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
                    response: { clientDataJSON: this.pkBufToB64u(cred.response.clientDataJSON), authenticatorData: this.pkBufToB64u(cred.response.authenticatorData),
                                signature: this.pkBufToB64u(cred.response.signature), userHandle: cred.response.userHandle ? this.pkBufToB64u(cred.response.userHandle) : null } };
@@ -19937,8 +19943,40 @@
           return { ok: res.ok, status: res.status, data };
         },
 
+        // Autofill sign-in ("conditional UI"): while the sign-in dialog is open the browser may offer the account's passkeys in the username field's autofill list.
+        // The request is pending until the user picks one; it is cancelled when the dialog closes or another sign-in path is used, and renewed before the
+        // server's challenge (5 minutes) runs out.
+        async startConditionalPasskey() {
+          const g = window.__dkwPk = window.__dkwPk || {};
+          if (g.ctl || !this.passkeyLoginAvailable || !window.PublicKeyCredential || !PublicKeyCredential.isConditionalMediationAvailable) return;
+          try { if (!(await PublicKeyCredential.isConditionalMediationAvailable())) return; } catch (e) { return; }
+          if (g.ctl || !this.showLoginModal || this.loginForm.mfaToken || this.isAuthenticated) return;
+          const ctl = new AbortController();
+          g.ctl = ctl;
+          try {
+            const o = await this.postJson('/api/auth/passkey/options');
+            if (!o.ok || ctl.signal.aborted) return;
+            g.timer = setTimeout(() => { ctl.renew = true; ctl.abort(); }, 240000);
+            const cred = await this.pkGet(o.data.options, { mediation: 'conditional', signal: ctl.signal });
+            clearTimeout(g.timer);
+            const r = await this.postJson('/api/auth/passkey/login', { challenge_id: o.data.challenge_id, credential: cred });
+            if (!r.ok) { this.loginForm.error = r.data.detail || 'The passkey was not accepted.'; return; }
+            await this.finishLogin(r.data);
+          } catch (e) { /* aborted or dismissed: nothing to say */ } finally {
+            clearTimeout(g.timer);
+            if (g.ctl === ctl) g.ctl = null;
+            if (ctl.renew && this.showLoginModal && !this.isAuthenticated) this.startConditionalPasskey();
+          }
+        },
+
+        stopConditionalPasskey() {
+          const g = window.__dkwPk;
+          if (g && g.ctl) { g.ctl.renew = false; g.ctl.abort(); g.ctl = null; }
+        },
+
         async loginWithPasskey() {
           if (this.loginForm.loading) return;
+          this.stopConditionalPasskey();
           this.loginForm.loading = true; this.loginForm.error = null;
           try {
             const o = await this.postJson('/api/auth/passkey/options');
@@ -19947,7 +19985,7 @@
             const r = await this.postJson('/api/auth/passkey/login', { challenge_id: o.data.challenge_id, credential: cred });
             if (!r.ok) { this.loginForm.error = r.data.detail || 'The passkey was not accepted.'; return; }
             await this.finishLogin(r.data);
-          } catch (e) { this.loginForm.error = this.pkErrorText(e); } finally { this.loginForm.loading = false; }
+          } catch (e) { this.loginForm.error = this.pkErrorText(e); } finally { this.loginForm.loading = false; if (!this.isAuthenticated) this.$nextTick(() => this.startConditionalPasskey()); }
         },
 
         async loginWithSecurityKey() {
@@ -20082,6 +20120,7 @@
         },
 
         async login() {
+          this.stopConditionalPasskey();
           this.loginForm.loading = true;
           this.loginForm.error = null;
           try {
@@ -20111,6 +20150,7 @@
             this.loginForm.error = 'Network error during login: ' + e.message;
           } finally {
             this.loginForm.loading = false;
+            if (!this.isAuthenticated && !this.loginForm.mfaToken) this.$nextTick(() => this.startConditionalPasskey());
           }
         },
 
@@ -21636,6 +21676,9 @@
           await this.checkAuth();
           await this.refreshNotebookAccess();
           this.applyTheme(this.isDarkMode);
+          this.$watch('showLoginModal', (open) => { if (open) this.$nextTick(() => this.startConditionalPasskey()); else this.stopConditionalPasskey(); });
+          this.$watch('passkeyLoginAvailable', () => { if (this.showLoginModal) this.$nextTick(() => this.startConditionalPasskey()); });
+          if (this.showLoginModal) this.$nextTick(() => this.startConditionalPasskey());
           this.$watch('currentView', (val) => {
             if (val) localStorage.setItem('dbx_current_view', val);
             if (val === 'sql') {
