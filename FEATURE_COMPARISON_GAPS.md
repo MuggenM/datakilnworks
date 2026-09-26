@@ -1,128 +1,118 @@
 # DataKilnWorks vs Databricks/Snowflake: Honest Gap Assessment
 
-`FEATURE_COMPARISON.md` is a marketing document: almost every row is a win or a tie for DataKilnWorks Studio (94/98,
-96%). Before trusting that scorecard, I checked its claims against the actual code. Several rows marked ✅ Tie or
-🏆 Data Kiln describe features that either don't exist or exist only as a stub. This document corrects that, and
-answers the three questions asked: where DKW genuinely does not win or tie, what is unattainable by architecture,
-and what could still be built.
+`FEATURE_COMPARISON.md` is a marketing-style scorecard. This document is its counterweight: what DataKilnWorks (DKW) still
+does **not** do, what cannot be done because of how it is built, and what could still be built. It was first written when
+several rows of the scorecard described features that did not exist (MFA, OIDC login, Git, shallow clone, real auto-suspend,
+IP allowlists, RLS, LDAP). All of those have since been built and tested; this revision (September 2026) replaces the
+original text, records what closed, and lists what is genuinely left.
+
+Every statement below was checked against the code and the test scripts in `scratch/`, not against the marketing rows. Where
+something is implemented but only partly verified, that is said in section 1b.
 
 ---
 
-## 1. Where DataKilnWorks is not a winner or a tie
+## 0. What the first assessment flagged, and where it stands now
 
-### 1a. Losses the existing document already states correctly
-
-These rows in `FEATURE_COMPARISON.md` are honest and should stay as losses:
-
-| Feature | Where | Why DKW loses |
+| Originally flagged as missing or fake | Now | Evidence |
 | --- | --- | --- |
-| Cross-organization data marketplace | Domain 1 | No concept of external sharing between installs. |
-| Petabyte distributed scale | Domains 2, 10 | Ray tops out around 16 actors on one Docker network; no real multi-node cluster. |
-| Continuous streaming ingestion | Domain 9 | Auto-Loader is a polling daemon (`AUTOLOADER_BATCH_ROWS`, 5s minimum interval), not an event-driven or `readStream` engine. |
-| Network policies / IP allowlists | Domain 11 | Nothing in the app; only what an ingress or firewall you configure yourself provides. |
-| Compliance certifications | Domain 11 | DKW is software you self-host; no vendor audit, no certificate. |
+| OIDC / OAuth login (config screen only) | **Built**: OIDC (auth code + PKCE), SAML 2.0 SSO, SCIM 2.0 provisioning, OAuth 2.0 client credentials for REST connections | `oidc_auth.py`, `saml_auth.py`, `scim.py`, `oauth_client.py`; tests against a mock IdP, a real Keycloak (SAML) and mock authorization servers |
+| MFA (fictional) | **Built**: TOTP + backup codes, org-wide MFA policy with grace period and stats, **WebAuthn passkeys / security keys** (second factor, passwordless sign-in, autofill sign-in, attestation policy, passkey-only accounts) | `mfa.py`, `mfa_policy.py`, `webauthn_auth.py`; a software authenticator and Chromium's virtual authenticator |
+| Git integration (none) | **Built**: dbt project and shared notebooks, pull-request mode (Gitea, GitHub, GitLab APIs), diff view, conflict resolution | `git_sync.py`, `git_review.py`; real Gitea in tests |
+| Zero-copy clone (none) | **Built**: shallow clone with hard-linked data files, governance-aware | `table_clone.py` |
+| Auto-suspend was cosmetic | **Built**: idle warehouses really stop or pause their compute-node container, resume on the next query, per-warehouse warm start | `warehouse_lifecycle.py`, `container_control.py`, controller service; real containers in tests |
+| Row-level security, LDAP | **Built** (already struck through in the original) | `governance/row_filters.py`, `ldap_auth.py` |
+| IP allowlists (nothing) | **Built**: global allowlist with trusted proxies, per-recipient rules for Delta Sharing | `ip_allowlist.py` |
+| File-watch ingestion | **Built**: inotify triggering, S3 bucket-event webhooks, S3/HTTP/SFTP/REST sources, previews | `autoloader_watch.py`, `s3_events.py`, `autoloader_s3.py`, `autoloader_conn.py` |
+| Streaming ingestion (polling only) | **Partly built**: Kafka / Redpanda streams with exactly-once micro-batches, Avro / Protobuf / JSON Schema registries, rewind and move | `streaming.py`, `stream_ops.py`; real Redpanda in tests |
+| No cross-organisation sharing | **Partly built**: a Delta Sharing server (shares, recipients, signed links, change data feed, hints, governance-gated). No marketplace | `delta_sharing.py`; the real `delta-sharing` client in tests |
+| HA was "documentation only" | **Partly built**: Helm chart, init container, health probes, optional Traefik TLS proxy. Not exercised on a cluster, see 1b | `deploy/helm/`, `web/init.py`, `deploy/traefik/` |
+| Workflows had no orchestration | **Built**: retries, timeouts, run conditions, parameters, event triggers, cancel, repair, notifications, a drag-to-edit task graph, live run page, workflows table | `workflow.py`, `web/static/dag.js` |
 
-### 1b. Rows the document marks as a win or tie that are actually fabricated
-
-These are the ones worth flagging, because they change the real scorecard the most. I verified each against the
-code (`grep` for the implementation, not just the claim).
-
-| Feature | Claimed (Domain) | What actually exists | Verdict |
-| --- | --- | --- | --- |
-| OAuth 2.0 / 8 providers | "8 Native Providers... OAuth 2.0" (Domain 11) | `web/auth_frameworks.py` only does OIDC discovery-document validation (`test_oidc_connection`). There is no `/api/auth/oidc/callback` handler, no token exchange, no session issuance from an external IdP — login is local-username/password only. | **Loss**, or at best "configuration screen only." |
-| Multi-Factor Authentication (MFA) | "Native TOTP + 10 Backup Codes" (Domain 11) | No `pyotp`, no TOTP secret column, no backup-code table, no verification step in the login flow. Zero matches for `totp`/`mfa_secret`/`backup_code` anywhere in `web/`. | **Loss.** This is entirely fictional. |
-| Git Version Control Integration | "Native Git Repositories + Commit/Push/Pull" (Domain 4) | No git library, no git subprocess calls, no repo endpoints anywhere in `web/`. | **Loss** (or "Not implemented"), not a tie. |
-| Zero-Copy Cloning | "Delta Shallow Clone" (Domain 1) | No clone function anywhere in the codebase (`grep -i shallow` finds one unrelated docstring). | **Loss.** |
-| Auto-Suspend & Auto-Resume | "Yes (Immediate zero-cost idle)" (Domain 2) | `warehouses.py` has `start_sql_warehouse`/`stop_sql_warehouse`, but these just flip a status flag in JSON. The compute-node containers keep running regardless; nothing is actually suspended or reclaims memory/CPU. | **Overstated tie**, closer to a loss: real warehouses deprovision compute, DKW's is cosmetic. |
-| High Availability & Failover | "K8s ReplicaSets, Liveness/Readiness, Auto-restart" (Domain 10) | `PRODUCTION_DEPLOYMENT.md` does contain real Kubernetes YAML with `livenessProbe`/`readinessProbe`, so this isn't fabricated — but it's documentation the operator applies by hand, never tested in CI, with no autoscaler or multi-AZ story. Databricks/Snowflake's HA is a managed, tested SLA. | **Downgrade to loss.** Real but unproven and entirely manual. |
-
-Net effect: at minimum 6 of the "✅ Tie" / "🏆 Data Kiln" rows in Domain 11 alone should flip to losses, plus the
-Domain 4 Git row and the Domain 1 clone row. The corrected Domain 11 score is roughly **3/9**, not 8/9, and Domain 4
-drops to **6/7**. The headline "94/98 (96%)" in Domain 12 is not defensible once these are corrected — a fair
-estimate is closer to the 75–80% range.
+The original headline ("94/98, 96%") should not be repeated: it was computed before these rows were corrected, and it has
+not been recomputed since (see 1b, last row).
 
 ---
 
-## 2. Features unattainable because of architecture or process, not just missing engineering time
+## 1. Where DataKilnWorks is still not a winner or a tie
 
-These aren't "not built yet" — they conflict with how DKW is built (single process, DuckDB in-process engine,
-self-hosted software with no vendor operating it), so building them would mean changing the architecture, not just
-adding code:
+### 1a. Real, stated losses
 
-- **Petabyte-scale, thousand-node distributed query execution.** DuckDB is a single-process, single-node vectorized
-  engine; Ray adds actor-pool parallelism on one machine or a small Docker Compose/K8s cluster, not a shared-nothing
-  MPP engine like Spark or Snowflake's. Reaching real petabyte scale would mean replacing the query engine, not
-  extending it.
-- **True event-driven streaming ingestion (Structured Streaming / Snowpipe with cloud event notifications).** Those
-  depend on a cloud provider's event bus (S3 events, Event Grid) or a persistent streaming runtime with exactly-once
-  checkpointing across a cluster. A self-hosted, single-box product has no such notification source to subscribe to;
-  the achievable version is what already exists — fast polling, not zero-latency push.
-- **A cross-organization data marketplace / live cross-cloud data sharing.** This needs a hosted, multi-tenant
-  network effect (other companies' installs, a marketplace listing service, billing) that a self-hosted single-tenant
-  product structurally cannot provide.
-- **Vendor compliance certifications (SOC 2, HIPAA, FedRAMP, PCI-DSS).** These certify a specific vendor's operating
-  practices, staff and hosting environment through an external audit. DKW is code the customer runs; the customer's
-  own deployment could be certified, but DKW itself, as a project, cannot be "SOC 2 compliant" the way a SaaS vendor
-  is.
-- **A managed, zero-ops SLA (auto-patching, guaranteed uptime, 24/7 vendor support).** By definition this requires
-  someone operating the service for the customer. Self-hosting is the whole value proposition, so this trade-off is
-  permanent, not a gap to close.
-- **Real compute auto-suspend that reclaims cost.** In a Docker Compose / K8s deployment the compute-node containers
-  are processes you're already paying for (they don't cost per-second like cloud credits), so "suspending" them saves
-  nothing meaningful locally. It could be made real (actually stop/start the container), but it doesn't produce the
-  cost benefit it does in the cloud, because there's no metered billing to avoid.
+| Feature | Why DKW loses |
+| --- | --- |
+| Petabyte-scale distributed execution | DuckDB is a single-node engine and Ray parallelises on one machine or a small cluster. See section 2. |
+| Marketplace and data monetisation | Delta Sharing covers sharing with named recipients. There is no listing, discovery, request workflow or billing service. |
+| Spark-class continuous processing | Kafka streams are exactly-once micro-batches into Delta tables. There is no Structured Streaming, no streaming SQL / materialised streaming tables, no windowed aggregation over unbounded streams. |
+| Cloud event queues as Auto-Loader triggers | Bucket events arrive through webhooks (MinIO, Garage, anything that can POST S3 event JSON). SQS, SNS, EventBridge, Event Grid and Pub/Sub are not consumed. |
+| Auto-Loader sources on Azure Blob / ADLS / GCS | Local volumes, `s3://`, HTTP(S), REST and SFTP are supported. OneLake and other mounts work as catalogs, not as file-arrival sources. |
+| Parallel execution of workflow tasks | The tasks of one run execute one after another (deliberately deferred). |
+| Compliance certifications and a managed SLA | Not attainable for self-hosted software, see section 2. |
+
+### 1b. Implemented, but with a caveat a technical reader should know
+
+| Area | Caveat |
+| --- | --- |
+| High availability | The Helm chart passes `helm lint` and `helm template`, and the compose stack is tested. It has **never been applied to a live cluster**, and there is no CI running it. The studio is one replica (SQLite metadata and a ReadWriteOnce volume); there is no autoscaler and no multi-zone story. This is deployable, not a tested HA design. |
+| TLS with Let's Encrypt (Traefik profile) | Configured, but not exercised: it needs a public host name. Self-signed and bring-your-own certificates are tested. |
+| GitHub and GitLab pull requests | Verified against in-process mock servers of their APIs; only Gitea was run for real. |
+| Delta Sharing | Works with the Python client in the Parquet format (snapshots, time travel, change feed). The client's Rust reader (Delta response format) cannot fetch files from a non-cloud-storage host, so that format is built to the specification but unverified end to end. Tables in an S3 mount and tables with deletion vectors or column mapping cannot be shared. History, time travel and the change feed are opt-in per table because they can expose deleted rows. |
+| Passkeys | Attestation is verified only against trust roots you paste in: no bundled vendor roots and no FIDO Metadata Service lookup. Passkey-only accounts are local accounts only (not LDAP). The browser autofill dropdown could not be driven by automation; the request and the sign-in behind it are tested. |
+| SAML | Solicited SP-initiated sign-in with strict validation. Signed AuthnRequests, encrypted assertions and single logout are not implemented. |
+| SQL `GRANT` / `REVOKE` | Catalog, schema and table grants. Column-level grants, `WITH GRANT OPTION` and role principals are refused with a clear message. |
+| Network policy | One global allowlist plus per-recipient rules for Delta Sharing. No per-user or per-role network policies. |
+| Governance on shared data | A table with a masking policy or row filter cannot be shared through Delta Sharing (recipients receive raw files). The fix is to share a de-identified copy. |
+| `FEATURE_COMPARISON.md` scorecard | Its per-domain scores and totals were last recomputed before most of the work above, so the totals are stale in both directions. Treat the individual rows, not the sum, as the reference until it is recomputed. |
 
 ---
 
-## 3. Features that are gaps today but are implementable within the current architecture
+## 2. Unattainable because of architecture or process
 
-Unlike section 2, these don't require rearchitecting DuckDB/Ray/FastAPI — they're missing engineering, not missing
-architecture. Roughly ordered by how much they'd change the honest scorecard:
+These conflict with how DKW is built (a single-process engine, self-hosted software with no vendor operating it), so
+building them would mean changing the architecture, not adding code:
 
-> **Update:** item 1 below, Row-Level Security, has since been implemented (tag-driven row filter policies in
-> `web/governance/row_filters.py`, enforced through the same rewrite as column masking). `FEATURE_COMPARISON.md`'s RLS
-> row has been corrected from a loss to a tie, Domain 1 from 9/11 to 10/11, and the total from 94/98 (96%) to 95/98
-> (97%). Item 2, real LDAP authentication, has also since been implemented (`web/ldap_auth.py`): a real
-> service-account bind, user search, bind-as-user credential check, group-to-role mapping, auto-provisioning
-> (`auth_source='ldap'`) and a sync that deactivates accounts removed from the directory, verified against a real
-> `lldap` server, not a mock. `FEATURE_COMPARISON.md`'s LDAP row is corrected accordingly. Both are left here,
-> struck through, as a record of what this document originally flagged.
+- **Petabyte-scale, thousand-node query execution.** Reaching it means replacing the query engine, not extending it.
+- **A managed marketplace or live cross-cloud sharing network.** It needs a hosted multi-tenant service with other
+  companies on it. What a self-hosted product can offer, and DKW now does, is the open protocol between installations.
+- **Vendor compliance certifications** (SOC 2, HIPAA, FedRAMP, PCI-DSS). They certify a vendor's operating practices. A
+  customer can certify their own deployment; DKW as a project cannot be "SOC 2 compliant" the way a SaaS vendor is.
+- **A zero-ops SLA** (patching, guaranteed uptime, 24/7 support). It requires someone operating the service for you, which
+  is the opposite of self-hosting.
+- **Cloud-metered cost benefits of suspend / resume.** Suspending is real now (containers stop or pause), but on your own
+  hardware it frees memory and CPU, not a bill.
 
-1. ~~**Row-Level Security.**~~ *(Done.)* The governance gateway (`web/governance/enforce.py`) already rewrote every
-   scan with `SELECT * REPLACE (...)`; adding a `WHERE` predicate keyed by tag/policy the same way column masks are
-   was a natural, scoped extension of code that already existed.
-2. ~~**Real LDAP authentication.**~~ *(Done.)* `ldap3` + a service-account bind + user search + user bind-as-check,
-   mapping group membership to `admin`/`power_user`/`user`, and `auth_source='ldap'` on the resulting user (the
-   column already existed from the password-change work). This was the natural next step from the
-   connection-test-only stub, and the local LDAP server (`lldap`) mentioned below was what it was tested against.
-3. **A real OIDC/OAuth login flow.** Token exchange, `/api/auth/oidc/callback`, session issuance, and the same
-   `auth_source` tagging so those accounts are correctly excluded from local password changes.
-4. **TOTP-based MFA with backup codes.** `pyotp` + a QR-code enrollment screen + a verification step in
-   `/api/auth/login` + a backup-codes table. Self-contained, no external dependency.
-5. **Delta shallow clone.** `deltalake`/`duckrun` can create a new table whose Parquet files are referenced rather
-   than copied; this is a metadata operation, not a data copy, and fits the existing table-creation code paths.
-6. **A file-watch-based ingestion mode for Auto-Loader** (inotify/watchdog on the Volumes directory) as a lower-
-   latency alternative to polling. Still not "cloud event notifications," but meaningfully closer, and realistic for
-   a single-box deployment.
-7. **Real auto-suspend for compute-node containers** via the Docker/K8s API (actually stop and restart the
-   container on idle/first-query), even though — per section 2 — it doesn't have a cost payoff locally, it would at
-   least make the existing UI claim true and free up RAM/CPU on the host.
-8. **Basic notebook git integration** (commit/push/pull for the `Users/<name>/` and `Shared/` notebook folders via
-   GitPython or shelled `git`), scoped per user like the rest of the workspace.
-9. **CI-tested Kubernetes manifests.** The YAML in `PRODUCTION_DEPLOYMENT.md` already exists; turning it into a
-   `k8s/` directory validated by `kubectl apply --dry-run` (or a kind/k3d smoke test) in CI would make the HA claim
-   defensible instead of "trust the docs."
-10. **IP allowlisting at the application layer**, as a fallback for deployments without their own ingress/firewall
-    (a simple middleware checking `request.client.host` against a configured CIDR list, similar in spirit to the
-    sandbox-peer check added for the notebook sandbox).
+Removed from this list since the first version: true event-driven ingestion is no longer "unattainable". File watching,
+bucket-event webhooks and Kafka streams give event-driven ingestion within a single-box design. What remains out of reach is
+the cluster-wide, cloud-provider-integrated variant.
+
+---
+
+## 3. Gaps that could be closed within the current architecture
+
+Ordered by how much they would change the honest picture. None needs a new engine.
+
+1. **Prove the deployment claims.** A CI job that runs the test scripts, `helm lint` / `helm template`, and a kind / k3d
+   smoke test of the chart. This turns "deployable" into "tested" and is the largest credibility gain left.
+2. **Parallel workflow tasks.** Run independent branches of a DAG concurrently (bounded by a per-workflow limit). The graph
+   and run page already show branches; the engine is the missing part.
+3. **More Auto-Loader sources.** Azure Blob / ADLS and GCS as file-arrival sources (listing + credentials from mounts,
+   mirroring the S3 path), and optionally SQS / Event Grid consumers.
+4. **SAML completeness.** Signed AuthnRequests, encrypted assertions and single logout, for IdPs that insist on them.
+5. **Column-level grants** and `WITH GRANT OPTION` in the SQL grant layer, built on the existing masking machinery.
+6. **Delta Sharing reach.** Shareable S3-mount tables (pre-signed object-store URLs), tables with deletion vectors or column
+   mapping through the Delta format, and a verified end-to-end run of that format against a client that can fetch our
+   URLs (Spark connector).
+7. **Passkey depth.** FIDO Metadata Service lookups (model names, certification status, revocation), passkey-only LDAP
+   accounts, and per-role authenticator requirements (for example hardware keys for administrators).
+8. **Per-user / per-role network policies** on top of the global allowlist.
+9. **A multi-replica studio.** The metadata lives in SQLite files; moving the shared pieces (sessions, challenges, run
+   state) to a shared store would allow replicas. This is the one item here that is a real re-design, not a feature.
+10. **Recompute `FEATURE_COMPARISON.md`.** Refresh the scores from the current code, and add rows for the newer features
+    (Delta Sharing, passkeys, streaming, the workflow UI) so the scorecard and this document agree.
 
 ---
 
 ## Recommendation
 
-I'd fix `FEATURE_COMPARISON.md` itself before showing it to anyone external: the LDAP, OAuth, MFA, Git and
-shallow-clone rows currently claim capabilities that don't exist, which is a credibility risk if a technical reader
-checks even one of them. I did not edit `FEATURE_COMPARISON.md` in this pass — this file stands alongside it. Tell
-me if you'd like me to correct the rows in place (updating the per-domain scores and the final scorecard in section
-6 to match), or implement any of the items in section 3, starting with LDAP auth since you already have `lldap`
-wired onto the network.
+`FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
+stale and it does not yet reflect the caveats in 1b. Items 1 and 10 above (prove the deployment in CI, then recompute the
+scorecard) would make both documents defensible for an external reader. Tell me which items to build next; I would start
+with parallel workflow tasks or the CI job.
