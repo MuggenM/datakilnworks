@@ -45,7 +45,7 @@ GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,59}$")
 MAX_PAGE = 200
 MAX_BODY = 1_000_000
 MEDIA_TYPE = "application/scim+json"
-LOGIN_SOURCES = ("oidc", "saml")
+LOGIN_SOURCES = {"oidc", "saml"}  # ggignore: sign-in provider names, not credentials
 
 
 class ScimError(Exception):

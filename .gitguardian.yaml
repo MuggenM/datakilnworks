@@ -1,0 +1,5 @@
+version: 2
+# scim.py lists the sign-in providers ("oidc", "saml") next to words like LOGIN; GitGuardian's "Authentication Tuple" detector read that as a
+# username/password pair (false positive, commit 018a41d). The inline `# ggignore` there covers the current code; this file documents the intent.
+secret:
+  ignored_paths: []
