@@ -5,6 +5,7 @@ created through the UI/API. A pipeline is created in the dialog with 'S3 events'
 (the rescan cannot explain it). Everything is removed at the end."""
 import os, subprocess, sys, time
 from playwright.sync_api import sync_playwright
+import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE = "http://localhost:8117"; NET, UI, MINIO = "s3evnet", "s3evui", "s3evminio"
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
@@ -51,7 +52,7 @@ def main():
     time.sleep(3); r = ex(SEED); check("seeded the S3 mount", r.returncode == 0, r.stderr[-300:])
     try:
         with sync_playwright() as p:
-            b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1440, "height": 1300}); page = ctx.new_page(); errors = []
+            b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1440, "height": 1300}); page = _ui_slow.apply(ctx.new_page()); errors = []
             page.on("pageerror", lambda e: errors.append(str(e)))
             check("logged in", ctx.request.post(f"{BASE}/api/auth/login", data={"username": "admin", "password": "adminpassword123"}).ok)
             page.goto(BASE, wait_until="networkidle"); time.sleep(1)

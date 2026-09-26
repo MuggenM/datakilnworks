@@ -3,6 +3,7 @@
 dialog (share, table, recipient, profile, revoke) and reads the table through the protocol with the profile that the dialog showed. Removes the container."""
 import json, os, subprocess, sys, time, urllib.request
 from playwright.sync_api import sync_playwright
+import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http://localhost:8117"
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 FAIL = []
@@ -26,7 +27,7 @@ try:
     r = sh("docker", "exec", "-w", "/workspace", "dshui", "python", "-c", "import sqlite3,pandas as pd;from deltalake import write_deltalake\nc=sqlite3.connect('/workspace/warehouse/.metadata/auth.db');c.execute('UPDATE users SET must_change_password=0');c.commit()\nwrite_deltalake('/workspace/warehouse/sales/orders', pd.DataFrame({'id':[1,2,3],'amount':[1.5,2.5,3.5]}))")
     check("seeded a Delta table", r.returncode == 0, r.stderr[-300:])
     with sync_playwright() as p:
-        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1440, "height": 1400}); page = ctx.new_page(); errors = []
+        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1440, "height": 1400}); page = _ui_slow.apply(ctx.new_page()); errors = []
         page.on("pageerror", lambda e: errors.append(str(e))); page.on("dialog", lambda d: d.accept())
         check("logged in", ctx.request.post(f"{BASE}/api/auth/login", data={"username": "admin", "password": "adminpassword123"}).ok)
         page.goto(BASE, wait_until="networkidle"); time.sleep(1)

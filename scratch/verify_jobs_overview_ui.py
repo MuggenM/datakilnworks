@@ -4,6 +4,7 @@ owner, filter, status chips, sort, Run), the details block of a workflow, Pause 
 studio `ovui` on port 8117, seeds workflows and a run history through the API, removes the container. LIGHT=1 also takes light-theme screenshots."""
 import json, os, subprocess, sys, time
 from playwright.sync_api import sync_playwright
+import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http://localhost:8117"
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 FAIL = []
@@ -23,7 +24,7 @@ try:
     time.sleep(3)
     sh("docker", "exec", "ovui", "python", "-c", "import sqlite3;c=sqlite3.connect('/workspace/warehouse/.metadata/auth.db');c.execute('UPDATE users SET must_change_password=0');c.commit()")
     with sync_playwright() as p:
-        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1600, "height": 1000}); page = ctx.new_page(); errors = []
+        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1600, "height": 1000}); page = _ui_slow.apply(ctx.new_page()); errors = []
         page.on("pageerror", lambda e: errors.append(str(e))); page.on("dialog", lambda d: d.accept())
         page.on("console", lambda m: errors.append(m.text[:200]) if m.type == "error" and "Failed to load resource" not in m.text else None)
         check("logged in", ctx.request.post(f"{BASE}/api/auth/login", data={"username": "admin", "password": "adminpassword123"}).ok)
@@ -38,7 +39,9 @@ try:
         job("delta", OK, description="quarterly reconciliation")
         page.goto(BASE, wait_until="networkidle"); time.sleep(1)
         ev = lambda code: page.evaluate(code)
-        ev("() => { const d = Alpine.$data(document.body); d.currentView = 'jobs'; d.fetchJobs(); }"); page.wait_for_timeout(1500)
+        ev("() => { const d = Alpine.$data(document.body); d.currentView = 'jobs'; d.fetchJobs(); }")
+        page.wait_for_function("() => document.querySelectorAll('[data-testid=jobs-row]').length >= 6", timeout=30000)      # seeded jobs + the two default workflows; a slow runner needs more than a fixed sleep
+        page.wait_for_timeout(500)
         rows = lambda: page.locator("[data-testid=jobs-row]")
         row = lambda j: page.locator(f"[data-testid=jobs-row][data-job={j}]")
         bars = lambda j: row(j).locator("[data-testid=spark-bar]")
@@ -50,7 +53,7 @@ try:
         check("last-run status per workflow (failed, succeeded, never run)", (st("alpha"), st("beta"), st("gamma")) == ("FAILED", "SUCCESS", "NEVER"), (st("alpha"), st("beta"), st("gamma")))
         check("the sparkline has one bar per recent run, oldest on the left, coloured by result", [bars("alpha").nth(i).get_attribute("data-status") for i in range(bars("alpha").count())] == ["SUCCESS"] * 3 + ["FAILED"] * 2 and bars("beta").count() == 1 and bars("gamma").count() == 0)
         hs = [float(bars("alpha").nth(i).evaluate("e => parseFloat(e.style.height)")) for i in range(5)]
-        check("bar heights follow durations (the longest is tallest, none is invisible)", max(hs) > min(hs) and min(hs) >= 5 and max(hs) <= 24.5, hs)
+        check("bar heights are scaled to the longest run (never invisible, never above the row); runs of equal length are equally tall", max(hs) >= min(hs) and min(hs) >= 5 and max(hs) <= 24.5 and abs(max(hs) - 24) < 0.6, hs)
         check("a workflow without runs says so", "no runs yet" in row("gamma").locator("[data-testid=jobs-spark]").inner_text())
         check("schedule and next run: cron workflows show the next tick, manual ones say Manual, paused ones say paused", "03:00" in row("alpha").locator("[data-testid=jobs-next]").inner_text() and "Manual" in row("beta").inner_text() and "paused" in row("gamma").locator("[data-testid=jobs-next]").inner_text().lower() and row("gamma").locator("[data-testid=jobs-paused]").is_visible(), row("alpha").locator("[data-testid=jobs-next]").inner_text())
         check("owner is shown", "admin" in row("alpha").inner_text())

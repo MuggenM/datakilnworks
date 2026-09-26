@@ -4,6 +4,7 @@ with it (passwordless), sign in with password + passkey as the second factor, th
 removal with the password. Builds a throwaway studio `pkui` on port 8117 (installs the webauthn package into that container) and removes it."""
 import base64, os, subprocess, sys, time
 from playwright.sync_api import sync_playwright
+import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http://localhost:8117"
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 FAIL = []
@@ -23,7 +24,7 @@ try:
     r = sh("docker", "exec", "-w", "/workspace", "pkui", "python", "-c", "import sys;sys.path.insert(0,'/workspace');from web import auth\nauth.create_user('alice','alicepassword1','Alice','user')\nwith auth.get_db_connection() as c: c.execute('UPDATE users SET must_change_password=0')")
     check("seeded a user", r.returncode == 0, r.stderr[-300:])
     with sync_playwright() as p:
-        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1400, "height": 1000}); page = ctx.new_page(); errors = []
+        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1400, "height": 1000}); page = _ui_slow.apply(ctx.new_page()); errors = []
         page.on("pageerror", lambda e: errors.append(str(e) + " @ " + str(getattr(e, "stack", ""))[:500])); page.on("dialog", lambda d: d.accept())
         page.on("console", lambda m: errors.append(m.text[:200]) if m.type == "error" and "Failed to load resource" not in m.text else None)
         # Chromium cannot operate the autofill dropdown in automation: a wrapper records every conditional (autofill) request and lets the test "pick the passkey"
@@ -50,7 +51,8 @@ try:
         ev("() => Alpine.$data(document.body).openMfa()"); page.wait_for_selector("[data-testid=passkeys-section]", state="visible"); page.wait_for_timeout(500)
         check("the security dialog has a passkeys section with an Add button", page.locator("[data-testid=passkey-add]").is_visible())
         page.click("[data-testid=passkey-add]"); page.fill("[data-testid=passkey-name-input]", "Virtual laptop key")
-        page.fill("[data-testid=passkey-password]", "wrong"); page.click("[data-testid=passkey-create]"); page.wait_for_timeout(1000)
+        page.fill("[data-testid=passkey-password]", "wrong"); page.click("[data-testid=passkey-create]"); page.wait_for_selector("[data-testid=passkey-error]", state="visible", timeout=20000)
+        page.wait_for_function("() => !Alpine.$data(document.body).pk.busy", timeout=20000)
         check("a wrong password is refused before the browser is asked", "incorrect" in page.locator("[data-testid=passkey-error]").inner_text() and page.locator("[data-testid=passkey-row]").count() == 0)
         page.fill("[data-testid=passkey-password]", "alicepassword1"); page.click("[data-testid=passkey-create]"); page.wait_for_selector("[data-testid=passkey-row]", timeout=10000)
         check("the passkey is created through the browser and listed", page.locator("[data-testid=passkey-name]").inner_text() == "Virtual laptop key")
@@ -132,7 +134,7 @@ try:
         page.evaluate("() => { Alpine.$data(document.body).fetchUsers(); }"); page.wait_for_timeout(1200)
         check("the user list marks the account as passkey-only", page.locator("[data-testid=passkey-only-badge]:visible").count() == 1 and page.locator("[data-testid=user-enroll-link]:visible").count() == 1)
         # the invited person opens the link in their own browser profile (own virtual authenticator)
-        ctx2 = b.new_context(viewport={"width": 1300, "height": 900}); pg2 = ctx2.new_page(); errors2 = []
+        ctx2 = b.new_context(viewport={"width": 1300, "height": 900}); pg2 = _ui_slow.apply(ctx2.new_page()); errors2 = []
         pg2.on("pageerror", lambda e: errors2.append(str(e))); pg2.on("dialog", lambda d: d.accept())
         cdp2 = ctx2.new_cdp_session(pg2); cdp2.send("WebAuthn.enable")
         cdp2.send("WebAuthn.addVirtualAuthenticator", {"options": {"protocol": "ctap2", "transport": "internal", "hasResidentKey": True, "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})
@@ -143,7 +145,7 @@ try:
         pg2.fill("[data-testid=enroll-name]", "Erin's laptop"); pg2.click("[data-testid=enroll-create]"); pg2.wait_for_function("() => Alpine.$data(document.body).isAuthenticated", timeout=15000)
         check("creating the passkey registers it and signs the new user in", who2() == "erin")
         check("the account shows no password features (no change-password entry, no authenticator app)", pg2.evaluate("() => Alpine.$data(document.body).currentUser.passwordless") is True)
-        pg3 = ctx2.new_page(); pg3.goto(link, wait_until="networkidle"); pg3.wait_for_selector("[data-testid=enroll-modal]", state="visible"); pg3.wait_for_timeout(800)
+        pg3 = _ui_slow.apply(ctx2.new_page()); pg3.goto(link, wait_until="networkidle"); pg3.wait_for_selector("[data-testid=enroll-modal]", state="visible"); pg3.wait_for_timeout(800)
         check("the same link is dead the second time", pg3.locator("[data-testid=enroll-error]").is_visible() and "not valid" in pg3.locator("[data-testid=enroll-error]").inner_text(), pg3.locator("[data-testid=enroll-error]").inner_text() if pg3.locator("[data-testid=enroll-error]").is_visible() else "")
         pg3.close()
         pg2.evaluate("() => Alpine.$data(document.body).openMfa()"); pg2.wait_for_selector("[data-testid=passkeys-section]", state="visible"); pg2.wait_for_timeout(500)

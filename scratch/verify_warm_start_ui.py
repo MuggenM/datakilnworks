@@ -2,6 +2,7 @@
 """Warm-start settings in the SQL warehouse dialog (Playwright, host /usr/bin/python3). Builds a throwaway studio `wsui` on port 8117 and removes it."""
 import os, subprocess, sys, time
 from playwright.sync_api import sync_playwright
+import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http://localhost:8117"
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 FAIL = []
@@ -18,7 +19,7 @@ try:
         time.sleep(1)
     time.sleep(3); sh("docker", "exec", "wsui", "python", "-c", "import sqlite3;c=sqlite3.connect('/workspace/warehouse/.metadata/auth.db');c.execute('UPDATE users SET must_change_password=0');c.commit()")
     with sync_playwright() as p:
-        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1440, "height": 1300}); page = ctx.new_page(); errors = []
+        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1440, "height": 1300}); page = _ui_slow.apply(ctx.new_page()); errors = []
         page.on("pageerror", lambda e: errors.append(str(e))); page.on("dialog", lambda d: (errors.append("dialog: " + d.message), d.accept()))
         check("logged in", ctx.request.post(f"{BASE}/api/auth/login", data={"username": "admin", "password": "adminpassword123"}).ok)
         page.goto(BASE, wait_until="networkidle"); time.sleep(1)
@@ -32,7 +33,10 @@ try:
         act("d.warehouseForm.name = 'Warm WH'; d.warehouseForm.warm_tables = 'warehouse.sales.orders, warehouse.sales.customers';")
         page.screenshot(path="/tmp/warm_form.png")
         page.locator("button:has-text('Create Warehouse'):visible").last.click()
-        time.sleep(1.5)
+        try:
+            page.wait_for_function("() => (Alpine.$data(document.body).sqlWarehouses || []).some(x => x.name === 'Warm WH')", timeout=20000)      # a slow runner needs longer than a fixed sleep
+        except Exception:
+            pass
         w = page.evaluate("() => Alpine.$data(document.body).sqlWarehouses.find(x => x.name === 'Warm WH')")
         check("the warehouse is saved with its warm-start settings", w and w["standby_mode"] == "pause" and w["warm_hold_mins"] == 120 and w["warm_tables"] == ["warehouse.sales.orders", "warehouse.sales.customers"], w)
         act(f"d.editWarehouse(d.sqlWarehouses.find(x => x.name === 'Warm WH'));")

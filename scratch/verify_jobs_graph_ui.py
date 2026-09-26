@@ -5,6 +5,7 @@ delete a task, save + persistence, validation errors, the Graph/List toggle, a r
 downstream, live RUNNING / PENDING, cancel, repair), the run selector and the minimap / zoom controls. Removes the container."""
 import json, os, subprocess, sys, time
 from playwright.sync_api import sync_playwright
+import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http://localhost:8117"
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 FAIL = []
@@ -29,7 +30,7 @@ try:
     time.sleep(3)
     sh("docker", "exec", "dagui", "python", "-c", "import sqlite3;c=sqlite3.connect('/workspace/warehouse/.metadata/auth.db');c.execute('UPDATE users SET must_change_password=0');c.commit()")
     with sync_playwright() as p:
-        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1600, "height": 1000}); page = ctx.new_page(); errors = []; dialogs = []
+        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1600, "height": 1000}); page = _ui_slow.apply(ctx.new_page()); errors = []; dialogs = []
         page.on("pageerror", lambda e: errors.append(str(e) + " @ " + str(getattr(e, "stack", ""))[:600])); page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
         page.on("console", lambda m: errors.append(m.text[:200]) if m.type == "error" and "Failed to load resource" not in m.text else None)
         check("logged in", ctx.request.post(f"{BASE}/api/auth/login", data={"username": "admin", "password": "adminpassword123"}).ok)
@@ -38,7 +39,11 @@ try:
         page.goto(BASE, wait_until="networkidle"); time.sleep(1)
         ev = lambda code: page.evaluate(code)
         ev("() => { const d = Alpine.$data(document.body); d.currentView = 'jobs'; d.fetchJobs(); }"); page.wait_for_timeout(1200)
-        pick = lambda jid: (ev(f"() => {{ const d = Alpine.$data(document.body); d.selectJob(d.jobs.find(j => j.id === '{jid}')); }}"), page.wait_for_timeout(900))
+        def pick(jid):
+            page.wait_for_function(f"() => Alpine.$data(document.body).jobs.some(j => j.id === '{jid}')", timeout=30000)
+            ev(f"() => {{ const d = Alpine.$data(document.body); d.selectJob(d.jobs.find(j => j.id === '{jid}')); }}")
+            page.wait_for_function(f"() => (Alpine.$data(document.body).selectedJob || {{}}).id === '{jid}'", timeout=30000)
+            page.wait_for_timeout(900)
         nodes = lambda: page.locator("[data-testid=dag-editor] [data-testid=dag-node]")
         edges = lambda: page.locator("[data-testid=dag-editor] [data-testid=dag-edge]")
         node = lambda tid: page.locator(f"[data-testid=dag-editor] [data-testid=dag-node][data-id={tid}]")
@@ -101,7 +106,11 @@ try:
         page.click("[data-testid=node-none]") if False else None
         page.locator("[data-testid=graph-task-retries]") if False else None
         node("audit").click(); page.locator("[data-testid=graph-task-resilience] input").first.fill("99")
-        page.click("[data-testid=graph-save]"); page.wait_for_timeout(1200)
+        page.click("[data-testid=graph-save]")
+        try:
+            page.wait_for_selector("[data-testid=graph-error]", state="visible", timeout=20000)
+        except Exception:
+            pass
         check("the server's validation error is shown and nothing is saved", page.locator("[data-testid=graph-error]").is_visible() and "retries" in page.locator("[data-testid=graph-error]").inner_text() and page.locator("[data-testid=graph-dirty]").is_visible(), page.locator("[data-testid=graph-error]").inner_text() if page.locator("[data-testid=graph-error]").is_visible() else "no banner")
         node("audit").click(); page.locator("[data-testid=graph-task-resilience] input").first.fill("1")
         page.click("[data-testid=graph-save]"); page.wait_for_timeout(1500)
