@@ -7122,8 +7122,74 @@
 
         <!-- Jobs Workspace: Left List + Right Detail -->
         <div class="flex-1 flex overflow-hidden">
-          <!-- Left: Jobs List Sidebar -->
-          <div class="w-80 border-r border-dbx-border bg-slate-950/40 flex flex-col overflow-hidden shrink-0">
+          <!-- Workflows table (Databricks style): shown until a workflow is opened -->
+          <div x-show="!selectedJob" class="flex-1 flex flex-col overflow-hidden" data-testid="jobs-table-page">
+            <div class="px-6 py-4 border-b border-dbx-border/60 flex items-center justify-between gap-4 flex-wrap shrink-0 bg-white dark:bg-transparent">
+              <div class="flex items-center space-x-3">
+                <div class="relative">
+                  <i class="ph ph-magnifying-glass absolute left-2.5 top-2 text-slate-400 text-xs"></i>
+                  <input type="text" x-model="jobSearch" data-testid="jobs-search" placeholder="Filter workflows by name, owner or id" class="w-72 pl-8 pr-3 py-1.5 text-xs rounded border border-slate-300 dark:border-dbx-border bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:border-dbx-orange">
+                </div>
+                <div class="flex space-x-1" data-testid="jobs-status-filter">
+                  <template x-for="f in [['all','All'],['SUCCESS','Succeeded'],['FAILED','Failed'],['RUNNING','Running'],['NEVER','Never run']]" :key="f[0]">
+                    <button @click="jobStatusFilter = f[0]" :data-testid="'jobs-filter-' + f[0]" :class="jobStatusFilter === f[0] ? 'bg-dbx-orange text-white border-dbx-orange' : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-dbx-border hover:bg-slate-100 dark:hover:bg-dbx-hover'" class="px-2.5 py-1 rounded border text-[11px] font-semibold transition flex items-center space-x-1.5">
+                      <span x-text="f[1]"></span><span class="opacity-70 font-mono" x-text="jobStatusCount(f[0])"></span>
+                    </button>
+                  </template>
+                </div>
+              </div>
+              <span class="text-[11px] text-slate-500 dark:text-slate-400" x-text="jobsFiltered.length + ' of ' + jobs.length + ' workflows'" data-testid="jobs-count"></span>
+            </div>
+            <div class="flex-1 overflow-y-auto bg-white dark:bg-transparent">
+              <table class="w-full text-left text-xs border-collapse" data-testid="jobs-table">
+                <thead class="bg-slate-100 dark:bg-slate-900/90 text-slate-500 dark:text-slate-400 text-[10px] uppercase font-mono sticky top-0 border-b border-slate-200 dark:border-dbx-border z-10">
+                  <tr>
+                    <th class="px-6 py-2.5 cursor-pointer select-none" @click="sortJobsBy('name')" data-testid="jobs-sort-name">Name <span x-text="jobSort.key === 'name' ? (jobSort.dir > 0 ? '▲' : '▼') : ''"></span></th>
+                    <th class="px-4 py-2.5 cursor-pointer select-none" @click="sortJobsBy('last')" data-testid="jobs-sort-last">Last run <span x-text="jobSort.key === 'last' ? (jobSort.dir > 0 ? '▲' : '▼') : ''"></span></th>
+                    <th class="px-4 py-2.5">Recent runs</th>
+                    <th class="px-4 py-2.5">Tasks</th>
+                    <th class="px-4 py-2.5 cursor-pointer select-none" @click="sortJobsBy('next')" data-testid="jobs-sort-next">Schedule / next run <span x-text="jobSort.key === 'next' ? (jobSort.dir > 0 ? '▲' : '▼') : ''"></span></th>
+                    <th class="px-4 py-2.5">Owner</th>
+                    <th class="px-4 py-2.5 text-right"></th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-200 dark:divide-dbx-border/40">
+                  <template x-for="job in jobsFiltered" :key="job.id">
+                    <tr @click="selectJob(job)" class="hover:bg-slate-50 dark:hover:bg-dbx-hover/60 cursor-pointer transition" data-testid="jobs-row" :data-job="job.id">
+                      <td class="px-6 py-3">
+                        <div class="flex items-center space-x-2"><i class="ph ph-git-merge text-cyan-600 dark:text-cyan-400"></i><span class="font-semibold text-slate-900 dark:text-white" x-text="job.name"></span>
+                          <span x-show="!job.enabled" class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-100 text-amber-700 border border-amber-300 dark:bg-amber-950 dark:text-amber-400 dark:border-amber-800" data-testid="jobs-paused">PAUSED</span></div>
+                        <div class="text-[11px] text-slate-500 dark:text-slate-400 truncate max-w-md" x-text="job.description"></div>
+                      </td>
+                      <td class="px-4 py-3 whitespace-nowrap" data-testid="jobs-last">
+                        <div class="flex items-center space-x-2"><span class="h-2.5 w-2.5 rounded-full" :class="[jobDotClass(jobLastStatus(job)), jobLastStatus(job) === 'RUNNING' ? 'animate-pulse' : '']" :data-status="jobLastStatus(job)" data-testid="jobs-dot"></span><span class="text-slate-800 dark:text-slate-200 font-medium" x-text="jobStatusLabel(jobLastStatus(job))"></span></div>
+                        <div class="text-[10px] text-slate-500 font-mono mt-0.5" x-text="job.last_run ? job.last_run.started_at.slice(0, 16) + ' · ' + fmtDur(job.last_run.duration_sec) : ''"></div>
+                      </td>
+                      <td class="px-4 py-3">
+                        <div class="flex items-end space-x-0.5 h-6" data-testid="jobs-spark">
+                          <template x-for="(b, bi) in sparkBars(job)" :key="bi"><span class="w-1.5 rounded-sm" :class="b.cls" :style="'height:' + b.h + 'px'" :title="b.title" data-testid="spark-bar" :data-status="b.status"></span></template>
+                          <span x-show="!(job.recent_runs || []).length" class="text-[10px] text-slate-400">no runs yet</span>
+                        </div>
+                      </td>
+                      <td class="px-4 py-3 text-slate-600 dark:text-slate-300 font-mono" x-text="(job.tasks || []).length"></td>
+                      <td class="px-4 py-3">
+                        <div class="font-mono text-[11px] text-slate-700 dark:text-slate-300" x-text="job.schedule_cron ? describeCron(job.schedule_cron) : 'Manual'"></div>
+                        <div class="text-[10px] font-mono text-slate-500" x-text="job.next_run ? 'next ' + job.next_run : (job.schedule_cron && !job.enabled ? 'paused' : '')" data-testid="jobs-next"></div>
+                      </td>
+                      <td class="px-4 py-3 text-slate-700 dark:text-slate-300" x-text="job.created_by || job.run_as || ''"></td>
+                      <td class="px-4 py-3 text-right whitespace-nowrap">
+                        <button @click.stop="runFromTable(job)" data-testid="jobs-run" class="px-2.5 py-1 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-[11px] font-semibold inline-flex items-center space-x-1" title="Run now"><i class="ph ph-play-fill"></i><span>Run</span></button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <div x-show="jobsFiltered.length === 0" class="p-12 text-center text-xs text-slate-500" data-testid="jobs-empty">No workflow matches. <span x-show="jobs.length === 0">Create one with "Create Job".</span></div>
+            </div>
+          </div>
+
+          <!-- Left: Jobs List Sidebar (visible while a workflow is open, for quick switching) -->
+          <div x-show="selectedJob" class="w-80 border-r border-dbx-border bg-slate-950/40 flex flex-col overflow-hidden shrink-0">
             <div class="p-3 border-b border-dbx-border flex items-center justify-between">
               <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Configured Workflows</span>
             </div>
@@ -7156,11 +7222,13 @@
           <div class="flex-1 flex flex-col overflow-hidden bg-slate-950/20" x-show="selectedJob">
             <!-- Job Detail Header -->
             <div class="p-6 border-b border-dbx-border bg-dbx-panel/40 space-y-3 shrink-0">
+              <button @click="closeJobDetail()" data-testid="job-back" class="text-xs text-cyan-600 dark:text-cyan-400 hover:underline flex items-center space-x-1"><i class="ph ph-arrow-left"></i><span>Workflows</span></button>
               <div class="flex items-start justify-between">
                 <div>
                   <h3 class="text-lg font-bold text-white flex items-center space-x-2">
                     <span x-text="selectedJob ? selectedJob.name : ''"></span>
                     <span x-show="selectedJob && selectedJob.enabled" class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800 font-mono">ACTIVE</span>
+                    <span x-show="selectedJob && !selectedJob.enabled" data-testid="job-paused-pill" class="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-300 dark:bg-amber-950 dark:text-amber-400 dark:border-amber-800 font-mono">PAUSED</span>
                   </h3>
                   <p class="text-xs text-slate-400 mt-1 max-w-2xl" x-text="selectedJob ? selectedJob.description : ''"></p>
                 </div>
@@ -7169,6 +7237,14 @@
                   <button @click="runJobNow(selectedJob.id)" class="px-3.5 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold shadow flex items-center space-x-1.5 transition" :class="{'opacity-50 pointer-events-none': isRunningJob}">
                     <i class="ph ph-play-fill text-xs" :class="{'animate-spin': isRunningJob}"></i>
                     <span>Run Now</span>
+                  </button>
+                  <button @click="toggleJobEnabled(selectedJob)" data-testid="job-pause" class="px-3 py-1.5 bg-dbx-panel hover:bg-dbx-hover border border-dbx-border text-slate-300 rounded text-xs transition flex items-center space-x-1" :title="selectedJob && selectedJob.enabled ? 'Stop scheduled and triggered runs (manual runs still work)' : 'Enable the schedule and triggers again'">
+                    <i class="ph" :class="selectedJob && selectedJob.enabled ? 'ph-pause' : 'ph-play'"></i>
+                    <span x-text="selectedJob && selectedJob.enabled ? 'Pause' : 'Resume'"></span>
+                  </button>
+                  <button @click="editJob(selectedJob)" data-testid="job-schedule-btn" class="px-3 py-1.5 bg-dbx-panel hover:bg-dbx-hover border border-dbx-border text-slate-300 rounded text-xs transition flex items-center space-x-1" title="Schedule and triggers (opens the workflow settings)">
+                    <i class="ph ph-clock"></i>
+                    <span x-text="'Schedule (' + jobScheduleCount(selectedJob) + ')'"></span>
                   </button>
                   <button @click="editJob(selectedJob)" class="px-3 py-1.5 bg-dbx-panel hover:bg-dbx-hover border border-dbx-border text-slate-300 rounded text-xs transition">
                     <i class="ph ph-pencil-simple mr-1"></i>
@@ -7180,12 +7256,24 @@
                 </div>
               </div>
 
-              <!-- Metadata Bar & Tabs -->
-              <div class="flex items-center justify-between pt-2 border-t border-dbx-border/60 text-xs">
-                <div class="flex items-center space-x-6 text-slate-400">
-                  <div>Schedule: <span class="text-slate-200 font-mono font-semibold" x-text="selectedJob && selectedJob.schedule_cron ? (selectedJob.schedule_cron + ' (' + describeCron(selectedJob.schedule_cron) + ')') : 'Manual Only'"></span></div>
-                  <div>Created: <span class="text-slate-200 font-mono" x-text="selectedJob ? selectedJob.created_at : ''"></span></div>
+              <!-- Job details (like Databricks' "Pipeline details") -->
+              <div class="pt-3 border-t border-dbx-border/60">
+                <button @click="toggleJobDetails()" class="text-[10px] uppercase tracking-wider font-bold text-slate-500 dark:text-slate-400 flex items-center space-x-1 mb-2" data-testid="job-details-toggle"><i class="ph" :class="jobDetailsOpen ? 'ph-caret-down' : 'ph-caret-right'"></i><span>Workflow details</span></button>
+                <div x-show="jobDetailsOpen" class="grid grid-cols-2 lg:grid-cols-4 gap-x-8 gap-y-2.5 text-xs" data-testid="job-details">
+                  <div><div class="text-[10px] text-slate-500">Workflow ID</div><div class="flex items-center space-x-1.5"><span class="font-mono text-slate-200 truncate" x-text="selectedJob ? selectedJob.id : ''" data-testid="job-detail-id"></span><button @click="copyText(selectedJob.id)" class="text-slate-500 hover:text-cyan-400" title="Copy the id"><i class="ph ph-copy"></i></button></div></div>
+                  <div><div class="text-[10px] text-slate-500">Type</div><div class="text-slate-200" x-text="'Workflow · ' + (selectedJob && selectedJob.tasks ? selectedJob.tasks.length : 0) + ' tasks'"></div></div>
+                  <div><div class="text-[10px] text-slate-500">Owner</div><div class="flex items-center space-x-1.5 text-slate-200" data-testid="job-detail-owner"><i class="ph ph-user text-slate-500"></i><span x-text="selectedJob ? (selectedJob.created_by || 'none recorded') : ''"></span></div></div>
+                  <div><div class="text-[10px] text-slate-500">Run as</div><div class="flex items-center space-x-1.5 text-slate-200" data-testid="job-detail-runas" title="A workflow runs with its owner's data access"><i class="ph ph-user-circle text-slate-500"></i><span x-text="selectedJob ? (selectedJob.run_as || selectedJob.created_by || 'anonymous') : ''"></span></div></div>
+                  <div><div class="text-[10px] text-slate-500">Schedule</div><div class="font-mono text-slate-200" x-text="selectedJob && selectedJob.schedule_cron ? (selectedJob.schedule_cron + ' (' + describeCron(selectedJob.schedule_cron) + ')') : 'Manual only'"></div></div>
+                  <div><div class="text-[10px] text-slate-500">Next run</div><div class="font-mono text-slate-200" data-testid="job-detail-next" x-text="selectedJob ? (selectedJob.next_run || (selectedJob.schedule_cron ? 'paused' : '-')) : ''"></div></div>
+                  <div><div class="text-[10px] text-slate-500">Triggers</div><div class="text-slate-200" x-text="jobTriggersText(selectedJob)"></div></div>
+                  <div><div class="text-[10px] text-slate-500">Limits</div><div class="text-slate-200 font-mono" x-text="selectedJob ? ((selectedJob.timeout_seconds ? 'timeout ' + selectedJob.timeout_seconds + 's' : 'no timeout') + ' · ' + (selectedJob.max_concurrent_runs || 1) + ' at a time') : ''"></div></div>
+                  <div class="col-span-2 lg:col-span-4"><div class="text-[10px] text-slate-500">Created</div><div class="font-mono text-slate-200" x-text="selectedJob ? (selectedJob.created_at || '') : ''"></div></div>
                 </div>
+              </div>
+              <!-- Tabs -->
+              <div class="flex items-center justify-between pt-2 border-t border-dbx-border/60 text-xs">
+                <div></div>
 
                 <!-- Tabs -->
                 <div class="flex space-x-1 bg-slate-900 p-0.5 rounded border border-dbx-border">
@@ -7437,6 +7525,21 @@
                 </div>
               </div>
               <div x-show="!runView" class="flex-1 overflow-y-auto p-6 space-y-4">
+                <!-- Runs timeline: the last 30 runs as bars (height = duration, colour = result), newest on the right -->
+                <div x-show="jobRuns.length > 0" class="rounded-lg border border-slate-200 dark:border-dbx-border bg-white dark:bg-slate-950/30 p-4 space-y-3" data-testid="runs-timeline">
+                  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs" data-testid="runs-stats">
+                    <div><div class="text-[10px] uppercase text-slate-500">Success rate</div><div class="text-lg font-bold text-slate-900 dark:text-white" data-testid="stat-rate" x-text="timelineStats().rate"></div><div class="text-[10px] text-slate-500" x-text="timelineStats().runs + ' finished runs'"></div></div>
+                    <div><div class="text-[10px] uppercase text-slate-500">Average duration</div><div class="text-lg font-bold text-slate-900 dark:text-white" data-testid="stat-avg" x-text="timelineStats().avg"></div><div class="text-[10px] text-slate-500">of succeeded runs</div></div>
+                    <div><div class="text-[10px] uppercase text-slate-500">Last success</div><div class="text-sm font-mono text-emerald-700 dark:text-emerald-400" data-testid="stat-last-ok" x-text="timelineStats().lastOk"></div></div>
+                    <div><div class="text-[10px] uppercase text-slate-500">Last failure</div><div class="text-sm font-mono text-red-700 dark:text-red-400" data-testid="stat-last-fail" x-text="timelineStats().lastFail"></div></div>
+                  </div>
+                  <div class="flex items-end space-x-1 h-24 border-b border-slate-200 dark:border-dbx-border/60" data-testid="timeline-bars">
+                    <template x-for="r in timelineRuns()" :key="r.run_id">
+                      <button @click="openRun(r.run_id)" class="flex-1 max-w-[22px] min-w-[6px] rounded-t transition hover:opacity-70" :class="[jobDotClass(r.status), r.status === 'RUNNING' ? 'animate-pulse' : '']" :style="'height:' + timelineBarHeight(r) + '%'" :title="r.started_at + ' · ' + jobStatusLabel(r.status) + ' · ' + fmtDur(r.duration_sec)" data-testid="timeline-bar" :data-status="r.status"></button>
+                    </template>
+                  </div>
+                  <div class="flex items-center justify-between text-[10px] text-slate-500 font-mono"><span x-text="timelineRuns().length ? timelineRuns()[0].started_at : ''"></span><span class="flex items-center space-x-3"><span class="flex items-center space-x-1"><span class="h-2 w-2 rounded-sm bg-emerald-500"></span><span>succeeded</span></span><span class="flex items-center space-x-1"><span class="h-2 w-2 rounded-sm bg-red-500"></span><span>failed</span></span><span class="flex items-center space-x-1"><span class="h-2 w-2 rounded-sm bg-amber-500"></span><span>cancelled / timeout</span></span><span>taller = longer</span></span><span x-text="timelineRuns().length ? timelineRuns()[timelineRuns().length - 1].started_at : ''"></span></div>
+                </div>
               <div class="flex items-center justify-between">
                 <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">Execution Runs & Audit Trail</h4>
                 <button @click="fetchJobRuns(selectedJob.id)" class="text-xs text-cyan-400 hover:text-cyan-300 flex items-center space-x-1">
@@ -19290,6 +19393,8 @@
         // graph editor + run page (canvas objects live in window.__dkwDag, not here: Alpine must not proxy DOM-bound objects)
         jobView: (function () { try { return localStorage.getItem('dkwJobView') === 'list' ? 'list' : 'graph'; } catch (e) { return 'graph'; } })(),
         graphDraft: [], graphOrig: '[]', graphSel: null, graphError: '', graphSaving: false, graphTick: 0,
+        jobSearch: '', jobStatusFilter: 'all', jobSort: { key: 'name', dir: 1 },
+        jobDetailsOpen: (function () { try { return localStorage.getItem('dkwJobDetails') !== 'closed'; } catch (e) { return true; } })(),
         runView: null,
         jobRuns: [],
         isRunningJob: false,
@@ -26730,9 +26835,7 @@
             if (res.ok) {
               const data = await res.json();
               this.jobs = data.jobs || [];
-              if (!this.selectedJob && this.jobs.length > 0) {
-                this.selectJob(this.jobs[0]);
-              } else if (this.selectedJob) {
+              if (this.selectedJob) {
                 const updated = this.jobs.find(j => j.id === this.selectedJob.id);
                 if (updated) {
                   this.selectedJob = updated;
@@ -26742,6 +26845,79 @@
           } catch (e) {
             console.error('Failed to fetch jobs:', e);
           }
+        },
+
+        // ---------------- Jobs: the workflows table, details and timeline ----------------
+        jobLastStatus(job) { return job && job.last_run ? job.last_run.status : 'NEVER'; },
+        jobStatusLabel(st) { return ({ SUCCESS: 'Succeeded', FAILED: 'Failed', RUNNING: 'Running', CANCELLED: 'Cancelled', TIMEOUT: 'Timed out', SKIPPED: 'Skipped', NEVER: 'Never run' })[st] || st; },
+        jobDotClass(st) { return ({ SUCCESS: 'bg-emerald-500', FAILED: 'bg-red-500', RUNNING: 'bg-blue-500', NEVER: 'bg-slate-400' })[st] || 'bg-amber-500'; },
+        jobStatusCount(f) { return f === 'all' ? this.jobs.length : this.jobs.filter(j => this.jobLastStatus(j) === f).length; },
+
+        get jobsFiltered() {
+          const q = (this.jobSearch || '').trim().toLowerCase(), f = this.jobStatusFilter;
+          let out = this.jobs.filter(j => (f === 'all' || this.jobLastStatus(j) === f)
+            && (!q || [j.name, j.id, j.description, j.created_by].some(v => (v || '').toLowerCase().includes(q))));
+          const k = this.jobSort.key, d = this.jobSort.dir;
+          const val = j => k === 'last' ? ((j.last_run && j.last_run.started_at) || '') : k === 'next' ? (j.next_run || '\uffff') : (j.name || '').toLowerCase();
+          return out.slice().sort((a, b) => (val(a) < val(b) ? -1 : val(a) > val(b) ? 1 : 0) * d);
+        },
+
+        sortJobsBy(key) { this.jobSort = { key, dir: this.jobSort.key === key ? -this.jobSort.dir : 1 }; },
+
+        // sparkline: the last runs, oldest left, bar height = duration relative to the longest of them
+        sparkBars(job) {
+          const runs = (job && job.recent_runs) || [];
+          const max = Math.max(0.001, ...runs.map(r => Number(r.duration_sec) || 0));
+          return runs.map(r => ({ cls: this.jobDotClass(r.status) + (r.status === 'RUNNING' ? ' animate-pulse' : ''), status: r.status, h: Math.round(5 + 19 * ((Number(r.duration_sec) || 0) / max)),
+                                  title: r.started_at + ' · ' + this.jobStatusLabel(r.status) + ' · ' + this.fmtDur(r.duration_sec) }));
+        },
+
+        closeJobDetail() {
+          if (this.jobView === 'graph' && this.graphDirty && !confirm('Discard the unsaved changes to the task graph?')) return;
+          this.runView = null; this.selectedJob = null; this.graphDraft = []; this.graphSel = null;
+          this.fetchJobs();
+        },
+
+        async runFromTable(job) {
+          await this.selectJob(job);
+          await this.runJobNow(job.id);
+        },
+
+        jobScheduleCount(job) { return job ? ((job.schedule_cron ? 1 : 0) + (job.triggers || []).length) : 0; },
+
+        jobTriggersText(job) {
+          const t = (job && job.triggers) || [];
+          if (!t.length) return 'none';
+          return t.map(x => x.type === 'job' ? 'after ' + x.job_id + ' (' + x.on + ')' : x.type === 'autoloader' ? 'Auto-Loader ' + x.pipeline_id : 'table ' + x.table).join(', ');
+        },
+
+        toggleJobDetails() { this.jobDetailsOpen = !this.jobDetailsOpen; try { localStorage.setItem('dkwJobDetails', this.jobDetailsOpen ? 'open' : 'closed'); } catch (e) {} },
+
+        copyText(t) { try { navigator.clipboard.writeText(t); this.showToast('Copied', 'success'); } catch (e) {} },
+
+        async toggleJobEnabled(job) {
+          if (!job) return;
+          const payload = JSON.parse(JSON.stringify(job));
+          payload.enabled = !job.enabled;
+          try {
+            const res = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { this.showToast(data.detail || 'Could not change the workflow', 'error'); return; }
+            await this.fetchJobs();
+            this.showToast(payload.enabled ? 'Workflow resumed' : 'Workflow paused', 'success');
+          } catch (e) { this.showToast('Could not change the workflow', 'error'); }
+        },
+
+        timelineRuns() { return (this.jobRuns || []).slice(0, 30).slice().reverse(); },
+        timelineBarHeight(r) {
+          const runs = this.timelineRuns(), max = Math.max(0.001, ...runs.map(x => Number(x.duration_sec) || 0));
+          return Math.max(8, Math.round(100 * (Number(r.duration_sec) || 0) / max));
+        },
+        timelineStats() {
+          const runs = (this.jobRuns || []).slice(0, 30), done = runs.filter(r => r.status !== 'RUNNING' && r.status !== 'SKIPPED'), ok = done.filter(r => r.status === 'SUCCESS');
+          const last = st => { const r = runs.find(x => x.status === st); return r ? r.started_at : '-'; };
+          const avg = ok.length ? ok.reduce((a, r) => a + (Number(r.duration_sec) || 0), 0) / ok.length : null;
+          return { rate: done.length ? Math.round(100 * ok.length / done.length) + '%' : '-', runs: done.length, avg: avg == null ? '-' : this.fmtDur(avg), lastOk: last('SUCCESS'), lastFail: last('FAILED') };
         },
 
         // ---------------- Jobs: graph editor ----------------

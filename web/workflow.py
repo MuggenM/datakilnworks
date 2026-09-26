@@ -1126,6 +1126,32 @@ def get_job_runs(job_id: Optional[str] = None, limit: int = 50) -> List[Dict[str
         return runs
 
 
+def recent_runs_by_job(limit: int = 10) -> Dict[str, List[Dict[str, Any]]]:
+    """The last `limit` runs of every job, oldest first (one query): what the workflows table draws its sparklines from."""
+    init_runs_db()
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    with sqlite3.connect(DB_PATH) as sconn:
+        sconn.row_factory = sqlite3.Row
+        rows = sconn.execute(
+            "SELECT run_id, job_id, status, trigger, started_at, duration_sec FROM ("
+            " SELECT run_id, job_id, status, trigger, started_at, duration_sec, rowid AS rid, ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY started_at DESC, rowid DESC) AS rn FROM job_runs"
+            ") WHERE rn <= ? ORDER BY job_id, started_at ASC, rid ASC", (int(limit),)).fetchall()
+    for r in rows:
+        out.setdefault(r["job_id"], []).append(dict(r))
+    return out
+
+
+def next_run_at(job: Dict[str, Any], now: Optional[datetime.datetime] = None) -> Optional[str]:
+    """When the cron schedule fires next (server local time, like the scheduler), or None: no schedule, a paused job or no croniter."""
+    cron = (job.get("schedule_cron") or "").strip()
+    if not cron or not croniter or not job.get("enabled", False):
+        return None
+    try:
+        return croniter(cron, now or datetime.datetime.now()).get_next(datetime.datetime).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
 def get_run_detail(run_id: str) -> Optional[Dict[str, Any]]:
     init_runs_db()
     with sqlite3.connect(DB_PATH) as sconn:

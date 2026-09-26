@@ -5968,12 +5968,17 @@ async def manual_log_query(payload: ManualLogPayload):
 
 @app.get("/api/jobs")
 async def list_jobs_endpoint():
+    from web import workflow as _wf
     jobs = load_jobs()
+    recent = _wf.recent_runs_by_job(10)
     enriched = []
     for j in jobs:
         j_copy = dict(j)
         runs = get_job_runs(job_id=j["id"], limit=1)
         j_copy["last_run"] = runs[0] if runs else None
+        j_copy["recent_runs"] = recent.get(j["id"], [])                       # computed for the workflows table; never stored (see save_job_endpoint)
+        j_copy["next_run"] = _wf.next_run_at(j)
+        j_copy["run_as"] = j.get("created_by") or ("system" if j.get("id") in {d["id"] for d in _wf.DEFAULT_JOBS} else "anonymous")
         enriched.append(j_copy)
     return {"jobs": enriched}
 
@@ -5981,6 +5986,8 @@ async def list_jobs_endpoint():
 async def save_job_endpoint(payload: Dict[str, Any], request: Request):
     from web.workflow import JobValidationError
     user = await resolve_principal(request)
+    for computed in ("last_run", "recent_runs", "next_run", "run_as"):          # fields the list endpoint adds; a client that echoes a job back must not persist them
+        payload.pop(computed, None)
     existing = get_job(payload.get("id")) if payload.get("id") else None
     if existing and existing.get("created_by") and user.get("role") != "admin" and existing["created_by"] != user.get("username"):
         raise HTTPException(status_code=403, detail="Only the job's owner or an admin can change it.")
