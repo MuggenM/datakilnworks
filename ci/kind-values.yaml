@@ -1,0 +1,20 @@
+# Values for the cluster smoke test (ci/kind-smoke.sh): a small kind cluster, the image loaded into it (pullPolicy Never), one compute node and tiny volumes.
+fullnameOverride: dkw
+image:
+  repository: dkw-ci
+  tag: smoke
+  pullPolicy: Never
+studio:
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 3Gi}
+init:
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+persistence:
+  warehouse: {size: 1Gi}
+  notebooks: {size: 200Mi}
+  dbtProject: {size: 200Mi}
+computeNodes:
+  - {name: compute-node-01, warehouseId: wh_starter, endpointEnv: WH_STARTER_ENDPOINT, port: 8001, nodeName: "Compute Worker 01 (Starter Node)", maxMemory: 1GB, threads: 2,
+     resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1536Mi}}}

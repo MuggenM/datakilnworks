@@ -10,7 +10,7 @@ import requests
 from playwright.sync_api import sync_playwright
 
 BASE_URL = "http://localhost:8891"
-ARTIFACT_DIR = "/home/martin/.gemini/antigravity-cli/brain/e598d0e4-1391-4974-9343-8271c1d6a271"
+ARTIFACT_DIR = os.getenv("ARTIFACT_DIR", "/tmp/dkw_shots")
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
 def get_session_token(username, password):

@@ -1,0 +1,180 @@
+{
+ "_comment": "tests run inside the built image (ci/run_test.sh); ui = scratch/verify_<name>.py (Playwright, starts its own throwaway containers). Keep out: tests that need real services or a running studio.",
+ "tests": [
+  {
+   "name": "autoloader",
+   "extras": ""
+  },
+  {
+   "name": "autoloader_watch",
+   "extras": ""
+  },
+  {
+   "name": "change_password",
+   "extras": ""
+  },
+  {
+   "name": "dbt_config",
+   "extras": "moto[server]"
+  },
+  {
+   "name": "dbt_duckrun",
+   "extras": ""
+  },
+  {
+   "name": "dbt_governance",
+   "extras": ""
+  },
+  {
+   "name": "delta_sharing",
+   "extras": "delta-sharing"
+  },
+  {
+   "name": "governance_groups",
+   "extras": ""
+  },
+  {
+   "name": "governance_phase0",
+   "extras": ""
+  },
+  {
+   "name": "governance_phase1",
+   "extras": ""
+  },
+  {
+   "name": "governance_phase2",
+   "extras": ""
+  },
+  {
+   "name": "governance_phase3",
+   "extras": ""
+  },
+  {
+   "name": "governance_phase4",
+   "extras": ""
+  },
+  {
+   "name": "governance_phase5",
+   "extras": ""
+  },
+  {
+   "name": "governance_phase6",
+   "extras": ""
+  },
+  {
+   "name": "governance_rls_phase1",
+   "extras": ""
+  },
+  {
+   "name": "governance_rls_phase2",
+   "extras": ""
+  },
+  {
+   "name": "groups",
+   "extras": ""
+  },
+  {
+   "name": "group_sync",
+   "extras": ""
+  },
+  {
+   "name": "init",
+   "extras": ""
+  },
+  {
+   "name": "ip_allowlist",
+   "extras": ""
+  },
+  {
+   "name": "mfa_policy",
+   "extras": ""
+  },
+  {
+   "name": "mfa",
+   "extras": ""
+  },
+  {
+   "name": "model_registry_namespaces",
+   "extras": ""
+  },
+  {
+   "name": "notebook_access",
+   "extras": ""
+  },
+  {
+   "name": "oauth_connection",
+   "extras": ""
+  },
+  {
+   "name": "oidc_auth",
+   "extras": ""
+  },
+  {
+   "name": "s3_events",
+   "extras": ""
+  },
+  {
+   "name": "saml_auth",
+   "extras": ""
+  },
+  {
+   "name": "scim",
+   "extras": ""
+  },
+  {
+   "name": "shallow_clone_api",
+   "extras": ""
+  },
+  {
+   "name": "shallow_clone",
+   "extras": ""
+  },
+  {
+   "name": "sql_grants",
+   "extras": ""
+  },
+  {
+   "name": "table_grants",
+   "extras": ""
+  },
+  {
+   "name": "warm_start",
+   "extras": ""
+  },
+  {
+   "name": "webauthn",
+   "extras": ""
+  },
+  {
+   "name": "workflow_orchestration",
+   "extras": ""
+  },
+  {
+   "name": "autoloader_s3",
+   "extras": "moto[server]"
+  }
+ ],
+ "ui": [
+  {
+   "name": "jobs_graph_ui"
+  },
+  {
+   "name": "jobs_overview_ui"
+  },
+  {
+   "name": "passkeys_ui"
+  },
+  {
+   "name": "warm_start_ui"
+  },
+  {
+   "name": "delta_sharing_ui"
+  },
+  {
+   "name": "delta_sharing_https"
+  },
+  {
+   "name": "s3_events_ui"
+  }
+ ]
+}

@@ -1,0 +1,144 @@
+# Continuous integration: static checks, the self-contained test scripts inside the built image, the browser tests, and a smoke test of the Helm chart
+# on a real Kubernetes cluster (kind). The list of tests lives in ci/plan.json; every job can be reproduced locally, see ci/README.md.
+name: CI
+
+on:
+  push:
+    branches: [development, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: localspark-lakehouse-notebook
+
+jobs:
+  static:
+    name: Static checks (Python, shell, compose, Helm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python compiles
+        run: python -m compileall -q web sandbox controller ci
+      - name: Every place that runs SQL is governed (or allow-listed with a reason)
+        run: python scratch/test_governance_coverage.py
+      - name: Shell scripts
+        run: shellcheck -S error ci/*.sh
+      - name: Docker Compose files are valid (default and proxy profile)
+        run: |
+          docker compose config -q
+          docker compose --profile proxy config -q
+      - uses: azure/setup-helm@v4
+      - name: Helm lint and template (default values and the smoke-test values)
+        run: |
+          # the $ signs below belong to the hash and must not expand
+          # shellcheck disable=SC2016
+          H='secrets.initAdminPasswordHash=pbkdf2_sha256$100000$00$00'
+          helm lint deploy/helm/datakilnworks --set-string "$H"
+          helm lint deploy/helm/datakilnworks -f ci/kind-values.yaml --set-string "$H"
+          helm template dkw deploy/helm/datakilnworks --set-string "$H" > /tmp/default.yaml
+          helm template dkw deploy/helm/datakilnworks -f ci/kind-values.yaml --set-string "$H" > /tmp/kind.yaml
+          helm template dkw deploy/helm/datakilnworks --set-string "$H" --set ingress.enabled=true --set ingress.host=studio.example.org --set networkPolicy.enabled=true > /tmp/full.yaml
+      - name: The rendered manifests are valid Kubernetes objects
+        run: |
+          for f in default kind full; do
+            docker run --rm -v "/tmp/$f.yaml:/r.yaml" ghcr.io/yannh/kubeconform:latest -strict -summary -kubernetes-version 1.30.0 /r.yaml
+          done
+
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.p.outputs.tests }}
+      ui: ${{ steps.p.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: p
+        run: |
+          echo "tests=$(jq -c '.tests' ci/plan.json)" >> "$GITHUB_OUTPUT"
+          echo "ui=$(jq -c '.ui' ci/plan.json)" >> "$GITHUB_OUTPUT"
+
+  tests:
+    name: test_${{ matrix.test.name }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJson(needs.plan.outputs.tests) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the studio image (layers cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+      - name: Run the test inside the image
+        run: ci/run_test.sh "${{ matrix.test.name }}" "${{ matrix.test.extras }}"
+
+  ui:
+    name: browser ${{ matrix.ui.name }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ui: ${{ fromJson(needs.plan.outputs.ui) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the studio image (layers cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Playwright and Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Run the browser test (it starts and removes its own throwaway containers)
+        run: python "scratch/verify_${{ matrix.ui.name }}.py"
+
+  kind:
+    name: Helm chart on a real cluster (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the studio image (layers cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+      - uses: azure/setup-helm@v4
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - name: Install the chart, sign in, run SQL on the compute node, restart, upgrade, misconfigure, uninstall
+        run: ci/kind-smoke.sh
