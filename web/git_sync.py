@@ -94,6 +94,20 @@ class Repo:
         except GitError:
             return False
 
+    def forge(self) -> str:
+        """gitea | github | gitlab: `GIT_FORGE` (or `NOTEBOOKS_GIT_FORGE`), else guessed from the host name (github.com / *github* -> github, *gitlab* -> gitlab)."""
+        f = self._var("FORGE").lower()
+        if f:
+            if f not in ("gitea", "github", "gitlab"):
+                raise GitError("The forge must be gitea, github or gitlab.")
+            return f
+        host = (urlparse(self.remote_url()).hostname or "").lower()
+        if host == "github.com" or host.startswith("github.") or ".github." in host:
+            return "github"
+        if host == "gitlab.com" or "gitlab" in host:
+            return "gitlab"
+        return "gitea"
+
     def _repo_ref(self) -> Tuple[str, str, str]:
         """(prefix, owner, repo) from the remote URL: http(s)://host[/prefix]/owner/repo(.git)."""
         parts = [p for p in urlparse(self.remote_url()).path.split("/") if p]
@@ -107,8 +121,31 @@ class Repo:
         if explicit:
             return explicit.rstrip("/")
         u = urlparse(self.remote_url())
+        f = self.forge()
+        if f == "github":
+            return "https://api.github.com" if (u.hostname or "").lower() == "github.com" else f"{u.scheme}://{u.netloc}/api/v3"
+        if f == "gitlab":
+            return f"{u.scheme}://{u.netloc}/api/v4"
         prefix = self._repo_ref()[0]
         return f"{u.scheme}://{u.netloc}" + (f"/{prefix}" if prefix else "") + "/api/v1"          # Gitea
+
+    def project_path(self) -> str:
+        """GitLab: the whole project path (group/subgroup/project) from the remote URL."""
+        parts = [p for p in urlparse(self.remote_url()).path.split("/") if p]
+        if len(parts) < 2:
+            raise GitError("The remote URL must look like http(s)://host/group/project.git.")
+        if parts[-1].endswith(".git"):
+            parts[-1] = parts[-1][:-4]
+        return "/".join(parts)
+
+    def _git_auth_header(self) -> str:
+        """How git itself authenticates over HTTP: Gitea takes `token X`; GitHub and GitLab want Basic with a fixed user name and the token as password."""
+        import base64
+        tok, f = self.token(), self.forge()
+        if f == "gitea":
+            return f"Authorization: token {tok}"
+        user = "x-access-token" if f == "github" else "oauth2"
+        return "Authorization: Basic " + base64.b64encode(f"{user}:{tok}".encode()).decode()
 
     def _check_url(self) -> None:
         u = urlparse(self.remote_url())
@@ -118,8 +155,14 @@ class Repo:
             raise GitError("The remote URL must not contain credentials; put the token in its own variable.")
 
     def _scrub(self, text: str) -> str:
+        import base64
         tok = self.token()
-        return text.replace(tok, "***") if tok else text
+        if not tok:
+            return text
+        text = text.replace(tok, "***")
+        for user in ("x-access-token", "oauth2"):
+            text = text.replace(base64.b64encode(f"{user}:{tok}".encode()).decode(), "***")
+        return text
 
     def _env(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         env = {k: v for k, v in os.environ.items()
@@ -129,7 +172,7 @@ class Repo:
         if self.token() and self.remote_url():
             host = urlparse(self.remote_url())
             env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{host.scheme}://{host.netloc}/.extraHeader",
-                        "GIT_CONFIG_VALUE_0": f"Authorization: token {self.token()}"})
+                        "GIT_CONFIG_VALUE_0": self._git_auth_header()})
         if extra:
             env.update(extra)
         return env
@@ -155,6 +198,11 @@ class Repo:
         except Exception:
             return False
         return bool(top) and os.path.realpath(top) == os.path.realpath(d)
+
+    def _refuse_during_merge(self) -> None:
+        from web import git_review
+        if git_review.merge_state(self)["in_progress"]:
+            raise GitError("A merge is in progress. Resolve its conflicts and finish the merge, or abort it, first.")
 
     def _require_repo(self) -> None:
         if not self.configured():
@@ -242,45 +290,76 @@ class Repo:
         return int(n) if code == "0" and n.strip().isdigit() else 0
 
     def _api(self, method: str, path: str, body: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Any:
-        """One call to the forge's REST API with the repository token. Errors are turned into short, token-free messages."""
+        """One call to the forge's REST API (Gitea, GitHub or GitLab) with the repository token. `path` is relative to the repository / project.
+        Errors are turned into short, token-free messages."""
         import requests
+        from urllib.parse import quote
         if not self.token():
             raise GitError("A token is needed to talk to the repository server (set the token variable).")
-        owner_repo = self._repo_ref()
-        url = f"{self.api_base()}/repos/{owner_repo[1]}/{owner_repo[2]}{path}"
+        f = self.forge()
+        if f == "gitlab":
+            url = f"{self.api_base()}/projects/{quote(self.project_path(), safe='')}{path}"
+            headers = {"PRIVATE-TOKEN": self.token()}
+        else:
+            owner_repo = self._repo_ref()
+            url = f"{self.api_base()}/repos/{owner_repo[1]}/{owner_repo[2]}{path}"
+            headers = {"Authorization": (f"Bearer {self.token()}" if f == "github" else f"token {self.token()}")}
+            if f == "github":
+                headers.update({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+        headers.update({"Accept": headers.get("Accept", "application/json"), "User-Agent": "DataKilnWorks-Git/1"})
         try:
-            r = requests.request(method, url, json=body, params=params, timeout=20, allow_redirects=False,
-                                 headers={"Authorization": f"token {self.token()}", "Accept": "application/json", "User-Agent": "DataKilnWorks-Git/1"})
+            r = requests.request(method, url, json=body, params=params, timeout=20, allow_redirects=False, headers=headers)
         except requests.RequestException as exc:
             raise GitError(f"The repository server could not be reached ({type(exc).__name__}).")
+
+        def server_message() -> str:
+            try:
+                j = r.json()
+                return str(j.get("message") or j.get("error") or "")[:300] if isinstance(j, dict) else ""
+            except ValueError:
+                return ""
+        scope = {"gitea": "write:repository", "github": "'repo' (or Pull requests: write)", "gitlab": "'api'"}[f]
         if r.status_code in (401, 403):
-            raise GitError(f"The repository server refused the token (HTTP {r.status_code}); pull requests need the write:repository scope.")
+            raise GitError(self._scrub(f"The repository server refused the token (HTTP {r.status_code}); pull requests need the {scope} scope. {server_message()}".strip()))
         if r.status_code == 404:
             raise GitError("The repository or pull request was not found (check the URL and that the token can see the repository).")
         if r.status_code >= 400:
-            try:
-                msg = str(r.json().get("message") or "")[:300]
-            except ValueError:
-                msg = ""
-            raise GitError(self._scrub(f"The repository server answered HTTP {r.status_code}: {msg}".strip()))
+            raise GitError(self._scrub(f"The repository server answered HTTP {r.status_code}: {server_message()}".strip()))
         try:
             return r.json()
         except ValueError:
             return {}
 
-    @staticmethod
-    def _pr_view(p: Dict[str, Any]) -> Dict[str, Any]:
+    def _pr_view(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        """One normalised pull / merge request from any forge."""
+        if self.forge() == "gitlab":
+            state = p.get("state")
+            return {"number": p.get("iid"), "url": p.get("web_url"), "title": p.get("title"), "state": "open" if state == "opened" else "closed",
+                    "merged": state == "merged", "mergeable": (p.get("detailed_merge_status") == "mergeable") if p.get("detailed_merge_status") else (p.get("merge_status") == "can_be_merged")}
         return {"number": p.get("number"), "url": p.get("html_url"), "title": p.get("title"), "state": p.get("state"),
                 "merged": bool(p.get("merged") or p.get("merged_at")), "mergeable": p.get("mergeable")}
 
     def _pr_for_branch(self, branch: str) -> Optional[Dict[str, Any]]:
         """The open pull request from `branch`, else the most recent one, else None."""
-        prs = [p for p in (self._api("GET", "/pulls", params={"state": "all", "sort": "recentupdate", "limit": 50}) or [])
-               if (p.get("head") or {}).get("ref") == branch and (p.get("base") or {}).get("ref") == self.branch()]
+        f = self.forge()
+        if f == "gitlab":
+            raw = self._api("GET", "/merge_requests", params={"state": "all", "source_branch": branch, "target_branch": self.branch(), "order_by": "updated_at", "sort": "desc", "per_page": 50}) or []
+            prs = [p for p in raw if p.get("source_branch") == branch and p.get("target_branch") == self.branch()]
+        elif f == "github":
+            raw = self._api("GET", "/pulls", params={"state": "all", "sort": "updated", "direction": "desc", "per_page": 50, "head": f"{self._repo_ref()[1]}:{branch}"}) or []
+            prs = [p for p in raw if (p.get("head") or {}).get("ref") == branch and (p.get("base") or {}).get("ref") == self.branch()]
+        else:
+            raw = self._api("GET", "/pulls", params={"state": "all", "sort": "recentupdate", "limit": 50}) or []
+            prs = [p for p in raw if (p.get("head") or {}).get("ref") == branch and (p.get("base") or {}).get("ref") == self.branch()]
         if not prs:
             return None
-        open_ones = [p for p in prs if p.get("state") == "open"]
+        open_ones = [p for p in prs if (p.get("state") in ("open", "opened"))]
         return self._pr_view((open_ones or prs)[0])
+
+    def _pr_create(self, head: str, base: str, title: str, body: str) -> Dict[str, Any]:
+        if self.forge() == "gitlab":
+            return self._pr_view(self._api("POST", "/merge_requests", body={"source_branch": head, "target_branch": base, "title": title, "description": body, "remove_source_branch": False}))
+        return self._pr_view(self._api("POST", "/pulls", body={"head": head, "base": base, "title": title, "body": body}))
 
     def _change_name(self, actor: str, name: Optional[str] = None) -> str:
         if name:
@@ -296,13 +375,14 @@ class Repo:
         with _LOCK:
             info: Dict[str, Any] = {"configured": self.configured(), "remote": self.remote_url() or None, "branch": None, "connected": False,
                                     "token_set": bool(self.token()), "head": None, "changes": [], "dirty": False, "ahead": 0, "behind": 0,
-                                    "unpushed": 0, "log": [], "mode": "direct", "current_branch": None, "on_base": True,
+                                    "unpushed": 0, "log": [], "mode": "direct", "forge": None, "merge": {"in_progress": False, "conflicts": []}, "current_branch": None, "on_base": True,
                                     "remote_has_base": False, "pull_request": None}
             if not self.configured():
                 return info
             try:
                 info["branch"] = self.branch()
                 info["mode"] = self.mode()
+                info["forge"] = self.forge()
                 self._check_url()
             except GitError as exc:
                 info["error"] = str(exc)
@@ -318,6 +398,8 @@ class Repo:
                 except GitError as exc:
                     info["fetch_error"] = str(exc)
             info["head"] = self._head()
+            from web import git_review
+            info["merge"] = git_review.merge_state(self)
             info["changes"] = self._changes()
             info["dirty"] = bool(info["changes"])
             cur = self.current_branch()
@@ -397,6 +479,7 @@ class Repo:
     def pull(self, actor: str) -> Dict[str, Any]:
         with _LOCK:
             self._require_repo()
+            self._refuse_during_merge()
             b = self.branch()
             if self.pr_mode() and self.current_branch() not in (None, b):
                 raise GitError(f"Pull updates '{b}'. You are on the change branch '{self.current_branch()}': use 'Update from {b}' "
@@ -412,8 +495,8 @@ class Repo:
                 if self._git(["merge-base", "--is-ancestor", ref, "HEAD"], check=False).startswith("0"):
                     return {**self.status(), "pulled": False, "message": "Already up to date."}
                 if not self._git(["merge-base", "--is-ancestor", "HEAD", ref], check=False).startswith("0"):
-                    raise GitError("Local and remote history have diverged; pulling would need a merge, which is not done automatically. "
-                                   "Resolve it in the repository.")
+                    raise GitError("Local and remote history have diverged, so pulling would need a merge. Use 'Merge remote changes' "
+                                   "(conflicts, if any, are resolved in the studio).")
                 self._git(["merge", "--ff-only", ref])
             after = self._head()
             problem = self._problem_with_tree()
@@ -430,6 +513,7 @@ class Repo:
     def commit(self, actor: str, message: str, branch: Optional[str] = None) -> Dict[str, Any]:
         with _LOCK:
             self._require_repo()
+            self._refuse_during_merge()
             message = (message or "").strip()
             if not message:
                 raise GitError("A commit message is required.")
@@ -455,6 +539,7 @@ class Repo:
     def push(self, actor: str) -> Dict[str, Any]:
         with _LOCK:
             self._require_repo()
+            self._refuse_during_merge()
             b = self.branch()
             if not self._head():
                 raise GitError("Nothing to push: there are no commits yet.")
@@ -480,6 +565,7 @@ class Repo:
     # ---- pull-request mode
     def _require_pr_mode(self) -> None:
         self._require_repo()
+        self._refuse_during_merge()
         if not self.pr_mode():
             raise GitError("Branch and pull-request mode is off. Set the mode variable to pull_request to use it.")
 
@@ -530,8 +616,7 @@ class Repo:
             if problem:
                 raise GitError("The change does not validate, so no pull request was opened:\n" + problem)
             subject = (title or "").strip() or self._git(["log", "-1", "--format=%s"], check=False).split("\n", 1)[-1].strip() or cur
-            created = self._api("POST", "/pulls", body={"head": cur, "base": b, "title": subject[:250], "body": (body or "")[:20000]})
-            pr = self._pr_view(created)
+            pr = self._pr_create(cur, b, subject[:250], (body or "")[:20000])
             self._audit(actor, "PR_OPEN", {"branch": cur, "number": pr["number"], "url": pr["url"]})
             return {**self.status(), "pull_request": pr, "message": f"Opened pull request #{pr['number']}."}
 
@@ -597,14 +682,98 @@ class Repo:
             try:
                 self._git(["merge", "--no-edit", "-m", f"Merge {b} into {cur}", f"origin/{b}"], extra_env=ident)
             except GitError as exc:
+                from web import git_review
+                state = git_review.merge_state(self)
+                if state["in_progress"] and state["conflicts"]:
+                    self._audit(actor, "MERGE_CONFLICT", {"branch": cur, "from": b, "files": [c["path"] for c in state["conflicts"]][:20]})
+                    return {**self.status(), "conflicts": state["conflicts"],
+                            "message": f"Merging '{b}' into '{cur}' conflicts in {len(state['conflicts'])} file(s). The merge is waiting for you: resolve each file, then finish it (or abort)."}
                 self._git(["merge", "--abort"], check=False)
-                raise GitError(f"Merging '{b}' into '{cur}' conflicts, so nothing was changed. Resolve it in the repository. ({str(exc)[:200]})")
+                raise GitError(f"Merging '{b}' into '{cur}' failed, so nothing was changed. ({str(exc)[:200]})")
             problem = self._problem_with_tree()
             if problem:
                 self._git(["reset", "-q", "--hard", before])
                 raise GitError(f"The merged result does not validate, so the merge was undone:\n{problem}")
             self._audit(actor, "BRANCH_UPDATE", {"branch": cur, "from": b})
             return {**self.status(), "message": f"Merged '{b}' into '{cur}'."}
+
+    def merge_remote(self, actor: str) -> Dict[str, Any]:
+        """Direct mode: the local branch and the remote both moved (a pull would have to merge). Merges the remote into the local branch; conflicts are
+        left in progress for the resolver, exactly as with 'Update from base'."""
+        with _LOCK:
+            self._require_repo()
+            self._refuse_during_merge()
+            b = self.branch()
+            cur = self.current_branch()
+            if self.pr_mode() and cur not in (None, b):
+                raise GitError(f"You are on the change branch '{cur}': use 'Update from {b}'.")
+            if self._changes():
+                raise GitError("There are uncommitted local changes. Commit them (or discard them) first.")
+            self._git(["fetch", "origin", b])
+            ref = f"origin/{b}"
+            if not self._head() or not self._has_ref(f"refs/remotes/{ref}"):
+                raise GitError("There is nothing to merge yet.")
+            if not self._count(f"HEAD..{ref}"):
+                return {**self.status(), "message": "Already up to date."}
+            if not self._count(f"{ref}..HEAD"):
+                raise GitError("Your branch has no commits of its own: use Pull.")
+            before = self._head()
+            ident = {"GIT_AUTHOR_NAME": "Data Kiln Works", "GIT_AUTHOR_EMAIL": "dkw@localhost", "GIT_COMMITTER_NAME": "Data Kiln Works", "GIT_COMMITTER_EMAIL": "dkw@localhost"}
+            try:
+                self._git(["merge", "--no-edit", "-m", f"Merge {ref} into {cur or b}", ref], extra_env=ident)
+            except GitError as exc:
+                from web import git_review
+                state = git_review.merge_state(self)
+                if state["in_progress"] and state["conflicts"]:
+                    self._audit(actor, "MERGE_CONFLICT", {"branch": cur or b, "from": ref, "files": [c["path"] for c in state["conflicts"]][:20]})
+                    return {**self.status(), "conflicts": state["conflicts"],
+                            "message": f"Merging {ref} conflicts in {len(state['conflicts'])} file(s). The merge is waiting for you: resolve each file, then finish it (or abort)."}
+                self._git(["merge", "--abort"], check=False)
+                raise GitError(f"Merging {ref} failed, so nothing was changed. ({str(exc)[:200]})")
+            problem = self._problem_with_tree()
+            if problem:
+                self._git(["reset", "-q", "--hard", before])
+                raise GitError(f"The merged result does not validate, so the merge was undone:\n{problem}")
+            self._audit(actor, "MERGE_REMOTE", {"branch": cur or b})
+            return {**self.status(), "message": f"Merged {ref} into your branch."}
+
+    # ---- review (web/git_review.py): diffs, discarding one file, resolving a merge
+    def diff(self, scope: str = "pending") -> Dict[str, Any]:
+        from web import git_review
+        with _LOCK:
+            return git_review.summary(self, scope)
+
+    def diff_file(self, path: str, scope: str = "pending") -> Dict[str, Any]:
+        from web import git_review
+        with _LOCK:
+            return git_review.file_diff(self, path, scope)
+
+    def discard(self, actor: str, path: str) -> Dict[str, Any]:
+        from web import git_review
+        return git_review.discard(self, path, actor)
+
+    def conflicts(self) -> Dict[str, Any]:
+        from web import git_review
+        with _LOCK:
+            self._require_repo()
+            return git_review.merge_state(self)
+
+    def conflict_file(self, path: str) -> Dict[str, Any]:
+        from web import git_review
+        with _LOCK:
+            return git_review.conflict_detail(self, path)
+
+    def resolve_conflict(self, actor: str, path: str, resolution: str, choices: Optional[List[Dict[str, Any]]] = None, content: Optional[str] = None) -> Dict[str, Any]:
+        from web import git_review
+        return git_review.resolve(self, path, resolution, choices, content, actor)
+
+    def finish_merge(self, actor: str, message: Optional[str] = None) -> Dict[str, Any]:
+        from web import git_review
+        return git_review.finish_merge(self, actor, message)
+
+    def abort_merge(self, actor: str) -> Dict[str, Any]:
+        from web import git_review
+        return git_review.abort_merge(self, actor)
 
 
 DBT = Repo("dbt")

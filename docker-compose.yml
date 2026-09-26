@@ -29,12 +29,15 @@ services:
       # direct (default) | pull_request: commit to a change branch and open a pull request on the server (Gitea API) instead of pushing to the base branch
       - GIT_MODE=${GIT_MODE:-direct}
       - GIT_API_URL=${GIT_API_URL:-}
+      # gitea | github | gitlab (default: guessed from the host name of the remote URL)
+      - GIT_FORGE=${GIT_FORGE:-}
       # Git sync of the shared notebooks (Workspace > Git; only notebooks/Shared). The token falls back to GIT_TOKEN.
       - NOTEBOOKS_GIT_REMOTE_URL=${NOTEBOOKS_GIT_REMOTE_URL:-}
       - NOTEBOOKS_GIT_BRANCH=${NOTEBOOKS_GIT_BRANCH:-main}
       - NOTEBOOKS_GIT_TOKEN=${NOTEBOOKS_GIT_TOKEN:-}
       - NOTEBOOKS_GIT_MODE=${NOTEBOOKS_GIT_MODE:-direct}
       - NOTEBOOKS_GIT_API_URL=${NOTEBOOKS_GIT_API_URL:-}
+      - NOTEBOOKS_GIT_FORGE=${NOTEBOOKS_GIT_FORGE:-}
       # IP allowlist (Users & IAM > Network access). TRUSTED_PROXIES: CIDRs of reverse proxies whose X-Forwarded-For is believed (added to the setting).
       # IP_ALLOWLIST_OVERRIDE=off suspends enforcement (break-glass); MFA_POLICY_OVERRIDE=off does the same for the required-MFA policy.
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}

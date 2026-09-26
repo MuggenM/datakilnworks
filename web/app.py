@@ -6098,6 +6098,61 @@ async def git_repo_update_endpoint(kind: str, current_user: Dict[str, Any] = Dep
 async def git_repo_push_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     return await _git_call(_git_repo(kind).push, current_user.get("username", "admin"))
 
+class GitDiscardPayload(BaseModel):
+    path: str
+
+
+class GitResolvePayload(BaseModel):
+    path: str
+    resolution: str
+    choices: Optional[List[Dict[str, Any]]] = None
+    content: Optional[str] = None
+
+
+class GitFinishMergePayload(BaseModel):
+    message: Optional[str] = None
+
+
+@app.get("/api/git/repos/{kind}/diff")
+async def git_repo_diff_endpoint(kind: str, scope: str = "pending", current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Files changed and their counts: `pending` (uncommitted) or `branch` (this change branch against the base, as a reviewer sees it)."""
+    return await _git_call(_git_repo(kind).diff, scope)
+
+@app.get("/api/git/repos/{kind}/diff/file")
+async def git_repo_diff_file_endpoint(kind: str, path: str, scope: str = "pending", current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).diff_file, path, scope)
+
+@app.post("/api/git/repos/{kind}/discard")
+async def git_repo_discard_endpoint(kind: str, payload: GitDiscardPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Throws away the uncommitted change of ONE file (restores it to the last commit, or deletes it when it is new)."""
+    return await _git_call(_git_repo(kind).discard, current_user.get("username", "admin"), payload.path)
+
+@app.post("/api/git/repos/{kind}/merge")
+async def git_repo_merge_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Direct mode, local and remote diverged: merge the remote into the local branch (conflicts are left for the resolver)."""
+    return await _git_call(_git_repo(kind).merge_remote, current_user.get("username", "admin"))
+
+@app.get("/api/git/repos/{kind}/conflicts")
+async def git_repo_conflicts_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).conflicts)
+
+@app.get("/api/git/repos/{kind}/conflicts/file")
+async def git_repo_conflict_file_endpoint(kind: str, path: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).conflict_file, path)
+
+@app.post("/api/git/repos/{kind}/conflicts/resolve")
+async def git_repo_resolve_endpoint(kind: str, payload: GitResolvePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """resolution: ours | theirs | delete | keep | merged (with `choices` per conflict hunk: pick ours/theirs/both/custom, or the whole `content`)."""
+    return await _git_call(_git_repo(kind).resolve_conflict, current_user.get("username", "admin"), payload.path, payload.resolution, payload.choices, payload.content)
+
+@app.post("/api/git/repos/{kind}/merge/finish")
+async def git_repo_finish_merge_endpoint(kind: str, payload: GitFinishMergePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).finish_merge, current_user.get("username", "admin"), payload.message)
+
+@app.post("/api/git/repos/{kind}/merge/abort")
+async def git_repo_abort_merge_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).abort_merge, current_user.get("username", "admin"))
+
 @app.post("/api/dbt/models/{model_name}/open")
 async def open_dbt_model_endpoint(model_name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     """An administrator deliberately opens one dbt table to users (refreshes its carried-over source tags first)."""

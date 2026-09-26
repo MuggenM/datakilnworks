@@ -11388,6 +11388,123 @@
     </div>
   </div>
 
+  <!-- Modal: review changes and resolve merge conflicts (dbt project and shared notebooks) -->
+  <div x-show="gitReview.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-[70] flex items-center justify-center p-4" @keydown.escape.window="gitReview.open = false">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-7xl h-[92vh] shadow-2xl p-4 flex flex-col space-y-3 text-xs" data-testid="git-review-modal">
+      <div class="flex items-center justify-between shrink-0">
+        <div class="flex items-center space-x-3">
+          <h3 class="text-base font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-git-diff text-teal-500"></i><span x-text="gitReview.kind === 'dbt' ? 'dbt project: changes' : 'Shared notebooks: changes'"></span></h3>
+          <div class="flex border border-slate-300 dark:border-dbx-border rounded overflow-hidden">
+            <button @click="grTab('changes')" :class="gitReview.tab === 'changes' ? 'bg-teal-600 text-white' : 'bg-slate-50 dark:bg-slate-900'" class="px-3 py-1" data-testid="gr-tab-changes">Changes</button>
+            <button @click="grTab('conflicts')" :class="gitReview.tab === 'conflicts' ? 'bg-amber-500 text-white' : 'bg-slate-50 dark:bg-slate-900'" class="px-3 py-1" data-testid="gr-tab-conflicts">Conflicts <span x-show="gitReview.merge.in_progress" class="ml-1 px-1.5 rounded bg-white/30" x-text="gitReview.merge.conflicts.length"></span></button>
+          </div>
+        </div>
+        <button @click="closeGitReview()" class="text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm" data-testid="gr-close"><i class="ph ph-x"></i></button>
+      </div>
+      <div x-show="gitReview.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300 whitespace-pre-wrap shrink-0" data-testid="gr-error" x-text="gitReview.error"></div>
+      <div x-show="gitReview.note" class="p-2 rounded bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-300 shrink-0" data-testid="gr-note" x-text="gitReview.note"></div>
+
+      <!-- Changes -->
+      <div x-show="gitReview.tab === 'changes'" class="flex-1 min-h-0 flex flex-col space-y-2">
+        <div class="flex items-center space-x-2 shrink-0">
+          <button @click="grScope('pending')" :class="gitReview.scope === 'pending' ? 'bg-teal-600 text-white' : 'bg-slate-50 dark:bg-slate-900'" class="px-3 py-1 border border-slate-300 dark:border-dbx-border rounded" data-testid="gr-scope-pending">Uncommitted</button>
+          <button @click="grScope('branch')" :disabled="!gitReview.status || gitReview.status.on_base || !gitReview.status.remote_has_base" :class="gitReview.scope === 'branch' ? 'bg-teal-600 text-white' : 'bg-slate-50 dark:bg-slate-900'" class="px-3 py-1 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" title="What this change branch adds to the base branch: the view a reviewer gets" data-testid="gr-scope-branch">This branch vs base</button>
+          <span class="text-slate-500" x-text="gitReview.summary ? (gitReview.summary.label + ' · ' + gitReview.summary.total_files + ' file(s), +' + gitReview.summary.additions + ' -' + gitReview.summary.deletions) : ''"></span>
+        </div>
+        <div class="flex-1 min-h-0 grid grid-cols-12 gap-3">
+          <div class="col-span-3 border border-slate-200 dark:border-dbx-border rounded-lg overflow-y-auto">
+            <div x-show="gitReview.summary && !gitReview.summary.files.length" class="p-4 text-slate-500 text-center" data-testid="gr-empty">No changes.</div>
+            <template x-for="f in (gitReview.summary ? gitReview.summary.files : [])" :key="f.path"><div @click="grSelectFile(f.path)" :class="gitReview.sel === f.path ? 'bg-teal-50 dark:bg-teal-950/30' : 'hover:bg-slate-50 dark:hover:bg-slate-900/50'" class="px-2 py-1.5 border-b border-slate-100 dark:border-dbx-border/40 cursor-pointer flex items-center space-x-2" data-testid="gr-file">
+              <span class="w-5 text-center font-bold rounded" :class="f.status === 'A' ? 'text-emerald-600' : (f.status === 'D' ? 'text-rose-600' : 'text-amber-600')" x-text="f.status"></span>
+              <span class="flex-1 font-mono truncate" x-text="f.path" :title="f.path"></span>
+              <span class="font-mono text-[10px]" x-show="!f.binary"><span class="text-emerald-600" x-text="'+' + f.additions"></span> <span class="text-rose-600" x-text="'-' + f.deletions"></span></span>
+              <span x-show="f.binary" class="text-[10px] text-slate-500">binary</span></div></template>
+          </div>
+          <div class="col-span-9 border border-slate-200 dark:border-dbx-border rounded-lg overflow-auto" data-testid="gr-diff">
+            <div x-show="!gitReview.diff" class="p-6 text-slate-500 text-center">Select a file to see its changes.</div>
+            <div x-show="gitReview.diff" class="min-w-full">
+              <div class="sticky top-0 bg-slate-50 dark:bg-slate-900 px-3 py-1.5 border-b border-slate-200 dark:border-dbx-border flex items-center space-x-3">
+                <span class="font-mono font-semibold" x-text="gitReview.diff ? gitReview.diff.path : ''"></span>
+                <span class="text-slate-500" x-text="gitReview.diff ? gitReview.diff.notice : ''"></span>
+                <span x-show="gitReview.diff && gitReview.diff.truncated" class="text-amber-600">Only the beginning is shown.</span>
+                <button x-show="gitReview.scope === 'pending' && gitReview.diff" @click="grDiscard(gitReview.diff.path)" class="ml-auto px-2 py-0.5 bg-rose-50 dark:bg-rose-950/40 border border-rose-300 dark:border-rose-800 text-rose-700 dark:text-rose-300 rounded" data-testid="gr-discard">Discard this change</button>
+              </div>
+              <template x-for="(r, ri) in gitReview.rows" :key="ri"><div>
+                <div x-show="r.t === 'hunk'" class="px-3 py-0.5 bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-300 font-mono" x-text="r.s"></div>
+                <div x-show="r.t !== 'hunk'" class="flex font-mono whitespace-pre" :class="r.t === 'add' ? 'bg-emerald-50 dark:bg-emerald-950/30' : (r.t === 'del' ? 'bg-rose-50 dark:bg-rose-950/30' : '')" :data-testid="r.t === 'hunk' ? null : 'gr-line'">
+                  <span class="w-10 text-right pr-2 text-slate-400 select-none" x-text="r.o === null || r.o === undefined ? '' : r.o"></span><span class="w-10 text-right pr-2 text-slate-400 select-none" x-text="r.n === null || r.n === undefined ? '' : r.n"></span>
+                  <span class="w-4 select-none" :class="r.t === 'add' ? 'text-emerald-600' : (r.t === 'del' ? 'text-rose-600' : '')" x-text="r.t === 'add' ? '+' : (r.t === 'del' ? '-' : ' ')"></span><span class="flex-1" x-text="r.s"></span></div>
+              </div></template>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Conflicts -->
+      <div x-show="gitReview.tab === 'conflicts'" class="flex-1 min-h-0 flex flex-col space-y-2">
+        <div x-show="!gitReview.merge.in_progress" class="p-6 text-slate-500 text-center" data-testid="gr-no-merge">No merge is in progress. When 'Update from base' or 'Merge remote changes' finds conflicts, they are resolved here.</div>
+        <div x-show="gitReview.merge.in_progress" class="flex-1 min-h-0 grid grid-cols-12 gap-3">
+          <div class="col-span-3 border border-slate-200 dark:border-dbx-border rounded-lg overflow-y-auto">
+            <div class="px-2 py-1 text-[10px] uppercase text-slate-500">In conflict</div>
+            <template x-for="c in gitReview.merge.conflicts" :key="c.path"><div @click="grSelectConflict(c.path)" :class="gitReview.csel === c.path ? 'bg-amber-50 dark:bg-amber-950/30' : 'hover:bg-slate-50 dark:hover:bg-slate-900/50'" class="px-2 py-1.5 border-b border-slate-100 dark:border-dbx-border/40 cursor-pointer" data-testid="gr-conflict">
+              <div class="font-mono truncate" x-text="c.path"></div><div class="text-[10px] text-amber-600" x-text="({both_modified: 'changed on both sides', both_added: 'added on both sides', deleted_by_incoming: 'deleted in the incoming branch, changed by you', deleted_by_you: 'deleted by you, changed in the incoming branch'})[c.kind]"></div></div></template>
+            <div x-show="!gitReview.merge.conflicts.length" class="p-3 text-emerald-600" data-testid="gr-all-resolved">Every file is resolved. Finish the merge.</div>
+            <div x-show="gitReview.merge.resolved && gitReview.merge.resolved.length" class="px-2 pt-2 pb-1 text-[10px] uppercase text-slate-500">Resolved</div>
+            <template x-for="p in (gitReview.merge.resolved || [])" :key="p"><div class="px-2 py-1 border-b border-slate-100 dark:border-dbx-border/40 flex items-center space-x-2"><span class="flex-1 font-mono truncate text-slate-500" x-text="p"></span><button @click="grReopen(p)" class="text-[10px] underline text-slate-500" data-testid="gr-reopen">reopen</button></div></template>
+          </div>
+          <div class="col-span-9 border border-slate-200 dark:border-dbx-border rounded-lg overflow-auto p-3 space-y-3" data-testid="gr-resolver">
+            <div x-show="!gitReview.cfile" class="text-slate-500 text-center p-6">Select a file to resolve it.</div>
+            <template x-if="gitReview.cfile">
+              <div class="space-y-3">
+                <div class="flex items-center space-x-2 flex-wrap gap-y-1">
+                  <span class="font-mono font-semibold" x-text="gitReview.cfile.path"></span>
+                  <button @click="grResolveWhole('ours')" x-show="['both_modified', 'both_added', 'deleted_by_incoming'].includes(gitReview.cfile.kind)" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="gr-take-ours">Take yours (whole file)</button>
+                  <button @click="grResolveWhole('theirs')" x-show="['both_modified', 'both_added', 'deleted_by_you'].includes(gitReview.cfile.kind)" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="gr-take-theirs">Take incoming (whole file)</button>
+                  <button @click="grResolveWhole('keep')" x-show="['deleted_by_incoming', 'deleted_by_you'].includes(gitReview.cfile.kind)" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="gr-keep">Keep the file</button>
+                  <button @click="grResolveWhole('delete')" x-show="['deleted_by_incoming', 'deleted_by_you'].includes(gitReview.cfile.kind)" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="gr-delete">Delete the file</button>
+                  <label x-show="gitReview.cfile.segments.length" class="ml-auto flex items-center space-x-1"><input type="checkbox" x-model="gitReview.fullEdit" data-testid="gr-full-edit"><span>Edit the whole text</span></label>
+                </div>
+                <div x-show="gitReview.cfile.binary && !gitReview.cfile.segments.length && ['both_modified', 'both_added'].includes(gitReview.cfile.kind)" class="text-slate-500">This file cannot be shown (binary or too large): choose a whole-file side.</div>
+                <pre x-show="gitReview.cfile.surviving_text" class="p-2 bg-slate-50 dark:bg-slate-900 rounded font-mono whitespace-pre-wrap max-h-64 overflow-auto" x-text="gitReview.cfile.surviving_text"></pre>
+                <div x-show="gitReview.cfile.ipynb" class="text-[11px] text-amber-600">A notebook is JSON: the result must stay valid, it is checked when you finish the merge.</div>
+
+                <div x-show="gitReview.cfile.segments.length && !gitReview.fullEdit" class="space-y-2">
+                  <template x-for="(seg, si) in gitReview.cfile.segments" :key="si"><div>
+                    <template x-if="seg.type === 'common'"><pre class="px-2 font-mono text-slate-500 whitespace-pre-wrap" x-text="grCommon(seg.lines)"></pre></template>
+                    <template x-if="seg.type === 'conflict'"><div class="border border-amber-300 dark:border-amber-800 rounded-lg overflow-hidden" data-testid="gr-hunk">
+                      <div class="grid grid-cols-2">
+                        <div class="bg-emerald-50 dark:bg-emerald-950/20 p-2"><div class="text-[10px] uppercase text-emerald-700 mb-1">Yours (this branch)</div><pre class="font-mono whitespace-pre-wrap" x-text="seg.ours.join('\n') || '(nothing)'"></pre></div>
+                        <div class="bg-sky-50 dark:bg-sky-950/20 p-2"><div class="text-[10px] uppercase text-sky-700 mb-1">Incoming</div><pre class="font-mono whitespace-pre-wrap" x-text="seg.theirs.join('\n') || '(nothing)'"></pre></div>
+                      </div>
+                      <div x-show="seg.base" class="px-2 py-1 bg-slate-50 dark:bg-slate-900 text-slate-500"><span class="text-[10px] uppercase">Common ancestor:</span> <span class="font-mono whitespace-pre-wrap" x-text="(seg.base || []).join(' / ')"></span></div>
+                      <template x-if="true"><div><div class="p-2 flex items-center space-x-3 bg-white dark:bg-dbx-panel">
+                        <label class="flex items-center space-x-1"><input type="radio" :name="'pick' + si" value="ours" :checked="grPickOf(seg.index) === 'ours'" @change="grPick(seg.index, 'ours')" data-testid="gr-pick-ours"><span>Yours</span></label>
+                        <label class="flex items-center space-x-1"><input type="radio" :name="'pick' + si" value="theirs" :checked="grPickOf(seg.index) === 'theirs'" @change="grPick(seg.index, 'theirs')" data-testid="gr-pick-theirs"><span>Incoming</span></label>
+                        <label class="flex items-center space-x-1"><input type="radio" :name="'pick' + si" value="both" :checked="grPickOf(seg.index) === 'both'" @change="grPick(seg.index, 'both')" data-testid="gr-pick-both"><span>Both (yours first)</span></label>
+                        <label class="flex items-center space-x-1"><input type="radio" :name="'pick' + si" value="custom" :checked="grPickOf(seg.index) === 'custom'" @change="grPick(seg.index, 'custom')" data-testid="gr-pick-custom"><span>Type it</span></label>
+                      </div>
+                      <textarea x-show="grPickOf(seg.index) === 'custom'" :value="grTextOf(seg.index)" @input="grText(seg.index, $event.target.value)" rows="3" class="w-full p-2 font-mono bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-dbx-border" data-testid="gr-custom-text"></textarea></div></template>
+                    </div></template>
+                  </div></template>
+                  <button @click="grResolveHunks()" :disabled="gitReview.busy" class="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white font-semibold rounded" data-testid="gr-resolve-file">Mark this file resolved</button>
+                </div>
+                <div x-show="gitReview.cfile.segments.length && gitReview.fullEdit" class="space-y-2">
+                  <textarea x-model="gitReview.fullText" rows="18" class="w-full p-2 font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" spellcheck="false" data-testid="gr-full-text"></textarea>
+                  <button @click="grResolveText()" :disabled="gitReview.busy" class="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white font-semibold rounded" data-testid="gr-resolve-text">Use this text</button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+        <div x-show="gitReview.merge.in_progress" class="flex items-center space-x-2 shrink-0 pt-1 border-t border-slate-200 dark:border-dbx-border">
+          <input type="text" x-model="gitReview.message" placeholder="Merge commit message (optional)" class="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1" data-testid="gr-merge-message">
+          <button @click="grFinish()" :disabled="gitReview.busy || gitReview.merge.conflicts.length > 0" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-semibold rounded" data-testid="gr-finish">Finish merge</button>
+          <button @click="grAbort()" :disabled="gitReview.busy" class="px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" title="Return to exactly where you were before the merge" data-testid="gr-abort">Abort merge</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Modal: Streams (Kafka / Redpanda topic -> Delta table) -->
   <div x-show="showStreamsModal" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="showStreamsModal = false">
     <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-5xl shadow-2xl p-6 space-y-4 max-h-[92vh] overflow-y-auto text-xs" @click.outside="showStreamsModal = false" data-testid="streams-modal">
@@ -16532,8 +16649,8 @@
 
   <!-- Modal: Change my own password (local accounts) -->
   <!-- Modal: dbt project files (profiles.yml / dbt_project.yml), admins only -->
-  <div x-show="dbtCfg.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="dbtCfg.open = false">
-    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-5xl shadow-2xl p-5 space-y-3 text-xs max-h-[92vh] flex flex-col" @click.outside="dbtCfg.open = false">
+  <div x-show="dbtCfg.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="gitReview.open || (dbtCfg.open = false)">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-5xl shadow-2xl p-5 space-y-3 text-xs max-h-[92vh] flex flex-col" @click.outside="gitReview.open || (dbtCfg.open = false)">
       <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-2 shrink-0">
         <div>
           <h4 class="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-1.5"><i class="ph ph-gear-six text-teal-500"></i><span>dbt project files</span></h4>
@@ -16574,6 +16691,11 @@
           <button type="button" x-show="dbtCfg.git && !dbtCfg.git.connected && !dbtCfg.git.error" @click="gitAction('connect')" :disabled="dbtCfg.gitBusy" class="px-3 py-1 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded font-semibold" data-testid="git-connect">Connect to repository</button>
         </div>
         <p x-show="dbtCfg.git && !dbtCfg.git.connected" class="text-[11px] text-slate-500" x-text="(dbtCfg.git && (dbtCfg.git.error || dbtCfg.git.reason)) || ''"></p>
+        <div x-show="dbtCfg.git && dbtCfg.git.connected" class="flex flex-wrap items-center gap-1.5" data-testid="git-review-bar">
+          <button type="button" @click="openGitReview('dbt')" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="git-review-open">Review changes</button>
+          <button type="button" x-show="dbtCfg.git.mode === 'direct' && dbtCfg.git.ahead > 0 && dbtCfg.git.behind > 0 && !(dbtCfg.git.merge && dbtCfg.git.merge.in_progress)" @click="gitAction('merge')" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" title="Both sides changed: merge the remote into your branch (conflicts are resolved in the studio)" data-testid="git-merge-remote">Merge remote changes</button>
+          <button type="button" x-show="dbtCfg.git.merge && dbtCfg.git.merge.in_progress" @click="openGitReview('dbt', 'conflicts')" class="px-2 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded font-semibold" data-testid="git-resolve-open">Merge in progress: <span x-text="dbtCfg.git.merge ? dbtCfg.git.merge.conflicts.length : 0"></span> conflict(s), resolve</button>
+        </div>
         <div x-show="dbtCfg.git && dbtCfg.git.connected && dbtCfg.git.dirty" class="space-y-1.5">
           <div class="text-[11px] text-slate-500"><span x-text="(dbtCfg.git ? dbtCfg.git.changes.length : 0) + ' uncommitted change(s): '"></span>
             <span class="font-mono" x-text="dbtCfg.git ? dbtCfg.git.changes.slice(0, 6).map(c => c.status + ' ' + c.path).join(', ') + (dbtCfg.git.changes.length > 6 ? ', …' : '') : ''"></span></div>
@@ -16670,8 +16792,8 @@
   </div>
 
   <!-- Modal: Git sync of notebooks/Shared, admins only -->
-  <div x-show="nbGit.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="nbGit.open = false">
-    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-lg shadow-2xl p-5 space-y-3 text-xs" @click.outside="nbGit.open = false" data-testid="nb-git-modal">
+  <div x-show="nbGit.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="gitReview.open || (nbGit.open = false)">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-lg shadow-2xl p-5 space-y-3 text-xs" @click.outside="gitReview.open || (nbGit.open = false)" data-testid="nb-git-modal">
       <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
         <div>
           <h4 class="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-1.5"><i class="ph ph-git-branch text-teal-500"></i><span>Git: shared notebooks</span></h4>
@@ -16696,6 +16818,11 @@
               <button type="button" @click="nbGitAction('push')" :disabled="nbGit.busy || !nbGit.git.unpushed" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-40" data-testid="nb-git-push">Push</button>
             </div>
           </div>
+        <div x-show="nbGit.git && nbGit.git.connected" class="flex flex-wrap items-center gap-1.5" data-testid="git-review-bar">
+          <button type="button" @click="openGitReview('notebooks')" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="git-review-open">Review changes</button>
+          <button type="button" x-show="nbGit.git.mode === 'direct' && nbGit.git.ahead > 0 && nbGit.git.behind > 0 && !(nbGit.git.merge && nbGit.git.merge.in_progress)" @click="nbGitAction('merge')" class="px-2 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" title="Both sides changed: merge the remote into your branch (conflicts are resolved in the studio)" data-testid="git-merge-remote">Merge remote changes</button>
+          <button type="button" x-show="nbGit.git.merge && nbGit.git.merge.in_progress" @click="openGitReview('notebooks', 'conflicts')" class="px-2 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded font-semibold" data-testid="git-resolve-open">Merge in progress: <span x-text="nbGit.git.merge ? nbGit.git.merge.conflicts.length : 0"></span> conflict(s), resolve</button>
+        </div>
           <div x-show="nbGit.git.dirty" class="space-y-1.5">
             <div class="text-[11px] text-slate-500"><span x-text="nbGit.git.changes.length + ' uncommitted change(s): '"></span>
               <span class="font-mono" x-text="nbGit.git.changes.slice(0, 6).map(c => c.status + ' ' + c.path).join(', ') + (nbGit.git.changes.length > 6 ? ', …' : '')"></span></div>
@@ -17621,6 +17748,8 @@
         showLoginModal: false,
         loginForm: { username: '', password: '', error: null, loading: false, mfaToken: null, mfaCode: '' },
         scim: { form: { enabled: false, login_source: 'oidc', default_role: 'user', max_role: 'power_user', use_roles_attribute: false, group_roles: [], base_url: '' }, data: null, error: '', busy: false, newTokenName: '', newTokenDays: null, secret: '' },
+        gitReview: { open: false, kind: 'dbt', tab: 'changes', scope: 'pending', status: null, summary: null, sel: null, diff: null, merge: { in_progress: false, conflicts: [], resolved: [] }, csel: null, cfile: null,
+          choices: [], fullEdit: false, fullText: '', message: '', busy: false, error: '', note: '', rows: [] },
         ipAllow: { form: { mode: 'off', rules: [], trusted_proxies: [] }, config: null, me: null, activity: null, error: '', busy: false, newRule: '', newNote: '', newProxy: '', checkIp: '', checkResult: null },
         mfaPolicy: { form: { enabled: false, roles: ['admin', 'power_user', 'user'], grace_days: 14 }, policy: null, stats: null, error: '', busy: false },
         mfa: { forced: false, graceDismissed: false, open: false, status: { enabled: false, pending: false, backup_codes_remaining: 0 }, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' },
@@ -19002,6 +19131,126 @@
         mfaEnrollmentRequired() {
           const p = this.currentUser && this.currentUser.mfa_policy;
           return !!(p && p.state === 'overdue');
+        },
+
+        // ---- Git review: diffs of pending / branch changes, and merge conflict resolution (shared by the dbt project and the notebooks)
+        async grApi(method, path, body) {
+          const g = this.gitReview;
+          try {
+            const res = await fetch(`/api/git/repos/${g.kind}/${path}`, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+            const data = await res.json();
+            if (!res.ok) { g.error = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail); return null; }
+            return data;
+          } catch (e) { g.error = 'Error: ' + e.message; return null; }
+        },
+
+        async grRefreshHost() {
+          const st = await fetch(`/api/git/repos/${this.gitReview.kind}/status`);
+          if (!st.ok) return;
+          const data = await st.json();
+          this.gitReview.status = data;
+          if (this.gitReview.kind === 'dbt') this.dbtCfg.git = data; else this.nbGit.git = data;
+          this.gitReview.merge = data.merge || { in_progress: false, conflicts: [], resolved: [] };
+        },
+
+        async openGitReview(kind, tab = null) {
+          const g = this.gitReview;
+          Object.assign(g, { open: true, kind, error: '', note: '', sel: null, diff: null, csel: null, cfile: null, summary: null, message: '' });
+          await this.grRefreshHost();
+          g.tab = tab || (g.merge.in_progress ? 'conflicts' : 'changes');
+          g.scope = 'pending';
+          await this.grLoadSummary();
+          if (g.tab === 'conflicts' && g.merge.conflicts.length) await this.grSelectConflict(g.merge.conflicts[0].path);
+        },
+
+        closeGitReview() { setTimeout(() => { this.gitReview.open = false; }, 60); },      // deferred: the modal underneath must not read this click as an 'outside' click
+
+        async grTab(t) { this.gitReview.tab = t; this.gitReview.error = ''; if (t === 'conflicts') await this.grRefreshHost(); },
+        async grScope(sc) { this.gitReview.scope = sc; this.gitReview.diff = null; this.gitReview.sel = null; await this.grLoadSummary(); },
+
+        async grLoadSummary() {
+          const g = this.gitReview; g.error = '';
+          const d = await this.grApi('GET', 'diff?scope=' + g.scope);
+          g.summary = d || { files: [], total_files: 0, additions: 0, deletions: 0, label: '' };
+          if (d && d.files.length) await this.grSelectFile(d.files[0].path);
+        },
+
+        async grSelectFile(path) {
+          const g = this.gitReview; g.sel = path; g.error = '';
+          g.diff = await this.grApi('GET', 'diff/file?scope=' + g.scope + '&path=' + encodeURIComponent(path));
+          g.rows = [];
+          if (g.diff) g.diff.hunks.forEach(h => { g.rows.push({ t: 'hunk', s: h.header }); h.lines.forEach(l => g.rows.push(l)); });
+        },
+
+        async grDiscard(path) {
+          if (!confirm(`Discard the uncommitted change to ${path}? This cannot be undone.`)) return;
+          const d = await this.grApi('POST', 'discard', { path });
+          if (d) { this.gitReview.note = 'Discarded ' + path + '.'; this.gitReview.diff = null; await this.grRefreshHost(); await this.grLoadSummary(); }
+        },
+
+        async grSelectConflict(path) {
+          const g = this.gitReview; g.csel = path; g.error = ''; g.fullEdit = false;
+          const c = await this.grApi('GET', 'conflicts/file?path=' + encodeURIComponent(path));
+          if (!c) { g.cfile = null; return; }
+          g.cfile = c;
+          g.choices = c.segments.filter(s => s.type === 'conflict').map(() => ({ pick: null, text: '' }));
+          g.fullText = c.text || '';
+        },
+
+        grPickOf(i) { return (this.gitReview.choices[i] || {}).pick || null; },
+        grTextOf(i) { return (this.gitReview.choices[i] || {}).text || ''; },
+        grPick(i, v) { if (this.gitReview.choices[i]) this.gitReview.choices[i].pick = v; },
+        grText(i, v) { if (this.gitReview.choices[i]) this.gitReview.choices[i].text = v; },
+
+        grCommon(lines) { return lines.length > 6 ? [...lines.slice(0, 2), `… ${lines.length - 4} unchanged line(s) …`, ...lines.slice(-2)].join('\n') : lines.join('\n'); },
+
+        async grAfterResolve(d, label) {
+          const g = this.gitReview;
+          if (!d) return;
+          g.note = label; await this.grRefreshHost();
+          g.cfile = null; g.csel = null;
+          if (g.merge.conflicts.length) await this.grSelectConflict(g.merge.conflicts[0].path);
+        },
+
+        async grResolveWhole(resolution) {
+          const g = this.gitReview; g.busy = true;
+          try { await this.grAfterResolve(await this.grApi('POST', 'conflicts/resolve', { path: g.csel, resolution }), `${g.csel}: resolved (${resolution}).`); } finally { g.busy = false; }
+        },
+
+        async grResolveHunks() {
+          const g = this.gitReview;
+          if (g.choices.some(c => !c.pick)) { g.error = 'Decide every conflict of this file first (yours, incoming, both, or type it).'; return; }
+          g.busy = true;
+          try { await this.grAfterResolve(await this.grApi('POST', 'conflicts/resolve', { path: g.csel, resolution: 'merged', choices: g.choices }), `${g.csel}: resolved.`); } finally { g.busy = false; }
+        },
+
+        async grResolveText() {
+          const g = this.gitReview; g.busy = true;
+          try { await this.grAfterResolve(await this.grApi('POST', 'conflicts/resolve', { path: g.csel, resolution: 'merged', content: g.fullText }), `${g.csel}: resolved.`); } finally { g.busy = false; }
+        },
+
+        async grReopen(path) {
+          const g = this.gitReview;
+          const d = await this.grApi('POST', 'conflicts/resolve', { path, resolution: 'reopen' });
+          if (d) { await this.grRefreshHost(); await this.grSelectConflict(path); g.note = path + ' is open again.'; }
+        },
+
+        async grFinish() {
+          const g = this.gitReview; g.busy = true; g.error = '';
+          try {
+            const d = await this.grApi('POST', 'merge/finish', { message: g.message || null });
+            if (d) { g.note = d.message || 'Merge finished.'; g.message = ''; await this.grRefreshHost(); g.tab = 'changes'; await this.grLoadSummary(); if (g.kind === 'dbt') this.openDbtConfig(); else this.fetchWorkspaceTree(); }
+          } finally { g.busy = false; }
+        },
+
+        async grAbort() {
+          const g = this.gitReview;
+          if (!confirm('Abort the merge? Everything returns to how it was before it started.')) return;
+          g.busy = true; g.error = '';
+          try {
+            const d = await this.grApi('POST', 'merge/abort');
+            if (d) { g.note = d.message || 'Merge aborted.'; await this.grRefreshHost(); g.cfile = null; g.csel = null; g.tab = 'changes'; await this.grLoadSummary(); }
+          } finally { g.busy = false; }
         },
 
         async loadScim() {
@@ -25343,6 +25592,7 @@
               return;
             }
             this.nbGit.git = data;
+            if (data.conflicts && data.conflicts.length) this.openGitReview('notebooks', 'conflicts');
             if (data.committed) { this.nbGit.msg = ''; this.nbGit.branchName = ''; this.nbGit.note = 'Committed ' + data.committed.slice(0, 8) + (data.started_branch ? ' on the new branch ' + data.started_branch : '') + '.'; }
             else if (data.pushed) this.nbGit.note = 'Pushed.';
             else if (data.message) this.nbGit.note = data.message;
@@ -25368,6 +25618,7 @@
             const data = await res.json();
             if (!res.ok) { this.dbtCfg.gitError = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail); await this.loadDbtGit(); return; }
             this.dbtCfg.git = data;
+            if (data.conflicts && data.conflicts.length) this.openGitReview('dbt', 'conflicts');
             if (data.committed) { this.dbtCfg.gitMsg = ''; this.dbtCfg.gitBranchName = ''; this.dbtCfg.gitNote = 'Committed ' + data.committed.slice(0, 8) + (data.started_branch ? ' on the new branch ' + data.started_branch : '') + '.'; }
             else if (data.pushed) this.dbtCfg.gitNote = 'Pushed.';
             else if (data.message) this.dbtCfg.gitNote = data.message;
