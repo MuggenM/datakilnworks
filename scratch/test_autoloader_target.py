@@ -3,13 +3,15 @@
 not Garage/MinIO/AWS). Run in a throwaway container:
   docker run --rm -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook \
      sh -c 'pip install -q "moto[server]" && python /workspace/scratch/test_autoloader_target.py'
-Prefer a real S3 server: with a throwaway MinIO on the same docker network and TEST_S3_ENDPOINT=<host>:9000 (delta-rs stalls against moto's threaded server)
+Prefer a real S3 server: a throwaway Deuxfleurs Garage on the same docker network (delta-rs stalls against moto's threaded server), then
+TEST_S3_ENDPOINT / TEST_S3_ACCESS_KEY / TEST_S3_SECRET_KEY from
+  eval "$(scratch/garage_up.sh)"; TEST_S3_ENDPOINT="$GARAGE_ENDPOINT" TEST_S3_ACCESS_KEY="$GARAGE_KEY_ID" TEST_S3_SECRET_KEY="$GARAGE_SECRET_KEY" ...
 Covers: the dropdown source lists local + writable S3 catalogs only; a local source loads into a catalog that is an S3 mount
 (append, merge, schema evolution, exactly-once); read-only and non-Delta mounts and unknown catalogs are refused up front."""
 import os, shutil, sys, tempfile
 TMP = tempfile.mkdtemp(prefix="al_target_"); os.environ["WAREHOUSE_DIR"] = TMP
 sys.path.insert(0, "/workspace")
-EXTERNAL = os.getenv("TEST_S3_ENDPOINT")        # e.g. a throwaway MinIO container (a real S3 implementation): host:port, keys minioadmin/minioadmin
+EXTERNAL = os.getenv("TEST_S3_ENDPOINT")        # e.g. a throwaway Garage container (a real S3 implementation): host:port, see scratch/garage_up.sh
 try:
     from moto.server import ThreadedMotoServer
 except ImportError:
@@ -25,14 +27,15 @@ import io
 import pyarrow as pa, pyarrow.parquet as pq
 PORT, BUCKET = 18933, "lake"
 EP = EXTERNAL or f"127.0.0.1:{PORT}"
-KEY = "minioadmin" if EXTERNAL else "k"
+KEY = os.getenv("TEST_S3_ACCESS_KEY", "k") if EXTERNAL else "k"
+SECRET = os.getenv("TEST_S3_SECRET_KEY", "k") if EXTERNAL else "k"
 def mount(mid, **kw):
     return {"id": mid, "type": kw.pop("type", "s3"), "catalog_name": mid, "name": mid, "read_only": kw.pop("read_only", False),
-            "config": {"bucket": BUCKET, "endpoint": EP, "key_id": KEY, "secret": KEY, "region": "us-east-1", "url_style": "path", "use_ssl": False}}
+            "config": {"bucket": BUCKET, "endpoint": EP, "key_id": KEY, "secret": SECRET, "region": "garage" if EXTERNAL else "us-east-1", "url_style": "path", "use_ssl": False}}
 server = None if EXTERNAL else ThreadedMotoServer(port=PORT, verbose=False)
 if server: server.start()
 try:
-    s3 = boto3.client("s3", endpoint_url=f"http://{EP}", aws_access_key_id=KEY, aws_secret_access_key=KEY, region_name="us-east-1"); s3.create_bucket(Bucket=BUCKET)
+    s3 = boto3.client("s3", endpoint_url=f"http://{EP}", aws_access_key_id=KEY, aws_secret_access_key=SECRET, region_name="garage" if EXTERNAL else "us-east-1"); s3.create_bucket(Bucket=BUCKET)
     autoloader.init_autoloader_db()
     so = mounts.get_s3_storage_options(mount("x")["config"])
     mounts.save_mounts([mount("lake_s3"), mount("ro_s3", read_only=True), mount("pg", type="postgres")])

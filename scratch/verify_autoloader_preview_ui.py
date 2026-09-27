@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Preview of local and s3:// sources in the Auto-Loader create dialog (Playwright, /usr/bin/python3) against a THROWAWAY studio `pvui` and MinIO `pvminio`
-on network pvnet (see scratch/test_autoloader_preview.py for the MinIO command):
+"""Preview of local and s3:// sources in the Auto-Loader create dialog (Playwright, /usr/bin/python3) against a THROWAWAY studio `pvui` and a THROWAWAY
+Deuxfleurs Garage `pv-garage` on network pvnet:
+  eval "$(scratch/garage_up.sh pvnet pv-garage)"   # prints/exports GARAGE_ENDPOINT, GARAGE_KEY_ID, GARAGE_SECRET_KEY
   docker run -d --name pvui --network pvnet -p 8117:8891 -v $PWD/web:/workspace/web -v $PWD/docs:/workspace/docs -w /workspace -e WAREHOUSE_DIR=/workspace/warehouse \
-     -e INIT_ADMIN_USERNAME=admin -e INIT_ADMIN_PASSWORD_HASH='<hash of adminpassword123>' localspark-lakehouse-notebook python -m uvicorn web.app:app --host 0.0.0.0 --port 8891 --no-proxy-headers
-  GIT_UI_URL=http://localhost:8117 python scratch/verify_autoloader_preview_ui.py"""
+     -e INIT_ADMIN_USERNAME=admin -e INIT_ADMIN_PASSWORD_HASH='<hash of adminpassword123>' \
+     -e S3_ENDPOINT="$GARAGE_ENDPOINT" -e S3_ACCESS_KEY="$GARAGE_KEY_ID" -e S3_SECRET_KEY="$GARAGE_SECRET_KEY" \
+     localspark-lakehouse-notebook python -m uvicorn web.app:app --host 0.0.0.0 --port 8891 --no-proxy-headers
+  GIT_UI_URL=http://localhost:8117 python scratch/verify_autoloader_preview_ui.py
+Garage stands in for MinIO here (MinIO's Docker Hub image can no longer be pulled without a login); see scratch/garage_up.sh for the one test that still
+needs MinIO. Container names must not use underscores (botocore rejects them in a hostname)."""
 import os, subprocess, sys, time
 from playwright.sync_api import sync_playwright
 BASE = os.getenv("GIT_UI_URL", "http://localhost:8117").rstrip("/")
@@ -19,7 +24,8 @@ for name, start, age in (("old.csv", 0, 500), ("new.csv", 100, 5)):
     p = "/workspace/warehouse/landing_ui/" + name
     open(p, "w").write("id,name\n" + "\n".join(f"{start+i},n{start+i}" for i in range(25)) + "\n"); os.utime(p, (now - age, now - age))
 c = sqlite3.connect("/workspace/warehouse/.metadata/auth.db"); c.execute("UPDATE users SET must_change_password=0"); c.commit()
-s3 = boto3.client("s3", endpoint_url="http://pvminio:9000", aws_access_key_id="minioadmin", aws_secret_access_key="minioadmin", region_name="us-east-1")
+EP, AK, SK = os.environ["S3_ENDPOINT"], os.environ["S3_ACCESS_KEY"], os.environ["S3_SECRET_KEY"]
+s3 = boto3.client("s3", endpoint_url=f"http://{EP}", aws_access_key_id=AK, aws_secret_access_key=SK, region_name="garage")
 for _ in range(20):
     try: s3.list_buckets(); break
     except Exception: time.sleep(1)
@@ -27,7 +33,7 @@ try: s3.create_bucket(Bucket="landing")
 except Exception: pass
 s3.put_object(Body=b"sensor,temp\nA,20.5\nB,21.5\n", Bucket="landing", Key="ui/s.csv")
 from web import mounts
-mounts.save_mounts([{"id": "m1", "type": "s3", "catalog_name": "lake", "name": "lake", "config": {"bucket": "landing", "endpoint": "pvminio:9000", "key_id": "minioadmin", "secret": "minioadmin", "region": "us-east-1", "url_style": "path", "use_ssl": False}}])
+mounts.save_mounts([{"id": "m1", "type": "s3", "catalog_name": "lake", "name": "lake", "config": {"bucket": "landing", "endpoint": EP, "key_id": AK, "secret": SK, "region": "garage", "url_style": "path", "use_ssl": False}}])
 '''
 def ev(page, js):
     for i in range(3):

@@ -10,8 +10,8 @@
 | **kind** | The Helm chart on a real Kubernetes cluster, see below | `ci/kind-smoke.sh` |
 
 The lists live in `ci/plan.json` (`tests` with optional extra pip packages, `ui`). Add a test there and it runs in its own job. A test script must exit
-non-zero on failure and must not need anything outside the container: tests that need real services (Gitea, Redpanda, MinIO, lldap, Keycloak, SFTP, the
-Docker socket) stay out of CI; each says how to run it in its docstring.
+non-zero on failure and must not need anything outside the container: tests that need real services (Gitea, Redpanda, a real S3 server, lldap, Keycloak,
+SFTP, the Docker socket) stay out of CI; each says how to run it in its docstring.
 
 ## The cluster smoke test (`ci/kind-smoke.sh`)
 
@@ -32,4 +32,8 @@ cluster, `USE_CURRENT_CONTEXT=1 IMAGE_LOADER=<cmd>` uses another cluster (k3s, m
 **Status of this test:** it passed on a real kind cluster on GitHub Actions on its first run (September 2026), so the chart has been installed, signed in to, queried, restarted, upgraded and uninstalled on a real cluster there. It cannot be run on the machine it was written on (rootless Docker without cgroup delegation, exhausted inotify limit), so it was never run locally; the HTTP part (`ci/smoke_api.py`) was also run against real containers laid out like the chart. It covers one replica on a single-node kind cluster, not a multi-node or multi-zone setup.
 
 
-**MinIO in tests:** MinIO no longer publishes images on Docker Hub or quay.io, so `scratch/verify_s3_events_ui.py` uses `cgr.dev/chainguard/minio` (env `MINIO_IMAGE` overrides).
+**A real S3 server in tests:** `scratch/garage_up.sh` boots a throwaway single-node Deuxfleurs Garage and prints its endpoint and a generated access key, used
+by `scratch/test_autoloader_preview.py`, `scratch/test_autoloader_target.py` and `scratch/verify_autoloader_preview_ui.py` (none of these run in CI; see
+their docstrings). `scratch/verify_s3_events_ui.py` is the one exception and still uses MinIO (`cgr.dev/chainguard/minio`, env `MINIO_IMAGE` overrides;
+MinIO no longer publishes images on Docker Hub or quay.io), because it tests MinIO's bucket-notification/webhook feature and Garage has no S3
+notification API at all.

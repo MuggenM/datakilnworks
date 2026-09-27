@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Preview of local-folder and s3:// Auto-Loader sources (web/autoloader_preview.py) against a throwaway warehouse and a THROWAWAY MinIO (a real S3):
-  docker network create pvnet; docker run -d --name pvminio --network pvnet -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin cgr.dev/chainguard/minio server /data
-  docker run --rm --network pvnet -e S3_ENDPOINT=pvminio:9000 -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook python /workspace/scratch/test_autoloader_preview.py"""
+"""Preview of local-folder and s3:// Auto-Loader sources (web/autoloader_preview.py) against a throwaway warehouse and a THROWAWAY Deuxfleurs Garage (a real S3):
+  eval "$(scratch/garage_up.sh pvnet pv-garage)"    # prints/exports GARAGE_ENDPOINT, GARAGE_KEY_ID, GARAGE_SECRET_KEY
+  docker run --rm --network pvnet -e S3_ENDPOINT="$GARAGE_ENDPOINT" -e S3_ACCESS_KEY="$GARAGE_KEY_ID" -e S3_SECRET_KEY="$GARAGE_SECRET_KEY" \
+     -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook python /workspace/scratch/test_autoloader_preview.py
+Garage stands in for MinIO here (MinIO's Docker Hub image can no longer be pulled without a login); see scratch/garage_up.sh for why one test still uses
+MinIO. Container names must not use underscores: botocore's endpoint validation rejects them in a hostname."""
 import io, json, os, shutil, sys, tempfile, time
 TMP = tempfile.mkdtemp(prefix="alpv_"); os.environ["WAREHOUSE_DIR"] = TMP
 sys.path.insert(0, "/workspace")
@@ -67,16 +70,17 @@ EP = os.environ.get("S3_ENDPOINT")
 if not EP:
     print("no S3_ENDPOINT: skipping the S3 section")
 else:
-    print("s3:// (MinIO)")
+    print("s3:// (Garage)")
+    AK = os.environ.get("S3_ACCESS_KEY", "minioadmin"); SK = os.environ.get("S3_SECRET_KEY", "minioadmin")  # defaults kept for an old MinIO-based run
     import boto3
-    s3 = boto3.client("s3", endpoint_url=f"http://{EP}", aws_access_key_id="minioadmin", aws_secret_access_key="minioadmin", region_name="us-east-1")
+    s3 = boto3.client("s3", endpoint_url=f"http://{EP}", aws_access_key_id=AK, aws_secret_access_key=SK, region_name="garage")
     for _ in range(30):
         try: s3.list_buckets(); break
         except Exception: time.sleep(1)
     s3.create_bucket(Bucket="landing")
     put = lambda k, b: s3.put_object(Bucket="landing", Key=k, Body=b if isinstance(b, bytes) else b.encode())
-    def mount(mid="m1", bucket="landing", secret="minioadmin", key="minioadmin", endpoint=EP):
-        return {"id": mid, "type": "s3", "catalog_name": mid, "name": mid, "config": {"bucket": bucket, "endpoint": endpoint, "key_id": key, "secret": secret, "region": "us-east-1", "url_style": "path", "use_ssl": False}}
+    def mount(mid="m1", bucket="landing", secret=SK, key=AK, endpoint=EP):
+        return {"id": mid, "type": "s3", "catalog_name": mid, "name": mid, "config": {"bucket": bucket, "endpoint": endpoint, "key_id": key, "secret": secret, "region": "garage", "url_style": "path", "use_ssl": False}}
     mounts.save_mounts([])
     check("no mount configured: a clear message", "mount" in (err(pv.preview, "s3://landing/in/", "*.csv") or "").lower())
     mounts.save_mounts([mount()])
