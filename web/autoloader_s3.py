@@ -38,6 +38,9 @@ class S3SourceError(Exception):
     """A problem with the S3 source (bad path, no mount, unreachable, access denied); the message is user-safe."""
 
 
+SOURCE_ERROR = S3SourceError          # the name every autoloader_* source module exposes, for autoloader.py's generic dispatch
+
+
 @dataclass
 class RemoteObject:
     bucket: str
@@ -157,8 +160,10 @@ def fingerprint(obj: RemoteObject) -> str:
     return hashlib.sha256(f"s3|{obj.bucket}|{obj.key}|{obj.size}|{obj.etag}".encode()).hexdigest()
 
 
-def configure_duckdb(duck_conn, conn: Dict[str, Any]):
-    """Point a DuckDB connection's httpfs at this mount so `s3://` URLs read straight from the bucket."""
+def configure_duckdb(duck_conn, conn: Dict[str, Any], bucket: Optional[str] = None):
+    """Point a DuckDB connection's httpfs at this mount so `s3://` URLs read straight from the bucket. `bucket` is
+    accepted (and unused) only so autoloader.py can call every source module's configure_duckdb the same way; unlike
+    GCS's, an S3 secret does not need a bucket-scoped SCOPE to honour a custom ENDPOINT."""
     def q(v: str) -> str:
         return (v or "").replace("'", "''")
     duck_conn.execute("INSTALL httpfs; LOAD httpfs;")

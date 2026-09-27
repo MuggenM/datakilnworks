@@ -21,9 +21,28 @@ except ImportError:  # requirements.txt ships croniter; guard like web/workflow.
 from deltalake import DeltaTable, write_deltalake
 
 from web.volumes import resolve_volume_posix_path, get_volume_physical_path
-from web import autoloader_s3, autoloader_conn
+from web import autoloader_s3, autoloader_azure, autoloader_gcs, autoloader_conn
 
 logger = logging.getLogger("localspark.autoloader")
+
+# Every object-store source module a pipeline's `source_volume_path` can name, in the order they are tried. Each
+# exposes the same small interface: is_<x>_path, normalize_path, SOURCE_ERROR, resolve_connection, make_client,
+# list_objects, fingerprint, configure_duckdb(duck_conn, conn, bucket=None), quarantine. Adding a fourth backend is
+# adding one more (name, module) pair here, not touching every call site below.
+REMOTE_SOURCES: List[Tuple[str, Any]] = [
+    ("s3", autoloader_s3),
+    ("azure", autoloader_azure),
+    ("gcs", autoloader_gcs),
+]
+REMOTE_SOURCE_MAP: Dict[str, Any] = dict(REMOTE_SOURCES)
+
+
+def _remote_provider(source_volume_path: str):
+    """(kind, module) of the object-store source `source_volume_path` names, or (None, None) for a local/conn:// path."""
+    for kind, module in REMOTE_SOURCES:
+        if getattr(module, f"is_{kind}_path")(source_volume_path):
+            return kind, module
+    return None, None
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
@@ -242,7 +261,7 @@ def _validate_conn_source(source_vol: str, watch_enabled: int, source_mount_id: 
     if watch_enabled:
         raise ValueError("File events watch local volumes only. A connection source is polled: use a poll interval or a cron schedule.")
     if source_mount_id:
-        raise ValueError("A storage mount only applies to s3:// sources.")
+        raise ValueError("A storage mount only applies to s3://, azure:// and gcs:// sources.")
     try:
         return autoloader_conn.validate_source(source_vol, options)
     except autoloader_conn.SourceError as exc:
@@ -250,12 +269,14 @@ def _validate_conn_source(source_vol: str, watch_enabled: int, source_mount_id: 
 
 
 def _validate_source(source_vol: str, watch_enabled: int, source_mount_id: Optional[str]) -> str:
-    """Validates and normalises a pipeline source. S3 sources are polled: inotify has nothing to watch there."""
+    """Validates and normalises a pipeline source. Object-store sources (s3://, azure://, gcs://) are polled: inotify
+    has nothing to watch there."""
     if autoloader_conn.is_conn_path(source_vol):
         return source_vol.strip()
-    if not autoloader_s3.is_s3_path(source_vol):
+    kind, module = _remote_provider(source_vol)
+    if module is None:
         if source_mount_id:
-            raise ValueError("A storage mount only applies to s3:// sources.")
+            raise ValueError("A storage mount only applies to s3://, azure:// and gcs:// sources.")
         try:                                                # a hidden folder of the warehouse (.metadata holds credentials) is never a source
             rel = os.path.relpath(os.path.realpath(resolve_volume_posix_path(source_vol)), os.path.realpath(WAREHOUSE_DIR))
             if any(p.startswith(".") and p != "." for p in rel.split(os.sep)):
@@ -267,10 +288,10 @@ def _validate_source(source_vol: str, watch_enabled: int, source_mount_id: Optio
             pass                                            # an unresolvable path is reported when the pipeline runs, as before
         return source_vol
     if watch_enabled:
-        raise ValueError("File events watch local volumes only. An S3 source is polled: use a poll interval or a cron schedule.")
+        raise ValueError(f"File events watch local volumes only. A {kind.upper()} source is polled: use a poll interval or a cron schedule.")
     try:
-        return autoloader_s3.normalize_path(source_vol)
-    except autoloader_s3.S3SourceError as exc:
+        return module.normalize_path(source_vol)
+    except module.SOURCE_ERROR as exc:
         raise ValueError(str(exc))
 
 
@@ -651,10 +672,10 @@ def _looks_like_remote_io_error(err: Exception) -> bool:
 
 
 def _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash, file_size,
-                     elapsed_ms, now_iso, err, remote=None, pipeline=None) -> Dict[str, Any]:
-    """Moves a malformed file (or copies an S3 object) into `_quarantine/`, records it in the checkpoint DB and returns the result."""
+                     elapsed_ms, now_iso, err, remote=None, pipeline=None, remote_kind=None) -> Dict[str, Any]:
+    """Moves a malformed file (or copies a remote object) into `_quarantine/`, records it in the checkpoint DB and returns the result."""
     if remote is not None:
-        autoloader_s3.quarantine(pipeline, remote)
+        REMOTE_SOURCE_MAP[remote_kind].quarantine(pipeline, remote)
     else:
         quarantine_dir = os.path.join(base_source_dir, "_quarantine")
         os.makedirs(quarantine_dir, exist_ok=True)
@@ -701,8 +722,9 @@ def _remove_pipeline_lineage(pipeline: Dict[str, Any]):
 
 def _volume_lineage_id(source_volume_path: str) -> str:
     """Lineage node id for the volume behind a pipeline (`volume:/Volumes/cat/schema/vol`)."""
-    if autoloader_s3.is_s3_path(source_volume_path):
-        return "volume:" + autoloader_s3.normalize_path(source_volume_path).rstrip("/")
+    _kind, module = _remote_provider(source_volume_path)
+    if module is not None:
+        return "volume:" + module.normalize_path(source_volume_path).rstrip("/")
     if autoloader_conn.is_conn_path(source_volume_path):
         return "volume:" + source_volume_path.strip().rstrip("/")
     parts = [p for p in (source_volume_path or "").strip().replace("\\", "/").split("/") if p]
@@ -721,9 +743,10 @@ def sync_pipeline_lineage(pipeline: Dict[str, Any], last_file: Optional[str] = N
         from web.lineage import upsert_node, upsert_edge, make_table_id
         vol_id = _volume_lineage_id(pipeline["source_volume_path"])
         vol_path = vol_id[len("volume:"):]
-        if autoloader_s3.is_s3_path(vol_path):
-            bucket, _prefix = autoloader_s3.parse_s3_path(vol_path)
-            vol_catalog, vol_schema, vol_name = "s3", bucket, vol_path[len("s3://"):]
+        kind, module = _remote_provider(vol_path)
+        if module is not None:
+            bucket, _prefix = getattr(module, f"parse_{kind}_path")(vol_path)
+            vol_catalog, vol_schema, vol_name = kind, bucket, vol_path[len(f"{kind}://"):]
         elif autoloader_conn.is_conn_path(vol_path):
             cname, _rest = autoloader_conn.parse_ref(vol_path)
             vol_catalog, vol_schema, vol_name = "connection", cname, vol_path[len(autoloader_conn.SCHEME):]
@@ -756,18 +779,21 @@ def purge_legacy_lineage_nodes():
 
 
 def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_dir: str,
-                        remote: Optional["autoloader_s3.RemoteObject"] = None,
-                        s3_conn: Optional[Dict[str, Any]] = None,
+                        remote: Optional[Any] = None,
+                        remote_conn: Optional[Dict[str, Any]] = None,
+                        remote_kind: Optional[str] = None,
                         identity: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
     """
-    Ingests a single file (or, with `remote`, one S3 object read in place; or, with `identity=(name, hash)`, a file staged from a
-    connection source, whose checkpoint identity is the remote's, not the staged copy's) into the pipeline's target Delta Lake table.
-    Enforces schema evolution and moves corrupt files into _quarantine.
+    Ingests a single file (or, with `remote` + `remote_kind`, one object of a REMOTE_SOURCES backend read in place; or,
+    with `identity=(name, hash)`, a file staged from a connection source, whose checkpoint identity is the remote's,
+    not the staged copy's) into the pipeline's target Delta Lake table. Enforces schema evolution and moves corrupt
+    files into _quarantine.
     """
     start_time = time.perf_counter()
     pipeline_id = pipeline["id"]
+    remote_module = REMOTE_SOURCE_MAP[remote_kind] if remote is not None else None
     if remote is not None:
-        file_size, file_hash, rel_path = remote.size, autoloader_s3.fingerprint(remote), remote.rel_key
+        file_size, file_hash, rel_path = remote.size, remote_module.fingerprint(remote), remote.rel_key
         file_path = remote.url
     elif identity is not None:
         file_size = os.stat(file_path).st_size
@@ -794,7 +820,7 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
     read_state = {"opened": False, "error": None, "rows": 0}
     try:
         if remote is not None:
-            autoloader_s3.configure_duckdb(duck_conn, s3_conn)
+            remote_module.configure_duckdb(duck_conn, remote_conn, remote.bucket)
         reader = _open_source_reader(duck_conn, file_path, ext_lower)
         read_state["opened"] = True
 
@@ -901,7 +927,7 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
             # (An S3 access / network / endpoint problem is not the object's fault: it is FAILED and retried instead.)
             return _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash,
                                     file_size, elapsed_ms, now_iso, read_state["error"] or write_err,
-                                    remote=remote, pipeline=pipeline)
+                                    remote=remote, pipeline=pipeline, remote_kind=remote_kind)
         db = get_db()
         db.execute("""
             INSERT OR REPLACE INTO autoloader_file_history (
@@ -953,8 +979,8 @@ def run_pipeline_cycle(pipeline_id: str) -> Dict[str, Any]:
     return result
 
 
-def _run_s3_cycle(pipe: Dict[str, Any]) -> Dict[str, Any]:
-    """One polling cycle over an S3 prefix: list, skip checkpointed objects, stream each new one into Delta."""
+def _run_remote_cycle(pipe: Dict[str, Any], kind: str, module: Any) -> Dict[str, Any]:
+    """One polling cycle over an object-store prefix (S3, Azure Blob or GCS): list, skip checkpointed objects, stream each new one into Delta."""
     pipeline_id = pipe["id"]
     now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     db = get_db()
@@ -976,10 +1002,10 @@ def _run_s3_cycle(pipe: Dict[str, Any]) -> Dict[str, Any]:
         d.close()
 
     try:
-        conn = autoloader_s3.resolve_connection(pipe)
-        client = autoloader_s3.make_client(conn)
-        objects = autoloader_s3.list_objects(pipe, client)
-    except autoloader_s3.S3SourceError as exc:
+        conn = module.resolve_connection(pipe)
+        client = module.make_client(conn)
+        objects = module.list_objects(pipe, client)
+    except module.SOURCE_ERROR as exc:
         logger.error(f"Auto-Loader pipeline {pipeline_id}: {exc}")
         finish("ERROR", str(exc))
         return {"error": str(exc), "pipeline_id": pipeline_id, "files_found": 0, "files_ingested": 0, "rows_ingested": 0}
@@ -988,14 +1014,14 @@ def _run_s3_cycle(pipe: Dict[str, Any]) -> Dict[str, Any]:
     results = []
     for obj in objects:
         try:
-            if autoloader_s3.fingerprint(obj) in known_hashes:
+            if module.fingerprint(obj) in known_hashes:
                 continue
-            res = process_single_file(pipe, obj.url, "", remote=obj, s3_conn=conn)
+            res = process_single_file(pipe, obj.url, "", remote=obj, remote_conn=conn, remote_kind=kind)
             results.append(res)
             if res["status"] == "SUCCESS":
                 files_ingested += 1
                 total_rows += res.get("rows", 0)
-                known_hashes.add(autoloader_s3.fingerprint(obj))
+                known_hashes.add(module.fingerprint(obj))
             elif res["status"] == "QUARANTINED":
                 files_quarantined += 1
         except Exception as exc:
@@ -1079,8 +1105,9 @@ def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
     pipe = get_pipeline(pipeline_id)
     if not pipe:
         return {"error": "Pipeline not found"}
-    if autoloader_s3.is_s3_path(pipe["source_volume_path"]):
-        return _run_s3_cycle(pipe)
+    kind, module = _remote_provider(pipe["source_volume_path"])
+    if module is not None:
+        return _run_remote_cycle(pipe, kind, module)
     if autoloader_conn.is_conn_path(pipe["source_volume_path"]):
         return _run_connection_cycle(pipe)
 

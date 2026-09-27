@@ -1,9 +1,9 @@
-"""Preview of the first rows of an Auto-Loader source that is a local volume folder or an `s3://` location, BEFORE a pipeline exists
-(connection sources have their own, `autoloader_conn.preview`).
+"""Preview of the first rows of an Auto-Loader source that is a local volume folder or an `s3://` / `azure://` / `gcs://` location,
+BEFORE a pipeline exists (connection sources have their own, `autoloader_conn.preview`).
 
 It answers "what would this pipeline read?" with the pipeline's own rules: the same discovery filters (hidden files and folders, `_quarantine`, `.tmp` /
-`.part`, the file pattern), the same reader (`autoloader._open_source_reader`, DuckDB streaming with a LIMIT) and, for S3, the same mount and DuckDB
-`httpfs` settings, so objects are read in place (a Parquet file costs a few range requests, nothing is downloaded). Nothing is created, checkpointed
+`.part`, the file pattern), the same reader (`autoloader._open_source_reader`, DuckDB streaming with a LIMIT) and, for an object store, the same mount and
+DuckDB settings, so objects are read in place (a Parquet file costs a few range requests, nothing is downloaded). Nothing is created, checkpointed
 or loaded: a missing folder is reported, not created (the pipeline itself creates it on its first run).
 
 The sample is the oldest file, like the pipeline's first cycle, unless a specific one is asked for (`sample_file`, which must be one of the
@@ -13,11 +13,12 @@ import fnmatch
 import os
 from typing import Any, Dict, List, Optional
 
-from web import autoloader_s3
+from web import autoloader_s3, autoloader_azure, autoloader_gcs
 
 PREVIEW_ROWS = 10
 MAX_LOCAL_SCAN = 5000
-MAX_S3_SCAN = 3000                      # keys looked at (3 pages); a preview must not list a bucket with millions of objects
+MAX_REMOTE_SCAN = 3000                  # objects looked at; a preview must not list a bucket/container with millions of them
+MAX_S3_SCAN = MAX_REMOTE_SCAN            # kept as an alias: existing callers/tests refer to this name for the S3 case
 LISTED_FILES = 30
 READABLE = ("csv", "tsv", "txt", "parquet", "json", "jsonl", "ndjson")
 
@@ -178,6 +179,65 @@ def _s3(path: str, pattern: str, mount_id: Optional[str], sample_file: Optional[
             "files": [{"path": c["path"], "size": c["size"], "readable": _ext(c["path"]) in READABLE} for c in found[:LISTED_FILES]], **body}
 
 
+# ---------------------------------------------------------------- azure:// and gcs://, mirroring _s3 above
+
+def _remote(module, source_name: str, path: str, pattern: str, mount_id: Optional[str], sample_file: Optional[str], limit: int) -> Dict[str, Any]:
+    """Shared body of _azure/_gcs: list, filter, pick, configure DuckDB, render. `module` is autoloader_azure or autoloader_gcs."""
+    Err = module.SOURCE_ERROR
+    pattern = pattern or "*"
+    try:
+        bucket, prefix = getattr(module, f"parse_{source_name}_path")(path)
+        pipe = {"source_volume_path": path, "source_mount_id": mount_id or "", "file_pattern": pattern}
+        conn = module.resolve_connection(pipe)
+        client = module.make_client(conn)
+    except Err as exc:
+        raise PreviewError(str(exc))
+    found: List[Dict[str, Any]] = []
+    scanned = 0
+    truncated = False
+    try:
+        for obj in module.list_objects(pipe, client):
+            scanned += 1
+            found.append({"path": obj.rel_key, "key": obj.key, "size": obj.size, "mtime": obj.last_modified.timestamp()})
+            if scanned >= MAX_REMOTE_SCAN:
+                truncated = True
+                break
+    except Err as exc:
+        raise PreviewError(str(exc))
+    except Exception as exc:
+        raise PreviewError(f"Could not list {source_name}://{bucket}/{prefix}: {str(exc).splitlines()[0][:160]}")
+    if not found:
+        raise PreviewError(f"No object under {source_name}://{bucket}/{prefix} matches '{pattern}'"
+                           + (f" among the first {scanned} objects." if truncated else ". Hidden names, .tmp / .part files and _quarantine/ are ignored."))
+    found.sort(key=lambda c: (c["mtime"], c["path"]))
+    chosen = _pick(found, sample_file)
+    import duckdb
+    duck = duckdb.connect(":memory:")
+    try:
+        try:
+            module.configure_duckdb(duck, conn, bucket)
+        except Exception as exc:
+            raise PreviewError(f"The storage could not be set up for reading ({str(exc).splitlines()[0][:160]}).")
+        body = _render(duck, f"{source_name}://{bucket}/{chosen['key']}", _ext(chosen["path"]), limit)
+    finally:
+        duck.close()
+    skipped = sum(1 for c in found if _ext(c["path"]) not in READABLE)
+    notes = [f"{len(found)}{'+' if truncated else ''} matching object(s)" + (f" (only the first {scanned} objects were looked at)" if truncated else "")
+             + f". Showing {chosen['path']} ({_size(chosen['size'])}), read in place; " + ("the one you chose." if sample_file else "the oldest, which the pipeline loads first.")]
+    if skipped:
+        notes.append(f"{skipped} matching object(s) have a format the loader does not read.")
+    return {"ok": True, "source": source_name, "sample": chosen["path"], "file_count": len(found), "truncated_listing": truncated, "notes": notes,
+            "files": [{"path": c["path"], "size": c["size"], "readable": _ext(c["path"]) in READABLE} for c in found[:LISTED_FILES]], **body}
+
+
+def _azure(path: str, pattern: str, mount_id: Optional[str], sample_file: Optional[str], limit: int) -> Dict[str, Any]:
+    return _remote(autoloader_azure, "azure", path, pattern, mount_id, sample_file, limit)
+
+
+def _gcs(path: str, pattern: str, mount_id: Optional[str], sample_file: Optional[str], limit: int) -> Dict[str, Any]:
+    return _remote(autoloader_gcs, "gcs", path, pattern, mount_id, sample_file, limit)
+
+
 def preview(path: str, file_pattern: str = "*", source_mount_id: Optional[str] = None, sample_file: Optional[str] = None, limit: int = PREVIEW_ROWS) -> Dict[str, Any]:
     path = (path or "").strip()
     if not path:
@@ -185,6 +245,10 @@ def preview(path: str, file_pattern: str = "*", source_mount_id: Optional[str] =
     limit = max(1, min(int(limit or PREVIEW_ROWS), 50))
     if autoloader_s3.is_s3_path(path):
         return _s3(path, file_pattern, source_mount_id, sample_file, limit)
+    if autoloader_azure.is_azure_path(path):
+        return _azure(path, file_pattern, source_mount_id, sample_file, limit)
+    if autoloader_gcs.is_gcs_path(path):
+        return _gcs(path, file_pattern, source_mount_id, sample_file, limit)
     if source_mount_id:
-        raise PreviewError("A storage mount only applies to s3:// sources.")
+        raise PreviewError("A storage mount only applies to s3://, azure:// and gcs:// sources.")
     return _local(path, file_pattern, sample_file, limit)

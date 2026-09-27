@@ -176,8 +176,8 @@ def main():
         pio = autoloader.create_pipeline({"name": "io", "source_volume_path": f"s3://{BUCKET}/io/", "file_pattern": "*.csv", "target_table": "t_io"})
         real_cfg = autoloader_s3.configure_duckdb
 
-        def dead_endpoint(duck, conn):
-            real_cfg(duck, dict(conn, endpoint="127.0.0.1:1"))
+        def dead_endpoint(duck, conn, bucket=None):
+            real_cfg(duck, dict(conn, endpoint="127.0.0.1:1"), bucket)
         autoloader_s3.configure_duckdb = dead_endpoint
         try:
             r = autoloader.run_pipeline_cycle(pio["id"])

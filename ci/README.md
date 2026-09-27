@@ -10,8 +10,8 @@
 | **kind** | The Helm chart on a real Kubernetes cluster, see below | `ci/kind-smoke.sh` |
 
 The lists live in `ci/plan.json` (`tests` with optional extra pip packages, `ui`). Add a test there and it runs in its own job. A test script must exit
-non-zero on failure and must not need anything outside the container: tests that need real services (Gitea, Redpanda, a real S3 server, lldap, Keycloak,
-SFTP, the Docker socket) stay out of CI; each says how to run it in its docstring.
+non-zero on failure and must not need anything outside the container: tests that need real services (Gitea, Redpanda, a real S3 server, Azurite, lldap,
+Keycloak, SFTP, the Docker socket) stay out of CI; each says how to run it in its docstring.
 
 ## The cluster smoke test (`ci/kind-smoke.sh`)
 

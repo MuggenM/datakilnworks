@@ -22,7 +22,7 @@ something is implemented but only partly verified, that is said in section 1b.
 | Auto-suspend was cosmetic | **Built**: idle warehouses really stop or pause their compute-node container, resume on the next query, per-warehouse warm start | `warehouse_lifecycle.py`, `container_control.py`, controller service; real containers in tests |
 | Row-level security, LDAP | **Built** (already struck through in the original) | `governance/row_filters.py`, `ldap_auth.py` |
 | IP allowlists (nothing) | **Built**: global allowlist with trusted proxies, per-recipient rules for Delta Sharing | `ip_allowlist.py` |
-| File-watch ingestion | **Built**: inotify triggering, S3 bucket-event webhooks, S3/HTTP/SFTP/REST sources, previews | `autoloader_watch.py`, `s3_events.py`, `autoloader_s3.py`, `autoloader_conn.py` |
+| File-watch ingestion | **Built**: inotify triggering, S3 bucket-event webhooks, S3/Azure Blob/GCS/HTTP/SFTP/REST sources, previews | `autoloader_watch.py`, `s3_events.py`, `autoloader_s3.py`, `autoloader_azure.py`, `autoloader_gcs.py`, `autoloader_conn.py` |
 | Streaming ingestion (polling only) | **Partly built**: Kafka / Redpanda streams with exactly-once micro-batches, Avro / Protobuf / JSON Schema registries, rewind and move | `streaming.py`, `stream_ops.py`; real Redpanda in tests |
 | No cross-organisation sharing | **Partly built**: a Delta Sharing server (shares, recipients, signed links, change data feed, hints, governance-gated). No marketplace | `delta_sharing.py`; the real `delta-sharing` client in tests |
 | HA was "documentation only" | **Partly built**: Helm chart, init container, health probes, optional Traefik TLS proxy. Not exercised on a cluster, see 1b | `deploy/helm/`, `web/init.py`, `deploy/traefik/` |
@@ -42,8 +42,7 @@ not been recomputed since (see 1b, last row).
 | Petabyte-scale distributed execution | DuckDB is a single-node engine and Ray parallelises on one machine or a small cluster. See section 2. |
 | Marketplace and data monetisation | Delta Sharing covers sharing with named recipients. There is no listing, discovery, request workflow or billing service. |
 | Spark-class continuous processing | Kafka streams are exactly-once micro-batches into Delta tables. There is no Structured Streaming, no streaming SQL / materialised streaming tables, no windowed aggregation over unbounded streams. |
-| Cloud event queues as Auto-Loader triggers | Bucket events arrive through webhooks (MinIO, Garage, anything that can POST S3 event JSON). SQS, SNS, EventBridge, Event Grid and Pub/Sub are not consumed. |
-| Auto-Loader sources on Azure Blob / ADLS / GCS | Local volumes, `s3://`, HTTP(S), REST and SFTP are supported. OneLake and other mounts work as catalogs, not as file-arrival sources. |
+| Cloud event queues as Auto-Loader triggers | Bucket events arrive through webhooks (MinIO, Garage, anything that can POST S3 event JSON). SQS, SNS, EventBridge, Event Grid and Pub/Sub are not consumed; only S3 has an instant-webhook trigger, Azure Blob and GCS sources are polled or cron only. |
 | Parallel execution of workflow tasks | The tasks of one run execute one after another (deliberately deferred). |
 | Compliance certifications and a managed SLA | Not attainable for self-hosted software, see section 2. |
 
@@ -60,6 +59,7 @@ not been recomputed since (see 1b, last row).
 | SQL `GRANT` / `REVOKE` | Catalog, schema and table grants. Column-level grants, `WITH GRANT OPTION` and role principals are refused with a clear message. |
 | Network policy | One global allowlist plus per-recipient rules for Delta Sharing. No per-user or per-role network policies. |
 | Governance on shared data | A table with a masking policy or row filter cannot be shared through Delta Sharing (recipients receive raw files). The fix is to share a de-identified copy. |
+| Azure Blob and GCS Auto-Loader sources | GCS goes through its S3-compatible interoperability API (HMAC keys), not the native Google Cloud SDK or OAuth service accounts; real GCS was not available to test against, so `scratch/test_autoloader_gcs.py` runs against a throwaway Garage container standing in for GCS's endpoint instead. Azure Blob was tested against a throwaway Azurite emulator, not a real Azure account. Neither is a Delta write target (source only, like every non-S3 mount); neither has an instant bucket-notification trigger (S3 events has no Azure/GCS equivalent here); ADLS Gen2-specific features (hierarchical namespace ACLs) are not used. |
 | `FEATURE_COMPARISON.md` scorecard | Its per-domain scores and totals were last recomputed before most of the work above, so the totals are stale in both directions. Treat the individual rows, not the sum, as the reference until it is recomputed. |
 
 ---
@@ -92,8 +92,10 @@ Ordered by how much they would change the honest picture. None needs a new engin
 1. ~~**Prove the deployment claims.**~~ *(Done: `.github/workflows/ci.yml`, `ci/`.)* CI runs 38 test scripts in the built image, 7 browser tests, the static checks and a kind smoke test of the chart. Still to do: the integration tier (tests that need Gitea, Redpanda, MinIO, lldap, Keycloak) as a scheduled job.
 2. **Parallel workflow tasks.** Run independent branches of a DAG concurrently (bounded by a per-workflow limit). The graph
    and run page already show branches; the engine is the missing part.
-3. **More Auto-Loader sources.** Azure Blob / ADLS and GCS as file-arrival sources (listing + credentials from mounts,
-   mirroring the S3 path), and optionally SQS / Event Grid consumers.
+3. ~~**More Auto-Loader sources.**~~ *(Done: `web/autoloader_azure.py`, `web/autoloader_gcs.py`.)* Azure Blob (`azure://`) and GCS
+   (`gcs://`, through its S3-compatible interoperability API) as file-arrival sources, mirroring the S3 path: listing, exactly-once
+   checkpoints, quarantine, preview, credentials from a storage mount. Both are sources only, not targets (see 1b). Still open:
+   SQS / Event Grid consumers (this was always the optional half of the item).
 4. **SAML completeness.** Signed AuthnRequests, encrypted assertions and single logout, for IdPs that insist on them.
 5. **Column-level grants** and `WITH GRANT OPTION` in the SQL grant layer, built on the existing masking machinery.
 6. **Delta Sharing reach.** Shareable S3-mount tables (pre-signed object-store URLs), tables with deletion vectors or column
@@ -112,6 +114,6 @@ Ordered by how much they would change the honest picture. None needs a new engin
 ## Recommendation
 
 `FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
-stale and it does not yet reflect the caveats in 1b. Items 1 and 10 above (prove the deployment in CI, then recompute the
-scorecard) would make both documents defensible for an external reader. Tell me which items to build next; I would start
-with parallel workflow tasks or the CI job.
+stale and it does not yet reflect the caveats in 1b. Items 1 and 3 are now done; item 10 (recompute the scorecard) would
+make both documents defensible for an external reader. Tell me which items to build next; I would start with parallel
+workflow tasks or the scorecard recompute.

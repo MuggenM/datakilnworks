@@ -25,6 +25,7 @@ httpx>=0.27.0   # studio -> compute worker calls (was only present transitively 
 ray[default]>=2.35.0
 azure-identity>=1.17.0
 azure-storage-file-datalake>=12.14.0
+azure-storage-blob>=12.19.0  # Auto-Loader Azure Blob sources (web/autoloader_azure.py); azure-storage-file-datalake above is for OneLake mounts only
 cryptography>=41.0.0
 boto3>=1.34.0    # Auto-Loader S3 sources (ListObjectsV2 polling, quarantine copies)
 paramiko>=3.4.0      # Connections: SFTP sources for Auto-Loader (host key pinned per connection)
