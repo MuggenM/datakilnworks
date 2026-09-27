@@ -216,7 +216,8 @@ async def _sandbox_isolation(request: Request, call_next):
     return await call_next(request)
 
 
-_MUST_CHANGE_PASSWORD_ALLOWED = {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me", "/api/auth/login"}
+_MUST_CHANGE_PASSWORD_ALLOWED = {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me", "/api/auth/login",
+                                 "/api/auth/saml/logout", "/api/auth/saml/sls"}
 
 
 @app.middleware("http")
@@ -248,7 +249,8 @@ async def _must_change_password_gate(request: Request, call_next):
 
 # What a user who has to enrol in two-factor authentication (organisation policy, deadline passed) may still call.
 _MFA_ENROLLMENT_ALLOWED = {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me", "/api/auth/login", "/api/auth/login/mfa",
-                           "/api/auth/mfa/status", "/api/auth/mfa/setup", "/api/auth/mfa/enable"}
+                           "/api/auth/mfa/status", "/api/auth/mfa/setup", "/api/auth/mfa/enable",
+                           "/api/auth/saml/logout", "/api/auth/saml/sls"}
 
 
 @app.middleware("http")
@@ -1438,9 +1440,53 @@ async def saml_acs(request: Request):
         resp.status_code = 303
         return resp
     record_user_login(u["id"])
+    saml_session = u.pop("_saml_session", None) or {}
     resp = RedirectResponse(url="/", status_code=303)             # 303: the browser must GET / after this POST
-    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u), max_age=86400, httponly=True, samesite="lax", secure=base.startswith("https://"))
+    # name_id/session_index ride in the session token (never re-derived later) so Single Logout can name exactly the
+    # session the IdP itself issued.
+    extra = {"saml_name_id": saml_session.get("name_id", ""), "saml_session_index": saml_session.get("session_index", ""),
+             "saml_name_id_format": saml_session.get("name_id_format", "")} if saml_session.get("name_id") else None
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, extra_claims=extra), max_age=86400, httponly=True, samesite="lax", secure=base.startswith("https://"))
     resp.delete_cookie(saml_auth.STATE_COOKIE, path="/api/auth/saml")
+    return resp
+
+
+@app.get("/api/auth/saml/logout")
+async def saml_logout(request: Request):
+    """SP-initiated Single Logout: for a SAML session with SLO configured, redirects to the IdP to end its own SSO
+    session too; otherwise (or on any error) falls back to a plain local sign-out. Always clears the local session."""
+    from web import saml_auth
+    token = request.cookies.get(COOKIE_NAME)
+    payload = decode_access_token(token) if token else None
+    resp = None
+    if payload and payload.get("saml_name_id"):
+        cfg = auth_frameworks.load_raw_config().get("saml", {})
+        base = _saml_base(cfg, request)
+        try:
+            url = await asyncio.to_thread(saml_auth.begin_logout, cfg, base, payload["saml_name_id"],
+                                          payload.get("saml_session_index") or None, payload.get("saml_name_id_format") or None)
+            resp = RedirectResponse(url=url, status_code=302)
+        except saml_auth.SamlError as exc:
+            logger.info(f"SAML SP-initiated logout not started: {exc}")
+    if resp is None:
+        resp = RedirectResponse(url="/", status_code=302)
+    resp.delete_cookie(COOKIE_NAME)          # the local session ends now regardless of what the IdP round trip does
+    return resp
+
+
+@app.get("/api/auth/saml/sls")
+async def saml_sls(request: Request):
+    """This studio's SingleLogoutService: an IdP-initiated LogoutRequest (validated, answered with a signed
+    LogoutResponse) or the return leg of a LogoutRequest this studio sent (a LogoutResponse, validated against it).
+    Public: the IdP calls it directly, and an IdP-initiated request needs no session here to act on."""
+    from web import saml_auth
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    base = _saml_base(cfg, request)
+    query = dict(request.query_params)
+    result = await asyncio.to_thread(saml_auth.complete_logout, cfg, base, query)
+    resp = RedirectResponse(url=result["redirect_url"] if result["redirect_url"] else ("/?slo_error=1" if result["error"] else "/?slo=1"),
+                            status_code=302)
+    resp.delete_cookie(COOKIE_NAME)           # reached only via a browser redirect (HTTP-Redirect binding is SLO's only one here)
     return resp
 
 
@@ -1463,12 +1509,30 @@ class SamlMetadataImport(BaseModel):
 
 @app.post("/api/auth/frameworks/saml/import-metadata")
 async def saml_import_metadata_endpoint(payload: SamlMetadataImport, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    """Reads the IdP's entity id, SSO URL and signing certificate from its metadata (URL or pasted XML) for the settings form."""
+    """Reads the IdP's entity id, SSO/SLO URLs and signing certificate from its metadata (URL or pasted XML) for the settings form."""
     from web import saml_auth
     try:
         return await asyncio.to_thread(saml_auth.import_idp_metadata, payload.url or "", payload.xml or "")
     except saml_auth.SamlError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/auth/frameworks/saml/sp-certificate")
+async def saml_sp_certificate_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """This studio's own SAML signing/decryption certificate (never the private key), to register with the IdP when
+    turning on signed AuthnRequests, encrypted assertions or Single Logout. Auto-generated on first use."""
+    from web import saml_auth
+    return {"certificate": await asyncio.to_thread(saml_auth.sp_certificate_pem)}
+
+
+@app.post("/api/auth/frameworks/saml/rotate-sp-key")
+async def saml_rotate_sp_key_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Discards this studio's SAML signing/decryption keypair; the next use generates a fresh one. Do this only after
+    updating the IdP with the new certificate (from sp-certificate above), or signed requests and encrypted assertions
+    will start failing until it is."""
+    from web import saml_auth
+    await asyncio.to_thread(saml_auth.rotate_sp_key)
+    return {"success": True}
 
 
 @app.post("/api/auth/change-password")

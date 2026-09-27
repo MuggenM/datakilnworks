@@ -74,7 +74,11 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "power_user_value": "",
         "want_assertions_signed": True,
         "allow_idp_initiated": False,    # off: only responses to a sign-in this studio started are accepted
-        "default_role": "user"
+        "default_role": "user",
+        "sign_authn_requests": False,    # off by default: most IdPs don't require it; turn on once the SP cert (see the SAML
+                                          # settings page) is registered with the IdP, or a strict IdP may reject the request
+        "require_encrypted_assertions": False,  # reject an assertion that isn't encrypted; decrypting one that is always works
+        "slo_url": ""                    # the IdP's Single Logout Service URL (HTTP-Redirect); blank disables SP-initiated SLO
     }
 }
 

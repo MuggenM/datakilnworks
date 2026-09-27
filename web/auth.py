@@ -233,22 +233,25 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(user: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-    """Encodes a signed JWT access token carrying sub, username, display_name, and role."""
+def create_access_token(user: Dict[str, Any], expires_delta: Optional[timedelta] = None, extra_claims: Optional[Dict[str, Any]] = None) -> str:
+    """Encodes a signed JWT access token carrying sub, username, display_name, and role. `extra_claims` (for example a
+    SAML session's name_id/session_index, so Single Logout can later name the session the IdP itself issued) is merged
+    in first, so it can never override the fixed identity/expiry claims below."""
     now = datetime.datetime.now(datetime.timezone.utc)
     if expires_delta:
         expire = now + expires_delta
     else:
         expire = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-    to_encode = {
+    to_encode = dict(extra_claims or {})
+    to_encode.update({
         "sub": user["id"],
         "username": user["username"],
         "display_name": user["display_name"],
         "role": user["role"],
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp())
-    }
+    })
 
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 

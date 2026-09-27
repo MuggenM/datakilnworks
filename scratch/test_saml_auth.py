@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """SAML 2.0 sign-in (web/saml_auth.py) against an in-process MOCK identity provider that signs real XML with real RSA keys (python3-saml's own
 signer): the validation itself (signature, audience, issuer, destination, InResponseTo, time window, wrapping) is the real library in strict mode,
-plus this studio's rules (solicited only, replay, browser binding, no takeover, roles, group sync). Run in the studio image + python3-saml:
+plus this studio's rules (solicited only, replay, browser binding, no takeover, roles, group sync), and now also signed AuthnRequests, the
+require_encrypted_assertions rejection path (a real encrypt+decrypt round trip is not covered here: see the note above that section) and Single
+Logout (SP- and IdP-initiated, both directions signed with real XML-DSig over the HTTP-Redirect query string, exactly like a real IdP). Run in
+the studio image + python3-saml:
   docker run --rm -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook sh -c 'pip install -q python3-saml && cd /workspace && python scratch/test_saml_auth.py'"""
 import base64, datetime, os, re, shutil, sys, tempfile, uuid, zlib
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 TMP = tempfile.mkdtemp(prefix="saml_test_"); os.environ["WAREHOUSE_DIR"] = TMP
 os.environ["INIT_ADMIN_USERNAME"] = "admin"; os.environ["INIT_ADMIN_PASSWORD_HASH"] = "pbkdf2_sha256$100000$" + "0" * 32 + "$" + "0" * 64
 for v in ("GOVERNANCE_REQUIRE_AUTH", "JWT_SECRET_KEY"): os.environ.pop(v, None)
@@ -223,5 +226,114 @@ check("a non-http(s) metadata URL is refused", good)
 try: saml_auth.import_idp_metadata(xml="<nope/>"); good = False
 except saml_auth.SamlError: good = True
 check("metadata without an SSO service is refused", good)
+
+print("SP signing/decryption keypair")
+c1, k1 = saml_auth.sp_cert_and_key()
+c2, k2 = saml_auth.sp_cert_and_key()
+check("generated once and reused across calls", c1 == c2 and k1 == k2)
+check("the certificate can be handed to an administrator, PEM-formatted", saml_auth.sp_certificate_pem().strip().startswith("-----BEGIN CERTIFICATE-----"))
+saml_auth.rotate_sp_key()
+c3, k3 = saml_auth.sp_cert_and_key()
+check("rotate_sp_key() discards it; the next use generates a fresh one", c3 != c1 and k3 != k1)
+
+print("signed AuthnRequests")
+configure(sign_authn_requests=True)
+r, q, req, rid_s, relay_s = start()
+check("off by default, on when sign_authn_requests is set: the redirect carries a query-string signature", "SigAlg" in q and "Signature" in q)
+meta2 = client.get("/api/auth/saml/metadata")
+check("SP metadata always advertises a signing certificate, whether or not signing is turned on", "X509Certificate" in meta2.text)
+r_ok = acs(response(sign_s(assertion_xml("kim", rid_s, attrs={"username": ["kim"]})), rid_s), relay_s)
+check("a signed AuthnRequest doesn't stop an otherwise-valid sign-in", ok(r_ok))
+configure()
+r2, q2, _, _, _ = start()
+check("off by default: no query-string signature", "SigAlg" not in q2)
+
+print("require_encrypted_assertions (the rejection path; a real encrypt+decrypt round trip is python3-saml's own")
+print("well-established _decrypt_assertion, verified by reading its source rather than built here -- see saml_auth.py's docstring)")
+configure(require_encrypted_assertions=True)
+_, _, _, rid_e, relay_e = start()
+r_enc = acs(response(sign_s(assertion_xml("liam", rid_e, attrs={"username": ["liam"]})), rid_e), relay_e)
+check("an unencrypted assertion is refused when encryption is required", refused(r_enc))
+configure()
+_, _, _, rid_e2, relay_e2 = start()
+check("...and accepted again once the requirement is off", ok(acs(response(sign_s(assertion_xml("liam", rid_e2, attrs={"username": ["liam"]})), rid_e2), relay_e2)))
+
+print("Single Logout")
+SLS = f"{SP_BASE}/api/auth/saml/sls"
+SLO_URL = "https://idp.example.org/slo"
+def deflate_sign(xml, relay_state, param_name, key=None):
+    """A real HTTP-Redirect-bound query string: DEFLATE + base64 the message, sign that + RelayState + SigAlg with the
+    IdP's key (real XML-DSig binary signing, the same primitive python3-saml itself uses), exactly as a real IdP would."""
+    b64 = U.deflate_and_base64_encode(xml)
+    b64 = b64.decode() if isinstance(b64, bytes) else b64
+    alg = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+    to_sign = f"{param_name}={quote(b64, safe='')}"
+    if relay_state is not None:
+        to_sign += f"&RelayState={quote(relay_state, safe='')}"
+    to_sign += f"&SigAlg={quote(alg, safe='')}"
+    sig = base64.b64encode(U.sign_binary(to_sign.encode(), key or KEY)).decode()   # default algorithm=xmlsec.Transform.RSA_SHA256, matching alg above
+    q = {param_name: b64, "SigAlg": alg, "Signature": sig}
+    if relay_state is not None:
+        q["RelayState"] = relay_state
+    return q
+
+def logout_request_xml(name_id="alice", session_index=None, destination=SLS, issuer=IDP):
+    now = utc()
+    sess = f"<samlp:SessionIndex>{session_index}</samlp:SessionIndex>" if session_index else ""
+    return (f'<samlp:LogoutRequest {NS} ID="_lr{uuid.uuid4().hex}" Version="2.0" IssueInstant="{iso(now)}" Destination="{destination}">'
+            f'<saml:Issuer>{issuer}</saml:Issuer><saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified">{name_id}</saml:NameID>{sess}</samlp:LogoutRequest>')
+
+def logout_response_xml(in_response_to, destination=SLS, issuer=IDP, status="Success"):
+    return (f'<samlp:LogoutResponse {NS} ID="_lp{uuid.uuid4().hex}" Version="2.0" IssueInstant="{iso(utc())}" Destination="{destination}" InResponseTo="{in_response_to}">'
+            f'<saml:Issuer>{issuer}</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:{status}"/></samlp:Status></samlp:LogoutResponse>')
+
+configure(slo_url=SLO_URL)
+_, _, _, rid_l, relay_l = start()
+r_login = acs(response(sign_s(assertion_xml("nora", rid_l, attrs={"username": ["nora"]})), rid_l), relay_l)
+check("(setup) signed in for the SLO tests", ok(r_login))
+sess_cookie = r_login.cookies.get(auth.COOKIE_NAME)
+
+def cookie_cleared(resp, name=auth.COOKIE_NAME):
+    """A Set-Cookie that deletes the cookie (Starlette's delete_cookie: empty value, Max-Age=0/expired in the past)."""
+    return any(name in h and ("Max-Age=0" in h or "1970" in h) for h in resp.headers.get_list("set-cookie"))
+
+r_slo = client.get("/api/auth/saml/logout", cookies={auth.COOKIE_NAME: sess_cookie})
+check("SP-initiated logout redirects to the IdP's SLO URL", r_slo.status_code == 302 and r_slo.headers["location"].startswith(SLO_URL))
+check("the local session is cleared immediately", cookie_cleared(r_slo))
+qlo = parse_qs(urlparse(r_slo.headers["location"]).query)
+lr_xml = zlib.decompress(base64.b64decode(qlo["SAMLRequest"][0]), -15).decode()
+check("the LogoutRequest is signed (this studio signs it) and names the session's own NameID", "SigAlg" in qlo and "Signature" in qlo and ">nora<" in lr_xml, lr_xml[:300])
+lr_id = re.search(r' ID="([^"]+)"', lr_xml).group(1)
+relay_lo = qlo["RelayState"][0]
+
+r_no_sess = client.get("/api/auth/saml/logout")
+check("with no session at all, it just goes home (graceful fallback, not an error)", r_no_sess.status_code == 302 and r_no_sess.headers["location"] == "/")
+
+lresp_q = deflate_sign(logout_response_xml(lr_id), relay_lo, "SAMLResponse")
+r_back = client.get("/api/auth/saml/sls", params=lresp_q)
+check("the IdP's LogoutResponse (return leg of SP-initiated logout) is accepted", r_back.status_code == 302 and "slo_error" not in r_back.headers["location"], r_back.headers.get("location"))
+
+lreq_q = deflate_sign(logout_request_xml("nora"), None, "SAMLRequest")
+r_idp_init = client.get("/api/auth/saml/sls", params=lreq_q, cookies={auth.COOKIE_NAME: sess_cookie})
+check("an IdP-initiated LogoutRequest gets a signed LogoutResponse redirect back to the IdP", r_idp_init.status_code == 302 and r_idp_init.headers["location"].startswith(SLO_URL))
+qresp = parse_qs(urlparse(r_idp_init.headers["location"]).query)
+check("...and this studio signs that response too", "SigAlg" in qresp and "Signature" in qresp)
+check("...and clears whatever local session cookie was present", cookie_cleared(r_idp_init))
+
+lreq_unsigned = logout_request_xml("nora")
+b64_unsigned = U.deflate_and_base64_encode(lreq_unsigned)
+b64_unsigned = b64_unsigned.decode() if isinstance(b64_unsigned, bytes) else b64_unsigned
+r_unsigned = client.get("/api/auth/saml/sls", params={"SAMLRequest": b64_unsigned})
+check("an UNSIGNED LogoutRequest is refused (SLO messages must be signed, unlike an ordinary login response)",
+      r_unsigned.status_code == 302 and "slo_error" in r_unsigned.headers["location"])
+
+try:
+    saml_auth.begin_logout(configure(slo_url=""), SP_BASE, "nora", None, None)
+    good = False
+except saml_auth.SamlError:
+    good = True
+check("SP-initiated logout is refused up front when no slo_url is configured", good)
+configure()
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("FAILED: " + ", ".join(FAIL) if FAIL else "ALL PASS"); sys.exit(1 if FAIL else 0)

@@ -55,7 +55,7 @@ not been recomputed since (see 1b, last row).
 | GitHub and GitLab pull requests | Verified against in-process mock servers of their APIs; only Gitea was run for real. |
 | Delta Sharing | Works with the Python client in the Parquet format (snapshots, time travel, change feed). The client's Rust reader (Delta response format) cannot fetch files from a non-cloud-storage host, so that format is built to the specification but unverified end to end. Tables in an S3 mount and tables with deletion vectors or column mapping cannot be shared. History, time travel and the change feed are opt-in per table because they can expose deleted rows. |
 | Passkeys | Attestation is verified only against trust roots you paste in: no bundled vendor roots and no FIDO Metadata Service lookup. Passkey-only accounts are local accounts only (not LDAP). The browser autofill dropdown could not be driven by automation; the request and the sign-in behind it are tested. |
-| SAML | Solicited SP-initiated sign-in with strict validation. Signed AuthnRequests, encrypted assertions and single logout are not implemented. |
+| SAML | Solicited SP-initiated sign-in with strict validation, signed AuthnRequests, encrypted assertions and Single Logout (SP- and IdP-initiated, both directions signed) all built and tested. A real encrypt+decrypt round trip is not covered end to end: building a valid `<xenc:EncryptedData>` fixture via the low-level xmlsec Python bindings proved impractical in the time available, so only the rejection-of-unencrypted path is tested, and the decrypt path is verified by reading python3-saml's own implementation instead. |
 | SQL `GRANT` / `REVOKE` | Catalog, schema and table grants. Column-level grants, `WITH GRANT OPTION` and role principals are refused with a clear message. |
 | Network policy | One global allowlist plus per-recipient rules for Delta Sharing. No per-user or per-role network policies. |
 | Governance on shared data | A table with a masking policy or row filter cannot be shared through Delta Sharing (recipients receive raw files). The fix is to share a de-identified copy. |
@@ -96,7 +96,7 @@ Ordered by how much they would change the honest picture. None needs a new engin
    (`gcs://`, through its S3-compatible interoperability API) as file-arrival sources, mirroring the S3 path: listing, exactly-once
    checkpoints, quarantine, preview, credentials from a storage mount. Both are sources only, not targets (see 1b). Still open:
    SQS / Event Grid consumers (this was always the optional half of the item).
-4. **SAML completeness.** Signed AuthnRequests, encrypted assertions and single logout, for IdPs that insist on them.
+4. ~~**SAML completeness.**~~ *(Done: signed AuthnRequests, encrypted assertions, Single Logout. See 1b for the one caveat.)*
 5. **Column-level grants** and `WITH GRANT OPTION` in the SQL grant layer, built on the existing masking machinery.
 6. **Delta Sharing reach.** Shareable S3-mount tables (pre-signed object-store URLs), tables with deletion vectors or column
    mapping through the Delta format, and a verified end-to-end run of that format against a client that can fetch our
@@ -114,6 +114,6 @@ Ordered by how much they would change the honest picture. None needs a new engin
 ## Recommendation
 
 `FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
-stale and it does not yet reflect the caveats in 1b. Items 1 and 3 are now done; item 10 (recompute the scorecard) would
+stale and it does not yet reflect the caveats in 1b. Items 1, 3 and 4 are now done; item 10 (recompute the scorecard) would
 make both documents defensible for an external reader. Tell me which items to build next; I would start with parallel
 workflow tasks or the scorecard recompute.

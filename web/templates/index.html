@@ -16535,11 +16535,26 @@
                 <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Display name attribute</label><input type="text" x-model="authConfig.saml.attribute_display_name" placeholder="displayName" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
                 <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Admin value</label><input type="text" x-model="authConfig.saml.admin_value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
                 <div><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">Power user value</label><input type="text" x-model="authConfig.saml.power_user_value" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"></div>
+                <div class="col-span-2"><label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">IdP Single Logout URL (optional)</label><input type="url" x-model="authConfig.saml.slo_url" placeholder="https://idp.company.internal/saml/slo" data-testid="saml-slo-url" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-indigo-500">
+                  <p class="text-[10px] text-slate-500 mt-1">Import from metadata fills this too, when the IdP publishes one. Blank disables the "sign out" button's federated round trip; this studio still answers an IdP-initiated logout either way, at <span class="font-mono">/api/auth/saml/sls</span>.</p></div>
               </div>
               <div class="flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-slate-700 dark:text-slate-300">
                 <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="authConfig.saml.want_assertions_signed"><span>Require signed assertions (recommended)</span></label>
                 <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="authConfig.saml.allow_idp_initiated"><span>Allow IdP-initiated sign-in (responses not started here)</span></label>
+                <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="authConfig.saml.sign_authn_requests" data-testid="saml-sign-requests"><span>Sign AuthnRequests (register the certificate below with the IdP first)</span></label>
+                <label class="flex items-center space-x-1.5"><input type="checkbox" x-model="authConfig.saml.require_encrypted_assertions" data-testid="saml-require-encrypted"><span>Require encrypted assertions</span></label>
               </div>
+            </div>
+
+            <div class="p-3 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-dbx-border rounded-xl space-y-2">
+              <div class="flex items-center justify-between"><span class="font-semibold text-slate-800 dark:text-slate-200 text-[11px]">This studio's own identity (signing / decryption)</span>
+                <span class="text-[10px] text-slate-500">Auto-generated on first use; register it with the IdP to turn on signed AuthnRequests, encrypted assertions or Single Logout.</span></div>
+              <div class="flex space-x-2">
+                <button type="button" @click="loadSamlSpCertificate()" :disabled="samlSpCert.busy" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 disabled:opacity-50 rounded font-semibold" data-testid="saml-sp-cert-load">Show certificate</button>
+                <button type="button" @click="copySamlSpCertificate()" x-show="samlSpCert.pem" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 rounded font-semibold">Copy</button>
+                <button type="button" @click="rotateSamlSpKey()" :disabled="samlSpCert.busy" class="px-3 py-1.5 bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-300 hover:bg-rose-200 dark:hover:bg-rose-900 disabled:opacity-50 rounded font-semibold" data-testid="saml-sp-cert-rotate">Rotate key</button>
+              </div>
+              <textarea x-show="samlSpCert.pem" x-model="samlSpCert.pem" readonly rows="4" data-testid="saml-sp-cert-pem" class="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white text-xs font-mono focus:outline-none"></textarea>
             </div>
           </div>
         </div>
@@ -18543,9 +18558,11 @@
             attribute_email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress',
             provider_name: 'SAML SSO', idp_entity_id: '', sp_base_url: '', attribute_display_name: '', attribute_groups: 'groups',
             admin_value: '', power_user_value: '', want_assertions_signed: true, allow_idp_initiated: false,
+            sign_authn_requests: false, require_encrypted_assertions: false, slo_url: '',
             default_role: 'user'
           }
         },
+        samlSpCert: { busy: false, pem: '' },
         isTestingLdap: false,
         ldapTestResult: null,
         isTestingLdapBind: false,
@@ -19715,6 +19732,11 @@
               this.loginForm.error = ssoError;
               window.history.replaceState({}, '', window.location.pathname);
             }
+            const sloParam = new URLSearchParams(window.location.search).get('slo'), sloError = new URLSearchParams(window.location.search).get('slo_error');
+            if (sloParam || sloError) {
+              window.history.replaceState({}, '', window.location.pathname);
+              this.$nextTick(() => this.showToast(sloError ? 'The identity provider could not complete Single Logout.' : 'Signed out everywhere.', sloError ? 'error' : 'info'));
+            }
             const res = await fetch('/api/auth/me');
             if (res.ok) {
               const data = await res.json();
@@ -20382,6 +20404,12 @@
         },
 
         async logout() {
+          if (this.currentUser?.auth_source === 'saml') {
+            // Single Logout needs a real browser navigation to the IdP (or, if none is configured, the endpoint
+            // just clears the local session and redirects home) -- an AJAX POST can't take the browser there.
+            window.location.href = '/api/auth/saml/logout';
+            return;
+          }
           try {
             await fetch('/api/auth/logout', { method: 'POST' });
           } catch (e) {}
@@ -21804,12 +21832,50 @@
             const res = await fetch('/api/auth/frameworks/saml/import-metadata', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: this.authConfig.saml.idp_metadata_url }) });
             const data = await res.json();
             if (!res.ok) { m.error = typeof data.detail === 'string' ? data.detail : 'Could not read the metadata.'; return; }
-            Object.assign(this.authConfig.saml, { idp_entity_id: data.idp_entity_id, sso_url: data.sso_url, x509_cert: data.x509_cert || this.authConfig.saml.x509_cert });
+            Object.assign(this.authConfig.saml, { idp_entity_id: data.idp_entity_id, sso_url: data.sso_url, x509_cert: data.x509_cert || this.authConfig.saml.x509_cert,
+                                                   slo_url: data.slo_url || this.authConfig.saml.slo_url });
             m.msg = 'Imported. Review the fields, then save.';
           } catch (e) {
             m.error = 'Error: ' + e.message;
           } finally {
             m.busy = false;
+          }
+        },
+
+        async loadSamlSpCertificate() {
+          this.samlSpCert.busy = true;
+          try {
+            const res = await fetch('/api/auth/frameworks/saml/sp-certificate');
+            const data = await res.json();
+            if (res.ok) this.samlSpCert.pem = data.certificate;
+            else this.showToast('Could not load the SP certificate: ' + (data.detail || 'server error'), 'error');
+          } catch (e) {
+            this.showToast('Error loading the SP certificate: ' + e.message, 'error');
+          } finally {
+            this.samlSpCert.busy = false;
+          }
+        },
+
+        async copySamlSpCertificate() {
+          try {
+            await navigator.clipboard.writeText(this.samlSpCert.pem);
+            this.showToast('Certificate copied', 'success');
+          } catch (e) {
+            this.showToast('Could not copy to clipboard', 'error');
+          }
+        },
+
+        async rotateSamlSpKey() {
+          if (!confirm('Rotate this studio\'s SAML signing/decryption key? Update the IdP with the new certificate first, or signed requests and encrypted assertions will start failing until it is.')) return;
+          this.samlSpCert.busy = true;
+          try {
+            const res = await fetch('/api/auth/frameworks/saml/rotate-sp-key', { method: 'POST' });
+            if (res.ok) { this.samlSpCert.pem = ''; this.showToast('SAML SP key rotated. Update the IdP with the new certificate.', 'success'); await this.loadSamlSpCertificate(); }
+            else this.showToast('Could not rotate the key.', 'error');
+          } catch (e) {
+            this.showToast('Error rotating the key: ' + e.message, 'error');
+          } finally {
+            this.samlSpCert.busy = false;
           }
         },
 
