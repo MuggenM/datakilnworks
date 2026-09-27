@@ -1,6 +1,6 @@
 # 📊 **ENTERPRISE FEATURE COMPARISON: Databricks vs Snowflake vs DataKilnWorks Studio**
 
-> **Evaluation Date:** September 19, 2026  
+> **Evaluation Date:** September 19, 2026 (scorecard in section 6 recomputed September 27, 2026 from the rows actually in this document -- see the methodology note there)  
 > **Evaluated Platforms:**  
 > - **Databricks Lakehouse Platform** (Unity Catalog, Lakeview, Spark/Photon, Genie, Model Serving, MLflow 3.x)  
 > - **Snowflake Data Cloud** (Snowflake Horizon, Snowsight, Virtual Warehouses, Cortex AI, Snowpark)  
@@ -19,14 +19,15 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │  VS DATABRICKS LAKEHOUSE PLATFORM                                                      │
-│  DataKilnWorks Studio:       ████████████████████████████████████ 142% (+58 Extras)    │
-│  Real Databricks Cloud:      ████████████████████                100%                  │
+│  DataKilnWorks Studio:       ████████████████████████████████████ 121%                 │
+│  Real Databricks Cloud:      ████████████████████████████         100% (baseline)      │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
 │  VS SNOWFLAKE DATA CLOUD                                                               │
-│  DataKilnWorks Studio:       ████████████████████████████        128% (+46 Extras)    │
-│  Snowflake Snowsight/Cortex: ████████████████████                100%                  │
+│  DataKilnWorks Studio:       ████████████████████████████████████ 143%                 │
+│  Snowflake Snowsight/Cortex: ████████████████████                 100% (baseline)      │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+*(DataKilnWorks Studio's row-by-row score from section 6, expressed as a percentage of each competitor's own score over the same 114 rows -- e.g. 121% means DataKilnWorks scored 111.5 of 114 rows against Databricks' 92.5. Not a separate "extras" count; see the methodology note under section 6 for exactly how each row is scored.)*
 
 ### **Core Platform Takeaways**
 1. **Vs Databricks**: DataKilnWorks delivers near 100% API and conceptual compatibility (Delta Lake, Unity Catalog 3-level namespace `catalog.schema.object`, Unity Catalog Volumes, Model Registry, PySpark DataFrame syntax via SQLFrame, MLflow LLM Traces, Genie conversational assistant, and SQL-native AI functions like `ai_query()` and `predict()`). It surpasses Databricks in local speed (0 JVM startup delay, instant vectorized execution), per-widget export flexibility (Excel, Parquet, JSON, PNG), zero-restart sub-20ms worker elasticity via Ray, and zero cloud spend.
@@ -254,7 +255,7 @@ By pairing **DuckDB's vectorized columnar engine** and **Ray's distributed actor
 | **Role-Based Access Control (RBAC)**| ✅ Full RBAC | ✅ Hierarchical RBAC | ✅ **Admin, Power User, User roles with UI & API enforcement** | ✅ Tie |
 | **Groups (local + directory)** | ✅ Groups, SCIM-synced | ✅ Roles / SCIM groups | ✅ **IAM groups of local, LDAP and OIDC users; access granted to groups (catalogs, tables, schemas, dashboards, saved queries, pipelines, policy exemptions); membership synced from an LDAP group or OIDC claim, manual members preserved** | 🤝 **Parity** (SCIM 2.0 provisioning for Entra ID / Okta; LDAP/OIDC/SAML membership refreshes at sign-in) |
 | **Table / Schema-Level Grants** | ✅ `GRANT SELECT` on tables, schemas, catalogs | ✅ `GRANT` on tables, schemas, databases | ✅ **Select / Modify on a table or schema for users and groups, additive to catalog ACLs; column-level `SELECT` grants (built on masking policies); `WITH GRANT OPTION` / `GRANT OPTION FOR` on tables and schemas; managed in the UI or with SQL `GRANT` / `REVOKE` / `SHOW GRANTS` (incl. `FUTURE TABLES IN SCHEMA`); fail-closed SQL verification** | ⚠️ **Databricks / Snowflake** (no column-level MODIFY grants, no `WITH GRANT OPTION` on a catalog or grants on all tables of one; the default `warehouse` catalog stays open to all users) |
-| **Network Policies / IP Allowlists**| ✅ Yes | ✅ Yes | ✅ **Per-deployment CIDR allowlist (IPv4/IPv6) as middleware, monitor mode, trusted-proxy setting, lock-out guard**; no per-user/per-role network policies | 🤝 **Parity** (deployment-wide) |
+| **Network Policies / IP Allowlists**| ⚠️ Workspace/account-level IP access lists only, no per-user policy | ✅ Account-wide or per-user `NETWORK_POLICY` (no per-role) | ✅ **Per-deployment CIDR allowlist (IPv4/IPv6) as middleware (monitor mode, trusted-proxy setting, lock-out guard), plus per-user AND per-role network policies on top (independent of the deployment-wide mode; a user's own policy wins over their role's)** | 🏆 **Data Kiln Works / Snowflake** |
 | **Compliance Certifications** | ✅ SOC 2, HIPAA, FedRAMP | ✅ SOC 2, HIPAA, PCI-DSS | ⚠️ Inherited from host / customer infrastructure | 🏆 **Databricks / Snowflake** |
 
 **Domain Verdict:** **DataKilnWorks Studio** democratizes enterprise security by providing generic OpenID Connect login (PKCE), LDAP sync, and TOTP MFA with backup codes at all tiers without requiring enterprise SaaS surcharges.
@@ -353,19 +354,21 @@ flowchart TD
 
 | Domain Category | Evaluated Categories | DataKilnWorks Studio | Real Databricks | Snowflake Data Cloud | Leader |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **1. Data Catalog & Governance** | 11 | **10 / 11** | 10 / 11 | 9 / 11 | 🏆 **Databricks / Data Kiln** |
-| **2. Query Engine & Performance** | 10 | **8 / 10** | 7 / 10 | 7 / 10 | 🏆 **Data Kiln Works (Local) / Cloud (Scale)** |
-| **3. BI & Lakeview Visualization** | 11 | **11 / 11** | 6 / 11 | 6 / 11 | 🏆 **Data Kiln Works** |
-| **4. Developer IDE & PySpark** | 7 | **7 / 7** | 6 / 7 | 4 / 7 | 🏆 **Data Kiln Works** |
+| **1. Data Catalog & Governance** | 13 | **12 / 13** | 12 / 13 | 11 / 13 | 🏆 **Databricks / Data Kiln** |
+| **2. Query Engine & Performance** | 10 | **9.5 / 10** | 8.5 / 10 | 9.5 / 10 | 🏆 **Data Kiln Works (Local) / Cloud (Scale)** |
+| **3. BI & Lakeview Visualization** | 11 | **11 / 11** | 4 / 11 | 4.5 / 11 | 🏆 **Data Kiln Works** |
+| **4. Developer IDE & PySpark** | 8 | **8 / 8** | 7 / 8 | 4 / 8 | 🏆 **Data Kiln Works** |
 | **5. AI Analyst (Genie / Cortex)** | 9 | **9 / 9** | 8 / 9 | 6 / 9 | 🏆 **Data Kiln Works** |
-| **6. SQL-Native AI Inference** | 9 | **9 / 9** | 8 / 9 | 7 / 9 | 🏆 **Data Kiln Works** |
-| **7. LLM Tracing & Observability** | 8 | **8 / 8** | 7 / 8 | 4 / 8 | 🏆 **Data Kiln Works** |
-| **8. ML Model Lifecycle & Serving**| 7 | **7 / 7** | 7 / 7 | 5 / 7 | 🏆 **Databricks / Data Kiln** |
-| **9. Transformations & dbt** | 6 | **5 / 6** | 4 / 6 | 3 / 6 | 🏆 **Data Kiln Works** |
-| **10. Compute Scaling & Infrastructure**| 8 | **7 / 8** | 7 / 8 | 6 / 8 | 🏆 **Data Kiln Works (Speed) / Cloud (Scale)**|
-| **11. Security & Authentication** | 9 | **8 / 9** | 8 / 9 | 8 / 9 | 🏆 **Data Kiln Works** |
-| **12. Alerting & Webhook Integrations**| 6 | **6 / 6** | 3 / 6 | 2 / 6 | 🏆 **Data Kiln Works** |
-| **TOTALS** | **98 Dimensions** | **95 / 98 (97%)** | **81 / 98 (83%)** | **67 / 98 (68%)** | 🏆 **Data Kiln Works: 1st in Local/On-Prem Lakehouse** |
+| **6. SQL-Native AI Inference** | 9 | **9 / 9** | 8.5 / 9 | 7 / 9 | 🏆 **Data Kiln Works** |
+| **7. LLM Tracing & Observability** | 8 | **8 / 8** | 7 / 8 | 3 / 8 | 🏆 **Data Kiln Works** |
+| **8. ML Model Lifecycle & Serving**| 7 | **7 / 7** | 7 / 7 | 4.5 / 7 | 🏆 **Databricks / Data Kiln** |
+| **9. Transformations & dbt** | 12 | **12 / 12** | 10.5 / 12 | 9.5 / 12 | 🏆 **Data Kiln Works** |
+| **10. Compute Scaling & Infrastructure**| 8 | **7.5 / 8** | 5.5 / 8 | 5 / 8 | 🏆 **Data Kiln Works (Speed) / Cloud (Scale)**|
+| **11. Security & Authentication** | 13 | **12.5 / 13** | 12 / 13 | 12 / 13 | 🏆 **Data Kiln Works** |
+| **12. Alerting & Webhook Integrations**| 6 | **6 / 6** | 2.5 / 6 | 2 / 6 | 🏆 **Data Kiln Works** |
+| **TOTALS** | **114 Dimensions** | **111.5 / 114 (98%)** | **92.5 / 114 (81%)** | **78 / 114 (68%)** | 🏆 **Data Kiln Works: 1st in Local/On-Prem Lakehouse** |
+
+**Methodology (recomputed September 27, 2026):** each row in the 12 domain tables of section 3 above (not the architecture table in section 2, which this scorecard does not cover) is scored per platform from its own cell marker -- ✅ = 1 point, ⚠️ = 0.5 (partial / limited), ❌ = 0; a row with no marker (a purely descriptive or quantitative comparison, e.g. an engine name or a latency figure) scores 1 for every platform shown, since the score measures whether a capability is *present*, not which platform is faster or cheaper at it (that judgment is instead carried by the row's own "Winner" column and the domain verdict text, unchanged by this recompute). A domain's "Evaluated Categories" count is the number of rows in its table above. The previous scorecard (**98 Dimensions**, dated with the rest of this document) had drifted out of sync with the tables above it as rows were added over time (notably Domains 1, 4, 9 and 11, which gained rows for Delta Sharing, dbt project Git sync, streaming ingestion, Auto-Loader source types, SAML, SCIM, groups, table grants and network policies); this recompute only re-derives the counts and scores from the rows as they stand above, it does not re-litigate any individual row's content beyond the one correction noted in Domain 11 (Network Policies, now reflecting the per-user / per-role feature). The overall percentages barely moved (97% → 98% for DataKilnWorks Studio, 68% → 68% for Snowflake, 83% → 81% for Databricks), which is a reasonable sanity check that the original scoring was not wildly off, just stale in its row counts.
 
 ---
 
@@ -373,4 +376,4 @@ flowchart TD
 
 The updated 2026 re-evaluation confirms that **DataKilnWorks Studio has crossed the threshold from a dashboarding emulator to a true, self-contained Data Lakehouse and AI Operating System**. 
 
-For organizations running in private clouds, on-premises data centers, air-gapped environments, or engineers seeking an uncompromised local development sandbox, **DataKilnWorks Studio delivers 97% overall feature coverage of Databricks and Snowflake while maintaining a 100% cost and sovereignty advantage**.
+For organizations running in private clouds, on-premises data centers, air-gapped environments, or engineers seeking an uncompromised local development sandbox, **DataKilnWorks Studio delivers 98% overall feature coverage of Databricks and Snowflake (section 6) while maintaining a 100% cost and sovereignty advantage**.

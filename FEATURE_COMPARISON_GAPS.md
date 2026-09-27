@@ -118,14 +118,22 @@ Ordered by how much they would change the honest picture. None needs a new engin
    out. See 1b.)*
 9. **A multi-replica studio.** The metadata lives in SQLite files; moving the shared pieces (sessions, challenges, run
    state) to a shared store would allow replicas. This is the one item here that is a real re-design, not a feature.
-10. **Recompute `FEATURE_COMPARISON.md`.** Refresh the scores from the current code, and add rows for the newer features
-    (Delta Sharing, passkeys, streaming, the workflow UI) so the scorecard and this document agree.
+10. ~~**Recompute `FEATURE_COMPARISON.md`.**~~ *(Done: rows for the newer features -- Delta Sharing, passkeys, streaming, the
+    workflow UI -- were already present in the document from earlier sessions; what was actually stale was section 6's
+    scorecard, which still counted "98 Dimensions" against tables that by then held 114 rows. Recomputed mechanically from
+    the tables' own ✅/⚠️/❌ markers (methodology documented under section 6), including one content correction (the Network
+    Policies row, to reflect item 8 above). The overall percentages barely moved -- 97% to 98% for DataKilnWorks Studio,
+    83% to 81% for Databricks, 68% to 68% for Snowflake -- a reasonable sanity check that the original scoring was not
+    wildly off, just stale in its row counts.)*
 
 ---
 
 ## Recommendation
 
-`FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
-stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4, 5, 6, 7 and 8 are now done; item 10 (recompute the scorecard) would
-make both documents defensible for an external reader. Tell me which items to build next; I would start with parallel
-workflow tasks or the scorecard recompute.
+`FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, and its scorecard
+(section 6) is now recomputed from the tables' own row counts and markers, not stale round numbers. Items 1, 3, 4, 5, 6, 7,
+8 and 10 are now done. What remains is item 9 (a multi-replica studio), the one item here that is a genuine architectural
+re-design rather than a feature -- it needs a decision on a shared store (Postgres? Redis? something else?) before any
+code gets written, since it touches nearly every module that currently owns its own SQLite file. Item 2 (parallel workflow
+tasks) is on hold per your instruction. Tell me how you would like to approach item 9, or say which of the two to build
+next.
