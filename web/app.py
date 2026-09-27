@@ -181,6 +181,13 @@ async def startup_event():
         asyncio.create_task(streaming_daemon_loop())
     except Exception as e_st:
         logger.warning(f"Failed to start the streaming ingestion daemon: {e_st}")
+    # FIDO Metadata Service cache (model names, certification status, revocation) for WebAuthn passkeys / security keys
+    try:
+        from web.fido_mds import init_db as init_fido_mds_db, mds_refresh_loop
+        init_fido_mds_db()
+        asyncio.create_task(mds_refresh_loop())
+    except Exception as e_mds:
+        logger.warning(f"Failed to start the FIDO Metadata Service refresh loop: {e_mds}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -663,6 +670,12 @@ class WebauthnPolicyPayload(BaseModel):
     mode: str = "none"
     allowed: Any = []
     roots_pem: str = ""
+    hardware_roles: List[str] = []
+
+
+class FidoMdsConfigPayload(BaseModel):
+    url: str = ""
+    root_pem: str = ""
 
 
 class PasskeyRenamePayload(BaseModel):
@@ -741,14 +754,54 @@ async def get_webauthn_policy(current_user: Dict[str, Any] = Depends(require_rol
 
 @app.put("/api/webauthn/policy")
 async def set_webauthn_policy(payload: WebauthnPolicyPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    """Which authenticators may be registered: no attestation, record what they prove, or require a verified attestation (and optionally an approved model)."""
+    """Which authenticators may be registered: no attestation, record what they prove, or require a verified attestation (and optionally an approved model);
+    `hardware_roles` additionally requires it for the chosen roles even while the mode above stays lenient for everyone else."""
     from web import webauthn_auth, mfa_policy
     try:
-        out = await asyncio.to_thread(webauthn_auth.set_policy, payload.mode, payload.allowed, payload.roots_pem, current_user["username"])
+        out = await asyncio.to_thread(webauthn_auth.set_policy, payload.mode, payload.allowed, payload.roots_pem, current_user["username"], payload.hardware_roles)
     except webauthn_auth.WebAuthnError as exc:
         raise _webauthn_error(exc)
-    mfa_policy._audit(current_user["username"], "WEBAUTHN_POLICY_UPDATE", "webauthn_policy", {"mode": out["mode"], "approved_models": len(out["allowed"]), "trust_roots": len(out["roots"])})
+    mfa_policy._audit(current_user["username"], "WEBAUTHN_POLICY_UPDATE", "webauthn_policy",
+                       {"mode": out["mode"], "approved_models": len(out["allowed"]), "trust_roots": len(out["roots"]), "hardware_roles": out["hardware_roles"]})
     return out
+
+
+@app.get("/api/webauthn/mds/status")
+async def fido_mds_status(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The FIDO Metadata Service cache's configuration and freshness (web/fido_mds.py)."""
+    from web import fido_mds
+    return fido_mds.config_view() | fido_mds.status()
+
+
+@app.put("/api/webauthn/mds/config")
+async def set_fido_mds_config(payload: FidoMdsConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Sets the pinned trust root (paste the FIDO Alliance's MDS root certificate) and, optionally, a non-default URL, then refreshes immediately
+    so a mistake (an untrusted or unreachable root) is visible right away rather than silently failing on the next scheduled check."""
+    from web import fido_mds, mfa_policy
+    try:
+        out = await asyncio.to_thread(fido_mds.set_config, payload.url, payload.root_pem, current_user["username"])
+    except fido_mds.MdsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    refreshed = await asyncio.to_thread(fido_mds.refresh, True)
+    mfa_policy._audit(current_user["username"], "FIDO_MDS_CONFIG_UPDATE", "fido_mds", {"url": out["effective_url"], "roots": len(out["roots"]), "refresh_error": refreshed.get("last_error")})
+    return {**out, **refreshed}
+
+
+@app.post("/api/webauthn/mds/refresh")
+async def refresh_fido_mds(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import fido_mds, mfa_policy
+    out = await asyncio.to_thread(fido_mds.refresh, True)
+    mfa_policy._audit(current_user["username"], "FIDO_MDS_REFRESH", "fido_mds", {"entry_count": out.get("entry_count"), "error": out.get("last_error")})
+    return out
+
+
+@app.get("/api/webauthn/mds/lookup/{aaguid}")
+async def lookup_fido_mds(aaguid: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import fido_mds
+    entry = fido_mds.lookup(aaguid)
+    if not entry:
+        raise HTTPException(status_code=404, detail="No FIDO MDS entry for this AAGUID (an unknown model, or the cache needs a refresh).")
+    return entry
 
 
 @app.post("/api/auth/webauthn/register/options")
@@ -858,8 +911,8 @@ async def remove_user_password(user_id: str, current_user: Dict[str, Any] = Depe
     target = get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    if (target.get("auth_source") or "local") != "local":
-        raise HTTPException(status_code=400, detail="Only local accounts can be made passkey-only.")
+    if (target.get("auth_source") or "local") not in ("local", "ldap"):
+        raise HTTPException(status_code=400, detail="Only local or LDAP accounts can be made passkey-only.")
     if target.get("passwordless"):
         raise HTTPException(status_code=400, detail="This account is already passkey-only.")
     if webauthn_auth.count(user_id) < 2:

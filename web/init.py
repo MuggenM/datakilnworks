@@ -119,7 +119,7 @@ def _database_steps() -> List[tuple]:
             ("lineage", "web.lineage:init_lineage_db"), ("recent items", "web.recents:init_recents_db"), ("model serving", "web.serving:init_serving_db"),
             ("job runs", "web.workflow:init_runs_db"), ("MFA policy", "web.mfa_policy:init_policy_db"), ("IP allowlist", "web.ip_allowlist:init_db"),
             ("connections", "web.connections:_db"), ("streams", "web.streaming:_db"), ("groups", "web.groups:_conn"), ("SCIM", "web.scim:_conn"),
-            ("Auto-Loader", "web.autoloader:init_autoloader_db")]
+            ("Auto-Loader", "web.autoloader:init_autoloader_db"), ("FIDO metadata cache", "web.fido_mds:init_db")]
 
 
 def _resolve(path: str) -> Callable[[], Any]:

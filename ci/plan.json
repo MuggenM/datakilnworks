@@ -146,6 +146,10 @@
    "extras": ""
   },
   {
+   "name": "fido_mds",
+   "extras": ""
+  },
+  {
    "name": "workflow_orchestration",
    "extras": ""
   },

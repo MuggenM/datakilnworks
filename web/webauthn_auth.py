@@ -16,7 +16,19 @@ Attestation policy (table `webauthn_policy`, administrators; `/api/webauthn/poli
 attestation; the model (AAGUID) and format are stored, and the certificate chain is verified against the trust roots the administrator pasted, if any),
 `require` (a registration must carry an attestation whose chain verifies against those roots and, when an allowlist of models is set, come from one of them).
 Only a chain that was verified against configured roots counts as "attested"; synced passkeys (Apple, Google, password managers) give no attestation,
-so `require` excludes them on purpose. There is no built-in vendor trust store and no FIDO MDS lookup: the roots are whatever you trust.
+so `require` excludes them on purpose. There is no built-in vendor trust store: the roots are whatever you trust.
+
+**Per-role hardware requirement** (`webauthn_policy.hardware_roles`): a role in this list (e.g. `admin`) may only register a passkey / security key
+whose attestation chain verifies -- a synced passkey is refused for that role even while the organisation-wide mode stays `none`/`record` for
+everyone else. Requesting this for a role also makes `registration_options` ask for attestation for that user regardless of the global mode
+(otherwise the browser would never even offer one to check). Needs the same trust roots as `require` mode, for the same reason: without roots
+`attested` can never be True.
+
+**FIDO Metadata Service** (`web/fido_mds.py`, `/api/webauthn/mds/*`): a cached, administrator-configured lookup of the model behind an AAGUID --
+its name, certification status and, critically, whether the FIDO Alliance has **revoked** it (a disclosed security issue). A revoked model is
+refused at registration UNCONDITIONALLY, even in `none` mode and even for a role with no hardware requirement: revocation is a fact about the
+hardware, not a local trust decision. The model name from a hit also fills in the credential list's "model" column when the administrator has not
+typed their own label for that AAGUID in `webauthn_policy.allowed`.
 
 RP id and origin: WEBAUTHN_RP_ID (default: the request's Host without the port) and WEBAUTHN_ORIGINS (comma list; default: the request's Origin,
 accepted only when it is the same host as the Host header, so it works behind a reverse proxy that keeps the Host). Browsers need https, except on
@@ -125,20 +137,33 @@ def _take_challenge(cid: str, purpose: str, user_id: Optional[str]) -> bytes:
 
 # ---------------------------------------------------------------- credentials
 
+def _mds_lookup(aaguid: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not aaguid or aaguid == _ZERO_AAGUID:
+        return None
+    try:
+        from web import fido_mds
+        return fido_mds.lookup(aaguid)
+    except Exception:
+        return None
+
+
 def _view(r) -> Dict[str, Any]:
     aaguid = r["aaguid"] if "aaguid" in r.keys() else None
-    model = None
-    if aaguid:
-        model = next((m["label"] for m in get_policy()["allowed"] if m["aaguid"] == aaguid), None)
+    mds = _mds_lookup(aaguid)
+    model = next((m["label"] for m in get_policy()["allowed"] if m["aaguid"] == aaguid), None) if aaguid else None
+    if not model and mds:
+        model = mds.get("description") or None
     return {"id": r["id"], "name": r["name"], "created_at": r["created_at"], "last_used_at": r["last_used_at"], "transports": json.loads(r["transports"] or "[]"),
             "device_type": r["device_type"], "backed_up": bool(r["backed_up"]), "user_verified": bool(r["uv"]),
-            "aaguid": aaguid if aaguid and aaguid != _ZERO_AAGUID else None, "model": model, "attestation_fmt": r["attestation_fmt"], "attested": bool(r["attested"])}
+            "aaguid": aaguid if aaguid and aaguid != _ZERO_AAGUID else None, "model": model, "attestation_fmt": r["attestation_fmt"], "attested": bool(r["attested"]),
+            "mds_status": (mds or {}).get("status"), "mds_revoked": bool((mds or {}).get("revoked"))}
 
 
 # ---------------------------------------------------------------- attestation policy
 
 _ZERO_AAGUID = "00000000-0000-0000-0000-000000000000"
 POLICY_MODES = ("none", "record", "require")
+_ROLES = ("admin", "power_user", "user")
 _UUID = __import__("re").compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -162,20 +187,24 @@ def _roots_summary(pem: str) -> List[Dict[str, Any]]:
 def get_policy() -> Dict[str, Any]:
     c = _conn()
     try:
-        r = c.execute("SELECT mode, allowed, roots_pem, updated_by, updated_at FROM webauthn_policy WHERE id = 1").fetchone()
+        r = c.execute("SELECT mode, allowed, roots_pem, hardware_roles, updated_by, updated_at FROM webauthn_policy WHERE id = 1").fetchone()
     finally:
         c.close()
     if not r:
-        return {"mode": "none", "allowed": [], "roots_pem": "", "updated_by": None, "updated_at": None}
-    return {"mode": r["mode"], "allowed": json.loads(r["allowed"] or "[]"), "roots_pem": r["roots_pem"] or "", "updated_by": r["updated_by"], "updated_at": r["updated_at"]}
+        return {"mode": "none", "allowed": [], "roots_pem": "", "hardware_roles": [], "updated_by": None, "updated_at": None}
+    keys = r.keys()
+    return {"mode": r["mode"], "allowed": json.loads(r["allowed"] or "[]"), "roots_pem": r["roots_pem"] or "",
+            "hardware_roles": json.loads(r["hardware_roles"] or "[]") if "hardware_roles" in keys else [],
+            "updated_by": r["updated_by"], "updated_at": r["updated_at"]}
 
 
 def policy_view() -> Dict[str, Any]:
     p = get_policy()
-    return {"mode": p["mode"], "allowed": p["allowed"], "roots_pem": p["roots_pem"], "roots": _roots_summary(p["roots_pem"]), "updated_by": p["updated_by"], "updated_at": p["updated_at"]}
+    return {"mode": p["mode"], "allowed": p["allowed"], "roots_pem": p["roots_pem"], "roots": _roots_summary(p["roots_pem"]),
+            "hardware_roles": p["hardware_roles"], "updated_by": p["updated_by"], "updated_at": p["updated_at"]}
 
 
-def set_policy(mode: str, allowed: Any, roots_pem: str, actor: str) -> Dict[str, Any]:
+def set_policy(mode: str, allowed: Any, roots_pem: str, actor: str, hardware_roles: Any = None) -> Dict[str, Any]:
     mode = (mode or "none").strip().lower()
     if mode not in POLICY_MODES:
         raise WebAuthnError("The mode is none, record or require.")
@@ -190,6 +219,10 @@ def set_policy(mode: str, allowed: Any, roots_pem: str, actor: str) -> Dict[str,
             raise WebAuthnError(f"'{g}' is not an AAGUID (a UUID such as 2fc0579f-8113-47ea-b116-bb5a8db9202a).")
         if g not in [x["aaguid"] for x in models]:
             models.append({"aaguid": g, "label": str((m or {}).get("label") or "").strip()[:60] or g})
+    roles = [r for r in dict.fromkeys(str(x).strip().lower() for x in (hardware_roles or [])) if r]
+    for r in roles:
+        if r not in _ROLES:
+            raise WebAuthnError(f"'{r}' is not a role (admin, power_user, user).")
     pem = (roots_pem or "").strip()
     if len(pem) > 100_000:
         raise WebAuthnError("The trust roots are too large (100 KB at most).")
@@ -200,13 +233,16 @@ def set_policy(mode: str, allowed: Any, roots_pem: str, actor: str) -> Dict[str,
         raise WebAuthnError("At most 30 trust root certificates.")
     if mode == "require" and not certs:
         raise WebAuthnError("'Require' needs trust roots: without them no authenticator could ever be verified and nobody could register a passkey.")
+    if roles and not certs:
+        raise WebAuthnError("A per-role hardware requirement needs trust roots too: without them no registration could ever prove it is a hardware key.")
     if pem:
         from cryptography.hazmat.primitives import serialization
         pem = "".join(c.public_bytes(serialization.Encoding.PEM).decode() for c in certs)
     c = _conn()
     try:
         with c:
-            c.execute("UPDATE webauthn_policy SET mode = ?, allowed = ?, roots_pem = ?, updated_by = ?, updated_at = ? WHERE id = 1", (mode, json.dumps(models), pem, actor, _now()))
+            c.execute("UPDATE webauthn_policy SET mode = ?, allowed = ?, roots_pem = ?, hardware_roles = ?, updated_by = ?, updated_at = ? WHERE id = 1",
+                      (mode, json.dumps(models), pem, json.dumps(roles), actor, _now()))
     finally:
         c.close()
     return policy_view()
@@ -298,10 +334,12 @@ def registration_options(user: Dict[str, Any], headers: Dict[str, str], require_
     if not rp_id or rp_id.replace(".", "").isdigit():
         raise WebAuthnError("Passkeys need the studio to be opened by a host name (not an IP address).")
     cid, challenge = _new_challenge(purpose, user["id"])
-    opts = generate_registration_options(
+    pol = get_policy()
+    needs_attestation = pol["mode"] != "none" or user.get("role") in pol["hardware_roles"]      # a role's hardware requirement asks for
+    opts = generate_registration_options(                                                       # attestation even while the global mode is lenient
         rp_id=rp_id, rp_name=RP_NAME, user_id=user["id"].encode(), user_name=user["username"], user_display_name=user.get("display_name") or user["username"],
         challenge=challenge, exclude_credentials=_descriptors(user["id"]),
-        attestation=AttestationConveyancePreference.NONE if get_policy()["mode"] == "none" else AttestationConveyancePreference.DIRECT,
+        attestation=AttestationConveyancePreference.DIRECT if needs_attestation else AttestationConveyancePreference.NONE,
         authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,
                                                                user_verification=UserVerificationRequirement.REQUIRED if require_uv else UserVerificationRequirement.PREFERRED))
     return {"challenge_id": cid, "options": json.loads(options_to_json(opts))}
@@ -349,11 +387,18 @@ def finish_registration(user: Dict[str, Any], challenge_id: str, credential: Dic
         raise WebAuthnError("The passkey could not be verified. Try again, or use another authenticator." if pol_mode() != "require" else
                             "This authenticator could not be verified. Your organisation only accepts authenticators that prove their make and model (attestation).")
     aaguid = str(getattr(v, "aaguid", "") or "").lower()
+    mds = _mds_lookup(aaguid)
+    if mds and mds.get("revoked"):
+        # Unconditional, independent of the administrator's own attestation policy: the FIDO Alliance disclosed a real
+        # security issue in this model, which is a fact about the hardware, not a local trust decision.
+        raise WebAuthnError(f"This authenticator model ({mds.get('description') or aaguid}) has been revoked by the FIDO Alliance (a disclosed security issue) and cannot be registered.")
     if pol["mode"] == "require":
         if not attested:
             raise WebAuthnError("Your organisation only accepts authenticators that prove their make and model (attestation). This one did not: synced passkeys and some authenticators cannot. Use an approved security key.")
         if pol["allowed"] and aaguid not in [m["aaguid"] for m in pol["allowed"]]:
             raise WebAuthnError(f"This authenticator model ({aaguid}) is not approved by your administrator.")
+    if user.get("role") in pol["hardware_roles"] and not attested:
+        raise WebAuthnError("Your role requires a hardware security key or an authenticator that proves its make and model (attestation); this one did not. Synced passkeys are not accepted for this role. Use a security key such as a YubiKey.")
     cid = _b64u(v.credential_id)
     if _get(cid):
         raise WebAuthnError("That passkey is already registered.")
@@ -450,7 +495,7 @@ def issue_enrollment(user_id: str, actor: str) -> Dict[str, Any]:
     try:
         with c:
             u = c.execute("SELECT passwordless, is_active, deleted_at, auth_source FROM users WHERE id = ?", (user_id,)).fetchone()
-            if not u or not u["passwordless"] or u["deleted_at"] or (u["auth_source"] or "local") != "local":
+            if not u or not u["passwordless"] or u["deleted_at"] or (u["auth_source"] or "local") not in ("local", "ldap"):
                 raise WebAuthnError("Enrolment links are for passkey-only accounts.")
             c.execute("DELETE FROM webauthn_enrollments WHERE user_id = ? AND used_at IS NULL", (user_id,))
             c.execute("DELETE FROM webauthn_enrollments WHERE expires < ?", (now - 86400,))
@@ -472,7 +517,7 @@ def enrollment_user(token: str) -> Dict[str, Any]:
         raise bad
     from web.auth import get_user_by_id
     u = get_user_by_id(r["user_id"])
-    if not u or not u.get("passwordless") or u.get("is_active", 1) != 1 or u.get("deleted_at") or (u.get("auth_source") or "local") != "local":
+    if not u or not u.get("passwordless") or u.get("is_active", 1) != 1 or u.get("deleted_at") or (u.get("auth_source") or "local") not in ("local", "ldap"):
         raise bad
     return u
 

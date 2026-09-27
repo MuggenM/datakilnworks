@@ -15401,7 +15401,12 @@
             <label class="flex items-start space-x-2"><input type="radio" value="record" x-model="wpol.mode" data-testid="wpol-mode-record" class="mt-0.5"><span><b>Record the model</b> <span class="text-slate-500">when the authenticator offers proof; nobody is turned away. Shown next to each passkey. Browsers may ask the user to allow this.</span></span></label>
             <label class="flex items-start space-x-2"><input type="radio" value="require" x-model="wpol.mode" data-testid="wpol-mode-require" class="mt-0.5"><span><b>Require a verified authenticator</b> <span class="text-slate-500">(and, if a list is given, an approved model). Synced passkeys (Apple, Google, password managers) give no attestation, so they can no longer be added; existing passkeys keep working.</span></span></label>
           </div>
-          <div x-show="wpol.mode !== 'none'" class="space-y-2">
+          <div class="flex items-center space-x-5 flex-wrap gap-y-1 pt-1 border-t border-slate-200 dark:border-dbx-border">
+            <span class="text-slate-500">Require a hardware-verified authenticator (no synced passkeys) for</span>
+            <template x-for="r in ['admin', 'power_user', 'user']" :key="r"><label class="flex items-center space-x-1"><input type="checkbox" :checked="wpol.hardware_roles.includes(r)" @change="wpol.hardware_roles = $event.target.checked ? [...wpol.hardware_roles, r] : wpol.hardware_roles.filter(x => x !== r)" :data-testid="'wpol-hw-' + r"><span x-text="r === 'power_user' ? 'power users' : (r === 'admin' ? 'administrators' : 'users')"></span></label></template>
+          </div>
+          <p x-show="wpol.hardware_roles.length" class="text-[10px] text-slate-500">These roles must register a passkey / security key whose attestation verifies against the trust roots below, even while the mode above stays lenient for everyone else. Needs trust roots, same as "Require a verified authenticator".</p>
+          <div x-show="wpol.mode !== 'none' || wpol.hardware_roles.length" class="space-y-2">
             <div><div class="text-[10px] uppercase text-slate-500 mb-0.5">Trust roots (PEM, one or more certificates, from the vendors you trust)</div>
               <textarea x-model="wpol.roots_pem" rows="4" data-testid="wpol-roots" placeholder="-----BEGIN CERTIFICATE-----" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded p-2 font-mono text-[11px] text-slate-900 dark:text-white"></textarea>
               <template x-for="r in wpol.roots" :key="r.sha256"><div class="text-[11px] font-mono text-slate-500" data-testid="wpol-root"><span x-text="r.subject"></span> · valid until <span x-text="r.not_after" :class="r.expired ? 'text-rose-500 font-bold' : ''"></span></div></template>
@@ -15410,6 +15415,28 @@
               <textarea x-model="wpol.allowedText" rows="3" data-testid="wpol-allowed" placeholder="2fc0579f-8113-47ea-b116-bb5a8db9202a  YubiKey 5 NFC" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded p-2 font-mono text-[11px] text-slate-900 dark:text-white"></textarea></div>
           </div>
           <div x-show="wpol.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="wpol-error" x-text="wpol.error"></div>
+        </div>
+
+        <!-- FIDO Metadata Service: model names, certification status, revocation -->
+        <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-3" data-testid="fido-mds-card">
+          <div class="flex items-center justify-between"><span class="font-semibold text-sm text-slate-800 dark:text-slate-100 flex items-center space-x-2"><i class="ph ph-shield-check text-indigo-500"></i><span>FIDO Metadata Service</span></span>
+            <div class="space-x-2"><button x-show="fidoMds.configured" @click="refreshFidoMds()" :disabled="fidoMds.busy" data-testid="fido-mds-refresh" class="px-3 py-1.5 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded disabled:opacity-50">Refresh now</button>
+              <button @click="saveFidoMds()" :disabled="fidoMds.busy" data-testid="fido-mds-save" class="px-3 py-1.5 bg-dbx-orange text-white font-semibold rounded disabled:opacity-50">Save</button></div></div>
+          <p class="text-[11px] text-slate-500">A cache of the FIDO Alliance's own registry of certified authenticator models, keyed by AAGUID: model name, certification level and, importantly, whether a model has been <b>revoked</b> (a disclosed security issue). A revoked model is refused at registration unconditionally, independent of the passkey policy above. Paste the Alliance's MDS root certificate (public information, published at <span class="font-mono">mds.fidoalliance.org/Root.cer</span>) to turn this on; without it nothing is fetched.</p>
+          <div class="grid grid-cols-2 gap-3">
+            <div><div class="text-[10px] uppercase text-slate-500 mb-0.5">Service URL (blank = the real FIDO Alliance service)</div>
+              <input type="text" x-model="fidoMds.url" data-testid="fido-mds-url" :placeholder="fidoMds.effective_url" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-[11px] text-slate-900 dark:text-white"></div>
+            <div class="text-[11px] text-slate-500 flex flex-col justify-end space-y-0.5" data-testid="fido-mds-status">
+              <span>Cached models: <span class="font-mono" x-text="fidoMds.entry_count || 0"></span></span>
+              <span x-show="fidoMds.last_refresh_at">Last refresh: <span class="font-mono" x-text="fidoMds.last_refresh_at ? new Date(fidoMds.last_refresh_at * 1000).toLocaleString() : ''"></span></span>
+              <span x-show="fidoMds.last_error" class="text-rose-500" data-testid="fido-mds-last-error" x-text="'Last error: ' + fidoMds.last_error"></span>
+            </div>
+          </div>
+          <div><div class="text-[10px] uppercase text-slate-500 mb-0.5">Trust root (PEM)</div>
+            <textarea x-model="fidoMds.root_pem" @input="fidoMds.editingRoot = true" rows="3" data-testid="fido-mds-root" placeholder="-----BEGIN CERTIFICATE-----" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded p-2 font-mono text-[11px] text-slate-900 dark:text-white"></textarea>
+            <template x-for="r in fidoMds.roots" :key="r.sha256"><div class="text-[11px] font-mono text-slate-500" data-testid="fido-mds-root-summary"><span x-text="r.subject"></span> · valid until <span x-text="r.not_after" :class="r.expired ? 'text-rose-500 font-bold' : ''"></span></div></template>
+          </div>
+          <div x-show="fidoMds.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="fido-mds-error" x-text="fidoMds.error"></div>
         </div>
 
         <div x-show="mfaPolicy.stats" class="space-y-3" data-testid="mfa-stats">
@@ -15677,7 +15704,7 @@
                         <i class="ph ph-key"></i>
                       </button>
                       <button x-show="u.passwordless" @click="issueEnrollmentLink(u)" data-testid="user-enroll-link" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Issue a new enrolment link (first sign-in, or recovery after every passkey was lost)"><i class="ph ph-link"></i></button>
-                      <button x-show="!u.passwordless && (u.auth_source || 'local') === 'local' && u.passkey_count >= 2 && u.id !== currentUser.id" @click="removeUserPassword(u)" data-testid="user-remove-password" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Remove the password: the account signs in with passkeys only"><i class="ph ph-password"></i></button>
+                      <button x-show="!u.passwordless && ['local','ldap'].includes(u.auth_source || 'local') && u.passkey_count >= 2 && u.id !== currentUser.id" @click="removeUserPassword(u)" data-testid="user-remove-password" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Remove the password: the account signs in with passkeys only"><i class="ph ph-password"></i></button>
                       <button x-show="u.mfa_enabled && u.id !== currentUser.id" @click="resetUserMfa(u)" class="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900 dark:text-sky-300 dark:border-sky-800 rounded transition text-[11px] font-medium" title="Turn off two-factor authentication and remove passkeys (lost device)">
                         <i class="ph ph-shield-slash"></i>
                       </button>
@@ -17598,7 +17625,9 @@
                 <div class="flex items-center justify-between"><div><span class="font-semibold text-slate-900 dark:text-white" x-text="c.name" data-testid="passkey-name"></span>
                   <span class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-300" x-text="c.device_type === 'multi_device' ? 'synced passkey' : 'this device / key'"></span>
                   <span x-show="c.attested" class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400" data-testid="passkey-attested" :title="'Verified by attestation' + (c.aaguid ? ' (' + c.aaguid + ')' : '')" x-text="'verified' + (c.model ? ': ' + c.model : '')"></span>
-                  <span x-show="!c.attested && c.model" class="ml-1 text-[10px] text-slate-500" x-text="c.model"></span></div>
+                  <span x-show="!c.attested && c.model" class="ml-1 text-[10px] text-slate-500" x-text="c.model"></span>
+                  <span x-show="c.mds_revoked" class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300 font-bold" data-testid="passkey-mds-revoked" title="The FIDO Alliance has revoked this authenticator model (a disclosed security issue). Replace it.">revoked model</span>
+                  <span x-show="!c.mds_revoked && c.mds_status" class="ml-1 text-[10px] text-slate-400" data-testid="passkey-mds-status" :title="'FIDO Alliance certification status'" x-text="c.mds_status"></span></div>
                   <div class="space-x-2"><button type="button" @click="pkRename(c)" class="text-slate-500 hover:text-indigo-500">Rename</button><button type="button" @click="pk.removeId = c.id; pk.removePassword = ''; pk.error = ''" data-testid="passkey-remove" class="text-slate-500 hover:text-rose-500">Remove</button></div></div>
                 <div class="text-[10px] text-slate-500" x-text="'Added ' + new Date(c.created_at * 1000).toLocaleDateString() + (c.last_used_at ? ' · last used ' + new Date(c.last_used_at * 1000).toLocaleDateString() : ' · never used')"></div>
                 <form x-show="pk.removeId === c.id" @submit.prevent="pkRemove(c)" class="flex items-center space-x-2 pt-1">
@@ -18422,7 +18451,8 @@
         gitReview: { open: false, kind: 'dbt', tab: 'changes', scope: 'pending', status: null, summary: null, sel: null, diff: null, merge: { in_progress: false, conflicts: [], resolved: [] }, csel: null, cfile: null,
           choices: [], fullEdit: false, fullText: '', message: '', busy: false, error: '', note: '', rows: [] },
         ipAllow: { form: { mode: 'off', rules: [], trusted_proxies: [] }, config: null, me: null, activity: null, error: '', busy: false, newRule: '', newNote: '', newProxy: '', checkIp: '', checkResult: null },
-        wpol: { mode: 'none', allowedText: '', roots_pem: '', roots: [], busy: false, error: '' },
+        wpol: { mode: 'none', allowedText: '', roots_pem: '', roots: [], hardware_roles: [], busy: false, error: '' },
+        fidoMds: { configured: false, effective_url: '', url: '', root_pem: '', roots: [], last_refresh_at: null, last_error: null, entry_count: 0, next_update: null, busy: false, error: '', editingRoot: false },
         mfaPolicy: { form: { enabled: false, roles: ['admin', 'power_user', 'user'], grace_days: 14 }, policy: null, stats: null, error: '', busy: false },
         mfa: { forced: false, graceDismissed: false, open: false, status: { enabled: false, pending: false, backup_codes_remaining: 0 }, setup: null, code: '', password: '', backupCodes: null, error: '', busy: false, action: '' },
 
@@ -20046,6 +20076,7 @@
             if (p.ok) { this.mfaPolicy.policy = await p.json(); this.mfaPolicy.form = { enabled: this.mfaPolicy.policy.stored_enabled, roles: [...this.mfaPolicy.policy.roles], grace_days: this.mfaPolicy.policy.grace_days }; }
             if (st.ok) this.mfaPolicy.stats = await st.json();
             this.loadWebauthnPolicy();
+            this.loadFidoMds();
           } catch (e) { this.mfaPolicy.error = 'Could not load the policy: ' + e.message; }
         },
 
@@ -20054,19 +20085,51 @@
             const res = await fetch('/api/webauthn/policy');
             if (!res.ok) return;
             const d = await res.json();
-            this.wpol = { ...this.wpol, mode: d.mode, allowedText: (d.allowed || []).map(m => m.aaguid + '  ' + m.label).join('\n'), roots_pem: d.roots_pem || '', roots: d.roots || [], error: '' };
+            this.wpol = { ...this.wpol, mode: d.mode, allowedText: (d.allowed || []).map(m => m.aaguid + '  ' + m.label).join('\n'), roots_pem: d.roots_pem || '', roots: d.roots || [], hardware_roles: d.hardware_roles || [], error: '' };
           } catch (e) { /* the card keeps its last values */ }
         },
 
         async saveWebauthnPolicy() {
           this.wpol.busy = true; this.wpol.error = '';
           try {
-            const res = await fetch('/api/webauthn/policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: this.wpol.mode, allowed: this.wpol.allowedText, roots_pem: this.wpol.roots_pem }) });
+            const res = await fetch('/api/webauthn/policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: this.wpol.mode, allowed: this.wpol.allowedText, roots_pem: this.wpol.roots_pem, hardware_roles: this.wpol.hardware_roles }) });
             const d = await res.json().catch(() => ({}));
             if (!res.ok) { this.wpol.error = typeof d.detail === 'string' ? d.detail : 'Could not save the passkey policy.'; return; }
             this.showToast('Passkey policy saved.', 'success');
             await this.loadWebauthnPolicy();
           } catch (e) { this.wpol.error = 'Error: ' + e.message; } finally { this.wpol.busy = false; }
+        },
+
+        async loadFidoMds() {
+          try {
+            const res = await fetch('/api/webauthn/mds/status');
+            if (!res.ok) return;
+            const d = await res.json();
+            this.fidoMds = { ...this.fidoMds, ...d, url: d.url || '', root_pem: this.fidoMds.editingRoot ? this.fidoMds.root_pem : (d.root_pem || ''), error: '' };
+          } catch (e) { /* the card keeps its last values */ }
+        },
+
+        async saveFidoMds() {
+          this.fidoMds.busy = true; this.fidoMds.error = '';
+          try {
+            const res = await fetch('/api/webauthn/mds/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: this.fidoMds.url, root_pem: this.fidoMds.root_pem }) });
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) { this.fidoMds.error = typeof d.detail === 'string' ? d.detail : 'Could not save the FIDO metadata configuration.'; return; }
+            this.fidoMds.editingRoot = false;
+            this.showToast(d.last_error ? ('Saved, but the refresh failed: ' + d.last_error) : `Saved. ${d.entry_count || 0} authenticator model(s) cached.`, d.last_error ? 'error' : 'success');
+            await this.loadFidoMds();
+          } catch (e) { this.fidoMds.error = 'Error: ' + e.message; } finally { this.fidoMds.busy = false; }
+        },
+
+        async refreshFidoMds() {
+          this.fidoMds.busy = true; this.fidoMds.error = '';
+          try {
+            const res = await fetch('/api/webauthn/mds/refresh', { method: 'POST' });
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) { this.fidoMds.error = 'Could not refresh.'; return; }
+            this.showToast(d.last_error ? ('Refresh failed: ' + d.last_error) : `Refreshed. ${d.entry_count || 0} authenticator model(s) cached.`, d.last_error ? 'error' : 'success');
+            await this.loadFidoMds();
+          } catch (e) { this.fidoMds.error = 'Error: ' + e.message; } finally { this.fidoMds.busy = false; }
         },
 
         async saveMfaPolicy() {

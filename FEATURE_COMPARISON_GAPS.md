@@ -54,7 +54,7 @@ not been recomputed since (see 1b, last row).
 | TLS with Let's Encrypt (Traefik profile) | Configured, but not exercised: it needs a public host name. Self-signed and bring-your-own certificates are tested. |
 | GitHub and GitLab pull requests | Verified against in-process mock servers of their APIs; only Gitea was run for real. |
 | Delta Sharing | Works with the Python client in the Parquet format (snapshots, time travel, change feed), for both local tables and tables in an S3 mount (pre-signed URLs straight to the mount's object store; verified end to end against a real throwaway Garage server). The client's Rust reader (Delta response format) only recognizes S3/Azure/GCS files by hostname, so a non-cloud-storage host is misread as a local path; that format is built to the specification but unverified end to end. Tables with deletion vectors or column mapping cannot be shared. The change data feed is local-tables-only (it reads the Delta log off local disk); it is refused for a table in an S3 mount. History, time travel and the change feed are opt-in per table because they can expose deleted rows. |
-| Passkeys | Attestation is verified only against trust roots you paste in: no bundled vendor roots and no FIDO Metadata Service lookup. Passkey-only accounts are local accounts only (not LDAP). The browser autofill dropdown could not be driven by automation; the request and the sign-in behind it are tested. |
+| Passkeys | Attestation is verified only against trust roots you paste in: no bundled vendor roots (a FIDO Metadata Service cache adds model names, certification status and revocation, but that is a separate check from the trust-root one and does not bundle vendor roots either). Passkey-only accounts work for local and LDAP accounts, never OIDC/SAML. The browser autofill dropdown could not be driven by automation; the request and the sign-in behind it are tested. |
 | SAML | Solicited SP-initiated sign-in with strict validation, signed AuthnRequests, encrypted assertions and Single Logout (SP- and IdP-initiated, both directions signed) all built and tested. A real encrypt+decrypt round trip is not covered end to end: building a valid `<xenc:EncryptedData>` fixture via the low-level xmlsec Python bindings proved impractical in the time available, so only the rejection-of-unencrypted path is tested, and the decrypt path is verified by reading python3-saml's own implementation instead. |
 | SQL `GRANT` / `REVOKE` | Catalog, schema, table and column-level grants, `WITH GRANT OPTION` / `GRANT OPTION FOR` on tables and schemas. Column-level grants only support SELECT (no column-level MODIFY) and never carry a grant option; `WITH GRANT OPTION` never applies to a catalog (an admin or the catalog's power-user owner still manages that directly) and only delegates GRANT, never REVOKE. Role principals and grants on all tables of a catalog are still refused with a clear message. |
 | Network policy | One global allowlist plus per-recipient rules for Delta Sharing. No per-user or per-role network policies. |
@@ -105,8 +105,12 @@ Ordered by how much they would change the honest picture. None needs a new engin
    verified end-to-end run of the Delta response format against a client that can fetch our URLs — the Python client's
    Rust kernel only recognizes S3/Azure/GCS files by hostname, so this needs real cloud storage or a Spark connector,
    neither available here.)*
-7. **Passkey depth.** FIDO Metadata Service lookups (model names, certification status, revocation), passkey-only LDAP
-   accounts, and per-role authenticator requirements (for example hardware keys for administrators).
+7. ~~**Passkey depth.**~~ *(Done: `web/fido_mds.py` caches the FIDO Alliance's own registry by AAGUID (model name, certification
+   status, revocation -- a real, from-scratch JWS + X.509 chain verification against an administrator-pasted trust root, no
+   vendor roots bundled); a revoked model is refused at registration unconditionally. Passkey-only accounts now work for LDAP
+   accounts too (`set_passwordless`/the enrolment endpoints), not just local ones. Per-role authenticator requirements
+   (`webauthn_policy.hardware_roles`, e.g. hardware keys for administrators) force attestation for the chosen roles even while
+   the organisation-wide mode stays lenient. See 1b for the one caveat kept from before.)*
 8. **Per-user / per-role network policies** on top of the global allowlist.
 9. **A multi-replica studio.** The metadata lives in SQLite files; moving the shared pieces (sessions, challenges, run
    state) to a shared store would allow replicas. This is the one item here that is a real re-design, not a feature.
@@ -118,6 +122,6 @@ Ordered by how much they would change the honest picture. None needs a new engin
 ## Recommendation
 
 `FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
-stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4, 5 and 6 are now done; item 10 (recompute the scorecard) would
+stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4, 5, 6 and 7 are now done; item 10 (recompute the scorecard) would
 make both documents defensible for an external reader. Tell me which items to build next; I would start with parallel
 workflow tasks or the scorecard recompute.

@@ -135,6 +135,11 @@ def init_auth_db():
                     conn.execute(f"ALTER TABLE webauthn_credentials ADD COLUMN {col} {ddl}")
             conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_policy (id INTEGER PRIMARY KEY CHECK (id = 1), mode TEXT NOT NULL DEFAULT 'none', allowed TEXT NOT NULL DEFAULT '[]',
                 roots_pem TEXT NOT NULL DEFAULT '', updated_by TEXT, updated_at INTEGER)""")
+            if "hardware_roles" not in {r[1] for r in conn.execute("PRAGMA table_info(webauthn_policy)").fetchall()}:
+                # Per-role requirement (web/webauthn_auth.py): a role in this list may only register a passkey / security key whose
+                # attestation chain verifies (a real hardware authenticator), never a synced passkey -- for example, requiring
+                # administrators to use hardware security keys even while the organisation-wide attestation mode stays lenient.
+                conn.execute("ALTER TABLE webauthn_policy ADD COLUMN hardware_roles TEXT NOT NULL DEFAULT '[]'")
             conn.execute("INSERT OR IGNORE INTO webauthn_policy (id, mode, allowed, roots_pem) VALUES (1, 'none', '[]', '')")
             conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_challenges (id TEXT PRIMARY KEY, challenge TEXT NOT NULL, purpose TEXT NOT NULL, user_id TEXT, expires INTEGER NOT NULL)""")
             # `must_change_password`: set when a password was provided by someone other than the account holder
@@ -437,12 +442,16 @@ def create_passwordless_user(username: str, display_name: str, role: str = "user
 
 
 def set_passwordless(user_id: str, on: bool) -> bool:
-    """Turns an account passkey-only (the password becomes unusable) or, with `on` False, only flags it as having a password again (reset_user_password does that too)."""
+    """Turns an account passkey-only (the password becomes unusable) or, with `on` False, only flags it as having a password again (reset_user_password does that too).
+    Works for a local OR an LDAP-provisioned account: an LDAP account already has an unusable local hash (upsert_external_user), so overwriting it
+    with a fresh random one changes nothing about how it authenticates today, but the `passwordless` flag itself makes `/api/auth/login` refuse it
+    before it ever reaches the LDAP bind (see login_endpoint), so its directory password stops being a way in at all -- the account signs in with
+    a passkey only, exactly like a local passkey-only account. Never for OIDC/SAML: those providers own the whole sign-in exchange already."""
     conn = get_db_connection()
     try:
         with conn:
             if on:
-                return conn.execute("UPDATE users SET passwordless = 1, password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE id = ? AND COALESCE(auth_source, 'local') = 'local'",
+                return conn.execute("UPDATE users SET passwordless = 1, password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE id = ? AND COALESCE(auth_source, 'local') IN ('local', 'ldap')",
                                     (hash_password(secrets.token_hex(32)), int(time.time()), user_id)).rowcount > 0
             return conn.execute("UPDATE users SET passwordless = 0 WHERE id = ?", (user_id,)).rowcount > 0
     finally:

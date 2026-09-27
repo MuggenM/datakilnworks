@@ -11,7 +11,16 @@ import cbor2
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
-from web import app as app_module, auth, mfa, mfa_policy, webauthn_auth as wa
+from web import app as app_module, auth, mfa, mfa_policy, webauthn_auth as wa, fido_mds as fmds
+fmds.init_db()
+def _seed_mds(aaguid, revoked=False, description="Test Model", status_=None):
+    c = auth.get_db_connection()
+    try:
+        with c:
+            c.execute("INSERT OR REPLACE INTO fido_mds_entries (aaguid, description, status, revoked, status_reports, updated_at) VALUES (?,?,?,?,?,?)",
+                      (aaguid, description, status_ or ("REVOKED" if revoked else "FIDO_CERTIFIED_L1"), 1 if revoked else 0, "[]", int(time.time())))
+    finally:
+        c.close()
 FAIL = []
 def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:300]}" if d and not c else ""))
@@ -338,6 +347,59 @@ check("...and accepts a verified one", r.status_code == 200, r.text)
 put(mode="none", roots_pem=root_e, allowed=[])
 check("an organisation policy that requires MFA counts a passkey-only account as compliant", mfa_policy.status_for_user_id(erin_id)["enrolled"] is True)
 check("the user list shows who is passkey-only and how many passkeys each has", any(u["username"] == "erin" and u["passwordless"] and u["passkey_count"] == 1 for u in admin.get("/api/users").json().get("users", admin.get("/api/users").json())))
+
+print("FIDO Metadata Service: revoked models are refused unconditionally")
+put(mode="none", roots_pem="", allowed=[], hardware_roles=[])
+clear()
+_seed_mds(AA, revoked=True, description="Revoked Key")
+a, o, r = dreg(aaguid=AA); check("a revoked FIDO MDS model is refused even under the lenient default policy", r.status_code == 400 and "revoked" in r.text.lower(), r.text)
+_seed_mds(BB, revoked=False, description="Good Key", status_="FIDO_CERTIFIED_L1")
+a, o, r = dreg(aaguid=BB, name="Good"); check("a certified, non-revoked model registers normally", r.status_code == 200, r.text)
+st = dave.get("/api/auth/webauthn/status").json()["credentials"]
+check("the credential list carries the model's name and certification status from the cache", any(x["model"] == "Good Key" and x["mds_status"] == "FIDO_CERTIFIED_L1" and x["mds_revoked"] is False for x in st), st)
+check("fido_mds.lookup answers unknown AAGUIDs with None", fmds.lookup("00000000-1111-2222-3333-444444444444") is None and fmds.lookup("") is None)
+clear()
+
+print("per-role hardware requirement")
+_seed_mds(AA, revoked=False, description="Vendor A security key", status_="FIDO_CERTIFIED")   # undo the earlier revocation seeding of this AAGUID
+r = put(mode="none", roots_pem="", allowed=[], hardware_roles=["user"]); check("a per-role hardware requirement needs trust roots too (refused without any)", r.status_code == 400, r.text)
+r = put(mode="none", roots_pem=root_a, allowed=[], hardware_roles=["not-a-role"]); check("an unknown role in the list is refused", r.status_code == 400, r.text)
+r = put(mode="none", roots_pem=root_a, allowed=[], hardware_roles=["user"])
+check("hardware_roles with roots is accepted, and the global mode stays lenient for everyone else", r.status_code == 200 and r.json()["hardware_roles"] == ["user"] and r.json()["mode"] == "none", r.text)
+o = dave.post("/api/auth/webauthn/register/options", json={"password": DPW}, headers=H).json()
+check("a covered role is asked for attestation even though the organisation-wide mode is 'none'", o["options"]["attestation"] == "direct", o)
+a, o, r = dreg(); check("a synced / unattested passkey is refused for a role with a hardware requirement", r.status_code == 400 and "hardware" in r.text.lower(), r.text)
+a, o, r = dreg(aaguid=AA, att=leaf_a, name="Dave's key"); check("a hardware key whose attestation verifies registers for a covered role", r.status_code == 200 and r.json()["credential"]["attested"] is True, r.text)
+ivan_id = auth.create_user("ivan", "ivanpassword1", "Ivan", "power_user")["id"]
+with auth.get_db_connection() as cx: cx.execute("UPDATE users SET must_change_password = 0")
+ivan = session("ivan")
+o = ivan.post("/api/auth/webauthn/register/options", json={"password": "ivanpassword1"}, headers=H).json()
+check("a role that is not covered is not asked for attestation under the same policy", o["options"]["attestation"] == "none", o)
+_, _, r = register(ivan, "ivanpassword1", name="Ivan phone"); check("...and a synced passkey registers normally for that role", r.status_code == 200, r.text)
+put(mode="none", roots_pem="", allowed=[], hardware_roles=[])
+
+print("passkey-only LDAP accounts")
+liam = auth.upsert_external_user("liam", "Liam", "user", "ldap")
+liam_id = liam["id"]
+check("an LDAP-provisioned account starts with a usable directory identity but is not passkey-only yet", liam["auth_source"] == "ldap" and liam["passwordless"] is False)
+HH = {**H, "Host": RP}   # a direct module call (not through TestClient) needs its own Host header for relying_party() to derive the RP id
+la1 = Authenticator(); opts1 = wa.registration_options(liam, HH, False); cred1 = la1.create(opts1)
+wa.finish_registration(liam, opts1["challenge_id"], cred1, "Liam key 1", HH, False)
+check("a passkey registers for it directly (one so far)", wa.count(liam_id) == 1)
+check("one passkey is not enough to remove the password yet, same rule as a local account (409)", admin.post(f"/api/users/{liam_id}/remove-password").status_code == 409)
+la2 = Authenticator(); opts2 = wa.registration_options(liam, HH, False); cred2 = la2.create(opts2)
+wa.finish_registration(liam, opts2["challenge_id"], cred2, "Liam key 2", HH, False)
+r = admin.post(f"/api/users/{liam_id}/remove-password"); check("with two passkeys, an administrator can make an LDAP account passkey-only too (previously local accounts only)", r.status_code == 200, r.text)
+liam_now = auth.get_user_by_username("liam")
+check("the account is passwordless and still auth_source ldap", liam_now["passwordless"] is True and liam_now["auth_source"] == "ldap")
+r = TestClient(app_module.app).post("/api/auth/login", json={"username": "liam", "password": "whatever-its-directory-password-is"})
+check("/api/auth/login refuses it before ever attempting an LDAP bind (the same answer as a wrong password)", r.status_code == 401 and "Invalid username or password" in r.text, r.text)
+lp = TestClient(app_module.app); lop = lp.post("/api/auth/passkey/options", headers=H).json()
+r = lp.post("/api/auth/passkey/login", json={"challenge_id": lop["challenge_id"], "credential": la1.get(lop)}, headers=H)
+check("it signs in with a passkey instead (passwordless)", r.status_code == 200 and r.json()["user"]["username"] == "liam", r.text)
+check("a recovery enrolment link can be issued for it like a local passkey-only account", admin.post(f"/api/users/{liam_id}/passkey-enrollment").status_code == 200)
+oscar = auth.upsert_external_user("oscar", "Oscar", "user", "oidc")
+check("an OIDC (or SAML) account still cannot be made passkey-only: only local and LDAP own a usable directory/local credential to bypass", admin.post(f"/api/users/{oscar['id']}/remove-password").status_code == 400)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("FAILED: " + ", ".join(FAIL) if FAIL else "ALL PASS"); sys.exit(1 if FAIL else 0)
