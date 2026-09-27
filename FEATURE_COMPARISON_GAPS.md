@@ -57,7 +57,7 @@ not been recomputed since (see 1b, last row).
 | Passkeys | Attestation is verified only against trust roots you paste in: no bundled vendor roots (a FIDO Metadata Service cache adds model names, certification status and revocation, but that is a separate check from the trust-root one and does not bundle vendor roots either). Passkey-only accounts work for local and LDAP accounts, never OIDC/SAML. The browser autofill dropdown could not be driven by automation; the request and the sign-in behind it are tested. |
 | SAML | Solicited SP-initiated sign-in with strict validation, signed AuthnRequests, encrypted assertions and Single Logout (SP- and IdP-initiated, both directions signed) all built and tested. A real encrypt+decrypt round trip is not covered end to end: building a valid `<xenc:EncryptedData>` fixture via the low-level xmlsec Python bindings proved impractical in the time available, so only the rejection-of-unencrypted path is tested, and the decrypt path is verified by reading python3-saml's own implementation instead. |
 | SQL `GRANT` / `REVOKE` | Catalog, schema, table and column-level grants, `WITH GRANT OPTION` / `GRANT OPTION FOR` on tables and schemas. Column-level grants only support SELECT (no column-level MODIFY) and never carry a grant option; `WITH GRANT OPTION` never applies to a catalog (an admin or the catalog's power-user owner still manages that directly) and only delegates GRANT, never REVOKE. Role principals and grants on all tables of a catalog are still refused with a clear message. |
-| Network policy | One global allowlist plus per-recipient rules for Delta Sharing. No per-user or per-role network policies. |
+| Network policy | One global allowlist plus per-recipient rules for Delta Sharing, and now per-user / per-role network policies on top (a specific account, or every account of a role, restricted to chosen address ranges, independent of the global allowlist's own mode). Only ever applies to an authenticated session: the login page itself, SSO callbacks and `/docs` have no identity yet to check it against. |
 | Governance on shared data | A table with a masking policy or row filter cannot be shared through Delta Sharing (recipients receive raw files). The fix is to share a de-identified copy. |
 | Azure Blob and GCS Auto-Loader sources | GCS goes through its S3-compatible interoperability API (HMAC keys), not the native Google Cloud SDK or OAuth service accounts; real GCS was not available to test against, so `scratch/test_autoloader_gcs.py` runs against a throwaway Garage container standing in for GCS's endpoint instead. Azure Blob was tested against a throwaway Azurite emulator, not a real Azure account. Neither is a Delta write target (source only, like every non-S3 mount); neither has an instant bucket-notification trigger (S3 events has no Azure/GCS equivalent here); ADLS Gen2-specific features (hierarchical namespace ACLs) are not used. |
 | `FEATURE_COMPARISON.md` scorecard | Its per-domain scores and totals were last recomputed before most of the work above, so the totals are stale in both directions. Treat the individual rows, not the sum, as the reference until it is recomputed. |
@@ -111,7 +111,11 @@ Ordered by how much they would change the honest picture. None needs a new engin
    accounts too (`set_passwordless`/the enrolment endpoints), not just local ones. Per-role authenticator requirements
    (`webauthn_policy.hardware_roles`, e.g. hardware keys for administrators) force attestation for the chosen roles even while
    the organisation-wide mode stays lenient. See 1b for the one caveat kept from before.)*
-8. **Per-user / per-role network policies** on top of the global allowlist.
+8. ~~**Per-user / per-role network policies**~~ *(Done: `web/ip_allowlist.py`'s `network_policies` table restricts a specific user, or
+   every user of a role, to chosen address ranges, independently of the global allowlist's own mode; a user policy takes precedence
+   over that user's role policy. Can only ever apply once a session exists (there is no identity yet for the login page, SSO
+   callbacks or `/docs`), and always allow-lists `/api/auth/me`/`/api/auth/logout` so a blocked account can still see why and sign
+   out. See 1b.)*
 9. **A multi-replica studio.** The metadata lives in SQLite files; moving the shared pieces (sessions, challenges, run
    state) to a shared store would allow replicas. This is the one item here that is a real re-design, not a feature.
 10. **Recompute `FEATURE_COMPARISON.md`.** Refresh the scores from the current code, and add rows for the newer features
@@ -122,6 +126,6 @@ Ordered by how much they would change the honest picture. None needs a new engin
 ## Recommendation
 
 `FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
-stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4, 5, 6 and 7 are now done; item 10 (recompute the scorecard) would
+stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4, 5, 6, 7 and 8 are now done; item 10 (recompute the scorecard) would
 make both documents defensible for an external reader. Tell me which items to build next; I would start with parallel
 workflow tasks or the scorecard recompute.

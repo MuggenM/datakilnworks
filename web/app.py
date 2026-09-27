@@ -284,6 +284,45 @@ async def _mfa_policy_gate(request: Request, call_next):
                         "detail": "Your organisation requires two-factor authentication. Turn it on to continue.", "mfa_enrollment_required": True})
     return await call_next(request)
 
+# What a request may still do while its own account is blocked by a per-user/role network policy: see it and sign out.
+_NETWORK_POLICY_ALLOWED = {"/api/auth/logout", "/api/auth/me"}
+
+
+@app.middleware("http")
+async def _network_policy_gate(request: Request, call_next):
+    """
+    Per-user or per-role network policy (web/ip_allowlist.py), on top of the global allowlist below. Unlike that one, this can only
+    ever apply to an authenticated session: there is no identity yet to check a per-user policy against for the login page itself,
+    an SSO callback or /docs, so those stay governed by the global allowlist alone. Only ever gates /api/*, mirroring
+    `_must_change_password_gate` (including its staleness check) so the SPA shell can still load and the account holder can see why
+    they are blocked and sign out; a direct API call cannot skip it either.
+    """
+    path = request.url.path
+    if not path.startswith("/api/") or path in _NETWORK_POLICY_ALLOWED or path.startswith("/api/sandbox/"):
+        return await call_next(request)
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        payload = decode_access_token(token)
+        if payload and "sub" in payload:
+            user = get_user_by_id(payload["sub"])
+            changed = user.get("password_changed_at") if user else None
+            stale = bool(changed and int(payload.get("iat", 0)) < int(changed))
+            if user and user.get("is_active", 1) == 1 and not user.get("deleted_at") and not stale:
+                from web import ip_allowlist
+                try:
+                    ok, policy, client = ip_allowlist.check_user_network(user, request.client.host if request.client else None, dict(request.headers))
+                except Exception as exc:                        # a bug here must not lock everybody out; it is logged loudly
+                    logger.error(f"per-user network policy check failed, letting the request through: {exc}", exc_info=True)
+                    return await call_next(request)
+                if not ok:
+                    ip_allowlist.record("block", client, request.method, path, source="network_policy",
+                                        principal=f"{policy['principal_type']}:{policy['principal_id']}")
+                    return JSONResponse(status_code=403, content={
+                        "detail": "Your account's network policy does not allow access from your current address.",
+                        "ip_blocked": True, "your_address": client.get("text", "")})
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _ip_allowlist_gate(request: Request, call_next):
     """
@@ -1141,6 +1180,42 @@ async def check_ip_allowlist_endpoint(payload: IpCheckPayload, current_user: Dic
         return ip_allowlist.check_address(payload.ip)
     except ip_allowlist.AllowlistError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+class NetworkPolicyPayload(BaseModel):
+    rules: List[Dict[str, Any]] = []
+
+
+@app.get("/api/network-policies")
+async def list_network_policies_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Every per-user / per-role network policy on top of the global allowlist above."""
+    from web import ip_allowlist
+    return {"policies": ip_allowlist.list_network_policies(), "roles": list(ip_allowlist.NETWORK_POLICY_ROLES)}
+
+
+@app.put("/api/network-policies/{principal_type}/{principal_id}")
+async def set_network_policy_endpoint(principal_type: str, principal_id: str, payload: NetworkPolicyPayload, request: Request,
+                                      current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Restricts one user, or every user of one role, to chosen address ranges. Refused when it would block the administrator
+    making the change (only relevant when the policy is about to apply to them)."""
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.set_network_policy(principal_type, principal_id, payload.rules, current_user,
+                                               request.client.host if request.client else None, dict(request.headers))
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/network-policies/{principal_type}/{principal_id}")
+async def delete_network_policy_endpoint(principal_type: str, principal_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import ip_allowlist
+    try:
+        ok = ip_allowlist.delete_network_policy(principal_type, principal_id, current_user.get("username", "admin"))
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not ok:
+        raise HTTPException(status_code=404, detail="No such policy.")
+    return {"success": True}
 
 
 class ScimConfigPayload(BaseModel):

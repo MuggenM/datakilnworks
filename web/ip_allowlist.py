@@ -16,6 +16,19 @@ Loopback WITH forwarding headers is judged like anyone else: it means a reverse 
 
 Guards: a change that would block the administrator making it (judged with the new proxy settings, from their own request) is refused; rules of
 /0 are refused; `IP_ALLOWLIST_OVERRIDE=off` in the environment suspends enforcement without touching the stored setting (break-glass).
+
+**Per-user / per-role network policies** (table `network_policies`, on top of everything above): a specific user, or every user of a role, can be
+restricted to chosen address ranges -- for example, administrators only from the office network, or one contractor's account only from their
+home range -- independently of the global allowlist's own mode (a deployment need not turn that on at all to use this). A user-specific policy
+takes precedence over a role policy (`resolve_network_policy`); at most one policy applies to any given request. Unlike the global list, there is
+no `off`/`monitor`/`enforce` mode here: a policy exists or it does not, and while it exists it is always enforced (an admin removes it with
+`delete_network_policy` instead of leaving an empty rule list, which would lock the principal out of everything). Loopback without forwarding
+headers is exempt, the same as the global list, so `docker exec` and health checks are never affected. **This can only ever apply to an
+authenticated session** (`_network_policy_gate` in `app.py` decodes the session cookie itself, mirroring `_must_change_password_gate`'s staleness
+check): the login page itself, SSO callbacks and the documentation portal have no identity yet to check a per-user policy against, and stay
+governed by the global allowlist alone. The same self-lockout guard as the global list applies: `set_network_policy` refuses to save a policy
+that would block the address the acting administrator is themselves saving it from, when it is about to apply to them (their own account, or
+their own role).
 """
 import collections
 import ipaddress
@@ -49,6 +62,10 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY CHECK (id = 1), mode TEXT NOT NULL DEFAULT 'off', rules TEXT NOT NULL DEFAULT '[]',
                 trusted_proxies TEXT NOT NULL DEFAULT '[]', updated_by TEXT, updated_at INTEGER)""")
             conn.execute("INSERT OR IGNORE INTO ip_allowlist (id) VALUES (1)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS network_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, principal_type TEXT NOT NULL CHECK(principal_type IN ('user', 'role')),
+                principal_id TEXT NOT NULL, rules TEXT NOT NULL DEFAULT '[]', updated_by TEXT, updated_at INTEGER,
+                UNIQUE(principal_type, principal_id))""")
     finally:
         conn.close()
 
@@ -219,11 +236,13 @@ _counts: "collections.OrderedDict[str, Dict[str, Any]]" = collections.OrderedDic
 _lock_events = __import__("threading").Lock()
 
 
-def record(verdict: str, client: Dict[str, Any], method: str, path: str) -> None:
+def record(verdict: str, client: Dict[str, Any], method: str, path: str, source: str = "ip", principal: Optional[str] = None) -> None:
+    """`source` is 'ip' for the global allowlist or 'network_policy' for a per-user/role one; `principal` names the policy
+    ('user:<id>' or 'role:<name>') for the latter, so the activity feed shows why, not only that."""
     now = int(time.time())
     key = client["text"] or "?"
     with _lock_events:
-        _events.appendleft({"at": now, "ip": key, "verdict": verdict, "method": method, "path": path[:120]})
+        _events.appendleft({"at": now, "ip": key, "verdict": verdict, "method": method, "path": path[:120], "source": source, "principal": principal})
         c = _counts.get(key) or {"ip": key, "blocked": 0, "would_block": 0, "first_at": now, "last_at": now}
         c["blocked" if verdict == "block" else "would_block"] += 1
         c["last_at"] = now
@@ -301,3 +320,122 @@ def check_address(text: str) -> Dict[str, Any]:
     cfg = get_config()
     hit = next((r for r in cfg["rules"] if ip.version == ipaddress.ip_network(r["cidr"], strict=False).version and ip in ipaddress.ip_network(r["cidr"], strict=False)), None)
     return {"ip": str(ip), "allowed": bool(hit) or ip.is_loopback, "rule": hit["cidr"] if hit else ("loopback" if ip.is_loopback else None)}
+
+
+# ---------------------------------------------------------------- per-user / per-role network policies
+
+NETWORK_POLICY_ROLES = ("admin", "power_user", "user")
+
+
+def _np_principal(principal_type: str, principal_id: str) -> Tuple[str, str]:
+    principal_type = str(principal_type or "").strip().lower()
+    if principal_type not in ("user", "role"):
+        raise AllowlistError("The principal type must be 'user' or 'role'.")
+    pid = str(principal_id or "").strip()
+    if principal_type == "role":
+        if pid not in NETWORK_POLICY_ROLES:
+            raise AllowlistError(f"'{pid}' is not a role ({', '.join(NETWORK_POLICY_ROLES)}).")
+    else:
+        if not pid:
+            raise AllowlistError("Choose a user.")
+        from web.auth import get_user_by_id
+        if not get_user_by_id(pid):
+            raise AllowlistError("That user does not exist.")
+    return principal_type, pid
+
+
+def list_network_policies() -> List[Dict[str, Any]]:
+    init_db()
+    conn = _conn()
+    try:
+        rows = conn.execute("SELECT * FROM network_policies ORDER BY principal_type, principal_id").fetchall()
+    finally:
+        conn.close()
+    from web.auth import get_user_by_id
+    out = []
+    for r in rows:
+        label = r["principal_id"]
+        if r["principal_type"] == "user":
+            u = get_user_by_id(r["principal_id"])
+            label = u["username"] if u else f"(deleted: {r['principal_id']})"
+        out.append({"id": r["id"], "principal_type": r["principal_type"], "principal_id": r["principal_id"], "label": label,
+                    "rules": json.loads(r["rules"] or "[]"), "updated_by": r["updated_by"], "updated_at": r["updated_at"]})
+    return out
+
+
+def get_network_policy(principal_type: str, principal_id: str) -> Optional[Dict[str, Any]]:
+    init_db()
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT * FROM network_policies WHERE principal_type = ? AND principal_id = ?", (principal_type, principal_id)).fetchone()
+    finally:
+        conn.close()
+    if not r:
+        return None
+    return {"principal_type": r["principal_type"], "principal_id": r["principal_id"], "rules": json.loads(r["rules"] or "[]"),
+            "updated_by": r["updated_by"], "updated_at": r["updated_at"]}
+
+
+def resolve_network_policy(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The policy that applies to this user, if any: their own (user-type) policy takes precedence over their role's."""
+    if not user or not user.get("id"):
+        return None
+    p = get_network_policy("user", user["id"])
+    if p:
+        return p
+    return get_network_policy("role", user.get("role") or "")
+
+
+def set_network_policy(principal_type: str, principal_id: str, rules: Any, actor_user: Dict[str, Any],
+                       actor_peer: Optional[str] = None, actor_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    principal_type, principal_id = _np_principal(principal_type, principal_id)
+    clean = _clean_entries(rules or [], "rules")
+    if not clean:
+        raise AllowlistError("A network policy needs at least one address range. To remove the restriction entirely, delete the policy instead.")
+    applies_to_actor = (principal_type == "user" and principal_id == actor_user.get("id")) or (principal_type == "role" and principal_id == actor_user.get("role"))
+    if applies_to_actor and actor_peer is not None:
+        me = resolve_client(actor_peer, actor_headers or {})
+        if me["ip"] is None or (not me["ip"].is_loopback and not _in(me["ip"], _networks(clean))):
+            raise AllowlistError(f"Your current address ({me['text'] or 'unknown'}) would be blocked by this policy. Add it first, so you cannot lock yourself out.")
+    init_db()
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute("""INSERT INTO network_policies (principal_type, principal_id, rules, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(principal_type, principal_id) DO UPDATE SET rules = excluded.rules, updated_by = excluded.updated_by, updated_at = excluded.updated_at""",
+                         (principal_type, principal_id, json.dumps(clean), actor_user.get("username", "admin"), int(time.time())))
+    finally:
+        conn.close()
+    _audit(actor_user.get("username", "admin"), "NETWORK_POLICY_UPDATE", {"principal_type": principal_type, "principal_id": principal_id, "rules": [r["cidr"] for r in clean]})
+    return get_network_policy(principal_type, principal_id)
+
+
+def delete_network_policy(principal_type: str, principal_id: str, actor: str) -> bool:
+    """Removes the restriction entirely (an empty rule list is never stored -- see set_network_policy). No existence check on
+    the principal: deleting the policy of an account that was since removed must still work."""
+    principal_type = str(principal_type or "").strip().lower()
+    if principal_type not in ("user", "role"):
+        raise AllowlistError("The principal type must be 'user' or 'role'.")
+    principal_id = str(principal_id or "").strip()
+    init_db()
+    conn = _conn()
+    try:
+        with conn:
+            n = conn.execute("DELETE FROM network_policies WHERE principal_type = ? AND principal_id = ?", (principal_type, principal_id)).rowcount
+    finally:
+        conn.close()
+    if n:
+        _audit(actor, "NETWORK_POLICY_DELETE", {"principal_type": principal_type, "principal_id": principal_id})
+    return n > 0
+
+
+def check_user_network(user: Optional[Dict[str, Any]], peer: Optional[str], headers: Dict[str, str]) -> Tuple[bool, Optional[Dict[str, Any]], Dict[str, Any]]:
+    """(allowed, policy_or_None, client). `allowed` is True whenever no per-user/role policy applies to this user."""
+    policy = resolve_network_policy(user)
+    if not policy:
+        return True, None, {}
+    client = resolve_client(peer, headers)
+    if client["ip"] is not None and client["ip"].is_loopback and not client["forwarding_headers_present"] and not client["via_proxy"]:
+        return True, policy, client            # loopback stays exempt, the same as the global allowlist
+    ok = client["ip"] is not None and _in(client["ip"], _networks(policy["rules"]))
+    return ok, policy, client

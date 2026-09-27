@@ -15264,7 +15264,7 @@
         <button @click="iamTab = 'users'" :class="iamTab === 'users' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-users">Users</button>
         <button @click="iamTab = 'groups'; loadGroups()" :class="iamTab === 'groups' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-groups">Groups <span class="ml-1 text-[10px] font-mono px-1.5 rounded bg-slate-100 dark:bg-slate-800" x-text="groupsList.length"></span></button>
         <button @click="iamTab = 'mfa'; loadMfaPolicy()" :class="iamTab === 'mfa' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-mfa">Two-factor policy</button>
-        <button @click="iamTab = 'network'; loadIpAllow()" :class="iamTab === 'network' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-network">Network access</button>
+        <button @click="iamTab = 'network'; loadIpAllow(); loadNetworkPolicies(); if (!iamUsers.length) fetchUsers()" :class="iamTab === 'network' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-network">Network access</button>
         <button @click="iamTab = 'scim'; loadScim()" :class="iamTab === 'scim' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-300' : 'border-transparent text-slate-500'" class="px-3 py-1.5 text-xs font-semibold border-b-2" data-testid="iam-tab-scim">Provisioning (SCIM)</button>
       </div>
 
@@ -15358,6 +15358,37 @@
           </div>
           <p class="text-[11px] text-slate-500">A request from an address outside every rule gets 403 before anything else runs (sign-in and SSO callbacks included). Loopback without forwarding headers (health checks, <span class="font-mono">docker exec</span>) and the notebook sandbox's own calls always pass. Start with <b>Monitor</b>, look at what would have been blocked below, then enforce. If you are locked out anyway, set <span class="font-mono">IP_ALLOWLIST_OVERRIDE=off</span> in the studio's environment and restart it.</p>
           <div x-show="ipAllow.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="ip-error" x-text="ipAllow.error"></div>
+        </div>
+
+        <!-- Per-user / per-role network policies: on top of the global allowlist above, always enforced once set -->
+        <div class="border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-3" data-testid="net-policy-card">
+          <span class="font-semibold text-sm text-slate-800 dark:text-slate-100">Per-user / per-role network policies</span>
+          <p class="text-[11px] text-slate-500">Restrict one account, or every account of a role, to chosen address ranges -- for example administrators only from the office network. Independent of the mode above (works even with the global allowlist off). Only applies to a signed-in session: the sign-in page itself has no identity yet to check. A user policy wins over that user's role policy. There is no "monitor" here: a policy that exists is always enforced; remove it instead of leaving an empty list.</p>
+          <table class="w-full text-left" data-testid="net-policy-table"><thead class="text-[10px] uppercase text-slate-500"><tr><th class="pb-1">Applies to</th><th class="pb-1">Address ranges</th><th class="pb-1">Updated</th><th></th></tr></thead>
+            <tbody>
+              <template x-for="p in netPol.policies" :key="p.principal_type + ':' + p.principal_id">
+                <tr class="border-t border-slate-200 dark:border-dbx-border/50" data-testid="net-policy-row">
+                  <td class="py-1.5 pr-2"><span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border mr-1" x-text="p.principal_type === 'role' ? 'role' : 'user'"></span><span class="font-mono" x-text="p.label"></span></td>
+                  <td class="py-1.5 pr-2 font-mono text-[11px]" x-text="p.rules.map(r => r.cidr).join(', ')"></td>
+                  <td class="py-1.5 pr-2 text-slate-500" x-text="p.updated_by ? (p.updated_by + ' · ' + new Date(p.updated_at * 1000).toLocaleDateString()) : ''"></td>
+                  <td class="py-1.5 text-right"><button @click="netPolDelete(p)" class="text-slate-400 hover:text-red-500" data-testid="net-policy-delete"><i class="ph ph-trash"></i></button></td>
+                </tr>
+              </template>
+              <tr x-show="!netPol.policies.length"><td colspan="4" class="py-2 text-slate-500">No per-user or per-role policies yet.</td></tr>
+            </tbody>
+          </table>
+          <div class="border-t border-slate-200 dark:border-dbx-border pt-3 space-y-2">
+            <div class="text-[10px] uppercase text-slate-500">Add a policy</div>
+            <div class="flex items-center space-x-2 flex-wrap gap-y-2">
+              <select x-model="netPol.addType" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5" data-testid="net-policy-type"><option value="role">Role</option><option value="user">User</option></select>
+              <select x-show="netPol.addType === 'role'" x-model="netPol.addPrincipal" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5" data-testid="net-policy-role"><option value="">Choose a role</option><template x-for="r in netPol.roles" :key="r"><option :value="r" x-text="r === 'power_user' ? 'power users' : (r === 'admin' ? 'administrators' : 'users')"></option></template></select>
+              <select x-show="netPol.addType === 'user'" x-model="netPol.addPrincipal" class="bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 max-w-[16rem]" data-testid="net-policy-user"><option value="">Choose a user</option><template x-for="u in iamUsers" :key="u.id"><option :value="u.id" x-text="u.username"></option></template></select>
+              <button @click="netPolSave()" :disabled="netPol.busy" class="ml-auto px-3 py-1.5 bg-dbx-orange text-white font-semibold rounded disabled:opacity-50" data-testid="net-policy-save">Save</button>
+            </div>
+            <div class="flex flex-wrap gap-1.5" data-testid="net-policy-add-rules"><template x-for="(r, i) in netPol.addRules" :key="r.cidr"><span class="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border font-mono text-[11px] flex items-center space-x-1"><span x-text="r.cidr"></span><button @click="netPol.addRules.splice(i, 1)" class="text-slate-400 hover:text-red-500"><i class="ph ph-x"></i></button></span></template></div>
+            <div class="flex items-center space-x-2"><input type="text" x-model="netPol.addRule" placeholder="203.0.113.0/24 or 198.51.100.7" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange" data-testid="net-policy-new-rule" @keydown.enter.prevent="netPolAddRule()"><input type="text" x-model="netPol.addNote" placeholder="note" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-3 py-1.5 text-slate-900 dark:text-white font-mono focus:outline-none focus:border-dbx-orange w-40"><button @click="netPolAddRule()" class="px-2 py-1 bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded" data-testid="net-policy-add-rule">Add range</button></div>
+          </div>
+          <div x-show="netPol.error" class="p-2 rounded bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-rose-700 dark:text-rose-300" data-testid="net-policy-error" x-text="netPol.error"></div>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
@@ -18451,6 +18482,7 @@
         gitReview: { open: false, kind: 'dbt', tab: 'changes', scope: 'pending', status: null, summary: null, sel: null, diff: null, merge: { in_progress: false, conflicts: [], resolved: [] }, csel: null, cfile: null,
           choices: [], fullEdit: false, fullText: '', message: '', busy: false, error: '', note: '', rows: [] },
         ipAllow: { form: { mode: 'off', rules: [], trusted_proxies: [] }, config: null, me: null, activity: null, error: '', busy: false, newRule: '', newNote: '', newProxy: '', checkIp: '', checkResult: null },
+        netPol: { policies: [], roles: [], error: '', busy: false, addType: 'role', addPrincipal: '', addRules: [], addRule: '', addNote: '' },
         wpol: { mode: 'none', allowedText: '', roots_pem: '', roots: [], hardware_roles: [], busy: false, error: '' },
         fidoMds: { configured: false, effective_url: '', url: '', root_pem: '', roots: [], last_refresh_at: null, last_error: null, entry_count: 0, next_update: null, busy: false, error: '', editingRoot: false },
         mfaPolicy: { form: { enabled: false, roles: ['admin', 'power_user', 'user'], grace_days: 14 }, policy: null, stats: null, error: '', busy: false },
@@ -20067,6 +20099,48 @@
           const d = await res.json();
           if (!res.ok) { this.ipAllow.error = d.detail || 'Could not check.'; return; }
           this.ipAllow.checkResult = d;
+        },
+
+        async loadNetworkPolicies() {
+          try {
+            const res = await fetch('/api/network-policies');
+            if (!res.ok) return;
+            const d = await res.json();
+            this.netPol.policies = d.policies || []; this.netPol.roles = d.roles || [];
+          } catch (e) { this.netPol.error = 'Could not load: ' + e.message; }
+        },
+
+        netPolAddRule() {
+          const cidr = (this.netPol.addRule || '').trim(); if (!cidr) return;
+          if (!this.netPol.addRules.some(r => r.cidr === cidr)) this.netPol.addRules.push({ cidr, note: this.netPol.addNote || '' });
+          this.netPol.addRule = ''; this.netPol.addNote = '';
+        },
+
+        async netPolSave() {
+          const principal = (this.netPol.addPrincipal || '').trim();
+          if (!principal) { this.netPol.error = 'Choose a user or role.'; return; }
+          if (!this.netPol.addRules.length) { this.netPol.error = 'Add at least one address range.'; return; }
+          this.netPol.busy = true; this.netPol.error = '';
+          try {
+            const res = await fetch(`/api/network-policies/${this.netPol.addType}/${encodeURIComponent(principal)}`, {
+              method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: this.netPol.addRules }) });
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) { this.netPol.error = typeof d.detail === 'string' ? d.detail : 'Could not save.'; return; }
+            this.netPol.addPrincipal = ''; this.netPol.addRules = [];
+            this.showToast('Network policy saved.', 'success');
+            await this.loadNetworkPolicies();
+          } catch (e) { this.netPol.error = 'Error: ' + e.message; } finally { this.netPol.busy = false; }
+        },
+
+        async netPolDelete(p) {
+          if (!confirm(`Remove the network policy for ${p.label}? Its ${p.principal_type === 'role' ? 'role' : 'account'} will no longer be restricted.`)) return;
+          this.netPol.busy = true; this.netPol.error = '';
+          try {
+            const res = await fetch(`/api/network-policies/${p.principal_type}/${encodeURIComponent(p.principal_id)}`, { method: 'DELETE' });
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) { this.netPol.error = d.detail || 'Could not remove.'; return; }
+            await this.loadNetworkPolicies();
+          } catch (e) { this.netPol.error = 'Error: ' + e.message; } finally { this.netPol.busy = false; }
         },
 
         async loadMfaPolicy() {

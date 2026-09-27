@@ -86,6 +86,10 @@
    "extras": ""
   },
   {
+   "name": "network_policy",
+   "extras": ""
+  },
+  {
    "name": "mfa_policy",
    "extras": ""
   },
