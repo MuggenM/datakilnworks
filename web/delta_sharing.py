@@ -12,7 +12,13 @@ Governance  A Delta Sharing recipient receives the raw Parquet files, so no mask
          when NO masking policy and NO row filter policy would apply to a non-exempt principal (this also refuses dbt output that is still
          "closed by default"). It is checked when the table is added AND on every metadata / query / file request, so a policy created later
          cuts the sharing off (fail closed, with the reason). Tables with reader features beyond protocol 1 (deletion vectors, column mapping) are
-         refused: the Parquet-format response cannot express them. Only local Delta tables are shared (not S3 mounts).
+         refused: the Parquet-format response cannot express them.
+S3-mount tables  A table in a writable-or-not S3 mount can be shared like a local one; its query/metadata responses hand out a pre-signed URL straight
+         to the mount's own S3-compatible endpoint (`generate_presigned_url`, TTL = the same `DELTA_SHARING_URL_TTL`) instead of our own
+         `/delta-sharing/files/<token>` proxy, so the file never passes through this server. Revoking a recipient stops NEW links from being issued;
+         an already-issued presigned URL, like a real cloud Delta Sharing server's, is only good until its own short expiry (this is the accepted
+         behaviour of the real protocol, not a local weakening). The change data feed (`/changes`) still reads `_delta_log/<v>.json` off local disk and
+         is refused for an S3-mount table for that reason; snapshot reads, time travel and both response formats work for one.
 History  Older versions, time travel and the change feed expose rows that may have been deleted since, so they are OFF by default: a table is shared
          "with history" only when the administrator says so (`history` on the share table). Without it only the latest version can be read.
 Change data feed  GET .../changes?startingVersion=&endingVersion= (or timestamps) reads the Delta log itself: a commit that wrote change-data files
@@ -156,17 +162,53 @@ def _split_source(source: str) -> Tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-def table_root(source: str) -> str:
-    """Local directory of the Delta table; refuses S3 and anything that is not a Delta table."""
+def resolve_table(source: str) -> Tuple[str, Optional[Dict[str, str]], Optional[Dict[str, Any]]]:
+    """(location, delta-rs storage_options, raw S3 mount config or None). Local: realpath, refuses anything that is
+    not a Delta directory. A writable-or-read-only S3 mount: `s3://bucket/schema/table`, storage_options for
+    delta-rs and the mount's raw config (bucket/endpoint/key_id/secret/...) for presigning file URLs later. Anything
+    else (an unknown catalog, a non-S3 mount) is refused."""
     from deltalake import DeltaTable
     from web import time_travel
     cat, sch, tbl = _split_source(source)
-    path, _ = time_travel.resolve_table_path(sch, tbl, cat)
+    path, cat_id = time_travel.resolve_table_path(sch, tbl, cat)
+    if path.startswith("s3://"):
+        from web.warehouses import get_catalog
+        from web.mounts import get_s3_storage_options
+        c = get_catalog(cat_id) or {}
+        cfg = c.get("config") or {}
+        storage_options = get_s3_storage_options(cfg)
+        if not DeltaTable.is_deltatable(path, storage_options=storage_options):
+            raise SharingError(f"{source} is not a Delta table.")
+        return path, storage_options, cfg
     if "://" in path:
-        raise SharingError("Only Delta tables on local storage can be shared (not tables in an S3 mount).")
+        raise SharingError("Only local Delta tables or tables in an S3 mount can be shared.")
     if not os.path.isdir(path) or not DeltaTable.is_deltatable(path):
         raise SharingError(f"{source} is not a Delta table.")
-    return os.path.realpath(path)
+    return os.path.realpath(path), None, None
+
+
+def _s3_client(cfg: Dict[str, Any]):
+    """A boto3 client for a mount's raw config, for presigning file URLs (delta-rs's own storage_options are a
+    different shape and boto3 does not accept them directly)."""
+    from web import autoloader_s3
+    endpoint = (cfg.get("endpoint") or "").strip()
+    use_ssl = bool(cfg.get("use_ssl", False))
+    if endpoint.lower().startswith("https://"):
+        use_ssl, endpoint = True, endpoint[8:]
+    elif endpoint.lower().startswith("http://"):
+        use_ssl, endpoint = False, endpoint[7:]
+    conn = {"endpoint": endpoint.rstrip("/"), "use_ssl": use_ssl, "region": (cfg.get("region") or "us-east-1").strip(),
+            "key_id": (cfg.get("key_id") or "").strip(), "secret": (cfg.get("secret") or "").strip(),
+            "url_style": (cfg.get("url_style") or "path").strip()}
+    return autoloader_s3.make_client(conn)
+
+
+def presigned_url(cfg: Dict[str, Any], bucket: str, key: str, ttl: int = URL_TTL) -> str:
+    try:
+        return _s3_client(cfg).generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl)
+    except Exception as exc:
+        logger.error(f"Could not presign s3://{bucket}/{key} for sharing: {exc}")
+        raise SharingError("The file's storage could not be reached to build a download link.", "INTERNAL_ERROR", 500)
 
 
 _DUCK = {"long": "BIGINT", "integer": "INTEGER", "short": "SMALLINT", "byte": "TINYINT", "string": "VARCHAR", "double": "DOUBLE", "float": "FLOAT",
@@ -186,7 +228,9 @@ def governance_problem(source: str, dt=None) -> Optional[str]:
         from deltalake import DeltaTable
         from web.governance import policies, row_filters
         cat, sch, tbl = (p.lower() for p in _split_source(source))
-        dt = dt or DeltaTable(table_root(source))
+        if dt is None:
+            root, storage_options, _s3cfg = resolve_table(source)
+            dt = DeltaTable(root, storage_options=storage_options)
         cols = [{"column": f["name"], "type": _duck_type(f["type"])} for f in json.loads(dt.schema().to_json())["fields"]]
         ghost = policies.Principal(username="\u0000sharing", role="user")
         masks = policies.masks_for_table(cat, sch, tbl, cols, ghost)
@@ -259,7 +303,8 @@ def add_table(share: str, source: str, actor: str, schema_alias: Optional[str] =
     from deltalake import DeltaTable
     cat, sch, tbl = _split_source(source)
     source = f"{cat}.{sch}.{tbl}"
-    dt = DeltaTable(table_root(source))
+    root, storage_options, _s3cfg = resolve_table(source)
+    dt = DeltaTable(root, storage_options=storage_options)
     problem = governance_problem(source, dt)
     if problem:
         _audit(actor, "SHARING_TABLE_REFUSED", f"share:{share}", {"source": source, "reason": problem})
@@ -600,10 +645,10 @@ def _open(rec, share, schema, table, version=None, timestamp=None, need_history=
     from deltalake import DeltaTable
     t = _resolve(rec, share, schema, table)
     try:
-        root = table_root(t["source"])
+        root, storage_options, s3cfg = resolve_table(t["source"])
     except SharingError:
         raise NotFound("The shared table is no longer available.")
-    dt = DeltaTable(root)
+    dt = DeltaTable(root, storage_options=storage_options)
     problem = governance_problem(t["source"], dt)
     if problem:
         _log(rec["name"], "REFUSED", share, f"{schema}.{table}", problem)
@@ -613,7 +658,7 @@ def _open(rec, share, schema, table, version=None, timestamp=None, need_history=
         raise SharingError("History is not shared for this table (an administrator has to enable it).", "PERMISSION_DENIED", 403)
     if version is not None:
         try:
-            dt = DeltaTable(root, version=int(version))
+            dt = DeltaTable(root, version=int(version), storage_options=storage_options)
         except Exception:
             raise SharingError(f"Version {version} does not exist or is no longer available.")
     elif timestamp:
@@ -624,11 +669,11 @@ def _open(rec, share, schema, table, version=None, timestamp=None, need_history=
             raise SharingError("The timestamp is invalid or earlier than the table's first version.")
     if dt.version() != latest and not t["history"]:
         raise SharingError("History is not shared for this table: only the latest version can be read.", "PERMISSION_DENIED", 403)
-    return t, root, dt
+    return t, root, dt, s3cfg
 
 
 def table_version(rec, share, schema, table, starting_timestamp=None) -> int:
-    _, _, dt = _open(rec, share, schema, table, timestamp=starting_timestamp)
+    _, _, dt, _s3cfg = _open(rec, share, schema, table, timestamp=starting_timestamp)
     _log(rec["name"], "VERSION", share, f"{schema}.{table}")
     return dt.version()
 
@@ -671,7 +716,7 @@ def response_format(capabilities: Optional[str]) -> str:
 
 
 def table_metadata(rec, share, schema, table, version=None, fmt: str = "parquet") -> Tuple[int, List[Dict[str, Any]]]:
-    _, _, dt = _open(rec, share, schema, table, version=version)
+    _, _, dt, _s3cfg = _open(rec, share, schema, table, version=version)
     _log(rec["name"], "METADATA", share, f"{schema}.{table}")
     return dt.version(), _metadata_lines(dt, fmt)
 
@@ -724,8 +769,12 @@ def verify_file(token: str, client_ip=None) -> Dict[str, Any]:
 
 
 def file_path_for(p: Dict[str, Any]) -> str:
-    """Absolute path of the file a valid link points at: inside the table directory, a Parquet file, never a symlink out."""
-    root = table_root(p["source"])
+    """Absolute path of the file a valid link points at: inside the table directory, a Parquet file, never a symlink out.
+    Only ever reached for a local table: an S3-mount one hands out a pre-signed URL directly and never signs one of
+    our own /files/<token> links in the first place."""
+    root, storage_options, s3cfg = resolve_table(p["source"])
+    if s3cfg is not None:
+        raise NotFound("No such file.")
     rel = p["f"]
     if not rel or rel.startswith("/") or ".." in rel.split("/") or "\\" in rel or not rel.endswith(".parquet") or rel.startswith("_delta_log"):
         raise NotFound("No such file.")
@@ -957,9 +1006,21 @@ def snapshot_files(dt) -> List[Dict[str, Any]]:
     return out
 
 
-def _file_line(rec, t, f: Dict[str, Any], base_url: str, fmt: str, version: int, kind: str = "add", timestamp: Optional[int] = None) -> Dict[str, Any]:
-    """One file entry in the requested response format. kind: add | remove | cdf."""
-    url = f"{base_url}/files/{sign_file(rec['id'], t['id'], f['path'])}"
+def _split_s3(root: str) -> Tuple[str, str]:
+    """(bucket, key prefix) of an `s3://bucket/schema/table` location, prefix ending in '/'."""
+    bucket, _, prefix = root[len("s3://"):].partition("/")
+    return bucket, prefix if prefix.endswith("/") else prefix + "/"
+
+
+def _file_line(rec, t, f: Dict[str, Any], base_url: str, fmt: str, version: int, kind: str = "add", timestamp: Optional[int] = None,
+              s3cfg: Optional[Dict[str, Any]] = None, root: Optional[str] = None) -> Dict[str, Any]:
+    """One file entry in the requested response format. kind: add | remove | cdf. A table in an S3 mount gets a
+    pre-signed URL straight to the mount's endpoint instead of our own signed file proxy (see the module docstring)."""
+    if s3cfg is not None:
+        bucket, prefix = _split_s3(root)
+        url = presigned_url(s3cfg, bucket, prefix + f["path"])
+    else:
+        url = f"{base_url}/files/{sign_file(rec['id'], t['id'], f['path'])}"
     fid = hashlib.md5(f["path"].encode()).hexdigest()
     expires = int((time.time() + URL_TTL) * 1000)
     stats = _stats_json(f["_stats"]) if f.get("_stats") is not None else None
@@ -984,7 +1045,7 @@ def query_table(rec, share, schema, table, base_url: str, body: Dict[str, Any], 
     for k in ("startingVersion", "endingVersion"):
         if body.get(k) is not None:
             raise SharingError("Version ranges are not part of a table query on this server: use the /changes endpoint.")
-    t, root, dt = _open(rec, share, schema, table, version=body.get("version"), timestamp=body.get("timestamp"))
+    t, root, dt, s3cfg = _open(rec, share, schema, table, version=body.get("version"), timestamp=body.get("timestamp"))
     files = snapshot_files(dt)
     if len(files) > MAX_FILES:
         raise SharingError(f"The table has {len(files)} files (limit {MAX_FILES}); compact it (OPTIMIZE) before sharing.")
@@ -993,7 +1054,7 @@ def query_table(rec, share, schema, table, base_url: str, body: Dict[str, Any], 
     ver = dt.version()
     lines = _metadata_lines(dt, fmt, size=sum(f["size"] for f in files), num_files=len(files))
     for f in files:
-        lines.append(_file_line(rec, t, f, base_url, fmt, ver))
+        lines.append(_file_line(rec, t, f, base_url, fmt, ver, s3cfg=s3cfg, root=root))
     _log(rec["name"], "QUERY", share, f"{schema}.{table}", f"version {ver}, {len(files)} of {total} files, {fmt} format")
     return ver, lines
 
@@ -1063,8 +1124,12 @@ def _resolve_version_range(root: str, latest: int, q: Dict[str, Any]) -> Tuple[i
 
 
 def table_changes(rec, share, schema, table, base_url: str, q: Dict[str, Any], fmt: str = "parquet") -> Tuple[int, List[Dict[str, Any]]]:
-    """The change feed of a table shared with history, from the Delta log."""
-    t, root, dt = _open(rec, share, schema, table, need_history=True)
+    """The change feed of a table shared with history, from the Delta log. Reads `_delta_log/<v>.json` off local
+    disk, so it is refused for a table in an S3 mount (see the module docstring); snapshot reads and time travel
+    still work for one, through `query_table` above."""
+    t, root, dt, s3cfg = _open(rec, share, schema, table, need_history=True)
+    if s3cfg is not None:
+        raise SharingError("The change feed is not available for a table in an S3 mount; read the current snapshot instead.", "PERMISSION_DENIED", 403)
     latest = dt.version()
     sv, ev = _resolve_version_range(root, latest, q)
     ctypes = _col_types(dt)

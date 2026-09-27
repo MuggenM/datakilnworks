@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Delta Sharing server (web/delta_sharing.py + /api/sharing) in a throwaway warehouse, including the REAL `delta-sharing` client library against a live
 server thread. Needs `pip install delta-sharing`:
-docker run --rm -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook sh -c "pip install -q delta-sharing && python /workspace/scratch/test_delta_sharing.py" """
+docker run --rm -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook sh -c "pip install -q delta-sharing && python /workspace/scratch/test_delta_sharing.py"
+The S3-mount section (pre-signed URLs straight to the mount's endpoint, real client included) only runs with a throwaway Garage container
+(`scratch/garage_up.sh`) and TEST_S3_ENDPOINT / TEST_S3_ACCESS_KEY / TEST_S3_SECRET_KEY set; it is skipped, not failed, without them."""
 import json, os, sys, tempfile, threading, time, shutil
 TMP = tempfile.mkdtemp(prefix="dsh_"); os.environ["WAREHOUSE_DIR"] = TMP + "/warehouse"; os.makedirs(TMP + "/warehouse/.metadata")
 os.environ["INIT_ADMIN_USERNAME"] = "admin"; os.environ["INIT_ADMIN_PASSWORD_HASH"] = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
@@ -320,6 +322,49 @@ admin.delete("/api/sharing/shares/partner_share")
 check("deleting a share removes it from the recipient", anon.get("/delta-sharing/shares", headers=H).json()["items"] == [] and admin.get("/api/sharing").json()["recipients"][0]["shares"] == [])
 acts = {x[0] for x in __import__("sqlite3").connect(W + "/.metadata/governance.db").execute("SELECT action FROM governance_audit")}
 check("all administration is audited", {"SHARING_SHARE_CREATE", "SHARING_TABLE_ADD", "SHARING_TABLE_REMOVE", "SHARING_RECIPIENT_CREATE", "SHARING_RECIPIENT_REVOKE", "SHARING_RECIPIENT_ROTATE", "SHARING_RECIPIENT_DELETE", "SHARING_SHARE_DELETE"} <= acts, acts)
+print("S3-mount tables (real Garage, optional)")
+S3_EP = os.environ.get("TEST_S3_ENDPOINT")
+if not S3_EP:
+    print("  (skipped: set TEST_S3_ENDPOINT/TEST_S3_ACCESS_KEY/TEST_S3_SECRET_KEY to a throwaway Garage container -- see scratch/garage_up.sh -- to run this section)")
+else:
+    import boto3
+    from web import mounts
+    S3_KEY, S3_SECRET, S3_REGION = os.environ.get("TEST_S3_ACCESS_KEY", ""), os.environ.get("TEST_S3_SECRET_KEY", ""), os.environ.get("TEST_S3_REGION", "garage")
+    s3cfg = {"bucket": "dshbucket", "endpoint": S3_EP, "key_id": S3_KEY, "secret": S3_SECRET, "region": S3_REGION, "use_ssl": False}
+    s3 = boto3.client("s3", endpoint_url=f"http://{S3_EP}", aws_access_key_id=S3_KEY, aws_secret_access_key=S3_SECRET, region_name=S3_REGION)
+    for _ in range(30):
+        try: s3.list_buckets(); break
+        except Exception: time.sleep(1)
+    try: s3.create_bucket(Bucket="dshbucket")
+    except Exception: pass
+    mounts.save_mounts([{"id": "dshm1", "type": "s3", "catalog_name": "dshcat", "name": "dshcat", "config": s3cfg}])
+    from web.mounts import get_s3_storage_options
+    write_deltalake("s3://dshbucket/dbo/items", pd.DataFrame({"id": [1, 2, 3], "val": ["a", "b", "c"]}), storage_options=get_s3_storage_options(s3cfg))
+    admin.post("/api/sharing/shares", json={"name": "s3_share"})
+    r3a = admin.post("/api/sharing/shares/s3_share/tables", json={"source": "dshcat.dbo.items", "history": True})
+    check("a table in an S3 mount can be added to a share", r3a.status_code == 200, r3a.text)
+    r3 = admin.post("/api/sharing/recipients", json={"name": "S3 Partner", "shares": ["s3_share"]}).json()
+    H3 = {"Authorization": "Bearer " + r3["token"]}
+    q3 = anon.post("/delta-sharing/shares/s3_share/schemas/dbo/tables/items/query", json={}, headers=H3)
+    ql3 = [json.loads(x) for x in q3.text.strip().split("\n")]
+    files3 = [x["file"] for x in ql3 if "file" in x]
+    check("query returns pre-signed URLs straight to the S3-compatible endpoint, not our own file proxy",
+          q3.status_code == 200 and len(files3) >= 1 and all(S3_EP in f["url"] and "/delta-sharing/files/" not in f["url"] for f in files3), q3.text[:500])
+    check("the pre-signed URL is fetchable on its own (a plain HTTP GET, no bearer token)", requests.get(files3[0]["url"]).status_code == 200)
+    pf3 = TMP + "/s3.share"; json.dump({**r3["profile"], "endpoint": "http://127.0.0.1:8931/delta-sharing"}, open(pf3, "w"))
+    try:
+        real = delta_sharing.load_as_pandas(pf3 + "#s3_share.dbo.items")
+        check("the REAL delta-sharing client reads an S3-mount table end to end via the pre-signed URL", sorted(real["id"].tolist()) == [1, 2, 3], real["id"].tolist())
+    except Exception as exc:
+        check("the real client reads an S3-mount table", False, repr(exc))
+    chg = anon.get("/delta-sharing/shares/s3_share/schemas/dbo/tables/items/changes?startingVersion=0", headers=H3)
+    check("the change feed is refused for an S3-mount table, with a clear reason", chg.status_code == 403 and "S3 mount" in chg.text, chg.text)
+    write_deltalake("s3://dshbucket/dbo/items", pd.DataFrame({"id": [4], "val": ["d"]}), mode="append", storage_options=get_s3_storage_options(s3cfg))
+    q3b = anon.post("/delta-sharing/shares/s3_share/schemas/dbo/tables/items/query", json={"version": 0}, headers=H3)
+    n0 = sum(json.loads(x["file"]["stats"])["numRecords"] for x in [json.loads(l) for l in q3b.text.strip().split("\n")] if "file" in x)
+    check("time travel (an older version) still works for an S3-mount table", n0 == 3, q3b.text[:400])
+    admin.delete(f"/api/sharing/recipients/{r3['recipient']['id']}"); admin.delete("/api/sharing/shares/s3_share")
+
 os.environ["DELTA_SHARING"] = "off"
 check("DELTA_SHARING=off switches the protocol off", anon.get("/delta-sharing/shares", headers=H).status_code == 404)
 srv.should_exit = True; shutil.rmtree(TMP, ignore_errors=True)

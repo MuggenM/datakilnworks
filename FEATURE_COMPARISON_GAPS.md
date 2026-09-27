@@ -53,7 +53,7 @@ not been recomputed since (see 1b, last row).
 | High availability | The Helm chart passes `helm lint`, `helm template` and kubeconform, and a GitHub Actions job installs it on a kind cluster and passed there (sign-in, SQL on the compute node, pod restart with data kept, upgrade with the compute token kept, a broken-config install failing in the init container, uninstall keeping the volumes). That is one replica on a single-node cluster: the studio is one replica (SQLite metadata and a ReadWriteOnce volume), and there is no autoscaler, no multi-node scheduling test and no multi-zone story. Deployable and smoke-tested, not a tested HA design. |
 | TLS with Let's Encrypt (Traefik profile) | Configured, but not exercised: it needs a public host name. Self-signed and bring-your-own certificates are tested. |
 | GitHub and GitLab pull requests | Verified against in-process mock servers of their APIs; only Gitea was run for real. |
-| Delta Sharing | Works with the Python client in the Parquet format (snapshots, time travel, change feed). The client's Rust reader (Delta response format) cannot fetch files from a non-cloud-storage host, so that format is built to the specification but unverified end to end. Tables in an S3 mount and tables with deletion vectors or column mapping cannot be shared. History, time travel and the change feed are opt-in per table because they can expose deleted rows. |
+| Delta Sharing | Works with the Python client in the Parquet format (snapshots, time travel, change feed), for both local tables and tables in an S3 mount (pre-signed URLs straight to the mount's object store; verified end to end against a real throwaway Garage server). The client's Rust reader (Delta response format) only recognizes S3/Azure/GCS files by hostname, so a non-cloud-storage host is misread as a local path; that format is built to the specification but unverified end to end. Tables with deletion vectors or column mapping cannot be shared. The change data feed is local-tables-only (it reads the Delta log off local disk); it is refused for a table in an S3 mount. History, time travel and the change feed are opt-in per table because they can expose deleted rows. |
 | Passkeys | Attestation is verified only against trust roots you paste in: no bundled vendor roots and no FIDO Metadata Service lookup. Passkey-only accounts are local accounts only (not LDAP). The browser autofill dropdown could not be driven by automation; the request and the sign-in behind it are tested. |
 | SAML | Solicited SP-initiated sign-in with strict validation, signed AuthnRequests, encrypted assertions and Single Logout (SP- and IdP-initiated, both directions signed) all built and tested. A real encrypt+decrypt round trip is not covered end to end: building a valid `<xenc:EncryptedData>` fixture via the low-level xmlsec Python bindings proved impractical in the time available, so only the rejection-of-unencrypted path is tested, and the decrypt path is verified by reading python3-saml's own implementation instead. |
 | SQL `GRANT` / `REVOKE` | Catalog, schema, table and column-level grants, `WITH GRANT OPTION` / `GRANT OPTION FOR` on tables and schemas. Column-level grants only support SELECT (no column-level MODIFY) and never carry a grant option; `WITH GRANT OPTION` never applies to a catalog (an admin or the catalog's power-user owner still manages that directly) and only delegates GRANT, never REVOKE. Role principals and grants on all tables of a catalog are still refused with a clear message. |
@@ -98,9 +98,13 @@ Ordered by how much they would change the honest picture. None needs a new engin
    SQS / Event Grid consumers (this was always the optional half of the item).
 4. ~~**SAML completeness.**~~ *(Done: signed AuthnRequests, encrypted assertions, Single Logout. See 1b for the one caveat.)*
 5. ~~**Column-level grants** and `WITH GRANT OPTION`~~ *(Done: `web/column_grants.py` built on the existing masking machinery; `WITH GRANT OPTION` / `GRANT OPTION FOR` on table and schema grants. See 1b for the scope kept deliberately narrow.)*
-6. **Delta Sharing reach.** Shareable S3-mount tables (pre-signed object-store URLs), tables with deletion vectors or column
-   mapping through the Delta format, and a verified end-to-end run of that format against a client that can fetch our
-   URLs (Spark connector).
+6. ~~**Delta Sharing reach.**~~ *(Done: tables in an S3 mount can now be shared, handing out a pre-signed URL straight to the
+   mount's own object store instead of proxying through this server, verified end to end against a real throwaway Garage
+   server with the standard `delta-sharing` client; the change data feed is refused for these tables since it reads the
+   Delta log off local disk. Still open: tables with deletion vectors or column mapping through the Delta format, and a
+   verified end-to-end run of the Delta response format against a client that can fetch our URLs — the Python client's
+   Rust kernel only recognizes S3/Azure/GCS files by hostname, so this needs real cloud storage or a Spark connector,
+   neither available here.)*
 7. **Passkey depth.** FIDO Metadata Service lookups (model names, certification status, revocation), passkey-only LDAP
    accounts, and per-role authenticator requirements (for example hardware keys for administrators).
 8. **Per-user / per-role network policies** on top of the global allowlist.
@@ -114,6 +118,6 @@ Ordered by how much they would change the honest picture. None needs a new engin
 ## Recommendation
 
 `FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
-stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4 and 5 are now done; item 10 (recompute the scorecard) would
+stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4, 5 and 6 are now done; item 10 (recompute the scorecard) would
 make both documents defensible for an external reader. Tell me which items to build next; I would start with parallel
 workflow tasks or the scorecard recompute.
