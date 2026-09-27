@@ -56,7 +56,7 @@ not been recomputed since (see 1b, last row).
 | Delta Sharing | Works with the Python client in the Parquet format (snapshots, time travel, change feed). The client's Rust reader (Delta response format) cannot fetch files from a non-cloud-storage host, so that format is built to the specification but unverified end to end. Tables in an S3 mount and tables with deletion vectors or column mapping cannot be shared. History, time travel and the change feed are opt-in per table because they can expose deleted rows. |
 | Passkeys | Attestation is verified only against trust roots you paste in: no bundled vendor roots and no FIDO Metadata Service lookup. Passkey-only accounts are local accounts only (not LDAP). The browser autofill dropdown could not be driven by automation; the request and the sign-in behind it are tested. |
 | SAML | Solicited SP-initiated sign-in with strict validation, signed AuthnRequests, encrypted assertions and Single Logout (SP- and IdP-initiated, both directions signed) all built and tested. A real encrypt+decrypt round trip is not covered end to end: building a valid `<xenc:EncryptedData>` fixture via the low-level xmlsec Python bindings proved impractical in the time available, so only the rejection-of-unencrypted path is tested, and the decrypt path is verified by reading python3-saml's own implementation instead. |
-| SQL `GRANT` / `REVOKE` | Catalog, schema and table grants. Column-level grants, `WITH GRANT OPTION` and role principals are refused with a clear message. |
+| SQL `GRANT` / `REVOKE` | Catalog, schema, table and column-level grants, `WITH GRANT OPTION` / `GRANT OPTION FOR` on tables and schemas. Column-level grants only support SELECT (no column-level MODIFY) and never carry a grant option; `WITH GRANT OPTION` never applies to a catalog (an admin or the catalog's power-user owner still manages that directly) and only delegates GRANT, never REVOKE. Role principals and grants on all tables of a catalog are still refused with a clear message. |
 | Network policy | One global allowlist plus per-recipient rules for Delta Sharing. No per-user or per-role network policies. |
 | Governance on shared data | A table with a masking policy or row filter cannot be shared through Delta Sharing (recipients receive raw files). The fix is to share a de-identified copy. |
 | Azure Blob and GCS Auto-Loader sources | GCS goes through its S3-compatible interoperability API (HMAC keys), not the native Google Cloud SDK or OAuth service accounts; real GCS was not available to test against, so `scratch/test_autoloader_gcs.py` runs against a throwaway Garage container standing in for GCS's endpoint instead. Azure Blob was tested against a throwaway Azurite emulator, not a real Azure account. Neither is a Delta write target (source only, like every non-S3 mount); neither has an instant bucket-notification trigger (S3 events has no Azure/GCS equivalent here); ADLS Gen2-specific features (hierarchical namespace ACLs) are not used. |
@@ -97,7 +97,7 @@ Ordered by how much they would change the honest picture. None needs a new engin
    checkpoints, quarantine, preview, credentials from a storage mount. Both are sources only, not targets (see 1b). Still open:
    SQS / Event Grid consumers (this was always the optional half of the item).
 4. ~~**SAML completeness.**~~ *(Done: signed AuthnRequests, encrypted assertions, Single Logout. See 1b for the one caveat.)*
-5. **Column-level grants** and `WITH GRANT OPTION` in the SQL grant layer, built on the existing masking machinery.
+5. ~~**Column-level grants** and `WITH GRANT OPTION`~~ *(Done: `web/column_grants.py` built on the existing masking machinery; `WITH GRANT OPTION` / `GRANT OPTION FOR` on table and schema grants. See 1b for the scope kept deliberately narrow.)*
 6. **Delta Sharing reach.** Shareable S3-mount tables (pre-signed object-store URLs), tables with deletion vectors or column
    mapping through the Delta format, and a verified end-to-end run of that format against a client that can fetch our
    URLs (Spark connector).
@@ -114,6 +114,6 @@ Ordered by how much they would change the honest picture. None needs a new engin
 ## Recommendation
 
 `FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, but its totals are
-stale and it does not yet reflect the caveats in 1b. Items 1, 3 and 4 are now done; item 10 (recompute the scorecard) would
+stale and it does not yet reflect the caveats in 1b. Items 1, 3, 4 and 5 are now done; item 10 (recompute the scorecard) would
 make both documents defensible for an external reader. Tell me which items to build next; I would start with parallel
 workflow tasks or the scorecard recompute.

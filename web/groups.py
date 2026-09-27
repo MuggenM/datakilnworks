@@ -86,6 +86,10 @@ def _conn() -> sqlite3.Connection:
         permission TEXT NOT NULL, granted_by TEXT, created_at TEXT,
         UNIQUE(resource_type, resource_id, principal_type, principal_id))""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_grants_principal ON resource_grants(principal_type, principal_id, resource_type)")
+    if "grantable" not in {r[1] for r in conn.execute("PRAGMA table_info(resource_grants)")}:
+        # WITH GRANT OPTION (web/sql_grants.py): a table/schema grant made with it lets its holder GRANT (not revoke)
+        # the same privilege on the same object to further principals, in addition to an admin/catalog owner.
+        conn.execute("ALTER TABLE resource_grants ADD COLUMN grantable INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -382,7 +386,7 @@ def _parse_principal(principal: str) -> tuple:
     return kind, pid
 
 
-def grant(resource_type: str, resource_id: str, principal: str, permission: str, actor: str) -> Dict[str, Any]:
+def grant(resource_type: str, resource_id: str, principal: str, permission: str, actor: str, grantable: bool = False) -> Dict[str, Any]:
     ladder = _ladder(resource_type)
     resource_id = _rid(resource_type, resource_id)
     permission = (permission or "").strip().upper()
@@ -401,15 +405,55 @@ def grant(resource_type: str, resource_id: str, principal: str, permission: str,
             if not u:
                 raise GroupError("That user does not exist.")
             pid, label = u["id"], u["username"]
-        c.execute("""INSERT INTO resource_grants (resource_type, resource_id, principal_type, principal_id, permission, granted_by, created_at)
-                     VALUES (?,?,?,?,?,?,?) ON CONFLICT(resource_type, resource_id, principal_type, principal_id)
-                     DO UPDATE SET permission = excluded.permission, granted_by = excluded.granted_by, created_at = excluded.created_at""",
-                  (resource_type, resource_id, kind, pid, permission, actor, _now()))
+        c.execute("""INSERT INTO resource_grants (resource_type, resource_id, principal_type, principal_id, permission, granted_by, created_at, grantable)
+                     VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(resource_type, resource_id, principal_type, principal_id)
+                     DO UPDATE SET permission = excluded.permission, granted_by = excluded.granted_by, created_at = excluded.created_at, grantable = excluded.grantable""",
+                  (resource_type, resource_id, kind, pid, permission, actor, _now(), int(grantable)))
         c.commit()
     finally:
         c.close()
-    _audit(actor, "GRANT_SET", f"{resource_type}:{resource_id}", {"principal": f"{kind}:{label}", "permission": permission})
-    return {"resource_type": resource_type, "resource_id": resource_id, "principal_type": kind, "principal_id": pid, "permission": permission}
+    _audit(actor, "GRANT_SET", f"{resource_type}:{resource_id}", {"principal": f"{kind}:{label}", "permission": permission, "grantable": bool(grantable)})
+    return {"resource_type": resource_type, "resource_id": resource_id, "principal_type": kind, "principal_id": pid, "permission": permission, "grantable": bool(grantable)}
+
+
+def revoke_grant_option(resource_type: str, resource_id: str, principal: str, actor: str) -> bool:
+    """GRANT OPTION FOR ... REVOKE (web/sql_grants.py): clears the grantable flag on an existing grant, keeping the
+    privilege itself. False when the principal held no such grant (nothing to do)."""
+    _ladder(resource_type)
+    resource_id = _rid(resource_type, resource_id)
+    kind, pid = _parse_principal(principal)
+    c = _conn()
+    try:
+        if kind == "user":
+            u = c.execute("SELECT id FROM users WHERE id = ? OR username = ?", (pid, pid)).fetchone()
+            pid = u["id"] if u else pid
+        n = c.execute("UPDATE resource_grants SET grantable = 0 WHERE resource_type = ? AND resource_id = ? AND principal_type = ? AND principal_id = ? AND grantable = 1",
+                      (resource_type, resource_id, kind, pid)).rowcount
+        c.commit()
+    finally:
+        c.close()
+    if n:
+        _audit(actor, "GRANT_OPTION_REVOKE", f"{resource_type}:{resource_id}", {"principal": f"{kind}:{pid}"})
+    return bool(n)
+
+
+def grantable_of(user: Dict[str, Any], resource_type: str, resource_id: str) -> Optional[str]:
+    """The highest permission the user holds WITH GRANT OPTION on the resource, directly or through a group; None if none.
+    Used to let a non-admin, non-owner grantee extend the same privilege to further principals (web/sql_grants.py)."""
+    ladder = _ladder(resource_type)
+    resource_id = _rid(resource_type, resource_id) if resource_type in _ID_PARTS else resource_id
+    gids = group_ids_for(user)
+    uid = (user or {}).get("id")
+    c = _conn()
+    try:
+        best = -1
+        for r in c.execute("SELECT principal_type, principal_id, permission FROM resource_grants WHERE resource_type = ? AND resource_id = ? AND grantable = 1", (resource_type, resource_id)):
+            if (r["principal_type"] == "user" and r["principal_id"] == uid) or (r["principal_type"] == "group" and r["principal_id"] in gids):
+                if r["permission"] in ladder:
+                    best = max(best, ladder.index(r["permission"]))
+        return ladder[best] if best >= 0 else None
+    finally:
+        c.close()
 
 
 def revoke(resource_type: str, resource_id: str, principal: str, actor: str) -> bool:
@@ -445,7 +489,8 @@ def list_grants(resource_type: str, resource_id: str) -> List[Dict[str, Any]]:
                 u = c.execute("SELECT username, display_name FROM users WHERE id = ?", (r["principal_id"],)).fetchone()
                 name, extra = (u["username"] if u else r["principal_id"]), {"display_name": u["display_name"] if u else None}
             out.append({"principal": f"{r['principal_type']}:{r['principal_id']}", "principal_type": r["principal_type"], "name": name,
-                        "permission": r["permission"], "granted_by": r["granted_by"], "created_at": r["created_at"], **extra})
+                        "permission": r["permission"], "granted_by": r["granted_by"], "created_at": r["created_at"],
+                        "grantable": bool(r["grantable"]), **extra})
         return out
     finally:
         c.close()

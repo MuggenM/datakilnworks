@@ -2913,7 +2913,7 @@
                               <tr data-testid="table-grant-row">
                                 <td class="py-2 px-3 font-mono" x-text="g.resource_id"></td>
                                 <td><span class="font-semibold" x-text="g.name"></span> <span class="text-[9px] px-1.5 py-0.5 rounded border border-slate-300 dark:border-slate-700" x-text="g.principal_type"></span></td>
-                                <td class="font-mono" x-text="g.permission"></td>
+                                <td class="font-mono"><span x-text="g.permission"></span> <span x-show="g.grantable" title="Granted WITH GRANT OPTION (see SQL GRANT in the editor)" class="text-[9px] px-1 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 font-sans">GRANT OPTION</span></td>
                                 <td class="text-right px-3"><button @click="removeTableGrant(g)" class="px-2 py-1 bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 rounded" data-testid="table-grant-revoke">Revoke</button></td>
                               </tr>
                             </template>

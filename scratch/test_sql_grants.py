@@ -20,8 +20,9 @@ def perr(sql):
 def rerr(sql, user, cat="warehouse"):
     try: sg.run(sg.parse(sql), sql, user, cat); return None
     except sg.GrantSqlError as e: return str(e)
+def rows(sql, user): return sg.run(sg.parse(sql), sql, user)["rows"]
 
-for t in ("orders", "customers"): write_deltalake(f"{TMP}/catalogs/sales/dbo/{t}", pd.DataFrame({"id": [1]}))
+for t in ("orders", "customers"): write_deltalake(f"{TMP}/catalogs/sales/dbo/{t}", pd.DataFrame({"id": [1], "email": ["ada@example.com"]}))
 write_deltalake(f"{TMP}/catalogs/sales/pub/items", pd.DataFrame({"id": [1]}))
 warehouses.create_catalog("Sales", "sales", "", None, False, "admin")
 ADMIN = auth.get_user_by_username("admin")
@@ -47,9 +48,16 @@ check("quoted names (with spaces, dots and escaped quotes)", P('grant select on 
 check("REVOKE ... FROM", P("revoke modify on table sales.dbo.orders from group analysts")["op"] == "revoke")
 check("SHOW GRANTS forms", P("show grants")["target"] is None and P("SHOW GRANTS ON TABLE sales.dbo.orders")["target"]["kind"] == "table" and P("show grants to user alice")["principal"] == {"kind": "user", "name": "alice"} and P("show grants alice")["principal"]["name"] == "alice")
 check("keywords are case-insensitive and whitespace is free", P("  GrAnT\n SELECT\tON  TABLE sales.dbo.orders  TO  alice ;  ")["op"] == "grant")
-for label, q, frag in (("WITH GRANT OPTION", "grant select on table sales.dbo.orders to alice with grant option", "GRANT OPTION"),
-                       ("REVOKE GRANT OPTION FOR", "revoke grant option for select on table sales.dbo.orders from alice", "GRANT OPTION"),
-                       ("column-level", "grant select (email) on table sales.dbo.orders to alice", "Column-level"),
+s = P("grant select on table sales.dbo.orders to alice with grant option")
+check("WITH GRANT OPTION parses", s["grant_option"] is True and s["columns"] is None)
+s = P("revoke grant option for select on table sales.dbo.orders from alice")
+check("REVOKE GRANT OPTION FOR parses (op stays revoke)", s["op"] == "revoke" and s["grant_option_for"] is True)
+s = P("grant select (email, ssn) on table sales.dbo.orders to alice")
+check("column-level GRANT parses", s["columns"] == ["email", "ssn"] and s["privileges"] == ["SELECT"])
+for label, q, frag in (("column-level needs SELECT only", "grant select (email), modify on table sales.dbo.orders to alice", "do not mix"),
+                       ("column-level needs a table", "grant select (email) on schema sales.dbo to alice", "table only"),
+                       ("column-level + WITH GRANT OPTION", "grant select (email) on table sales.dbo.orders to alice with grant option", "does not apply"),
+                       ("column-level + GRANT OPTION FOR", "revoke grant option for select (email) on table sales.dbo.orders from alice", "does not apply"),
                        ("two statements", "grant select on table a.b.c to alice; grant select on table a.b.d to bob", "one"),
                        ("missing ON", "grant select to alice", "ON"),
                        ("missing TO", "grant select on table sales.dbo.orders alice", "TO"),
@@ -94,11 +102,49 @@ groups.create_group("alice", "", "admin")
 check("a name that is both a user and a group must be qualified", "both a user and a group" in (rerr("grant select on table sales.dbo.orders to alice", U(ADMIN)) or "") and rerr("grant select on table sales.dbo.orders to user alice", U(ADMIN)) is None)
 check("revoking what is not held says so", "does not hold" in sg.run(P("revoke select on table sales.dbo.orders from user bob"), "x", U(ADMIN))["message"])
 
+print("WITH GRANT OPTION / REVOKE GRANT OPTION FOR")
+check("a plain grant does not delegate: alice cannot yet grant it onward", "Only an administrator" in (rerr("grant select on table sales.dbo.customers to user bob", U(alice)) or ""))
+r = sg.run(P("grant select on table sales.dbo.customers to user alice with grant option"), "x", U(ADMIN))
+check("WITH GRANT OPTION says so", "WITH GRANT OPTION" in r["message"], r)
+check("alice can now grant SELECT on that table to user bob", rerr("grant select on table sales.dbo.customers to user bob", U(alice)) is None and can_sql(bob, "select * from sales.dbo.customers"))
+check("...but only that exact privilege/object: alice cannot grant MODIFY, or grant on a different table", "Only an administrator" in (rerr("grant modify on table sales.dbo.customers to user bob", U(alice)) or "") and "Only an administrator" in (rerr("grant select on table sales.dbo.orders to user bob", U(alice)) or ""))
+check("...and alice cannot REVOKE: grant option only delegates GRANT, never REVOKE", "Only an administrator" in (rerr("revoke select on table sales.dbo.customers from user bob", U(alice)) or ""))
+sg.run(P("revoke grant option for select on table sales.dbo.customers from user alice"), "x", U(ADMIN))
+check("GRANT OPTION FOR revoke: alice keeps SELECT but loses the option", can_sql(alice, "select * from sales.dbo.customers") and "Only an administrator" in (rerr("grant select on table sales.dbo.customers to user bob", U(alice)) or ""))
+check("...and bob's earlier grant (already applied) is untouched", can_sql(bob, "select * from sales.dbo.customers"))
+check("REVOKE GRANT OPTION FOR on someone who never had it says so", "does not hold" in sg.run(P("revoke grant option for select on table sales.dbo.customers from user bob"), "x", U(ADMIN))["message"])
+
+print("column-level grants (masking: no ACL check, a real query)")
+from web import app as app_module
+from web.governance import enforce
+from web.governance.policies import Principal
+gcon = app_module.get_duckrun_conn().con
+def email_seen_by(principal):
+    rel = enforce.masked_relation("sales", "dbo", "orders", principal, gcon.cursor())
+    return gcon.cursor().execute(f"SELECT email FROM {rel} WHERE id = 1").fetchone()[0]
+P_ALICE, P_BOB, P_ADMIN = Principal("alice", "user"), Principal("bob", "user"), Principal("admin", "admin")
+check("before any column grant: email is plainly visible", email_seen_by(P_ALICE) == "ada@example.com")
+r = sg.run(P("grant select (email) on table sales.dbo.orders to user alice"), "x", U(ADMIN))
+check("column grant message", "Granted SELECT on column sales.dbo.orders.email to user alice" in r["message"], r)
+check("...the granted user still sees the real value", email_seen_by(P_ALICE) == "ada@example.com")
+check("...a user with ordinary table access but no column grant now sees NULL", email_seen_by(P_BOB) is None)
+check("...admin is always exempt", email_seen_by(P_ADMIN) == "ada@example.com")
+check("SHOW GRANTS on the table lists the column grant", any(x[2] == "column" and x[3] == "sales.dbo.orders.email" and x[0] == "alice" for x in rows("show grants on table sales.dbo.orders", U(ADMIN))))
+r = sg.run(P("grant select (email) on table sales.dbo.orders to group \"PII readers\""), "x", U(ADMIN))
+check("a group can be column-granted too", "PII readers" in r["message"])
+BOB_IN_H = Principal("bob", "user", groups=frozenset([H["id"]]))
+check("group membership grants the column too", email_seen_by(BOB_IN_H) == "ada@example.com")
+r = sg.run(P("revoke select (email) on table sales.dbo.orders from user alice"), "x", U(ADMIN))
+check("column REVOKE message", "Revoked SELECT on column sales.dbo.orders.email from user alice" in r["message"], r)
+check("after REVOKE: even the previously-granted user is masked again (REVOKE never reopens the column)", email_seen_by(P_ALICE) is None)
+check("...but the group grant (untouched by alice's revoke) still applies", email_seen_by(BOB_IN_H) == "ada@example.com")
+check("re-revoking says so", "does not hold" in sg.run(P("revoke select (email) on table sales.dbo.orders from user alice"), "x", U(ADMIN))["message"])
+check("a missing column is refused (typo protection)", "does not exist" in (rerr("grant select (emial) on table sales.dbo.orders to user alice", U(ADMIN)) or ""))
+
 print("SHOW GRANTS")
-def rows(sql, user): return sg.run(P(sql), sql, user)["rows"]
 r = rows("show grants on table sales.dbo.orders", U(ADMIN))
 check("on a table: its grants and the inherited catalog grants", any(x[0] == "alice" and x[2] == "table" and x[4] == "SELECT" for x in r), r)
-check("columns are principal, type, object type, object, privilege, granted by, at", sg.run(P("show grants"), "x", U(ADMIN))["columns"][0]["name"] == "principal" and len(sg.COLUMNS) == 7)
+check("columns are principal, type, object type, object, privilege, grant option, granted by, at", sg.run(P("show grants"), "x", U(ADMIN))["columns"][0]["name"] == "principal" and len(sg.COLUMNS) == 8)
 sg.run(P("grant select on table sales.dbo.customers to group analysts"), "x", U(ADMIN))
 r = rows("show grants to group analysts", U(ADMIN)); check("for a group", [(x[0], x[1], x[2], x[3], x[4]) for x in r] == [("Analysts", "group", "table", "sales.dbo.customers", "SELECT")], r)
 r = rows("show grants to user alice", U(ADMIN)); check("for a user: every object (catalog, schema and table)", {x[2] for x in r} == {"catalog", "schema", "table"} and all(x[0] == "alice" for x in r), r)
