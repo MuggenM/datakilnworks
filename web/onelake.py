@@ -34,7 +34,13 @@ class OneLakeCredentials:
             self._credential = ClientSecretCredential(
                 tenant_id=self.tenant_id,
                 client_id=self.client_id,
-                client_secret=self.client_secret
+                client_secret=self.client_secret,
+                # MSAL's "is this authority actually Microsoft" lookup refuses any authority it does not
+                # already know about -- which is every authority but the real login.microsoftonline.com,
+                # including a local OneLake emulator's (AZURE_AUTHORITY_HOST env var, dev/test only; see
+                # CLAUDE.md). Harmless against a real tenant: it only skips that preliminary discovery
+                # call, never changes which token gets issued or what gets validated.
+                disable_instance_discovery=True
             )
         return self._credential
 
@@ -84,15 +90,31 @@ class OneLakeCatalog:
         """Test if OneLake lakehouse is accessible."""
         try:
             service_client = self._get_service_client()
-            filesystem = service_client.get_file_system_client(
-                f"{self.workspace}/{self.lakehouse}"
-            )
-            # Try to list Tables/Files directory (OneLake lakehouse structure)
-            list(filesystem.get_paths(path="Tables/Files", max_results=1))
+            # The ADLS Gen2 filesystem (container) is the WORKSPACE alone -- the lakehouse is a directory
+            # within it, not part of the filesystem name (verified directly against a real OneLake-shaped
+            # data plane: a filesystem name containing '/' is simply not a thing this API has).
+            filesystem = service_client.get_file_system_client(self.workspace)
+            # Try to list Tables/Files directory (OneLake lakehouse structure). recursive=False: see
+            # list_tables for why (a recursive listing never reports a directory as one).
+            list(filesystem.get_paths(path=f"{self.lakehouse}/Tables/Files", recursive=False, max_results=1))
             logger.info(f"OneLake connection test successful: {self.catalog_id}")
             return True
         except Exception as e:
             logger.error(f"OneLake connection test failed: {e}")
+            return False
+
+    def _is_skippable_name(self, name: str) -> bool:
+        return name.startswith('_') or 'year=' in name or 'month=' in name
+
+    def _is_table_dir(self, filesystem, dir_path: str) -> bool:
+        """A Delta table's own directory always has a _delta_log child; a category folder (one level of
+        grouping between Tables/Files and the tables themselves) does not."""
+        try:
+            next(iter(filesystem.get_paths(path=f"{dir_path}/_delta_log", recursive=False, max_results=1)))
+            return True
+        except StopIteration:
+            return False
+        except Exception:
             return False
 
     def list_tables(self, force_refresh: bool = False) -> List[str]:
@@ -102,30 +124,33 @@ class OneLakeCatalog:
 
         try:
             service_client = self._get_service_client()
-            filesystem = service_client.get_file_system_client(
-                f"{self.workspace}/{self.lakehouse}"
-            )
+            filesystem = service_client.get_file_system_client(self.workspace)
 
-            # Managed tables are directly under Tables/ (not Files/Tables/)
-            paths = filesystem.get_paths(path="Tables/Files")
+            # Managed tables are directly under Tables/ (not Files/Tables/). recursive=False is essential
+            # here: a recursive listing returns only leaf FILES (never a directory entry for the table
+            # folder itself, so `path.is_directory` would never be true), while a non-recursive listing at
+            # a given path returns exactly its immediate children, correctly flagged as files or
+            # directories -- which is what distinguishing a table folder from a plain file needs.
+            top = list(filesystem.get_paths(path=f"{self.lakehouse}/Tables/Files", recursive=False))
 
-            tables = []
-            for path in paths:
-                if path.is_directory and not path.name.startswith('_') and not 'year=' in path.name and not 'month=' in path.name:
-                    # Extract table name from path (Tables/Files/table_name or Tables/Files/category/table_name)
-                    parts = path.name.split('/')
-                    if len(parts) >= 3:
-                        # Direct child: Tables/Files/table_name
-                        if len(parts) == 3:
-                            table_name = parts[2]
-                            tables.append(table_name)
-                        # One level deep: Tables/Files/API/table_name
-                        elif len(parts) == 4:
-                            table_name = parts[3]
-                            tables.append(table_name)
+            tables: List[str] = []
+            for entry in top:
+                name = entry.name.rsplit('/', 1)[-1]
+                if not entry.is_directory or self._is_skippable_name(name):
+                    continue
+                if self._is_table_dir(filesystem, entry.name):
+                    # Direct child: {lakehouse}/Tables/Files/table_name
+                    tables.append(name)
+                else:
+                    # A category folder, one level deep: {lakehouse}/Tables/Files/category/table_name
+                    for nested in filesystem.get_paths(path=entry.name, recursive=False):
+                        nested_name = nested.name.rsplit('/', 1)[-1]
+                        if (nested.is_directory and not self._is_skippable_name(nested_name)
+                                and self._is_table_dir(filesystem, nested.name)):
+                            tables.append(nested_name)
 
             # Remove duplicates and sort
-            tables = sorted(list(set(tables)))
+            tables = sorted(set(tables))
 
             self.tables_cache = tables
             logger.info(f"Found {len(tables)} tables in OneLake catalog {self.catalog_id}")
@@ -149,7 +174,7 @@ class OneLakeCatalog:
 
             dt = DeltaTable(table_url, storage_options=storage_options)
 
-            schema = dt.schema().to_pyarrow()
+            schema = dt.schema().to_arrow()  # to_pyarrow() was renamed to_arrow() in the pinned deltalake version
 
             metadata = {
                 'name': table_name,
@@ -157,7 +182,7 @@ class OneLakeCatalog:
                 'source': 'onelake',
                 'read_only': True,
                 'delta_version': dt.version(),
-                'num_files': len(dt.files()),
+                'num_files': len(dt.file_uris()),  # files() was renamed file_uris() in the pinned deltalake version
                 'columns': [
                     {
                         'name': field.name,
