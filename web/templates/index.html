@@ -10790,6 +10790,11 @@
             <div><label class="block text-[10px] text-slate-500 mb-0.5">Max concurrent runs</label><input type="number" min="1" max="10" x-model.number="jobForm.max_concurrent_runs" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
             <label class="flex items-center space-x-2 col-span-2 pt-4 cursor-pointer" title="After downtime, run once for schedule ticks missed while the studio was stopped"><input type="checkbox" x-model="jobForm.catch_up" class="rounded bg-slate-900 border-dbx-border text-cyan-600 focus:ring-0"><span class="text-slate-300">Catch up a missed schedule tick after downtime</span></label>
           </div>
+          <div class="grid grid-cols-4 gap-3 text-xs items-start" data-testid="job-parallel-settings">
+            <label class="flex items-center space-x-2 pt-4 cursor-pointer" title="Tasks whose dependencies are already met run at the same time instead of one after another"><input type="checkbox" x-model="jobForm.parallel" data-testid="job-parallel-toggle" class="rounded bg-slate-900 border-dbx-border text-cyan-600 focus:ring-0"><span class="text-slate-300">Run independent tasks in parallel</span></label>
+            <div x-show="jobForm.parallel"><label class="block text-[10px] text-slate-500 mb-0.5">Max parallel tasks</label><input type="number" min="1" max="16" x-model.number="jobForm.max_parallel_tasks" data-testid="job-max-parallel-tasks" class="w-full bg-slate-950 border border-dbx-border rounded px-2 py-1 font-mono text-white"></div>
+            <p x-show="jobForm.parallel" class="col-span-2 text-[10px] text-slate-500 pt-4">Saving is refused if two tasks with no dependency between them could write to the same table, or either one's target cannot be determined (a notebook or a dbt task) -- add a depends_on edge between them on the graph, or turn this off.</p>
+          </div>
 
           <div class="space-y-1.5">
             <div class="flex items-center justify-between"><span class="text-[11px] text-slate-400">Parameters <span class="text-slate-500">(use <span class="font-mono">{&#123; params.name &#125;}</span> in SQL and notebook parameters; values are checked against the pattern or allowed list)</span></span>
@@ -19671,6 +19676,8 @@
           timeout_seconds: 0,
           max_concurrent_runs: 1,
           catch_up: false,
+          parallel: false,
+          max_parallel_tasks: 4,
           parameters: [],
           triggers: [],
           notifications: [],
@@ -27944,7 +27951,7 @@
             description: '',
             schedule_cron: '',
             enabled: true,
-            timeout_seconds: 0, max_concurrent_runs: 1, catch_up: false, parameters: [], triggers: [], notifications: [],
+            timeout_seconds: 0, max_concurrent_runs: 1, catch_up: false, parallel: false, max_parallel_tasks: 4, parameters: [], triggers: [], notifications: [],
             tasks: [
               {
                 id: 'task_1',
@@ -27967,6 +27974,7 @@
           if (!this.jobForm.tasks) this.jobForm.tasks = [];
           const f = this.jobForm;
           f.timeout_seconds = f.timeout_seconds || 0; f.max_concurrent_runs = f.max_concurrent_runs || 1; f.catch_up = !!f.catch_up;
+          f.parallel = !!f.parallel; f.max_parallel_tasks = f.max_parallel_tasks || 4;
           f.parameters = (f.parameters || []).map(p => ({ name: p.name, default: p.default ?? '', description: p.description || '', pattern: p.pattern || '', allowed_text: (p.allowed || []).join(', ') }));
           f.triggers = f.triggers || [];
           f.notifications = (f.notifications || []).map(n => ({ on_failure: (n.on || []).includes('failure'), on_success: (n.on || []).includes('success'), on_cancelled: (n.on || []).includes('cancelled'), channel: n.channel, target: n.target || '' }));

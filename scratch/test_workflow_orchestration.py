@@ -152,6 +152,58 @@ r1_ = wf.start_run_in_background("cc2"); r2_ = wf.start_run_in_background("cc2")
 check("max_concurrent_runs=2 allows two", wf.running_count("cc2") == 2)
 wf.cancel_run(r1_); wf.cancel_run(r2_); wait_for(lambda: wf.running_count("cc2") == 0)
 
+print("parallel tasks: validation")
+check("parallel and max_parallel_tasks are defaulted (off, 4) and an out-of-range value is refused, like every other orchestration field",
+      wf.validate_job({"name": "x", "tasks": []})["parallel"] is False
+      and wf.validate_job({"name": "x", "tasks": [], "parallel": True})["max_parallel_tasks"] == 4
+      and (bad({"name": "x", "tasks": [], "parallel": True, "max_parallel_tasks": 99}) or "") != "")
+same_target = [{"id": "a", "type": "sql", "parameters": {"query": "create or replace table dbo.same as select 1"}},
+              {"id": "b", "type": "sql", "parameters": {"query": "insert into dbo.same select 2"}}]
+e = bad({"name": "x", "parallel": True, "tasks": same_target})
+check("two independent tasks writing the same table are refused when parallel is on", e is not None and "'a'" in e and "'b'" in e and "dbo.same" in e, e)
+check("the identical pair is accepted when parallel is off (today's sequential behaviour, unchanged)", wf.validate_job({"name": "x", "tasks": [dict(t) for t in same_target]})["parallel"] is False)
+serialised = [dict(same_target[0]), dict(same_target[1], depends_on=["a"])]
+check("...but an explicit dependency edge between them makes it acceptable under parallel too", wf.validate_job({"name": "x", "parallel": True, "tasks": serialised})["tasks"][1]["depends_on"] == ["a"])
+check("independent tasks writing DIFFERENT tables are accepted", wf.validate_job({"name": "x", "parallel": True, "tasks": [
+    {"id": "a", "type": "sql", "parameters": {"query": "create or replace table dbo.t1 as select 1"}},
+    {"id": "b", "type": "sql", "parameters": {"query": "create or replace table dbo.t2 as select 1"}}]})["parallel"] is True)
+e = bad({"name": "x", "parallel": True, "tasks": [{"id": "a", "type": "sql", "parameters": {"query": "select 1"}},
+                                                  {"id": "b", "type": "notebook", "parameters": {"notebook_path": "x.ipynb"}}]})
+check("a notebook task alongside anything else with no dependency is refused: its write target is unknown", e is not None and "notebook" in e.lower(), e)
+e = bad({"name": "x", "parallel": True, "tasks": [{"id": "a", "type": "dbt", "parameters": {}}, {"id": "b", "type": "dbt", "parameters": {}}]})
+check("two independent dbt tasks are refused too (a dbt task's real targets depend on the project DAG, not re-derived here)", e is not None, e)
+check("a bare SELECT (no write) never conflicts with anything", wf.validate_job({"name": "x", "parallel": True, "tasks": [
+    {"id": "a", "type": "sql", "parameters": {"query": "select 1"}}, {"id": "b", "type": "sql", "parameters": {"query": "select 2"}}]})["parallel"] is True)
+check("partially-qualified names are matched conservatively (a dotted suffix counts as the same table)",
+      wf._targets_overlap(["dbo.same"], ["same"]) and wf._targets_overlap(["cat.dbo.same"], ["dbo.same"]) and not wf._targets_overlap(["dbo.one"], ["dbo.two"]))
+
+print("parallel tasks: real concurrent execution")
+job("par1", [
+    sqlt("root", "create or replace table dbo.par_root as select 1 as x"),
+    sqlt("b1", "create or replace table dbo.par_b1 as select sum(length(md5(i::varchar))) as x from range(10000000) t(i)", depends_on=["root"]),
+    sqlt("b2", "create or replace table dbo.par_b2 as select sum(length(md5(i::varchar))) as x from range(10000000) t(i)", depends_on=["root"]),
+    sqlt("join", "create or replace table dbo.par_join as select (select x from dbo.par_b1) + (select x from dbo.par_b2) as total", depends_on=["b1", "b2"]),
+], parallel=True, max_parallel_tasks=4)
+rid = wf.start_run_in_background("par1")
+both_running = wait_for(lambda: (lambda d: d if d and sum(1 for t in d["tasks_summary"] if t["id"] in ("b1", "b2") and t["status"] == "RUNNING") == 2 else None)(wf.get_run_detail(rid)), 15)
+check("both independent branches are RUNNING at the same time (real overlap, not just a declared setting)", both_running is not None, both_running and both_running["tasks_summary"])
+r = wait_for(lambda: (lambda d: d if d and d["status"] != "RUNNING" else None)(wf.get_run_detail(rid)), 30)
+check("the whole run succeeds", r and r["status"] == "SUCCESS", r)
+check("the join task sees both branches' correct results (each ran on its own connection, no interference between them)", peek("dbo.par_join") == [{"total": 640000000}], peek("dbo.par_join") if r else None)
+
+print("parallel tasks: cancel interrupts every connection in flight, not just one")
+job("pcn", [sqlt("s1", LONG), sqlt("s2", LONG)], parallel=True, max_parallel_tasks=4)
+rid2 = wf.start_run_in_background("pcn")
+d = wait_for(lambda: (lambda x: x if x and sum(1 for t in x["tasks_summary"] if t["status"] == "RUNNING") == 2 else None)(wf.get_run_detail(rid2)), 15)
+check("both independent long tasks are running at once", d is not None, d and d["tasks_summary"])
+time.sleep(1.5)                                       # give both worker threads time to actually open their connection and dispatch the query (the
+                                                       # RUNNING marker above is written optimistically at dispatch, same as the sequential cancel test above)
+t0 = time.time(); check("cancel_run reports it was running", wf.cancel_run(rid2) is True)
+d2 = wait_for(lambda: (wf.get_run_detail(rid2) or {}).get("status") not in ("RUNNING", None) and wf.get_run_detail(rid2))
+check("both are interrupted quickly, not left to finish (each had its own connection; cancel_run reached both)", d2 and d2["status"] == "CANCELLED" and time.time() - t0 < 10, d2 and (d2["status"], time.time() - t0))
+st = {x["task_id"]: x["status"] for x in (d2 or {}).get("tasks_detail", [])}
+check("both branches ended CANCELLED", st.get("s1") == "CANCELLED" and st.get("s2") == "CANCELLED", st)
+
 print("notifications")
 sent = []
 import web.email_reports as er, web.slack_integration as si, web.webhook_alerts as wa

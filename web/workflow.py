@@ -441,8 +441,12 @@ def execute_task(task: Dict[str, Any], conn, principal=None) -> Dict[str, Any]:
 # =====================================================================================================================
 # Orchestration: validation, parameters, retries, timeouts, run conditions, cancel, repair, notifications, triggers.
 #
-# A job is a DAG of tasks run one after another in dependency order on one connection, as the job's owner. Everything below is optional
-# and additive: a job saved before these fields existed behaves exactly as it did.
+# A job is a DAG of tasks run in dependency order, as the job's owner. By default (parallel=False, unchanged since before this existed)
+# they run one after another on one shared connection. With parallel=True, any tasks whose dependencies are already satisfied run at once
+# (bounded by max_parallel_tasks), each on its own fresh connection (see _run_tasks_parallel / _run_one_parallel_task) -- opting in also
+# means validate_job refuses to save the job if two tasks that could end up running at the same time (no dependency path between them,
+# in either direction) write to the same table, or either one's write target cannot be determined (a notebook or a dbt task); see
+# _validate_parallel_safety. Everything below is optional and additive: a job saved before these fields existed behaves exactly as it did.
 #
 #   task  retries / retry_delay_seconds / retry_backoff   a failed attempt is retried; the delay grows by the backoff factor
 #         timeout_seconds                                 an attempt still running after this long is abandoned (a SQL task is interrupted)
@@ -451,6 +455,7 @@ def execute_task(task: Dict[str, Any], conn, principal=None) -> Dict[str, Any]:
 #                         must match the declared allowed list / pattern (default: letters, digits and _.:@- and space only), because the
 #                         job runs with its OWNER's rights and whoever starts it must not be able to inject SQL
 #         timeout_seconds, max_concurrent_runs, catch_up
+#         parallel, max_parallel_tasks (1-16, default 4)   see above
 #         triggers        [{type: job|autoloader|table, ...}]  besides the cron schedule
 #         notifications   [{on: [failure|success|cancelled], channel: email|slack|webhook, target}]
 # =====================================================================================================================
@@ -509,6 +514,106 @@ def _has_cycle(tasks: List[Dict[str, Any]]) -> bool:
     return any(visit(n) for n in deps)
 
 
+# ---------------------------------------------------------------- parallel-safety: can two tasks with no dependency between them ever
+# safely run at the same time, or would they race on the same Delta table? See _validate_parallel_safety and run_pipeline's parallel branch.
+
+def _sql_write_targets(query: str) -> Optional[List[str]]:
+    """The table(s) a SQL statement (or `;`-separated script) writes to, lower-cased, as given (1 to 3 dotted parts, not forced to 3).
+    None means "could write anywhere, or this could not be determined" -- a bare SELECT contributes nothing, but anything sqlglot cannot
+    parse, or a statement kind this does not recognise, makes the WHOLE task unknown (fail closed: better an unnecessary dependency edge
+    than a missed race)."""
+    import sqlglot
+    from sqlglot import exp
+    try:
+        statements = sqlglot.parse(query, read="duckdb")
+    except Exception:
+        return None
+    targets: List[str] = []
+    for stmt in statements:
+        if stmt is None or isinstance(stmt, exp.Select):
+            continue
+        if not isinstance(stmt, (exp.Insert, exp.Merge, exp.Create, exp.Update, exp.Delete, exp.Copy)):
+            return None
+        node = stmt.this
+        if isinstance(node, exp.Schema):                 # CREATE TABLE x (col ...) AS ...: the table sits one level deeper
+            node = node.this
+        if not isinstance(node, exp.Table) or not node.name:
+            return None
+        targets.append(".".join(p for p in (node.catalog, node.db, node.name) if p).lower())
+    return targets
+
+
+def _task_write_targets(task: Dict[str, Any]) -> Optional[List[str]]:
+    """The table(s) a task writes to, or None for "unknown / could be anything" (fail closed). `notebook` and `dbt` tasks are always
+    unknown: a notebook runs arbitrary code, and a dbt task's real targets depend on its `select` and the project's own DAG, which is
+    not something this function re-derives (dbt_service / dbt_governance already do that at run time, for a different purpose)."""
+    ttype = str(task.get("type", "sql")).lower()
+    params = task.get("parameters") or {}
+    if ttype == "sql":
+        return _sql_write_targets(str(params.get("query") or ""))
+    if ttype in ("optimize", "ingest"):
+        t = str(params.get("target_table") or "").strip().lower()
+        return [t] if t else None
+    return None                                          # notebook, dbt, or an unrecognised type
+
+
+def _targets_overlap(a: List[str], b: List[str]) -> bool:
+    """Two dotted table names are treated as the same table when they are equal, or one is a dot-suffix of the other (a task naming
+    `sch.tbl` and one naming `cat.sch.tbl` might well be the same table under the run's default catalog; a false positive here only
+    costs the user an extra dependency edge, a false negative could lose data)."""
+    for x in a:
+        for y in b:
+            xp, yp = x.split("."), y.split(".")
+            shorter, longer = (xp, yp) if len(xp) <= len(yp) else (yp, xp)
+            if longer[-len(shorter):] == shorter:
+                return True
+    return False
+
+
+def _task_ancestors(tasks: List[Dict[str, Any]]) -> Dict[str, set]:
+    """Every task's transitive dependencies (its id is never in its own set)."""
+    deps = {t["id"]: list(t.get("depends_on") or []) for t in tasks}
+    memo: Dict[str, set] = {}
+
+    def anc(n: str) -> set:
+        if n in memo:
+            return memo[n]
+        memo[n] = set()                                  # break any cycle defensively; _has_cycle already refuses a job with one
+        out = set()
+        for d in deps.get(n, []):
+            out.add(d)
+            out |= anc(d)
+        memo[n] = out
+        return out
+    return {n: anc(n) for n in deps}
+
+
+def _validate_parallel_safety(tasks: List[Dict[str, Any]]) -> None:
+    """For a job with `parallel` on: any two tasks that have no dependency path between them (in either direction) could end up
+    running at the same time, so if they write to the same table -- or either one's targets cannot be determined at all (a notebook
+    or a dbt task) -- the job is refused. Add a `depends_on` edge between them (even one not otherwise needed) to serialise that pair,
+    or turn `parallel` off."""
+    ancestors = _task_ancestors(tasks)
+    targets = {t["id"]: _task_write_targets(t) for t in tasks}
+    for i, a in enumerate(tasks):
+        for b in tasks[i + 1:]:
+            ai, bi = a["id"], b["id"]
+            if bi in ancestors[ai] or ai in ancestors[bi]:
+                continue                                  # ordered relative to each other: never actually concurrent
+            ta, tb = targets[ai], targets[bi]
+            if ta is None or tb is None:
+                unknown = ai if ta is None else bi
+                raise JobValidationError(
+                    f"Tasks '{ai}' and '{bi}' have no dependency between them, so they could run at the same time under 'parallel', but "
+                    f"'{unknown}' is a {a['type'] if unknown == ai else b['type']} task whose write target cannot be determined in advance. "
+                    f"Add a depends_on edge between them, or turn parallel execution off for this job.")
+            if _targets_overlap(ta, tb):
+                shared = next(x for x in ta for y in tb if _targets_overlap([x], [y]))
+                raise JobValidationError(
+                    f"Tasks '{ai}' and '{bi}' have no dependency between them, so they could run at the same time under 'parallel', but "
+                    f"both write to '{shared}'. Add a depends_on edge between them, or turn parallel execution off for this job.")
+
+
 def validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     """Normalises a job definition (clamping and defaulting the orchestration fields) or raises JobValidationError."""
     if not isinstance(job, dict):
@@ -558,6 +663,10 @@ def validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
             t["position"] = {"x": round(x, 1), "y": round(y, 1)}
     if _has_cycle(tasks):
         raise JobValidationError("The tasks depend on each other in a circle.")
+    job["parallel"] = bool(job.get("parallel"))
+    job["max_parallel_tasks"] = _int(job.get("max_parallel_tasks"), 1, 16, 4, "Max parallel tasks")
+    if job["parallel"]:
+        _validate_parallel_safety(tasks)
     cron = str(job.get("schedule_cron") or "").strip()
     if cron and croniter and not croniter.is_valid(cron):
         raise JobValidationError(f"'{cron}' is not a valid cron expression.")
@@ -736,12 +845,13 @@ def graph_snapshot(job: Dict[str, Any]) -> List[Dict[str, Any]]:
              **({"position": t["position"]} if t.get("position") else {})} for t in job.get("tasks", [])]
 
 
-def _save_progress(run_id: str, task_runs: List[Dict[str, Any]], current: Optional[Dict[str, Any]] = None) -> None:
-    """Writes the finished tasks (and the one that is running now) into the run row, so a live view sees a run advance instead of only its end."""
+def _save_progress(run_id: str, task_runs: List[Dict[str, Any]], current: Optional[Dict[str, Any]] = None, running: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Writes the finished tasks (and whichever ones are running right now -- one at a time for a sequential run via `current`, or several at once
+    for a parallel one via `running`) into the run row, so a live view sees a run advance instead of only its end."""
     summary = [{"id": tr["task_id"], "name": tr["task_name"], "type": tr["task_type"], "status": tr["status"], "duration_sec": tr["duration_sec"],
                 "attempts": tr.get("attempt_count", 1)} for tr in task_runs]
-    if current:
-        summary.append({"id": current["id"], "name": current.get("name", current["id"]), "type": current.get("type", "sql"), "status": "RUNNING",
+    for c in ([current] if current else []) + (running or []):
+        summary.append({"id": c["id"], "name": c.get("name", c["id"]), "type": c.get("type", "sql"), "status": "RUNNING",
                         "started_at": _now(), "duration_sec": 0, "attempts": 0})
     try:
         with sqlite3.connect(DB_PATH, timeout=10.0) as sconn:
@@ -763,14 +873,16 @@ def _interrupt(conn) -> None:
 
 
 def cancel_run(run_id: str) -> bool:
-    """Asks a running run to stop: no further task or retry starts, and a running SQL statement is interrupted. False if it is not running."""
+    """Asks a running run to stop: no further task or retry starts, and every currently-running SQL statement is interrupted (one connection for a
+    sequential run, or however many parallel tasks are in flight for a parallel one -- see _active[run_id]['conns']). False if it is not running."""
     with _active_lock:
         a = _active.get(run_id)
+        conns = set(a["conns"]) if a else set()
     if not a:
         return False
     a["cancel"].set()
-    if a.get("conn") is not None:
-        _interrupt(a["conn"])
+    for c in conns:
+        _interrupt(c)
     return True
 
 
@@ -892,6 +1004,98 @@ def _notify(job: Dict[str, Any], run: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 # ---------------------------------------------------------------- the run
 
+def _run_one_parallel_task(raw: Dict[str, Any], run_params: Dict[str, str], run_id: str, principal, cancel: threading.Event,
+                           deadline: Optional[float], base_ok: Dict[str, Dict[str, Any]], repair_of: Optional[str],
+                           deps_results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """One task of a parallel run (see _run_tasks_parallel), on its own fresh connection -- concurrent tasks never share a DuckDB
+    connection, unlike the sequential branch of run_pipeline, which this otherwise mirrors task by task."""
+    task = substitute_params(raw, run_params)
+    deps = raw.get("depends_on") or []
+    if cancel.is_set():
+        return _task_result(task, "CANCELLED", "The run was cancelled before this task started.")
+    if deadline is not None and time.time() >= deadline:
+        return _task_result(task, "SKIPPED", "The job timed out before this task started.", _job_timeout=True)
+    if raw["id"] in base_ok:
+        res = dict(base_ok[raw["id"]])
+        res.update(reused_from=repair_of, output_log=f"Reused from run {repair_of} (it had succeeded): {res.get('output_log', '')[:200]}")
+        res["output"] = res["output_log"]
+        return res
+    if not should_run(raw.get("run_if", "all_success"), [deps_results[d]["status"] for d in deps if d in deps_results]):
+        dep_desc = ", ".join(f"{d}={deps_results[d]['status']}" for d in deps if d in deps_results)
+        return _task_result(task, "SKIPPED", f"Skipped: run_if '{raw.get('run_if', 'all_success')}' is not met ({dep_desc}).")
+    conn = None
+    try:
+        import duckrun
+        conn = duckrun.connect(WAREHOUSE_DIR, read_only=False)
+        with _active_lock:
+            a = _active.get(run_id)
+            if a is not None:
+                a["conns"].add(conn)
+        res = _execute_with_retries(task, conn, principal, cancel, deadline)
+        if cancel.is_set() and res["status"] != "SUCCESS":
+            res["status"] = "CANCELLED"
+        if res.get("timed_out") and deadline is not None and time.time() >= deadline - 1:
+            res["_job_timeout"] = True
+        return res
+    finally:
+        if conn is not None:
+            with _active_lock:
+                a = _active.get(run_id)
+                if a is not None:
+                    a["conns"].discard(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _run_tasks_parallel(job: Dict[str, Any], tasks: List[Dict[str, Any]], run_params: Dict[str, str], run_id: str, principal,
+                        cancel: threading.Event, deadline: Optional[float], base_ok: Dict[str, Dict[str, Any]],
+                        repair_of: Optional[str]) -> Any:
+    """Runs `tasks` respecting depends_on: any task whose dependencies are all resolved is dispatched at once, bounded by
+    job['max_parallel_tasks']. validate_job already refused to save this job if two tasks that could ever be dispatched together this
+    way (no dependency path between them, in either direction) write to the same table, so this never has to reason about that itself
+    -- it only has to schedule. Returns (results_by_task_id, task_runs_in_completion_order)."""
+    task_map = {t["id"]: t for t in tasks}
+    remaining_deps = {t["id"]: set(t.get("depends_on") or []) for t in tasks}
+    dependents: Dict[str, List[str]] = {t["id"]: [] for t in tasks}
+    for t in tasks:
+        for d in t.get("depends_on") or []:
+            dependents.setdefault(d, []).append(t["id"])
+    results: Dict[str, Dict[str, Any]] = {}
+    task_runs: List[Dict[str, Any]] = []
+    running: Dict[str, Dict[str, Any]] = {}
+    max_workers = max(1, int(job.get("max_parallel_tasks") or 4))
+    pending: Dict[concurrent.futures.Future, str] = {}
+
+    def submit(pool, tid):
+        raw = task_map[tid]
+        deps_results = {d: results[d] for d in (raw.get("depends_on") or []) if d in results}
+        running[tid] = raw
+        _save_progress(run_id, task_runs, running=list(running.values()))
+        fut = pool.submit(_run_one_parallel_task, raw, run_params, run_id, principal, cancel, deadline, base_ok, repair_of, deps_results)
+        pending[fut] = tid
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"job-{job['id']}") as pool:
+        for tid, deps in remaining_deps.items():
+            if not deps:
+                submit(pool, tid)
+        while pending:
+            done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in done:
+                tid = pending.pop(fut)
+                res = fut.result()
+                running.pop(tid, None)
+                results[tid] = res
+                task_runs.append(res)
+                _save_progress(run_id, task_runs, running=list(running.values()))
+                for child in dependents.get(tid, []):
+                    remaining_deps[child].discard(tid)
+                    if not remaining_deps[child] and child not in results and all(pending.get(f) != child for f in pending):
+                        submit(pool, child)
+    return results, task_runs
+
+
 def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None, principal=None, params: Optional[Dict[str, Any]] = None,
                  run_id: Optional[str] = None, repair_of: Optional[str] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     job = get_job(job_id)
@@ -922,7 +1126,10 @@ def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None, principal=None
         conn = duckrun.connect(WAREHOUSE_DIR, read_only=False)
     cancel = threading.Event()
     with _active_lock:
-        _active[run_id] = {"job_id": job_id, "cancel": cancel, "conn": conn, "started_at": started_at}
+        # `conns`: every connection a running SQL statement could be on right now, for cancel_run to interrupt. A sequential run has
+        # exactly one (the shared `conn`); a parallel run starts with none and each task adds/removes its own as it runs (see
+        # _run_one_parallel_task) -- `conn` itself is never used to execute a task in that mode, only kept for introspection.
+        _active[run_id] = {"job_id": job_id, "cancel": cancel, "conn": conn, "conns": (set() if job.get("parallel") else {conn}), "started_at": started_at}
     start_time = time.perf_counter()
     with sqlite3.connect(DB_PATH) as sconn:
         sconn.execute("""
@@ -937,31 +1144,35 @@ def run_pipeline(job_id: str, trigger: str = "MANUAL", conn=None, principal=None
     job_timed_out = False
     base_ok = {t["task_id"]: t for t in (base or {}).get("tasks_detail", []) if t.get("status") == "SUCCESS"}
     try:
-        for raw in topological_sort_tasks(job.get("tasks", [])):
-            task = substitute_params(raw, run_params)
-            deps = raw.get("depends_on") or []
-            if cancel.is_set():
-                res = _task_result(task, "CANCELLED", "The run was cancelled before this task started.")
-            elif deadline is not None and time.time() >= deadline:
-                job_timed_out = True
-                res = _task_result(task, "SKIPPED", "The job timed out before this task started.")
-            elif raw["id"] in base_ok:
-                res = dict(base_ok[raw["id"]])
-                res.update(reused_from=repair_of, output_log=f"Reused from run {repair_of} (it had succeeded): {res.get('output_log', '')[:200]}")
-                res["output"] = res["output_log"]
-            elif not should_run(raw.get("run_if", "all_success"), [results[d]["status"] for d in deps if d in results]):
-                dep_desc = ", ".join(f"{d}={results[d]['status']}" for d in deps if d in results)
-                res = _task_result(task, "SKIPPED", f"Skipped: run_if '{raw.get('run_if', 'all_success')}' is not met ({dep_desc}).")
-            else:
-                _save_progress(run_id, task_runs, task)
-                res = _execute_with_retries(task, conn, principal, cancel, deadline)
-                if cancel.is_set() and res["status"] != "SUCCESS":
-                    res["status"] = "CANCELLED"
-                if res.get("timed_out") and deadline is not None and time.time() >= deadline - 1:
+        if job.get("parallel"):
+            results, task_runs = _run_tasks_parallel(job, job.get("tasks", []), run_params, run_id, principal, cancel, deadline, base_ok, repair_of)
+            job_timed_out = any(r.get("_job_timeout") for r in task_runs)
+        else:
+            for raw in topological_sort_tasks(job.get("tasks", [])):
+                task = substitute_params(raw, run_params)
+                deps = raw.get("depends_on") or []
+                if cancel.is_set():
+                    res = _task_result(task, "CANCELLED", "The run was cancelled before this task started.")
+                elif deadline is not None and time.time() >= deadline:
                     job_timed_out = True
-            results[raw["id"]] = res
-            task_runs.append(res)
-            _save_progress(run_id, task_runs)
+                    res = _task_result(task, "SKIPPED", "The job timed out before this task started.")
+                elif raw["id"] in base_ok:
+                    res = dict(base_ok[raw["id"]])
+                    res.update(reused_from=repair_of, output_log=f"Reused from run {repair_of} (it had succeeded): {res.get('output_log', '')[:200]}")
+                    res["output"] = res["output_log"]
+                elif not should_run(raw.get("run_if", "all_success"), [results[d]["status"] for d in deps if d in results]):
+                    dep_desc = ", ".join(f"{d}={results[d]['status']}" for d in deps if d in results)
+                    res = _task_result(task, "SKIPPED", f"Skipped: run_if '{raw.get('run_if', 'all_success')}' is not met ({dep_desc}).")
+                else:
+                    _save_progress(run_id, task_runs, task)
+                    res = _execute_with_retries(task, conn, principal, cancel, deadline)
+                    if cancel.is_set() and res["status"] != "SUCCESS":
+                        res["status"] = "CANCELLED"
+                    if res.get("timed_out") and deadline is not None and time.time() >= deadline - 1:
+                        job_timed_out = True
+                results[raw["id"]] = res
+                task_runs.append(res)
+                _save_progress(run_id, task_runs)
     except Exception as exc:                                    # an engine error must not leave the run RUNNING forever
         logger.error(f"Run {run_id} of {job_id} failed in the engine: {exc}", exc_info=True)
         task_runs.append(_task_result({"id": "_engine", "name": "Engine"}, "FAILED", f"Internal error: {exc}"))

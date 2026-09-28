@@ -90,8 +90,15 @@ the cluster-wide, cloud-provider-integrated variant.
 Ordered by how much they would change the honest picture. None needs a new engine.
 
 1. ~~**Prove the deployment claims.**~~ *(Done: `.github/workflows/ci.yml`, `ci/`.)* CI runs 38 test scripts in the built image, 7 browser tests, the static checks and a kind smoke test of the chart. Still to do: the integration tier (tests that need Gitea, Redpanda, MinIO, lldap, Keycloak) as a scheduled job.
-2. **Parallel workflow tasks.** Run independent branches of a DAG concurrently (bounded by a per-workflow limit). The graph
-   and run page already show branches; the engine is the missing part.
+2. ~~**Parallel workflow tasks.**~~ *(Done: opt-in per job (`parallel` + `max_parallel_tasks`, default off = the old sequential
+   behaviour, unchanged); a ready-queue scheduler dispatches any task whose dependencies are met, each on its own fresh
+   connection (concurrent tasks never share one). The concern this raised while scoping it -- two independent tasks racing
+   to write the same Delta table -- is closed at validation time, not at runtime: saving a job with `parallel` on is refused
+   if two tasks with no dependency path between them (in either direction, not just same DAG "level") write to the same
+   table (a real sqlglot parse of `INSERT`/`MERGE`/`CREATE ... AS`/`UPDATE`/`DELETE`/`COPY` targets), or if either one's
+   target can't be determined at all (a notebook or a dbt task, always treated as an unknown, universal conflict). See 1b
+   for a fuller account, including a real gap caught while building it: `cancel_run` had to learn to interrupt every
+   connection a parallel run has open, not just one.)*
 3. ~~**More Auto-Loader sources.**~~ *(Done: `web/autoloader_azure.py`, `web/autoloader_gcs.py`.)* Azure Blob (`azure://`) and GCS
    (`gcs://`, through its S3-compatible interoperability API) as file-arrival sources, mirroring the S3 path: listing, exactly-once
    checkpoints, quarantine, preview, credentials from a storage mount. Both are sources only, not targets (see 1b). Still open:
@@ -131,9 +138,8 @@ Ordered by how much they would change the honest picture. None needs a new engin
 ## Recommendation
 
 `FEATURE_COMPARISON.md` no longer contains the fabricated rows this document originally warned about, and its scorecard
-(section 6) is now recomputed from the tables' own row counts and markers, not stale round numbers. Items 1, 3, 4, 5, 6, 7,
-8 and 10 are now done. What remains is item 9 (a multi-replica studio), the one item here that is a genuine architectural
+(section 6) is now recomputed from the tables' own row counts and markers, not stale round numbers. Items 1, 2, 3, 4, 5, 6,
+7, 8 and 10 are now done. What remains is item 9 (a multi-replica studio), the one item here that is a genuine architectural
 re-design rather than a feature -- it needs a decision on a shared store (Postgres? Redis? something else?) before any
-code gets written, since it touches nearly every module that currently owns its own SQLite file. Item 2 (parallel workflow
-tasks) is on hold per your instruction. Tell me how you would like to approach item 9, or say which of the two to build
-next.
+code gets written, since it touches nearly every module that currently owns its own SQLite file. Tell me how you would
+like to approach it.
