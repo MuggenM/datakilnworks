@@ -2136,6 +2136,9 @@ class OneLakeMountRequest(BaseModel):
     client_id: str
     client_secret: str
     catalog_id: Optional[str] = None
+    authority: Optional[str] = None       # dev/test only: a non-default AAD authority (a local identity-provider
+                                           # emulator); leave unset for a real tenant. See CLAUDE.md.
+    ca_cert_pem: Optional[str] = None     # dev/test only: trusts this CA container-wide (web.onelake.trust_ca_cert)
 
 @app.post("/api/catalogs/onelake/mount")
 async def mount_onelake_catalog_endpoint(payload: OneLakeMountRequest, request: Request):
@@ -2153,7 +2156,9 @@ async def mount_onelake_catalog_endpoint(payload: OneLakeMountRequest, request: 
             tenant_id=payload.tenant_id,
             client_id=payload.client_id,
             client_secret=payload.client_secret,
-            catalog_id=payload.catalog_id
+            catalog_id=payload.catalog_id,
+            authority=payload.authority,
+            ca_cert_pem=payload.ca_cert_pem
         )
 
         # List tables
