@@ -160,6 +160,10 @@
   {
    "name": "autoloader_s3",
    "extras": "moto[server]"
+  },
+  {
+   "name": "apps",
+   "extras": ""
   }
  ],
  "ui": [

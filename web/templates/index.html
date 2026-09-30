@@ -1154,6 +1154,11 @@
             <span class="flex-1">Lakeview Dashboards</span>
             <span class="text-[9px] px-1 py-0.2 bg-indigo-100 dark:bg-indigo-950 text-indigo-800 dark:text-indigo-300 rounded border border-indigo-300/80 dark:border-indigo-800/80 font-mono font-semibold">BI</span>
           </button>
+          <button @click="currentView = 'apps'; loadApps();" :class="currentView === 'apps' ? 'bg-slate-100 dark:bg-dbx-hover text-slate-900 dark:text-white border-l-2 border-violet-600 dark:border-violet-400 font-semibold' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-dbx-panel dark:hover:text-slate-200'" class="w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded-r text-xs transition text-left" data-testid="nav-apps">
+            <i class="ph ph-browser text-base text-violet-600 dark:text-violet-400"></i>
+            <span class="flex-1">Apps</span>
+            <span x-show="apps && apps.length > 0" class="text-[9px] px-1.5 py-0.2 bg-violet-100 dark:bg-violet-950 text-violet-800 dark:text-violet-300 rounded border border-violet-300/80 dark:border-violet-800/80 font-mono font-semibold" x-text="apps.length"></span>
+          </button>
           <button @click="currentView = 'history'; fetchHistory();" :class="currentView === 'history' ? 'bg-slate-100 dark:bg-dbx-hover text-slate-900 dark:text-white border-l-2 border-amber-600 dark:border-amber-400 font-semibold' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-dbx-panel dark:hover:text-slate-200'" class="w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded-r text-xs transition text-left">
             <i class="ph ph-clock-counter-clockwise text-base text-amber-700 dark:text-amber-400"></i>
             <span class="flex-1">Query History</span>
@@ -6201,6 +6206,119 @@
             </template>
           </div>
         </div>
+      </div>
+
+      <!-- ================= 5b. EMBEDDED HTML APPS VIEW ================= -->
+      <div x-show="currentView === 'apps'" class="flex-1 flex flex-col overflow-hidden">
+        <div class="h-14 border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-dbx-sidebar/80 px-6 flex items-center justify-between shrink-0">
+          <div class="flex items-center space-x-2">
+            <i class="ph ph-browser text-lg text-violet-600 dark:text-violet-400"></i>
+            <h2 class="text-sm font-bold text-slate-900 dark:text-white">Apps</h2>
+            <span class="text-[10px] text-slate-500">Static HTML/JS, served read-only in a sandboxed frame</span>
+          </div>
+          <button x-show="['admin', 'power_user'].includes(currentUser?.role)" @click="openNewApp()" data-testid="new-app-btn"
+                  class="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
+            <i class="ph ph-plus"></i><span>New App</span>
+          </button>
+        </div>
+        <div class="flex-1 overflow-y-auto p-6">
+          <div x-show="!apps.length" class="text-center text-slate-500 text-sm py-16">
+            <i class="ph ph-browser text-4xl block mb-2 opacity-50"></i>
+            No apps yet.
+            <span x-show="['admin', 'power_user'].includes(currentUser?.role)">Publish a folder of HTML/CSS/JS as a zip to get started.</span>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <template x-for="a in apps" :key="a.id">
+              <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-2.5" data-testid="app-card">
+                <div class="flex items-start justify-between">
+                  <div class="min-w-0">
+                    <div class="font-semibold text-slate-900 dark:text-white text-sm truncate" x-text="a.name"></div>
+                    <div class="text-[10px] text-slate-500 truncate">owner: <span x-text="a.owner"></span></div>
+                  </div>
+                  <span class="text-[9px] px-1.5 py-0.5 rounded border font-mono font-semibold shrink-0"
+                        :class="a.visibility === 'public' ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border-emerald-300/80 dark:border-emerald-800/80' : a.visibility === 'shared' ? 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border-amber-300/80 dark:border-amber-800/80' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-300/80 dark:border-slate-700/80'"
+                        x-text="a.visibility"></span>
+                </div>
+                <div class="text-[10px] text-slate-500">updated <span x-text="a.updated_at"></span></div>
+                <div class="flex items-center space-x-1.5 pt-1">
+                  <button @click="openAppViewer(a)" data-testid="app-open-btn" class="flex-1 px-2.5 py-1.5 bg-slate-100 dark:bg-dbx-hover hover:bg-slate-200 dark:hover:bg-dbx-border text-slate-700 dark:text-slate-200 rounded-lg text-[11px] font-semibold flex items-center justify-center space-x-1">
+                    <i class="ph ph-arrow-square-out"></i><span>Open</span>
+                  </button>
+                  <button x-show="a.my_access === 'manage'" @click="openShare('app', a.id, a.name)" title="Share" class="p-1.5 bg-slate-100 dark:bg-dbx-hover hover:bg-slate-200 dark:hover:bg-dbx-border text-slate-600 dark:text-slate-300 rounded-lg">
+                    <i class="ph ph-share-network"></i>
+                  </button>
+                  <button x-show="a.my_access === 'manage'" @click="openAppManage(a)" title="Manage" data-testid="app-manage-btn" class="p-1.5 bg-slate-100 dark:bg-dbx-hover hover:bg-slate-200 dark:hover:bg-dbx-border text-slate-600 dark:text-slate-300 rounded-lg">
+                    <i class="ph ph-gear-six"></i>
+                  </button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- New App modal -->
+      <div x-show="newAppForm.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="newAppForm.open = false">
+        <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-md shadow-2xl p-5 space-y-3 text-xs" @click.outside="newAppForm.open = false">
+          <h3 class="text-sm font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-browser text-violet-600"></i><span>New App</span></h3>
+          <p class="text-[11px] text-slate-500">A zip with an index.html at its root, plus whatever CSS/JS/assets it needs. No server-side code runs -- it is served exactly as uploaded, inside a sandboxed frame.</p>
+          <div class="space-y-2">
+            <input type="text" x-model="newAppForm.name" placeholder="App name" data-testid="new-app-name" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white">
+            <select x-model="newAppForm.visibility" data-testid="new-app-visibility" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2">
+              <option value="private">Private -- share it explicitly</option>
+              <option value="shared">Shared -- share it explicitly (same as private; grants decide who sees it)</option>
+              <option value="public">Public -- any signed-in user can open it</option>
+            </select>
+            <input type="file" accept=".zip" @change="newAppForm.file = $event.target.files[0]" data-testid="new-app-file" class="w-full text-slate-700 dark:text-slate-300 text-[11px]">
+          </div>
+          <div x-show="newAppForm.error" class="text-rose-600 dark:text-rose-400" x-text="newAppForm.error"></div>
+          <div class="flex justify-end space-x-2 pt-1">
+            <button @click="newAppForm.open = false" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg font-medium">Cancel</button>
+            <button @click="submitNewApp()" :disabled="newAppForm.busy" data-testid="new-app-submit" class="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg font-semibold">
+              <span x-text="newAppForm.busy ? 'Publishing...' : 'Publish'"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Manage App modal -->
+      <div x-show="appManage.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="appManage.open = false">
+        <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-md shadow-2xl p-5 space-y-3 text-xs" @click.outside="appManage.open = false">
+          <h3 class="text-sm font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-gear-six text-violet-600"></i><span>Manage</span><span class="font-mono font-normal text-slate-500" x-text="appManage.name"></span></h3>
+          <div class="space-y-2">
+            <input type="text" x-model="appManage.name" placeholder="App name" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white">
+            <select x-model="appManage.visibility" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2">
+              <option value="private">Private</option>
+              <option value="shared">Shared</option>
+              <option value="public">Public</option>
+            </select>
+            <button @click="saveAppMeta()" :disabled="appManage.busy" class="w-full px-3 py-1.5 bg-slate-100 dark:bg-dbx-hover hover:bg-slate-200 dark:hover:bg-dbx-border text-slate-700 dark:text-slate-200 rounded-lg font-semibold">Save name / visibility</button>
+          </div>
+          <div class="border-t border-slate-200 dark:border-dbx-border pt-2.5 space-y-2">
+            <label class="block text-slate-700 dark:text-slate-300 font-semibold uppercase text-[10px]">Redeploy (replaces every file)</label>
+            <input type="file" accept=".zip" @change="appManage.redeployFile = $event.target.files[0]" class="w-full text-slate-700 dark:text-slate-300 text-[11px]">
+            <button @click="redeployApp()" :disabled="appManage.busy || !appManage.redeployFile" data-testid="app-redeploy-submit" class="w-full px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg font-semibold">Redeploy</button>
+          </div>
+          <div x-show="appManage.error" class="text-rose-600 dark:text-rose-400" x-text="appManage.error"></div>
+          <div class="flex justify-between pt-1">
+            <button @click="deleteAppConfirm()" data-testid="app-delete-btn" class="px-3 py-1.5 bg-rose-50 dark:bg-rose-950 hover:bg-rose-100 dark:hover:bg-rose-900 text-rose-700 dark:text-rose-300 rounded-lg font-semibold">Delete</button>
+            <button @click="appManage.open = false" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg font-medium">Close</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- App viewer: the ONLY place an app's page is ever loaded. sandbox (no allow-same-origin) gives it an
+           opaque origin, so it cannot read this session's cookie or storage -- see web/apps.py's module docstring. -->
+      <div x-show="appViewer.open" x-cloak class="fixed inset-0 bg-slate-950/95 z-50 flex flex-col" data-testid="app-viewer">
+        <div class="h-12 border-b border-dbx-border bg-dbx-sidebar px-4 flex items-center justify-between shrink-0">
+          <div class="flex items-center space-x-2 text-white text-xs">
+            <i class="ph ph-browser text-violet-400"></i>
+            <span class="font-semibold" x-text="appViewer.name"></span>
+          </div>
+          <button @click="closeAppViewer()" data-testid="app-viewer-close" class="text-slate-400 hover:text-white text-sm px-2 py-1"><i class="ph ph-x"></i> Close</button>
+        </div>
+        <iframe x-show="appViewer.open" :src="appViewer.id ? '/apps/' + appViewer.id + '/' : 'about:blank'"
+                sandbox="allow-scripts allow-forms" referrerpolicy="no-referrer" class="flex-1 w-full border-0 bg-white"></iframe>
       </div>
 
       <!-- ================= 6. QUERY HISTORY & AUDIT LOG VIEW ================= -->
@@ -11534,7 +11652,7 @@
       <div class="flex items-start justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
         <div>
           <h3 class="text-sm font-bold text-slate-900 dark:text-white flex items-center space-x-2"><i class="ph ph-share-network text-dbx-orange"></i><span>Share</span><span class="font-mono font-normal text-slate-500" x-text="shareDlg.name"></span></h3>
-          <p class="text-[11px] text-slate-500 mt-0.5" x-text="(shareDlg.type === 'table' || shareDlg.type === 'schema') ? 'Select lets them read ' + (shareDlg.type === 'table' ? 'this table' : 'every table in this schema, including ones created later') + ', without access to the rest of the catalog. Modify also lets them write. Masking and row filters still apply to them.' : shareDlg.type === 'pipeline' ? 'Run lets someone trigger the pipeline; Manage also lets them change, reset and delete it. Administrators and power users already manage every pipeline.' : 'View lets someone see and run the query; Edit also lets them change it. Data access is unaffected: the query still runs with each person\'s own permissions.'"></p>
+          <p class="text-[11px] text-slate-500 mt-0.5" x-text="(shareDlg.type === 'table' || shareDlg.type === 'schema') ? 'Select lets them read ' + (shareDlg.type === 'table' ? 'this table' : 'every table in this schema, including ones created later') + ', without access to the rest of the catalog. Modify also lets them write. Masking and row filters still apply to them.' : shareDlg.type === 'pipeline' ? 'Run lets someone trigger the pipeline; Manage also lets them change, reset and delete it. Administrators and power users already manage every pipeline.' : shareDlg.type === 'app' ? 'View lets someone open the app; Manage also lets them redeploy, rename or delete it. Administrators and power users already manage every app.' : 'View lets someone see and run the query; Edit also lets them change it. Data access is unaffected: the query still runs with each person\'s own permissions.'"></p>
         </div>
         <button @click="shareDlg.open = false" class="text-slate-400 hover:text-white text-sm"><i class="ph ph-x"></i></button>
       </div>
@@ -18500,6 +18618,11 @@
         iamTab: 'users',
         tableGrants: [],
         shareDlg: { open: false, type: '', id: '', name: '', grants: [], permissions: [], perm: '', q: '', results: [], error: '' },
+        // Embedded HTML apps (web/apps.py)
+        apps: [],
+        newAppForm: { open: false, name: '', visibility: 'private', file: null, busy: false, error: '' },
+        appManage: { open: false, id: '', name: '', visibility: 'private', redeployFile: null, busy: false, error: '' },
+        appViewer: { open: false, id: '', name: '' },
         groupsList: [],
         groupSel: null,
         groupMembers: [],
@@ -20723,6 +20846,90 @@
           await this.searchSharePrincipals();
         },
 
+        // ---------------------------------------------------------------- Embedded HTML apps (web/apps.py)
+        async loadApps() {
+          const res = await fetch('/api/apps');
+          if (!res.ok) return;
+          const data = await res.json();
+          this.apps = data.apps || [];
+        },
+
+        openNewApp() {
+          this.newAppForm = { open: true, name: '', visibility: 'private', file: null, busy: false, error: '' };
+        },
+
+        async submitNewApp() {
+          const f = this.newAppForm;
+          if (!f.name.trim()) { f.error = 'Name it first.'; return; }
+          if (!f.file) { f.error = 'Choose a zip with an index.html at its root.'; return; }
+          f.busy = true; f.error = '';
+          try {
+            const body = new FormData();
+            body.append('name', f.name); body.append('visibility', f.visibility); body.append('file', f.file);
+            const res = await fetch('/api/apps', { method: 'POST', body });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { f.error = typeof data.detail === 'string' ? data.detail : 'Could not publish the app.'; return; }
+            f.open = false;
+            await this.loadApps();
+            this.showToast(`Published "${data.name}".`, 'success');
+          } finally {
+            f.busy = false;
+          }
+        },
+
+        openAppManage(a) {
+          this.appManage = { open: true, id: a.id, name: a.name, visibility: a.visibility, redeployFile: null, busy: false, error: '' };
+        },
+
+        async saveAppMeta() {
+          const m = this.appManage; m.busy = true; m.error = '';
+          try {
+            const res = await fetch(`/api/apps/${m.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: m.name, visibility: m.visibility }) });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { m.error = typeof data.detail === 'string' ? data.detail : 'Could not save.'; return; }
+            await this.loadApps();
+            this.showToast('Saved.', 'success');
+          } finally {
+            m.busy = false;
+          }
+        },
+
+        async redeployApp() {
+          const m = this.appManage;
+          if (!m.redeployFile) return;
+          m.busy = true; m.error = '';
+          try {
+            const body = new FormData();
+            body.append('file', m.redeployFile);
+            const res = await fetch(`/api/apps/${m.id}/files`, { method: 'PUT', body });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { m.error = typeof data.detail === 'string' ? data.detail : 'Could not redeploy.'; return; }
+            m.redeployFile = null;
+            await this.loadApps();
+            this.showToast('Redeployed.', 'success');
+          } finally {
+            m.busy = false;
+          }
+        },
+
+        async deleteAppConfirm() {
+          const m = this.appManage;
+          if (!confirm(`Delete "${m.name}"? This cannot be undone.`)) return;
+          const res = await fetch(`/api/apps/${m.id}`, { method: 'DELETE' });
+          if (!res.ok) { const data = await res.json().catch(() => ({})); m.error = data.detail || 'Could not delete.'; return; }
+          m.open = false;
+          await this.loadApps();
+          this.showToast('Deleted.', 'success');
+        },
+
+        openAppViewer(a) {
+          this.appViewer = { open: true, id: a.id, name: a.name };
+        },
+
+        closeAppViewer() {
+          this.appViewer = { open: false, id: '', name: '' };
+        },
+
         async loadShareGrants() {
           const d = this.shareDlg;
           const res = await fetch(`/api/grants/${d.type}/${encodeURIComponent(d.id)}`);
@@ -22120,6 +22327,16 @@
             history.replaceState({}, '', window.location.pathname);          // the token must not stay in the address bar, history or a Referer
             await this.startEnrollment(enrollToken);
           } else if (this.showLoginModal) this.$nextTick(() => this.startConditionalPasskey());
+          // The server bounces a top-level navigation to /apps/{id}/ back here (see web/apps.py: an app is only
+          // ever meant to load inside the sandboxed iframe below, never as its own tab/window).
+          const openAppId = new URLSearchParams(window.location.search).get('open_app');
+          if (openAppId && !this.showLoginModal) {
+            history.replaceState({}, '', window.location.pathname);
+            this.currentView = 'apps';
+            await this.loadApps();
+            const a = this.apps.find(x => x.id === openAppId);
+            if (a) this.openAppViewer(a);
+          }
           this.$watch('currentView', (val) => {
             if (val) localStorage.setItem('dbx_current_view', val);
             if (val === 'sql') {

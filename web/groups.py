@@ -38,6 +38,10 @@ RESOURCE_TYPES: Dict[str, tuple] = {
     # SELECT reads; MODIFY also writes. They only ever ADD to what catalog-level access already gives.
     "table": ("SELECT", "MODIFY"),
     "schema": ("SELECT", "MODIFY"),
+    # Embedded HTML apps (web/apps.py). VIEW loads the app (a public app skips the grant entirely); MANAGE
+    # redeploys/renames/deletes it -- a materially bigger trust level, since it ships code that runs in other
+    # users' browsers, which is why publishing one in the first place is admin/power_user only regardless of grants.
+    "app": ("VIEW", "MANAGE"),
 }
 _ID_PARTS = {"table": 3, "schema": 2}
 _ID_PART_RE = re.compile(r"^[a-z0-9_]{1,128}$")

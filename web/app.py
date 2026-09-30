@@ -210,6 +210,8 @@ app.include_router(delta_sharing_module.router)             # /delta-sharing/* :
 app.include_router(s3_events_module.router)               # POST /hooks/s3-events : bearer-token receiver for S3 bucket notifications (web/s3_events.py)
 from web import scim as scim_module
 app.include_router(scim_module.router)                    # /scim/v2/* : authenticated by SCIM bearer tokens only (web/scim.py)
+from web import apps as apps_module
+app.include_router(apps_module.router)                    # /apps/* + /api/apps* : embedded HTML apps, sandboxed-iframe only (web/apps.py)
 
 
 @app.middleware("http")
@@ -9272,6 +9274,10 @@ def _may_manage_grants(user: Dict[str, Any], resource_type: str, resource_id: st
         from web.autoloader import get_pipeline
         p = get_pipeline(resource_id)
         return bool(p) and _pipeline_access(user, p) == "manage"
+    if resource_type == "app":
+        from web import apps as apps_module
+        a = apps_module.get_app(resource_id)
+        return bool(a) and apps_module.app_access(user, a) == "manage"
     return False
 
 

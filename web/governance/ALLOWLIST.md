@@ -9,6 +9,13 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | Site | Status | Why it does not read governed data |
 | :--- | :--- | :--- |
 | alerts.py::* | sqlite | SQLite alert store; the alert query itself runs in `execute_alert_check`, which is governed as the alert's owner |
+| apps.py::_conn | sqlite | The `apps` metadata table (auth.db, SQLite): id/name/owner/visibility only, no warehouse data |
+| apps.py::create_app | sqlite | Writes the `apps` metadata row; the zip's files go straight to disk, never through DuckDB |
+| apps.py::get_app | sqlite | Reads the `apps` metadata row |
+| apps.py::list_apps | sqlite | Reads the `apps` metadata table |
+| apps.py::update_app_files | sqlite | Updates the `apps` metadata row's `updated_at`; the redeploy zip goes straight to disk |
+| apps.py::update_app_meta | sqlite | Updates the `apps` metadata row (name/visibility) |
+| apps.py::delete_app | sqlite | Deletes the `apps` metadata row; the actual data-reading site, `_run_app_query`, is governed (`gov_gateway.govern_sql`) and is not in this list |
 | autoloader.py::* | sqlite | SQLite checkpoint store |
 | permissions.py::* | sqlite | Catalog ACL store (auth.db, SQLite); the SQL fence itself only parses text with sqlglot and executes nothing |
 | app.py::search_principals_endpoint | sqlite | Looks up users in the SQLite account store for the share dialog |
