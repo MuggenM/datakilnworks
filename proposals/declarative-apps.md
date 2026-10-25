@@ -1,5 +1,7 @@
 # Proposal: declarative apps (no author code) built on the dashboard engine
 
+**Status: option A implemented** (`web/dashboard_apps.py`, see CLAUDE.md "Dashboard apps"). Phases 1-4 are done; the form-based designer is the edit dialogs on the dashboard itself (page tabs, parameters dialog, widget dialog, text blocks). Not done: a drag-and-drop layout editor, option B (a separate listing type), write-back.
+
 ## 1. Problem
 
 Embedded HTML apps (`web/apps.py`) run author-supplied JS. The sandboxed iframe and the token-only query endpoint contain

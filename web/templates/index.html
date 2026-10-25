@@ -5959,7 +5959,7 @@
               <span>Embed</span>
             </button>
 
-            <button @click="openAddWidgetModal()" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition">
+            <button x-show="canEditDash()" @click="openAddWidgetModal()" class="px-3 py-1.5 bg-dbx-orange hover:bg-dbx-orange/90 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition">
               <i class="ph ph-plus text-xs"></i>
               <span>Add Widget</span>
             </button>
@@ -5967,14 +5967,68 @@
               <i class="ph ph-plus-circle text-xs"></i>
               <span>New Dashboard</span>
             </button>
-            <button @click="deleteCurrentDashboard()" class="p-1.5 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded hover:bg-slate-100 dark:hover:bg-dbx-panel transition" title="Delete Dashboard">
+            <button x-show="canOwnDash()" @click="deleteCurrentDashboard()" class="p-1.5 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded hover:bg-slate-100 dark:hover:bg-dbx-panel transition" title="Delete Dashboard">
               <i class="ph ph-trash text-sm"></i>
             </button>
           </div>
         </div>
 
+        <!-- App bar: pages, editor tools -->
+        <div x-show="currentDashboard && ((currentDashboard.pages || []).length || canEditDash())" class="border-b border-slate-200 dark:border-dbx-border bg-slate-50 dark:bg-dbx-sidebar/60 px-6 py-1.5 flex flex-wrap items-center justify-between gap-2 shrink-0 text-xs" data-testid="app-bar">
+          <div class="flex items-center space-x-1">
+            <template x-for="pg in (currentDashboard?.pages || [])" :key="pg.id">
+              <button @click="selectDashPage(pg.id)" data-testid="page-tab"
+                      :class="currentDashPage === pg.id ? 'bg-violet-600 text-white' : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-dbx-hover'"
+                      class="px-3 py-1 rounded-md font-semibold transition" x-text="pg.title"></button>
+            </template>
+            <template x-if="canEditDash() && (currentDashboard?.pages || []).length">
+              <span class="flex items-center space-x-0.5 pl-1">
+                <button @click="addDashPage()" title="Add a page" data-testid="page-add" class="p-1 text-slate-500 hover:text-violet-600"><i class="ph ph-plus"></i></button>
+                <button @click="renameDashPage()" title="Rename this page" class="p-1 text-slate-500 hover:text-violet-600"><i class="ph ph-pencil-simple"></i></button>
+                <button @click="deleteDashPage()" title="Delete this page" class="p-1 text-slate-500 hover:text-rose-500"><i class="ph ph-trash"></i></button>
+              </span>
+            </template>
+          </div>
+          <div class="flex items-center space-x-1.5" x-show="canEditDash()">
+            <button x-show="!(currentDashboard?.pages || []).length" @click="makeDashboardApp()" data-testid="make-app" class="px-2.5 py-1 bg-violet-100 dark:bg-violet-950 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-800 rounded-md font-semibold"><i class="ph ph-browser"></i> Turn into an app (pages)</button>
+            <button @click="openTextDlg()" data-testid="add-text" class="px-2.5 py-1 bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-md text-slate-700 dark:text-slate-200 font-semibold"><i class="ph ph-text-aa"></i> Add text</button>
+            <button @click="openParamsDlg()" data-testid="edit-params" class="px-2.5 py-1 bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-md text-slate-700 dark:text-slate-200 font-semibold"><i class="ph ph-sliders-horizontal"></i> Parameters</button>
+          </div>
+        </div>
+
+        <!-- App parameters (typed, validated server-side) -->
+        <div x-show="currentDashboard && (currentDashboard.parameters || []).length" class="border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-slate-900/90 px-6 py-2 flex flex-wrap items-end gap-3 shrink-0 text-xs" data-testid="param-bar">
+          <template x-for="pr in (currentDashboard?.parameters || [])" :key="pr.id">
+            <label class="flex flex-col space-y-0.5">
+              <span class="text-[10px] font-semibold uppercase tracking-wide text-slate-500" x-text="pr.label || pr.id"></span>
+              <template x-if="pr.type === 'select'">
+                <select x-model="dashboardFilters[pr.id]" @change="applyDashboardFilters()" :data-param="pr.id" class="bg-slate-50 dark:bg-dbx-panel border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-slate-900 dark:text-white max-w-[16rem]">
+                  <template x-for="opt in ((currentDashboard.parameter_options || {})[pr.id] || [])" :key="opt"><option :value="opt" x-text="opt"></option></template>
+                </select>
+              </template>
+              <template x-if="pr.type === 'date'">
+                <input type="date" x-model="dashboardFilters[pr.id]" @change="applyDashboardFilters()" :data-param="pr.id" class="bg-slate-50 dark:bg-dbx-panel border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-slate-900 dark:text-white">
+              </template>
+              <template x-if="pr.type === 'number'">
+                <input type="number" step="any" x-model="dashboardFilters[pr.id]" @change="applyDashboardFilters()" :data-param="pr.id" class="w-28 bg-slate-50 dark:bg-dbx-panel border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-slate-900 dark:text-white">
+              </template>
+              <template x-if="pr.type === 'text'">
+                <input type="text" x-model="dashboardFilters[pr.id]" @change="applyDashboardFilters()" :data-param="pr.id" maxlength="500" class="w-40 bg-slate-50 dark:bg-dbx-panel border border-slate-300 dark:border-dbx-border rounded px-2 py-1 text-slate-900 dark:text-white">
+              </template>
+            </label>
+          </template>
+          <template x-if="activeCrossFilter">
+            <div class="flex items-center space-x-1.5 px-2.5 py-1 bg-violet-100 dark:bg-violet-950/90 border border-violet-300 dark:border-violet-700 rounded text-violet-900 dark:text-violet-300">
+              <i class="ph ph-cursor-click"></i>
+              <span>Clicked: <strong x-text="activeCrossFilter.dimension + ' = ' + activeCrossFilter.value"></strong></span>
+              <button @click="clearCrossFilter()" class="ml-1 hover:text-red-600" title="Clear"><i class="ph ph-x"></i></button>
+            </div>
+          </template>
+          <button @click="resetAppParameters()" data-testid="param-reset" class="px-2.5 py-1 text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white bg-slate-100 hover:bg-slate-200 dark:bg-dbx-panel dark:hover:bg-dbx-hover border border-slate-200 dark:border-dbx-border rounded"><i class="ph ph-arrow-counter-clockwise"></i> Reset</button>
+        </div>
+
         <!-- Dashboard Global Parameters & Cross-Filtering Toolbar -->
-        <div class="border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-slate-900/90 px-6 py-2 flex flex-wrap items-center justify-between gap-3 shrink-0 text-xs shadow-xs">
+        <div x-show="!(currentDashboard && (currentDashboard.parameters || []).length)" class="border-b border-slate-200 dark:border-dbx-border bg-white dark:bg-slate-900/90 px-6 py-2 flex flex-wrap items-center justify-between gap-3 shrink-0 text-xs shadow-xs">
           <div class="flex flex-wrap items-center gap-2.5">
             <div class="flex items-center space-x-1.5 text-slate-500 dark:text-slate-400 font-semibold">
               <i class="ph ph-funnel text-indigo-600 dark:text-indigo-400 text-sm"></i>
@@ -6038,7 +6092,7 @@
           </div>
 
           <!-- Empty State -->
-          <div x-show="!isLoadingDashboard && (!currentDashboard || !currentDashboard.widgets || currentDashboard.widgets.length === 0)" class="flex flex-col items-center justify-center py-20 space-y-4 border border-dashed border-dbx-border rounded-xl">
+          <div x-show="!isLoadingDashboard && visibleDashWidgets.length === 0" class="flex flex-col items-center justify-center py-20 space-y-4 border border-dashed border-dbx-border rounded-xl">
             <div class="h-12 w-12 rounded-full bg-indigo-950/60 border border-indigo-800 text-indigo-400 flex items-center justify-center">
               <i class="ph ph-chart-pie-slice text-2xl"></i>
             </div>
@@ -6053,8 +6107,8 @@
           </div>
 
           <!-- Widgets Grid -->
-          <div x-show="!isLoadingDashboard && currentDashboard && currentDashboard.widgets && currentDashboard.widgets.length > 0" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-            <template x-for="widget in (currentDashboard ? currentDashboard.widgets : [])" :key="widget.id">
+          <div x-show="!isLoadingDashboard && visibleDashWidgets.length > 0" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            <template x-for="widget in visibleDashWidgets" :key="widget.id">
               <div :class="[getWidgetColSpanClass(widget.width || (widget.type === 'kpi' ? 'col-span-1' : 'col-span-2')), getWidgetBorderClass(widget)]" class="bg-dbx-panel rounded-lg p-4 flex flex-col justify-between group shadow-sm transition">
                 <!-- Widget Header -->
                 <div class="flex items-start justify-between mb-2">
@@ -6063,12 +6117,12 @@
                     <div class="flex items-center space-x-2 mt-0.5">
                       <span class="text-[10px] text-slate-400 font-mono" x-show="widget.result && widget.result.elapsed_ms" x-text="widget.result.elapsed_ms + 'ms'"></span>
                       <span class="text-[9px] text-emerald-400 font-bold uppercase tracking-wide px-1.5 py-0.5 bg-emerald-500/10 rounded" x-show="widget.result && widget.result.from_cache" title="Result from cache">⚡ CACHED</span>
-                      <span class="text-[10px] text-slate-500 uppercase font-mono" x-text="widget.type"></span>
+                      <span class="text-[10px] text-slate-500 uppercase font-mono" x-show="widget.type !== 'text'" x-text="widget.type"></span>
                     </div>
                   </div>
                   <div class="flex items-center space-x-1 opacity-0 group-hover:opacity-100 transition">
                     <!-- Export Dropdown -->
-                    <div class="relative" x-data="{ exportOpen: false }">
+                    <div class="relative" x-data="{ exportOpen: false }" x-show="widget.type !== 'text'">
                       <button @click="exportOpen = !exportOpen" class="text-slate-500 hover:text-blue-400 p-1 rounded transition" title="Export Data">
                         <i class="ph ph-download text-xs"></i>
                       </button>
@@ -6090,7 +6144,7 @@
                           <i class="ph ph-brackets-curly text-xs"></i>
                           <span>JSON</span>
                         </button>
-                        <div x-show="!['kpi', 'big_number_trendline', 'table', 'pivot_table'].includes(widget.type)" class="border-t border-dbx-border/50 mt-1 pt-1">
+                        <div x-show="!['kpi', 'big_number_trendline', 'table', 'pivot_table', 'text'].includes(widget.type)" class="border-t border-dbx-border/50 mt-1 pt-1">
                           <div class="px-2 py-1 text-[10px] text-slate-500 uppercase font-semibold">Chart Image</div>
                           <button @click="exportChartPNG(widget.id); exportOpen = false" class="w-full text-left px-3 py-1.5 text-xs text-slate-300 hover:bg-dbx-hover transition flex items-center space-x-2">
                             <i class="ph ph-image text-xs"></i>
@@ -6099,11 +6153,17 @@
                         </div>
                       </div>
                     </div>
-                    <button @click="deleteWidget(widget.id)" class="text-slate-500 hover:text-red-400 p-1 rounded transition" title="Delete Widget">
+                    <button x-show="canEditDash()" @click="openEditWidget(widget)" class="text-slate-500 hover:text-violet-400 p-1 rounded transition" title="Edit Widget" data-testid="widget-edit">
+                      <i class="ph ph-pencil-simple text-xs"></i>
+                    </button>
+                    <button x-show="canEditDash()" @click="deleteWidget(widget.id)" class="text-slate-500 hover:text-red-400 p-1 rounded transition" title="Delete Widget">
                       <i class="ph ph-trash text-xs"></i>
                     </button>
                   </div>
                 </div>
+
+                <!-- Text block: escaped first, then a few safe markdown forms; never raw HTML -->
+                <div x-show="widget.type === 'text'" class="text-xs text-slate-300 leading-relaxed space-y-1.5 mt-1" x-html="renderTextBlock(widget.markdown)" data-testid="text-widget"></div>
 
                 <!-- Query Error Banner -->
                 <div x-show="widget.result && !widget.result.success" class="p-3 bg-red-950/40 border border-red-800/80 rounded text-[11px] text-red-300 font-mono break-all my-auto">
@@ -6125,7 +6185,7 @@
                       <span x-text="getThresholdLabel(widget)"></span>
                     </span>
                   </div>
-                  <div class="text-[11px] text-slate-400 mt-1 truncate" :title="widget.query" x-text="widget.query"></div>
+                  <div x-show="!(currentDashboard && (currentDashboard.pages || []).length)" class="text-[11px] text-slate-400 mt-1 truncate" :title="widget.query" x-text="widget.query"></div>
                 </div>
 
                 <!-- Big Number with Trendline Widget -->
@@ -6143,7 +6203,7 @@
                 </div>
 
                 <!-- Chart Widget (Area, Bar, Boxplot, Bubble, Funnel, Gantt, Gauge, Graph, Heatmap, Line, Mixed, Pie, Radar, Scatter, Sunburst, Tree, Treemap, Waterfall, World Map) -->
-                <div x-show="!['kpi', 'big_number_trendline', 'table', 'pivot_table'].includes(widget.type) && widget.result && widget.result.success" class="relative w-full h-56 mt-2">
+                <div x-show="!['kpi', 'big_number_trendline', 'table', 'pivot_table', 'text'].includes(widget.type) && widget.result && widget.result.success" class="relative w-full h-56 mt-2">
                   <div :id="'chart-' + widget.id" class="w-full h-full"></div>
                 </div>
 
@@ -6214,18 +6274,71 @@
           <div class="flex items-center space-x-2">
             <i class="ph ph-browser text-lg text-violet-600 dark:text-violet-400"></i>
             <h2 class="text-sm font-bold text-slate-900 dark:text-white">Apps</h2>
-            <span class="text-[10px] text-slate-500">Static HTML/JS, served read-only in a sandboxed frame</span>
+            <span class="text-[10px] text-slate-500">Dashboards with pages and parameters, plus uploaded HTML apps</span>
           </div>
+          <div class="flex items-center space-x-2">
+          <button @click="openClone('blank')" data-testid="new-dash-app-btn"
+                  class="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
+            <i class="ph ph-plus"></i><span>New app</span>
+          </button>
           <button x-show="['admin', 'power_user'].includes(currentUser?.role)" @click="openNewApp()" data-testid="new-app-btn"
                   class="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
-            <i class="ph ph-plus"></i><span>New App</span>
+            <i class="ph ph-upload-simple"></i><span>Upload HTML app</span>
           </button>
+          </div>
         </div>
         <div class="flex-1 overflow-y-auto p-6">
-          <div x-show="!apps.length" class="text-center text-slate-500 text-sm py-16">
+          <!-- Dashboard apps: dashboards with pages. No author code; the dashboard renderer draws them. -->
+          <div x-show="dashApps.length" class="mb-8" data-testid="dash-apps">
+            <h3 class="text-[11px] font-bold uppercase tracking-wide text-slate-500 mb-3">Your apps</h3>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              <template x-for="a in dashApps" :key="a.id">
+                <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl p-4 space-y-2.5" data-testid="dash-app-card">
+                  <div class="min-w-0">
+                    <div class="font-semibold text-slate-900 dark:text-white text-sm truncate" x-text="a.name"></div>
+                    <div class="text-[10px] text-slate-500 truncate">owner: <span x-text="a.created_by"></span></div>
+                  </div>
+                  <div class="text-[11px] text-slate-600 dark:text-slate-400 line-clamp-2 min-h-[2rem]" x-text="a.description"></div>
+                  <div class="text-[10px] text-slate-500 font-mono" x-text="a.page_count + ' pages · ' + a.widget_count + ' widgets · ' + a.parameter_count + ' parameters'"></div>
+                  <div class="flex items-center space-x-1.5 pt-1">
+                    <button @click="openDashboardApp(a.id)" data-testid="dash-app-open" class="flex-1 px-2.5 py-1.5 bg-slate-100 dark:bg-dbx-hover hover:bg-slate-200 dark:hover:bg-dbx-border text-slate-700 dark:text-slate-200 rounded-lg text-[11px] font-semibold flex items-center justify-center space-x-1">
+                      <i class="ph ph-arrow-square-out"></i><span>Open</span>
+                    </button>
+                    <button @click="openClone('app', a)" title="Make a copy" class="p-1.5 bg-slate-100 dark:bg-dbx-hover hover:bg-slate-200 dark:hover:bg-dbx-border text-slate-600 dark:text-slate-300 rounded-lg">
+                      <i class="ph ph-copy"></i>
+                    </button>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- Samples: a clone is an ordinary app of your own, to edit freely. -->
+          <div x-show="dashSamples.length" class="mb-8" data-testid="dash-samples">
+            <h3 class="text-[11px] font-bold uppercase tracking-wide text-slate-500 mb-3">Start from a sample</h3>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              <template x-for="sm in dashSamples" :key="sm.id">
+                <div class="bg-violet-50/60 dark:bg-violet-950/20 border border-violet-200 dark:border-violet-900/60 rounded-xl p-4 space-y-2" data-testid="dash-sample-card">
+                  <div class="font-semibold text-slate-900 dark:text-white text-sm" x-text="sm.title"></div>
+                  <div class="text-[11px] text-slate-600 dark:text-slate-400 min-h-[3rem]" x-text="sm.description"></div>
+                  <div class="flex flex-wrap gap-1">
+                    <template x-for="pg in sm.pages" :key="pg"><span class="text-[9px] px-1.5 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-dbx-border text-slate-600 dark:text-slate-300 font-mono" x-text="pg"></span></template>
+                    <template x-for="t in sm.tags" :key="t"><span class="text-[9px] px-1.5 py-0.5 rounded bg-violet-100 dark:bg-violet-950 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-800" x-text="t"></span></template>
+                  </div>
+                  <button @click="openClone('sample', sm)" data-testid="dash-sample-use" class="w-full px-2.5 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg text-[11px] font-semibold flex items-center justify-center space-x-1">
+                    <i class="ph ph-copy"></i><span>Use this sample</span>
+                  </button>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <h3 x-show="apps.length" class="text-[11px] font-bold uppercase tracking-wide text-slate-500 mb-3">HTML apps</h3>
+          <div x-show="!apps.length && !dashApps.length" class="text-center text-slate-500 text-sm py-16">
             <i class="ph ph-browser text-4xl block mb-2 opacity-50"></i>
             No apps yet.
-            <span x-show="['admin', 'power_user'].includes(currentUser?.role)">Publish a folder of HTML/CSS/JS as a zip to get started.</span>
+            <span>Start from a sample above, or create one with <em>New app</em>.</span>
+            <span x-show="['admin', 'power_user'].includes(currentUser?.role)">You can also publish a folder of HTML/CSS/JS as a zip.</span>
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             <template x-for="a in apps" :key="a.id">
@@ -6303,6 +6416,109 @@
           <div class="flex justify-between pt-1">
             <button @click="deleteAppConfirm()" data-testid="app-delete-btn" class="px-3 py-1.5 bg-rose-50 dark:bg-rose-950 hover:bg-rose-100 dark:hover:bg-rose-900 text-rose-700 dark:text-rose-300 rounded-lg font-semibold">Delete</button>
             <button @click="appManage.open = false" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg font-medium">Close</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Clone a sample / copy an app / start a blank app -->
+      <div x-show="cloneDlg.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="cloneDlg.open = false">
+        <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-md shadow-2xl p-5 space-y-3 text-xs" @click.outside="cloneDlg.open = false" data-testid="clone-dlg">
+          <h3 class="text-sm font-bold text-slate-900 dark:text-white" x-text="cloneDlg.kind === 'blank' ? 'New app' : (cloneDlg.kind === 'sample' ? 'Use sample: ' + cloneDlg.title : 'Copy ' + cloneDlg.title)"></h3>
+          <p class="text-[11px] text-slate-500" x-show="cloneDlg.kind !== 'blank'">You get your own copy to edit freely. Samples use generated data, so they work on any warehouse; point the queries at your tables when you are ready.</p>
+          <p class="text-[11px] text-slate-500" x-show="cloneDlg.kind === 'blank'">An app is a dashboard with pages and parameters. Add widgets and text on its pages once it opens.</p>
+          <input type="text" x-model="cloneDlg.name" @keydown.enter="submitAppClone()" placeholder="Name" data-testid="clone-name" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white">
+          <div x-show="cloneDlg.error" class="text-rose-600 dark:text-rose-400" x-text="cloneDlg.error"></div>
+          <div class="flex justify-end space-x-2 pt-1">
+            <button @click="cloneDlg.open = false" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg font-medium">Cancel</button>
+            <button @click="submitAppClone()" :disabled="cloneDlg.busy || !cloneDlg.name.trim()" data-testid="clone-submit" class="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg font-semibold" x-text="cloneDlg.busy ? 'Creating...' : 'Create'"></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Edit a widget / add a text block to the current page -->
+      <div x-show="wDlg.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="wDlg.open = false">
+        <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-xl max-h-[90vh] overflow-y-auto shadow-2xl p-5 space-y-3 text-xs" @click.outside="wDlg.open = false" data-testid="widget-edit-dlg">
+          <h3 class="text-sm font-bold text-slate-900 dark:text-white" x-text="wDlg.mode === 'text' ? 'Add text' : 'Edit widget'"></h3>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="col-span-2 space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Title</span>
+              <input type="text" x-model="wDlg.form.title" data-testid="wedit-title" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white"></label>
+            <label class="space-y-1" x-show="(currentDashboard?.pages || []).length"><span class="font-semibold text-slate-600 dark:text-slate-300">Page</span>
+              <select x-model="wDlg.form.page" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2 py-2 text-slate-900 dark:text-white">
+                <template x-for="pg in (currentDashboard?.pages || [])" :key="pg.id"><option :value="pg.id" x-text="pg.title"></option></template>
+              </select></label>
+            <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Width</span>
+              <select x-model="wDlg.form.width" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2 py-2 text-slate-900 dark:text-white">
+                <option value="col-span-1">Quarter</option><option value="col-span-2">Half</option><option value="col-span-3">Three quarters</option><option value="col-span-4">Full</option>
+              </select></label>
+            <template x-if="wDlg.form.type === 'text'">
+              <label class="col-span-2 space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Text <span class="font-normal text-slate-500">(**bold**, `code`, # heading, - list, [link](https://...))</span></span>
+                <textarea x-model="wDlg.form.markdown" rows="6" data-testid="wedit-markdown" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white font-mono"></textarea></label>
+            </template>
+            <template x-if="wDlg.form.type !== 'text'">
+              <div class="col-span-2 grid grid-cols-2 gap-2">
+                <label class="col-span-2 space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Query <span class="font-normal text-slate-500">(one SELECT; use <code>:name</code> for a parameter)</span></span>
+                  <textarea x-model="wDlg.form.query" rows="7" data-testid="wedit-query" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white font-mono"></textarea></label>
+                <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">X column</span>
+                  <input type="text" x-model="wDlg.form.x_col" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white"></label>
+                <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Y column</span>
+                  <input type="text" x-model="wDlg.form.y_col" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white"></label>
+                <label class="space-y-1" x-show="(currentDashboard?.parameters || []).length"><span class="font-semibold text-slate-600 dark:text-slate-300">Clicking a bar / slice sets</span>
+                  <select x-model="wDlg.form.filter_dimension" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2 py-2 text-slate-900 dark:text-white">
+                    <option value="">(nothing)</option>
+                    <template x-for="pr in (currentDashboard?.parameters || [])" :key="pr.id"><option :value="pr.id" x-text="pr.label || pr.id"></option></template>
+                  </select></label>
+                <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Unit</span>
+                  <input type="text" x-model="wDlg.form.unit" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-3 py-2 text-slate-900 dark:text-white"></label>
+              </div>
+            </template>
+          </div>
+          <div x-show="wDlg.error" class="text-rose-600 dark:text-rose-400 whitespace-pre-wrap" x-text="wDlg.error" data-testid="wedit-error"></div>
+          <div class="flex justify-end space-x-2 pt-1">
+            <button @click="wDlg.open = false" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg font-medium">Cancel</button>
+            <button @click="submitWidgetDlg()" :disabled="wDlg.busy" data-testid="wedit-save" class="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg font-semibold" x-text="wDlg.busy ? 'Saving...' : 'Save'"></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Parameters of the current app -->
+      <div x-show="pDlg.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="pDlg.open = false">
+        <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-2xl p-5 space-y-3 text-xs" @click.outside="pDlg.open = false" data-testid="params-dlg">
+          <h3 class="text-sm font-bold text-slate-900 dark:text-white">Parameters</h3>
+          <p class="text-[11px] text-slate-500">Viewers pick these above the page. Queries use them as <code>:id</code>, e.g. <code>WHERE region = :region OR :region IS NULL</code>. A value is checked against its type before it reaches SQL; an empty value or <em>ALL</em> is NULL. A table-name choice also offers <code>:id_text</code> (the same name as a string).</p>
+          <template x-for="(it, i) in pDlg.items" :key="i">
+            <div class="border border-slate-200 dark:border-dbx-border rounded-lg p-3 grid grid-cols-6 gap-2" data-testid="param-row">
+              <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Id</span>
+                <input type="text" x-model="it.id" placeholder="region" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></label>
+              <label class="col-span-2 space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Label</span>
+                <input type="text" x-model="it.label" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"></label>
+              <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Type</span>
+                <select x-model="it.type" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-1 py-1.5 text-slate-900 dark:text-white">
+                  <option value="text">Text</option><option value="number">Number</option><option value="date">Date</option><option value="select">Choice</option>
+                </select></label>
+              <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Default</span>
+                <input type="text" x-model="it.default" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 text-slate-900 dark:text-white"></label>
+              <div class="flex items-end justify-between pb-1">
+                <label class="flex items-center space-x-1"><input type="checkbox" x-model="it.required"><span>Required</span></label>
+                <button @click="pDlg.items.splice(i, 1)" class="text-slate-400 hover:text-rose-500" title="Remove"><i class="ph ph-trash"></i></button>
+              </div>
+              <template x-if="it.type === 'select'">
+                <div class="col-span-6 grid grid-cols-2 gap-2">
+                  <label class="space-y-1"><span class="font-semibold text-slate-600 dark:text-slate-300">Choices (one per line)</span>
+                    <textarea x-model="it.optionsText" rows="3" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></textarea></label>
+                  <div class="space-y-1">
+                    <label class="space-y-1 block"><span class="font-semibold text-slate-600 dark:text-slate-300">...or a query returning the choices</span>
+                      <textarea x-model="it.options_query" rows="2" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded px-2 py-1.5 font-mono text-slate-900 dark:text-white"></textarea></label>
+                    <label class="flex items-center space-x-1"><input type="checkbox" x-model="it.as_identifier"><span>The choice is a table name (<code>catalog.schema.table</code>), used as <code>FROM :id</code></span></label>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+          <button @click="pDlg.items.push({id: '', label: '', type: 'text', default: '', required: false, optionsText: '', options_query: '', as_identifier: false})" data-testid="param-add" class="px-3 py-1.5 bg-slate-100 dark:bg-dbx-hover hover:bg-slate-200 dark:hover:bg-dbx-border text-slate-700 dark:text-slate-200 rounded-lg font-semibold"><i class="ph ph-plus"></i> Add parameter</button>
+          <div x-show="pDlg.error" class="text-rose-600 dark:text-rose-400 whitespace-pre-wrap" x-text="pDlg.error" data-testid="params-error"></div>
+          <div class="flex justify-end space-x-2 pt-1">
+            <button @click="pDlg.open = false" class="px-3 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg font-medium">Cancel</button>
+            <button @click="saveParamsDlg()" :disabled="pDlg.busy" data-testid="params-save" class="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg font-semibold" x-text="pDlg.busy ? 'Saving...' : 'Save'"></button>
           </div>
         </div>
       </div>
@@ -18623,6 +18839,14 @@
         newAppForm: { open: false, name: '', visibility: 'private', file: null, busy: false, error: '' },
         appManage: { open: false, id: '', name: '', visibility: 'private', redeployFile: null, busy: false, error: '' },
         appViewer: { open: false, id: '', name: '' },
+        // Dashboard apps (web/dashboard_apps.py): dashboards with pages and typed parameters
+        dashApps: [],
+        dashSamples: [],
+        currentDashPage: '',
+        _paramDashId: null,
+        cloneDlg: { open: false, kind: 'blank', id: '', title: '', name: '', busy: false, error: '' },
+        wDlg: { open: false, mode: 'edit', id: '', form: {}, busy: false, error: '' },
+        pDlg: { open: false, items: [], busy: false, error: '' },
         groupsList: [],
         groupSel: null,
         groupMembers: [],
@@ -20849,9 +21073,241 @@
         // ---------------------------------------------------------------- Embedded HTML apps (web/apps.py)
         async loadApps() {
           const res = await fetch('/api/apps');
-          if (!res.ok) return;
-          const data = await res.json();
-          this.apps = data.apps || [];
+          if (res.ok) {
+            const data = await res.json();
+            this.apps = data.apps || [];
+          }
+          this.loadDashApps();
+        },
+
+        // ---------------------------------------------------------------- Dashboard apps (web/dashboard_apps.py)
+        get visibleDashWidgets() {
+          const d = this.currentDashboard;
+          if (!d || !d.widgets) return [];
+          if (!d.pages || !d.pages.length) return d.widgets;
+          const first = d.pages[0].id;
+          return d.widgets.filter(w => (w.page || first) === this.currentDashPage);
+        },
+
+        canEditDash() { return !!this.currentDashboard && ['editor', 'owner'].includes(this.currentDashboard.my_access); },
+        canOwnDash() { return !!this.currentDashboard && this.currentDashboard.my_access === 'owner'; },
+
+        async loadDashApps() {
+          try {
+            const [a, s] = await Promise.all([fetch('/api/dashboard-apps'), fetch('/api/dashboard-apps/samples')]);
+            if (a.ok) this.dashApps = (await a.json()).apps || [];
+            if (s.ok) this.dashSamples = (await s.json()).samples || [];
+          } catch (e) { console.warn('Failed to load dashboard apps:', e); }
+        },
+
+        async openDashboardApp(id) {
+          this.currentView = 'dashboards';
+          this.selectedDashboardId = id;
+          this.currentDashPage = '';
+          await this.loadDashboards();
+          // the <select> of dashboards was bound before its options existed: set the value again once they are rendered
+          this.selectedDashboardId = '';
+          this.$nextTick(() => { this.selectedDashboardId = id; });
+          if (this.currentDashboard) this.recordRecent('dashboard', id, this.currentDashboard.name, `${this.currentDashboard.widgets?.length || 0} widgets`, { id });
+        },
+
+        openClone(kind, item) {
+          this.cloneDlg = { open: true, kind, id: item ? item.id : '', title: item ? (item.title || item.name) : '',
+                            name: kind === 'blank' ? '' : (kind === 'app' ? item.name + ' (copy)' : item.title), busy: false, error: '' };
+        },
+
+        async submitAppClone() {
+          const c = this.cloneDlg;
+          if (!c.name.trim() || c.busy) return;
+          c.busy = true; c.error = '';
+          try {
+            const url = c.kind === 'sample' ? `/api/dashboard-apps/samples/${c.id}/clone` : (c.kind === 'app' ? `/api/dashboard-apps/${c.id}/clone` : '/api/dashboard-apps');
+            const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: c.name.trim() }) });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { c.error = typeof data.detail === 'string' ? data.detail : 'Could not create the app.'; return; }
+            c.open = false;
+            await this.loadDashApps();
+            await this.openDashboardApp(data.id);
+            this.showToast(`Created "${data.name}".`, 'success');
+          } finally {
+            c.busy = false;
+          }
+        },
+
+        // Called by fetchDashboard once the dashboard is in place: pages, parameter defaults.
+        afterDashboardLoaded(keptParams) {
+          const d = this.currentDashboard;
+          if (!d) return;
+          if (d.pages && d.pages.length) {
+            if (!d.pages.some(p => p.id === this.currentDashPage)) this.currentDashPage = d.pages[0].id;
+          } else {
+            this.currentDashPage = '';
+          }
+          if (d.parameters && d.parameters.length) {
+            if (!keptParams) this.initAppParameters(d);
+            this._paramDashId = d.id;
+          } else if (this._paramDashId) {
+            // back on a classic dashboard: restore its own filter state
+            this.dashboardFilters = { department: 'ALL', sector: 'ALL', category: 'ALL', start_date: '', end_date: '' };
+            this.activeCrossFilter = null;
+            this._paramDashId = null;
+          }
+        },
+
+        initAppParameters(d) {
+          const f = {};
+          (d.parameters || []).forEach(p => {
+            let v = p.default;
+            const opts = (d.parameter_options || {})[p.id] || [];
+            if (v === null || v === undefined || v === '') v = p.type === 'select' ? (p.required ? (opts[0] || '') : 'ALL') : '';
+            f[p.id] = v;
+          });
+          this.dashboardFilters = f;
+          this.activeCrossFilter = null;
+        },
+
+        async resetAppParameters() {
+          if (!this.currentDashboard) return;
+          this.initAppParameters(this.currentDashboard);
+          await this.applyDashboardFilters();
+        },
+
+        selectDashPage(id) {
+          this.currentDashPage = id;
+          this.$nextTick(() => this.renderAllCharts());
+        },
+
+        async saveDashSpec(body) {
+          const res = await fetch(`/api/dashboards/${this.currentDashboard.id}/spec`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { return typeof data.detail === 'string' ? data.detail : 'Could not save.'; }
+          return '';
+        },
+
+        async makeDashboardApp() {
+          const err = await this.saveDashSpec({ pages: [{ id: 'page1', title: 'Page 1' }] });
+          if (err) { alert(err); return; }
+          await this.fetchDashboard(this.currentDashboard.id);
+          this.loadDashApps();
+        },
+
+        async addDashPage() {
+          const title = (prompt('Page title') || '').trim();
+          if (!title) return;
+          const pages = [...(this.currentDashboard.pages || [])];
+          let base = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'page';
+          if (!/^[a-z]/.test(base)) base = 'p-' + base;
+          let id = base, n = 2;
+          while (pages.some(p => p.id === id)) id = `${base}-${n++}`;
+          pages.push({ id, title });
+          const err = await this.saveDashSpec({ pages });
+          if (err) { alert(err); return; }
+          this.currentDashPage = id;
+          await this.fetchDashboard(this.currentDashboard.id);
+        },
+
+        async renameDashPage() {
+          const pages = (this.currentDashboard.pages || []).map(p => ({ ...p }));
+          const pg = pages.find(p => p.id === this.currentDashPage);
+          if (!pg) return;
+          const title = (prompt('Page title', pg.title) || '').trim();
+          if (!title) return;
+          pg.title = title;
+          const err = await this.saveDashSpec({ pages });
+          if (err) { alert(err); return; }
+          await this.fetchDashboard(this.currentDashboard.id);
+        },
+
+        async deleteDashPage() {
+          const pages = (this.currentDashboard.pages || []).filter(p => p.id !== this.currentDashPage);
+          if (!confirm('Delete this page? Its widgets move to the first remaining page.')) return;
+          const err = await this.saveDashSpec({ pages });
+          if (err) { alert(err); return; }
+          this.currentDashPage = '';
+          await this.fetchDashboard(this.currentDashboard.id);
+        },
+
+        openTextDlg() {
+          this.wDlg = { open: true, mode: 'text', id: '', busy: false, error: '',
+                        form: { type: 'text', title: '', markdown: '', width: 'col-span-4', page: this.currentDashPage || '' } };
+        },
+
+        openEditWidget(w) {
+          this.wDlg = { open: true, mode: 'edit', id: w.id, busy: false, error: '',
+                        form: { type: w.type, title: w.title || '', markdown: w.markdown || '', width: w.width || 'col-span-2', page: w.page || this.currentDashPage || '',
+                                query: w.query || '', x_col: w.x_col || '', y_col: w.y_col || '', z_col: w.z_col || '', unit: w.unit || '', filter_dimension: w.filter_dimension || '' } };
+        },
+
+        async submitWidgetDlg() {
+          const d = this.wDlg;
+          if (d.busy) return;
+          d.busy = true; d.error = '';
+          try {
+            const f = { ...d.form };
+            if (!f.page) delete f.page;
+            const isNew = d.mode === 'text';
+            const url = `/api/dashboards/${this.currentDashboard.id}/widgets` + (isNew ? '' : `/${d.id}`);
+            const res = await fetch(url, { method: isNew ? 'POST' : 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(isNew ? { ...f, query: '' } : f) });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { d.error = typeof data.detail === 'string' ? data.detail : 'Could not save the widget.'; return; }
+            d.open = false;
+            await this.fetchDashboard(this.currentDashboard.id);
+          } finally {
+            d.busy = false;
+          }
+        },
+
+        openParamsDlg() {
+          const items = (this.currentDashboard.parameters || []).map(p => ({
+            id: p.id, label: p.label || '', type: p.type, default: p.default === null || p.default === undefined ? '' : String(p.default),
+            required: !!p.required, optionsText: (p.options || []).join('\n'), options_query: p.options_query || '', as_identifier: !!p.as_identifier }));
+          this.pDlg = { open: true, items, busy: false, error: '' };
+        },
+
+        async saveParamsDlg() {
+          const d = this.pDlg;
+          if (d.busy) return;
+          d.busy = true; d.error = '';
+          try {
+            const parameters = d.items.map(it => {
+              const p = { id: it.id.trim(), label: it.label.trim() || it.id.trim(), type: it.type, required: !!it.required, default: it.default === '' ? null : it.default };
+              if (it.type === 'select') {
+                const opts = it.optionsText.split('\n').map(x => x.trim()).filter(Boolean);
+                if (opts.length) p.options = opts;
+                if (it.options_query.trim()) p.options_query = it.options_query.trim();
+                p.as_identifier = !!it.as_identifier;
+              }
+              return p;
+            });
+            const err = await this.saveDashSpec({ parameters });
+            if (err) { d.error = err; return; }
+            d.open = false;
+            this._paramDashId = null;   // re-read defaults for the new definition
+            await this.fetchDashboard(this.currentDashboard.id);
+          } finally {
+            d.busy = false;
+          }
+        },
+
+        // Escape everything first, then allow a few markdown forms. The result is built only from escaped text and fixed tags.
+        renderTextBlock(md) {
+          const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+          const inline = (t) => esc(t)
+            .replace(/\*\*([^*]+)\*\*/g, '<strong class="text-white">$1</strong>')
+            .replace(/`([^`]+)`/g, '<code class="px-1 rounded bg-slate-800 text-indigo-300 font-mono">$1</code>')
+            .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" class="text-indigo-400 underline">$1</a>');
+          const out = [];
+          let list = false;
+          String(md || '').split('\n').forEach(line => {
+            const li = line.match(/^\s*[-*]\s+(.*)$/);
+            if (li) { if (!list) { out.push('<ul class="list-disc pl-5 space-y-0.5">'); list = true; } out.push('<li>' + inline(li[1]) + '</li>'); return; }
+            if (list) { out.push('</ul>'); list = false; }
+            const h = line.match(/^(#{1,3})\s+(.*)$/);
+            if (h) out.push('<div class="font-bold text-white ' + (h[1].length === 1 ? 'text-base' : 'text-sm') + '">' + inline(h[2]) + '</div>');
+            else if (line.trim()) out.push('<p>' + inline(line) + '</p>');
+          });
+          if (list) out.push('</ul>');
+          return out.join('');
         },
 
         openNewApp() {
@@ -25322,9 +25778,11 @@
           this.chartInstances = {};
 
           try {
-            const res = await fetch(`/api/dashboards/${id}`);
+            const keepParams = this._paramDashId === id && Object.keys(this.dashboardFilters).length > 0;
+            const res = await fetch(`/api/dashboards/${id}` + (keepParams ? `?params=${encodeURIComponent(JSON.stringify(this.dashboardFilters))}` : ''));
             if (res.ok) {
               this.currentDashboard = await res.json();
+              this.afterDashboardLoaded(keepParams);
               if (this.currentDashboard && this.currentDashboard.filter_options) {
                 this.dashboardFilterOptions = this.currentDashboard.filter_options;
               }
@@ -25758,7 +26216,7 @@
         renderAllCharts() {
           if (!this.currentDashboard || !this.currentDashboard.widgets) return;
           this.currentDashboard.widgets.forEach(w => {
-            if (!['kpi', 'table', 'pivot_table'].includes(w.type)) {
+            if (!['kpi', 'table', 'pivot_table', 'text'].includes(w.type)) {
               this.renderChart(w);
             }
           });
@@ -26187,6 +26645,7 @@
 
               echartsInstance.setOption(option, true);
               echartsInstance.on('click', (params) => {
+                if (this.currentDashboard?.parameters?.length && !widget.filter_dimension) return;
                 if (params && params.name) {
                   // Check if drill-down is enabled
                   if (widget.drill_down && widget.drill_down.enabled) {
@@ -26231,6 +26690,7 @@
                 responsive: true,
                 maintainAspectRatio: false,
                 onClick: (evt, elements) => {
+                  if (this.currentDashboard?.parameters?.length && !widget.filter_dimension) return;
                   if (elements && elements.length > 0) {
                     const elIndex = elements[0].index;
                     const clickedLabel = labels[elIndex];
@@ -26552,7 +27012,7 @@
             const res = await fetch(`/api/dashboards/${this.selectedDashboardId}/widgets`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(this.widgetForm)
+              body: JSON.stringify(this.currentDashPage ? { ...this.widgetForm, page: this.currentDashPage } : this.widgetForm)
             });
             if (res.ok) {
               this.showAddWidgetModal = false;
@@ -26580,7 +27040,35 @@
           }
         },
 
+        // Server-side export: the query is re-run as the viewer (masking, row filters and catalog access apply) with the page's
+        // current parameter values, so the file is the full result, not just what the widget shows. Needs only view access.
         async exportWidget(widgetId, format) {
+          if (!this.currentDashboard) return;
+          try {
+            const params = encodeURIComponent(JSON.stringify(this.dashboardFilters || {}));
+            const res = await fetch(`/api/dashboards/${this.currentDashboard.id}/widgets/${widgetId}/export?format=${encodeURIComponent(format)}&params=${params}`);
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              alert('Export failed: ' + (typeof err.detail === 'string' ? err.detail : res.statusText));
+              return;
+            }
+            const blob = await res.blob();
+            const url = window.URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            const cd = res.headers.get('Content-Disposition') || '';
+            const m = cd.match(/filename="?([^";]+)"?/);
+            link.download = m ? m[1] : `${widgetId}.${format === 'excel' ? 'xlsx' : format}`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            window.URL.revokeObjectURL(url);
+          } catch (e) {
+            alert('Export failed: ' + e.message);
+          }
+        },
+
+        async exportWidgetClientSide(widgetId, format) {
           try {
             // Find the widget
             const widget = this.currentDashboard.widgets.find(w => w.id === widgetId);

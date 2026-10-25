@@ -282,6 +282,13 @@ docker compose up -d
 * **Active Filter Pills & Reset**: Visual badge displaying active cross-filtered dimensions with 1-click dismissal (`×`) and a global **Reset Filters** action.
 * **Safe Parameter Substitution**: Backend SQL parameter compiler supports `:param` and `{{param}}` syntax with parameterized sanitization and null-safe execution (`(:param IS NULL OR col = :param)`).
 
+### 17b. 🧩 Apps (dashboards with pages, typed parameters and text) 
+* **An app is a dashboard with pages.** Parameters (text, number, date, choice, or a table picker filled from the catalogue), several pages, KPI/chart/table widgets, markdown text blocks. **No author code runs anywhere**: an app is data (a JSON spec), drawn by the same fixed dashboard renderer, so there is nothing to inject. Text is escaped before the few allowed markdown forms (bold, code, headings, lists, https links) are applied.
+* **Apps catalogue** (sidebar > Apps): your apps, three clonable **samples** (Sales explorer, Customer segments, Table explorer; they use generated data, so they work on any warehouse) and, for admins/power users, uploaded static HTML apps (sandboxed iframe, see `web/apps.py`).
+* **Typed binding, not string pasting.** A declared parameter is validated for its type (number parsed, date parsed, choice checked against its list, text length-capped) and rendered as a literal; the placeholder scanner skips string literals, quoted identifiers, comments and `::` casts. A table-picker value must be one of the offered names. Saving an app checks that every query is one read-only `SELECT` and that every `:name` is declared.
+* **Runs as the viewer.** Masking, row filters and catalog/table access apply to whoever is looking (not the author); the dashboard list, read, query, export and edit endpoints now enforce dashboard permissions (viewer / editor / owner), which they did not before. Click a bar or slice to set a parameter; export any widget (CSV, Excel, Parquet, JSON) with the page's current values.
+* Design notes: `proposals/declarative-apps.md`. Write-back (forms inserting rows) is deliberately not part of this; apps are read-only.
+
 ### 18. 🧠 Monaco Context-Aware Autocomplete (Unity Catalog Parity)
 * **Live Catalog Metadata Ingestion**: Dynamically indexes all catalogs, schemas, tables, and column schemas with data types (`BIGINT`, `VARCHAR`, `TIMESTAMP`, etc.) from DuckDB and Unity Catalog via fast in-memory caching.
 * **Clause-Aware Completion**:

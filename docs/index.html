@@ -758,6 +758,21 @@ SELECT name, region FROM warehouse.hr.employees;
           <li><strong>PNG / SVG:</strong> High-resolution vector/raster graphic rendering of the chart.</li>
         </ul>
 
+        <h4 id="dashboard-apps">Apps: pages, parameters and text</h4>
+        <p>
+          <strong>Apps</strong> (sidebar) are dashboards with pages. Start from one of the three <em>samples</em> (a copy is yours to edit), or choose
+          <em>New app</em>. On an app you can add <strong>pages</strong> (tabs above the widgets), <strong>parameters</strong> (text, number, date, choice or a table
+          picker; viewers set them above the page), <strong>text</strong> blocks and widgets. Use a parameter in a widget query as <code>:name</code>, for example
+          <code>WHERE region = :region OR :region IS NULL</code>; an empty value or <em>ALL</em> is <code>NULL</code>. A table picker is used as
+          <code>FROM :tbl</code> (and <code>:tbl_text</code> is the same name as a string). Choose <em>Clicking a bar / slice sets</em> in a widget's edit dialog to
+          filter the whole app by clicking a chart.
+        </p>
+        <ul>
+          <li>An app contains no code. Values are checked against their type before they reach SQL, and text blocks are escaped.</li>
+          <li>Every query runs with the <strong>viewer's</strong> permissions, so masks, row filters and catalog access apply to them, not the author.</li>
+          <li>Viewers can export each widget (CSV, Excel, Parquet, JSON) with the current parameter values. Only editors see the editing tools.</li>
+        </ul>
+
         <h4 id="iframe-embedding">Responsive Iframe Embedding</h4>
         <p>
           Any dashboard can be shared or embedded inside third-party portals. The <strong>Embed Modal</strong> generates a responsive snippet:

@@ -169,6 +169,9 @@ def test_dashboards(client):
     print("\n2. Dashboards and the result cache")
     r = client.post("/api/dashboards", json={"name": "HR"}, cookies=ADMIN)
     dash = r.json()["id"]
+    # a new dashboard is private to its owner (dashboard permissions are enforced on read/query/export): share it with the masked user
+    from web.dashboard_permissions import grant_permission
+    grant_permission(dash, user="analyst_bob", level="viewer", granted_by="admin")
     widget_q = "SELECT email, ssn, dept FROM warehouse.hr.employees ORDER BY id"
     r = client.post(f"/api/dashboards/{dash}/widgets", json={"title": "People", "type": "table", "query": widget_q}, cookies=ADMIN)
     check("widget created (its preview ran as the admin)", r.status_code == 200, r.text[:200])

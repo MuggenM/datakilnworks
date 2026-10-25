@@ -212,6 +212,8 @@ from web import scim as scim_module
 app.include_router(scim_module.router)                    # /scim/v2/* : authenticated by SCIM bearer tokens only (web/scim.py)
 from web import apps as apps_module
 app.include_router(apps_module.router)                    # /apps/* + /api/apps* : embedded HTML apps, sandboxed-iframe only (web/apps.py)
+from web import dashboard_apps as dashboard_apps_module
+app.include_router(dashboard_apps_module.router)          # /api/dashboard-apps* + dashboard spec/widget edit : dashboards with pages and typed parameters (web/dashboard_apps.py)
 
 
 @app.middleware("http")
@@ -4675,8 +4677,10 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
 # Dashboards logic and store managed via web.dashboards
 
 @app.get("/api/dashboards")
-async def list_dashboards():
-    dashboards = load_dashboards_store()
+async def list_dashboards(request: Request):
+    from web import dashboard_apps as da
+    user = await resolve_principal(request)
+    dashboards = [d for d in load_dashboards_store() if da.level_for(d["id"], user) in ("viewer", "editor", "owner")]
     return {
         "dashboards": [
             {
@@ -4684,7 +4688,8 @@ async def list_dashboards():
                 "name": d["name"],
                 "description": d.get("description", ""),
                 "created_at": d.get("created_at", ""),
-                "widget_count": len(d.get("widgets", []))
+                "widget_count": len(d.get("widgets", [])),
+                "is_app": bool(d.get("pages")),
             }
             for d in dashboards
         ]
@@ -4692,6 +4697,7 @@ async def list_dashboards():
 
 @app.get("/api/dashboards/{dashboard_id}")
 async def get_dashboard(dashboard_id: str, request: Request, params: Optional[str] = None):
+    from web import dashboard_apps as da
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -4708,14 +4714,11 @@ async def get_dashboard(dashboard_id: str, request: Request, params: Optional[st
             pass
 
     current_user = await resolve_principal(request)
+    my_access = da.require_level(target["id"], current_user, "viewer")
     conn = get_duckrun_conn()
     filter_data = get_dashboard_filter_options(conn, target["id"], principal=current_user)
-    hydrated_widgets = []
-    for w in target.get("widgets", []):
-        w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], parsed_params, principal=current_user)
-        w_copy["result"] = exec_res
-        hydrated_widgets.append(w_copy)
+    declared = target.get("parameters") or []
+    hydrated_widgets = da.hydrate_dashboard(conn, target, parsed_params, current_user)
 
     return {
         "id": target["id"],
@@ -4724,6 +4727,10 @@ async def get_dashboard(dashboard_id: str, request: Request, params: Optional[st
         "created_at": target.get("created_at", ""),
         "filters": filter_data.get("filters", []),
         "filter_options": filter_data.get("options", {}),
+        "parameters": declared,
+        "parameter_options": da.parameter_options(conn, declared, current_user) if declared else {},
+        "pages": target.get("pages", []),
+        "my_access": my_access,
         "widgets": hydrated_widgets
     }
 
@@ -4732,19 +4739,16 @@ class DashboardQueryParams(BaseModel):
 
 @app.post("/api/dashboards/{dashboard_id}/query")
 async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams, request: Request):
+    from web import dashboard_apps as da
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Dashboard not found")
 
     current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "viewer")
     conn = get_duckrun_conn()
-    hydrated_widgets = []
-    for w in target.get("widgets", []):
-        w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], payload.parameters or {}, principal=current_user)
-        w_copy["result"] = exec_res
-        hydrated_widgets.append(w_copy)
+    hydrated_widgets = da.hydrate_dashboard(conn, target, payload.parameters or {}, current_user)
 
     return {
         "id": target["id"],
@@ -4753,7 +4757,9 @@ async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams, requ
 
 @app.get("/api/dashboards/{dashboard_id}/filters")
 async def get_dashboard_filters(dashboard_id: str, request: Request):
+    from web import dashboard_apps as da
     current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "viewer")
     conn = get_duckrun_conn()
     return get_dashboard_filter_options(conn, dashboard_id, principal=current_user)
 
@@ -4811,13 +4817,19 @@ class WidgetPayload(BaseModel):
     query_source: Optional[str] = "custom"
     saved_query_id: Optional[str] = None
     history_query_id: Optional[str] = None
+    page: Optional[str] = None               # page id, for a dashboard with pages (an app)
+    markdown: Optional[str] = None           # body of a `text` widget
+    filter_dimension: Optional[str] = None   # clicking a chart sets this parameter / filter
 
 @app.post("/api/dashboards/{dashboard_id}/widgets")
 async def add_widget(dashboard_id: str, payload: WidgetPayload, request: Request):
+    from web import dashboard_apps as da
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Dashboard not found")
+    current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "editor")
 
     widget_id = f"w_{uuid.uuid4().hex[:8]}"
     default_w = "col-span-1" if payload.type in ["kpi", "big_number_trendline"] else ("col-span-4" if payload.type in ["table", "pivot_table", "world_map"] else "col-span-2")
@@ -4835,20 +4847,37 @@ async def add_widget(dashboard_id: str, payload: WidgetPayload, request: Request
         "saved_query_id": payload.saved_query_id,
         "history_query_id": payload.history_query_id
     }
+    if payload.page:
+        new_widget["page"] = payload.page
+    if payload.markdown is not None:
+        new_widget["markdown"] = payload.markdown
+    if payload.filter_dimension:
+        new_widget["filter_dimension"] = payload.filter_dimension
+    if target.get("pages") or target.get("parameters") or payload.type == "text":
+        # An app's widgets are validated like a saved spec (page exists, parameters declared, one read-only query).
+        if target.get("pages") and not new_widget.get("page"):
+            new_widget["page"] = target["pages"][0]["id"]
+        try:
+            new_widget = da.clean_widget(new_widget, target.get("parameters", []), {p["id"] for p in target.get("pages", [])})
+        except da.SpecError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if len(target.get("widgets", [])) >= da.MAX_WIDGETS:
+            raise HTTPException(status_code=400, detail=f"An app can have at most {da.MAX_WIDGETS} widgets.")
 
     if "widgets" not in target:
         target["widgets"] = []
     target["widgets"].append(new_widget)
     save_dashboards_store(dashboards)
 
-    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     new_widget_copy = dict(new_widget)
-    new_widget_copy["result"] = execute_widget_query(conn, new_widget["query"], principal=current_user)
+    new_widget_copy["result"] = da.hydrate_widget(conn, new_widget, None, current_user, target.get("parameters") or None)
     return new_widget_copy
 
 @app.delete("/api/dashboards/{dashboard_id}/widgets/{widget_id}")
-async def delete_widget(dashboard_id: str, widget_id: str):
+async def delete_widget(dashboard_id: str, widget_id: str, request: Request):
+    from web import dashboard_apps as da
+    da.require_level(dashboard_id, await resolve_principal(request), "editor")
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -4868,11 +4897,14 @@ async def export_widget(dashboard_id: str, widget_id: str, request: Request, for
     """
     from fastapi.responses import StreamingResponse
     import io
+    from web import dashboard_apps as da
 
     dashboards = load_dashboards_store()
     target_dashboard = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target_dashboard:
         raise HTTPException(status_code=404, detail="Dashboard not found")
+    current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "viewer")
 
     target_widget = next((w for w in target_dashboard.get("widgets", []) if w["id"] == widget_id), None)
     if not target_widget:
@@ -4886,11 +4918,9 @@ async def export_widget(dashboard_id: str, widget_id: str, request: Request, for
         except:
             filter_params = {}
 
-    # Execute the query
-    current_user = await resolve_principal(request)
+    # Execute the query as the viewer, with the same typed binding the page used
     conn = get_duckrun_conn()
-    query = target_widget.get("query", "")
-    result = execute_widget_query(conn, query, filter_params, principal=current_user)
+    result = da.hydrate_widget(conn, target_widget, filter_params, current_user, target_dashboard.get("parameters") or None)
 
     if not result.get("success"):
         raise HTTPException(status_code=500, detail=f"Query failed: {result.get('error')}")
@@ -4927,8 +4957,27 @@ async def export_widget(dashboard_id: str, widget_id: str, request: Request, for
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
 
+    elif format.lower() == "json":
+        filename = f"{widget_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        return StreamingResponse(
+            io.BytesIO(df.to_json(orient="records", date_format="iso").encode("utf-8")),
+            media_type="application/json",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    elif format.lower() in ("xlsx", "excel"):
+        output = io.BytesIO()
+        df.to_excel(output, index=False)
+        output.seek(0)
+        filename = f"{widget_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported format: {format}. Use 'csv' or 'parquet'")
+        raise HTTPException(status_code=400, detail=f"Unsupported format: {format}. Use csv, parquet, json or xlsx")
 
 @app.post("/api/dashboards/cache/clear")
 async def clear_dashboard_cache(current_user: dict = Depends(get_current_user)):
