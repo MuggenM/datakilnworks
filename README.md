@@ -311,6 +311,8 @@ docker compose up -d
   - **PostgreSQL**: Vectorized federation via DuckDB's native `postgres` extension (`ATTACH 'dbname=... host=... user=...' AS pg_local (TYPE postgres)`). Allows instant zero-copy queries against live relational tables and pgvector stores.
   - **S3 / MinIO / Garage S3**: Direct object storage queries via DuckDB's native `httpfs` extension and S3 secrets configuration (`CREATE SECRET (TYPE s3, KEY_ID '...', SECRET '...', ENDPOINT '...', URL_STYLE 'path')`). Exposes remote Parquet/Delta buckets as first-class schemas.
   - **SQLite**: Local relational database attachment (`ATTACH '/path/to/db.sqlite' AS sqlite_db (TYPE sqlite)`).
+  - **Microsoft Fabric OneLake**: a Lakehouse mounted read-only as a catalog through a service principal (`web/onelake.py`); its managed tables under `Tables/<table>` become the catalog's tables. For testing against an emulator, `POST /api/catalogs/onelake/mount` also accepts an optional `authority` (a non-Microsoft sign-in authority) and `ca_cert_pem` (trusted container-wide while mounted); neither is needed for a real tenant. Verified end to end against [fabric-emulator](https://github.com/calvinchengx/fabric-emulator).
+  - **Azure Blob Storage / Google Cloud Storage**: mounts used as Auto-Loader sources (`azure://`, `gcs://`), not yet queryable as catalogs.
 * **Unity Catalog 3-Level Namespace Integration**: Mounted external databases automatically populate the Unity Catalog hierarchy (`pg_local.public.demo_data`, `garage_s3.localspark.demo_metrics.parquet`) alongside local Delta Lakehouses, complete with catalog type badges (`POSTGRES`, `GARAGE S3`, `SQLITE`).
 * **Interactive Mount Manager**:
   - Dedicated **Mount** modal in the Unity Catalog toolbar with multi-database tab configuration.
