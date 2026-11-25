@@ -176,6 +176,10 @@
   {
    "name": "kernel_isolation",
    "extras": ""
+  },
+  {
+   "name": "csrf",
+   "extras": ""
   }
  ],
  "ui": [

@@ -330,6 +330,66 @@ async def _network_policy_gate(request: Request, call_next):
     return await call_next(request)
 
 
+_CSRF_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_CSRF_EXEMPT = {"/api/auth/saml/acs"}      # the IdP's own cross-site POST (it carries no session cookie anyway: SameSite=Lax)
+
+
+def _csrf_trusted_hosts() -> set:
+    out = set()
+    for o in (os.getenv("CSRF_TRUSTED_ORIGINS", "") or "").split(","):
+        o = o.strip().lower()
+        if o:
+            from urllib.parse import urlparse
+            out.add(urlparse(o).netloc if "://" in o else o)
+    return out
+
+
+def csrf_verdict(method: str, path: str, headers: Dict[str, str], has_session_cookie: bool) -> Optional[str]:
+    """None = allowed, else the reason a state-changing request is refused as cross-site. Applies only to requests that carry the
+    session cookie (bearer-token clients -- SCIM, Delta Sharing, S3 hooks, apps, the sandbox -- cannot be forged by a browser).
+    Order: Fetch Metadata (`Sec-Fetch-Site`, every current browser), then `Origin`, then `Referer`; a request with none of them is
+    not from a current browser and is let through (SameSite=Lax already keeps the cookie off cross-site POSTs). The expected host
+    is the request's own Host header (a proxy that keeps Host -- Traefik does by default -- needs nothing), plus
+    CSRF_TRUSTED_ORIGINS."""
+    if method.upper() not in _CSRF_METHODS or not has_session_cookie or path in _CSRF_EXEMPT:
+        return None
+    if os.getenv("CSRF_CHECK", "on").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    h = {k.lower(): v for k, v in headers.items()}
+    site = h.get("sec-fetch-site", "").strip().lower()
+    if site in ("same-origin", "none"):
+        return None
+    host = h.get("host", "").strip().lower()
+    allowed = {host} | _csrf_trusted_hosts()
+    from urllib.parse import urlparse
+    origin = h.get("origin", "").strip()
+    if origin:
+        if origin.lower() == "null":
+            return "Origin: null"
+        if urlparse(origin.lower()).netloc in allowed:
+            return None
+        return f"Origin {origin[:100]}"
+    referer = h.get("referer", "").strip()
+    if referer:
+        if urlparse(referer.lower()).netloc in allowed:
+            return None
+        return "Referer from another site"
+    if site in ("same-site", "cross-site"):
+        return f"Sec-Fetch-Site: {site}"
+    return None
+
+
+@app.middleware("http")
+async def _csrf_origin_gate(request: Request, call_next):
+    """Refuses cross-site state-changing requests made with the session cookie (CSRF), beyond what SameSite=Lax already blocks:
+    a sibling subdomain counts as same-site for Lax, but not as same-origin here. See csrf_verdict."""
+    why = csrf_verdict(request.method, request.url.path, dict(request.headers), COOKIE_NAME in request.cookies)
+    if why:
+        logger.warning(f"CSRF: refused {request.method} {request.url.path} ({why})")
+        return JSONResponse(status_code=403, content={"detail": "Cross-site request refused. Reload the page and try again.", "csrf": True})
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _ip_allowlist_gate(request: Request, call_next):
     """
