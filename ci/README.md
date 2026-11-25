@@ -8,6 +8,7 @@
 | **test_\*** (one job each) | A self-contained test script in the **freshly built image** (`scratch/test_<name>.py`), in a throwaway container with a throwaway warehouse | `docker build -t localspark-lakehouse-notebook . && ci/run_test.sh <name>` (add `CI_MOUNT_SOURCES=1` to use your working tree instead of the image's copy) |
 | **browser \<name\>** | A Playwright script that starts its own throwaway studio (and MinIO / Traefik where needed) and drives the UI with Chromium | `pip install playwright && playwright install chromium && python scratch/verify_<name>.py` |
 | **kind** | The Helm chart on a real Kubernetes cluster, see below | `ci/kind-smoke.sh` |
+| **Supply chain** (own workflow, `supply-chain.yml`; also weekly with a cache-less rebuild) | Known vulnerabilities in the built image: Python packages with pip-audit, OS and other packages with Trivy (HIGH/CRITICAL that have a fix). Fails on anything not listed, with a reason, in `ci/pip-audit-ignore.txt` / `ci/trivyignore`. Dependabot (`.github/dependabot.yml`) proposes the updates weekly | `ci/pip_audit.sh`, `ci/trivy_scan.sh` (env `IMAGE`, `DOCKER_NETWORK`, `DOCKER_SOCKET_PATH` for rootless Docker) |
 
 The lists live in `ci/plan.json` (`tests` with optional extra pip packages, `ui`). Add a test there and it runs in its own job. A test script must exit
 non-zero on failure and must not need anything outside the container: tests that need real services (Gitea, Redpanda, a real S3 server, Azurite, lldap,

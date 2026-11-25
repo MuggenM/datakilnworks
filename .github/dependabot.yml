@@ -1,0 +1,23 @@
+# Weekly update pull requests for the Python dependencies, the GitHub Actions used by CI and the Docker base image.
+# The supply-chain workflow (.github/workflows/supply-chain.yml) is what fails on a known vulnerability; this keeps the fixes coming.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    target-branch: development
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: development
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/"
+    target-branch: development
+    schedule:
+      interval: weekly

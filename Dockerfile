@@ -5,8 +5,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /workspace
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies. `upgrade` pulls the security fixes Debian published since the base image was built (CI scans the
+# image with Trivy, see .github/workflows/supply-chain.yml).
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     git \
@@ -14,7 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements and install packages
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+# pip / setuptools / wheel come from the base image and are otherwise never upgraded (pip-audit flags them).
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm -rf /usr/local/lib/python3.11/site-packages/ray/jars
+# ray/jars is Ray's Java worker support (jackson, guava, httpcore with known CVEs); this image has no JVM and never uses it.
 
 # Directory layout for lakehouse warehouse, notebooks, web app, and ipython startup hooks
 RUN mkdir -p /workspace/warehouse /workspace/notebooks /workspace/web /root/.ipython/profile_default/startup

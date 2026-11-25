@@ -1,0 +1,5 @@
+# Vulnerabilities Trivy may report without failing CI (ci/trivy_scan.sh). One id per line, then '#' and WHY it is accepted and
+# when to look again. Only fixed HIGH/CRITICAL findings are reported at all (--ignore-unfixed).
+# setuptools 70.3.0 is only pip's vendor.txt entry: pip vendors pkg_resources from it, not package_index.py, where this path
+# traversal lives (easy_install-style downloads). The installed setuptools is current. Drop when pip vendors a newer one.
+CVE-2025-47273

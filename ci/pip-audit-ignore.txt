@@ -1,0 +1,2 @@
+# Vulnerabilities pip-audit may report without failing CI (ci/pip_audit.sh). One id per line, then '#' and WHY it is accepted
+# (not reachable here, no fix yet, ...) and when to look again. Keep this short: the fix is normally a dependency update.
