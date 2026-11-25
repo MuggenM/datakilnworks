@@ -22,6 +22,7 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | autoloader_s3.py::configure_duckdb | system | Only installs httpfs and an S3 secret on the ingestion's private in-memory connection; runs no data query |
 | autoloader_azure.py::configure_duckdb | system | Only installs the azure extension and a connection-string secret on the ingestion's private in-memory connection; runs no data query |
 | autoloader_gcs.py::configure_duckdb | system | Only installs httpfs and a bucket-scoped gcs secret on the ingestion's private in-memory connection; runs no data query |
+| kernel_isolation.py::sync_duckdb_extensions | system | Only runs `INSTALL <extension>` on a private in-memory connection so isolated notebook kernels find the extensions; runs no data query |
 | autoloader.py::_open_source_reader | system | Reads volume files it was told to ingest; writes tables, never reads tagged tables |
 | experiments.py::* | sqlite | MLflow tracking store |
 | lineage.py::* | sqlite | Lineage graph store (`parse_sql_lineage` only renders SQL text with sqlglot) |

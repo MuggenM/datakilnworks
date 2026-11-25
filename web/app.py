@@ -1,4 +1,5 @@
 import os
+import secrets
 import re
 import time
 import math
@@ -23,7 +24,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from web.auth import (
-    get_current_user, resolve_principal, require_role, create_access_token, verify_password,
+    get_current_user, resolve_principal, require_role, create_access_token, verify_password, hash_password,
     get_user_by_username, get_user_by_id, list_users, create_user, update_user, reset_user_password,
     delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db, decode_access_token
 )
@@ -137,6 +138,8 @@ async def readyz():
 @app.on_event("startup")
 async def startup_event():
     _log_security_posture()
+    from web import kernel_isolation
+    kernel_isolation.prepare_studio()
     from web.governance.store import init_governance_db
     init_governance_db()
     asyncio.create_task(_governance_reconcile_loop())
@@ -352,7 +355,28 @@ async def _ip_allowlist_gate(request: Request, call_next):
     return HTMLResponse(status_code=403, content=f"<!doctype html><title>Access denied</title><body style='font-family:sans-serif;margin:3rem'><h2>Access denied</h2><p>This Data Kiln Works Studio only accepts connections from approved networks. Your address is <code>{client['text'] or 'unknown'}</code>.</p><p>Ask an administrator to add it.</p></body>")
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+}
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Baseline browser hardening on every response, including the gates' own refusals (defined after the IP allowlist gate so it
+    wraps it). `setdefault`: a route that sets its own (web/apps.py: CSP, frame-ancestors) keeps it. HSTS only over https. No CSP
+    here yet: the Alpine page evaluates inline expressions, so a useful policy needs Alpine's CSP build first."""
+    resp = await call_next(request)
+    for k, v in _SECURITY_HEADERS.items():
+        resp.headers.setdefault(k, v)
+    if _request_is_https(request):
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return resp
+
+
+BASE_DIR =os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 UPLOADS_DIR = "/tmp/uploads"
@@ -579,18 +603,44 @@ class CatalogPermissionRequest(BaseModel):
     permission: str = "READ"  # READ, WRITE, ADMIN
 
 
+# A hash nothing can match, checked whenever no real one is: an unknown username then costs as much time as a wrong password, so
+# response times do not tell which usernames exist.
+_DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(24))
+
+
+def _client_text(request: Request) -> str:
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.resolve_client(request.client.host if request.client else None, dict(request.headers))["text"] or "?"
+    except Exception:
+        return request.client.host if request.client else "?"
+
+
+def _login_failed(username: str, ip: str):
+    from web import login_throttle
+    login_throttle.record_failure(username, ip)
+    return HTTPException(status_code=401, detail="Invalid username or password")
+
+
 @app.post("/api/auth/login")
-async def login_endpoint(payload: LoginRequest):
+async def login_endpoint(payload: LoginRequest, request: Request):
+    from web import login_throttle
+    ip = _client_text(request)
+    wait = login_throttle.retry_after(payload.username, ip)
+    if wait:
+        raise HTTPException(status_code=429, detail=f"Too many failed sign-in attempts. Try again in {wait} seconds.",
+                            headers={"Retry-After": str(wait)})
     u = get_user_by_username(payload.username, include_password_hash=True)
     source = (u.get("auth_source") or "local") if u else None
     if u and u.get("passwordless"):
-        raise HTTPException(status_code=401, detail="Invalid username or password")        # a passkey-only account has no password to try (same answer as a wrong one)
+        verify_password(payload.password, _DUMMY_PASSWORD_HASH)
+        raise _login_failed(payload.username, ip)          # a passkey-only account has no password to try (same answer as a wrong one)
     if u and source != "ldap":
         # Every account except an LDAP-provisioned one authenticates against its own stored hash (unchanged from
         # before LDAP support existed). LDAP accounts never have a usable hash by design (see
         # auth.upsert_external_user), so they always fall to the branch below instead.
         if not verify_password(payload.password, u["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+            raise _login_failed(payload.username, ip)
     else:
         # No local account at all, or one already provisioned from LDAP: the only way in is a fresh directory
         # bind-as-user, so credential changes and account locks in LDAP take effect immediately rather than being
@@ -600,8 +650,10 @@ async def login_endpoint(payload: LoginRequest):
         ldap_user, reason = await asyncio.to_thread(ldap_auth.authenticate, payload.username, payload.password)
         if ldap_user is None:
             logger.info(f"LDAP login failed for '{payload.username}': {reason}")
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+            verify_password(payload.password, _DUMMY_PASSWORD_HASH)
+            raise _login_failed(payload.username, ip)
         u = ldap_user
+    login_throttle.record_success(payload.username, ip)
     if u.get("is_active", 1) != 1:
         raise HTTPException(status_code=403, detail="Account is deactivated. Contact an administrator.")
 
@@ -611,7 +663,7 @@ async def login_endpoint(payload: LoginRequest):
         # Password was right, but a second factor is required: no session yet, only a short-lived token that is
         # good for nothing except the second-factor endpoints (/api/auth/login/mfa and /api/auth/login/webauthn*).
         return JSONResponse(content={"success": False, "mfa_required": True, "mfa_token": mfa.create_mfa_token(u), "mfa_methods": methods})
-    return _session_response(u)
+    return _session_response(u, request)
 
 
 def _mfa_policy_view(u: Dict[str, Any]) -> Dict[str, Any]:
@@ -624,7 +676,35 @@ def _mfa_policy_view(u: Dict[str, Any]) -> Dict[str, Any]:
         return {"required": False, "state": "off", "deadline": None, "days_left": None, "enrolled": bool(u.get("mfa_enabled"))}
 
 
-def _session_response(u: Dict[str, Any]) -> JSONResponse:
+def _request_is_https(request: Optional[Request]) -> bool:
+    """https as the browser sees it: the socket itself, or X-Forwarded-Proto from a trusted proxy (the studio runs with
+    --no-proxy-headers, so uvicorn never rewrites the scheme by itself)."""
+    if request is None:
+        return False
+    if request.url.scheme == "https":
+        return True
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if proto != "https":
+        return False
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.is_trusted_proxy(request.client.host if request.client else None)
+    except Exception:
+        return False
+
+
+def _cookie_secure(request: Optional[Request], hint: bool = False) -> bool:
+    """`Secure` for the session cookie. COOKIE_SECURE=true|false overrides; `auto` (default) = https detected (or `hint`, the SSO
+    paths' own https base URL). Behind a proxy that is not in TRUSTED_PROXIES set COOKIE_SECURE=true."""
+    env = os.getenv("COOKIE_SECURE", "auto").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    return hint or _request_is_https(request)
+
+
+def _session_response(u: Dict[str, Any], request: Optional[Request] = None) -> JSONResponse:
     """Records the login and returns the session (cookie + user), shared by every password-based sign-in path."""
     record_user_login(u["id"])
     token = create_access_token(u)
@@ -643,14 +723,15 @@ def _session_response(u: Dict[str, Any]) -> JSONResponse:
         "mfa_enabled": bool(u.get("mfa_enabled")),
         "mfa_policy": _mfa_policy_view(u)
     }
-    resp = JSONResponse(content={"success": True, "token": token, "user": safe_user})
+    # The session token travels only in the HttpOnly cookie, never in the body: script on the page (an XSS) cannot read it.
+    resp = JSONResponse(content={"success": True, "user": safe_user})
     resp.set_cookie(
         key=COOKIE_NAME,
         value=token,
         max_age=86400,
         httponly=True,
         samesite="lax",
-        secure=False
+        secure=_cookie_secure(request)
     )
     return resp
 
@@ -666,7 +747,7 @@ class MfaCodeRequest(BaseModel):
 
 
 @app.post("/api/auth/login/mfa")
-async def login_mfa_endpoint(payload: MfaLoginRequest):
+async def login_mfa_endpoint(payload: MfaLoginRequest, request: Request):
     """Second step of a two-step sign-in: the mfa_token from /api/auth/login plus a TOTP or backup code."""
     from web import mfa
     u = mfa.user_from_mfa_token(payload.mfa_token)
@@ -675,7 +756,7 @@ async def login_mfa_endpoint(payload: MfaLoginRequest):
     ok, reason = mfa.verify_login(u["id"], payload.code)
     if not ok:
         raise HTTPException(status_code=401 if "not valid" in reason else 429, detail=reason)
-    return _session_response(u)
+    return _session_response(u, request)
 
 
 # ---------------------------------------------------------------- WebAuthn: passkeys and security keys (web/webauthn_auth.py)
@@ -990,7 +1071,7 @@ async def enroll_verify(payload: EnrollVerifyPayload, request: Request):
     except webauthn_auth.WebAuthnError as exc:
         raise _webauthn_error(exc)
     mfa_policy._audit(u["username"], "PASSKEY_ENROLL_USED", f"user:{u['username']}", {})
-    return _session_response(get_user_by_id(u["id"]))
+    return _session_response(get_user_by_id(u["id"]), request)
 
 
 @app.post("/api/auth/login/webauthn/options")
@@ -1018,7 +1099,7 @@ async def login_webauthn(payload: WebauthnLoginPayload, request: Request):
         await asyncio.to_thread(webauthn_auth.finish_authentication, payload.challenge_id, payload.credential, dict(request.headers), u["id"])
     except webauthn_auth.WebAuthnError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
-    return _session_response(u)
+    return _session_response(u, request)
 
 
 @app.post("/api/auth/passkey/options")
@@ -1042,7 +1123,7 @@ async def passkey_login(payload: PasskeyLoginPayload, request: Request):
     u = get_user_by_id(uid)
     if not u or u.get("is_active", 1) != 1 or u.get("deleted_at") or (u.get("auth_source") or "local") not in ("local", "ldap"):
         raise HTTPException(status_code=401, detail="This passkey cannot be used to sign in.")
-    return _session_response(u)
+    return _session_response(u, request)
 
 
 @app.get("/api/auth/mfa/status")
@@ -1532,7 +1613,7 @@ async def oidc_callback(request: Request, code: str = "", state: str = "", error
     record_user_login(u["id"])
     resp = RedirectResponse(url="/", status_code=302)
     resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u), max_age=86400, httponly=True, samesite="lax",
-                    secure=redirect_uri.startswith("https://"))
+                    secure=_cookie_secure(request, redirect_uri.startswith("https://")))
     resp.delete_cookie(oidc_auth.STATE_COOKIE, path="/api/auth/oidc")
     return resp
 
@@ -1578,7 +1659,7 @@ async def saml_acs(request: Request):
     # session the IdP itself issued.
     extra = {"saml_name_id": saml_session.get("name_id", ""), "saml_session_index": saml_session.get("session_index", ""),
              "saml_name_id_format": saml_session.get("name_id_format", "")} if saml_session.get("name_id") else None
-    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, extra_claims=extra), max_age=86400, httponly=True, samesite="lax", secure=base.startswith("https://"))
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, extra_claims=extra), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request, base.startswith("https://")))
     resp.delete_cookie(saml_auth.STATE_COOKIE, path="/api/auth/saml")
     return resp
 
@@ -1680,7 +1761,7 @@ async def change_password_endpoint(payload: PasswordChangeRequest, request: Requ
         raise HTTPException(status_code=400, detail=str(exc))
     fresh = get_user_by_username(user["username"])
     resp = JSONResponse(content={"success": True, "message": "Password changed. Other sessions were signed out."})
-    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh), max_age=86400, httponly=True, samesite="lax", secure=False)
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request))
     return resp
 
 

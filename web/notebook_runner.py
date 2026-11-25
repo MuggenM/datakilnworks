@@ -277,6 +277,33 @@ class RemoteKernelSession:
         return result
 
 
+class LocalKernelSession(KernelSession):
+    """A kernel in the studio container for a user no policy applies to, run under that user's own OS uid with a clean
+    environment (web/kernel_isolation.py): full warehouse data access, no access to the studio's secrets."""
+
+    def __init__(self, notebook_rel_path: str, owner: str = "anonymous"):
+        super().__init__(notebook_rel_path, owner)
+        from web import kernel_isolation
+        self._iso = kernel_isolation.enabled()
+
+    def start(self, timeout: int = 15):
+        if self._iso:
+            from web import kernel_isolation
+            self.kernel_name = kernel_isolation.kernelspec_for(self.owner)      # raises IsolationUnavailable: fail closed
+        super().start(timeout=timeout)
+
+    def execute_code(self, code: str, timeout: int = 120) -> Dict[str, Any]:
+        try:
+            return super().execute_code(code, timeout=timeout)
+        finally:
+            if self._iso:
+                try:
+                    from web import kernel_isolation
+                    kernel_isolation.ingest_history(self.owner)
+                except Exception as exc:
+                    logger.warning(f"could not ingest notebook query history: {exc}")
+
+
 # Registry of active kernel sessions: { (owner, rel_path, sandboxed): session }. Kernels are per user: two users who open
 # the same Shared notebook get separate kernels, so one cannot read or alter the other's variables. A user who becomes
 # subject to a masking policy stops using their unrestricted local kernel: it is shut down and a sandboxed one replaces it.
@@ -293,7 +320,7 @@ def get_kernel_session(notebook_rel_path: str, owner: str = "anonymous", sandbox
         if sandboxed:
             stale = SESSIONS.pop((owner, norm_path, False), None)
         if key not in SESSIONS:
-            SESSIONS[key] = RemoteKernelSession(norm_path, owner) if sandboxed else KernelSession(norm_path, owner)
+            SESSIONS[key] = RemoteKernelSession(norm_path, owner) if sandboxed else LocalKernelSession(norm_path, owner)
         session = SESSIONS[key]
     if stale is not None:
         try:

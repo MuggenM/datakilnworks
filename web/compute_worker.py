@@ -20,6 +20,8 @@ from pydantic import BaseModel
 
 from web.warehouses import sync_catalogs_with_duckrun, load_catalogs
 
+os.umask(0o002)        # new tables group-writable for isolated notebook kernels (web/kernel_isolation.py)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [compute-worker] %(message)s")
 logger = logging.getLogger("localspark.compute_worker")
 

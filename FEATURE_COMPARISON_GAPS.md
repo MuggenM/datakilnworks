@@ -43,7 +43,6 @@ not been recomputed since (see 1b, last row).
 | Marketplace and data monetisation | Delta Sharing covers sharing with named recipients. There is no listing, discovery, request workflow or billing service. |
 | Spark-class continuous processing | Kafka streams are exactly-once micro-batches into Delta tables. There is no Structured Streaming, no streaming SQL / materialised streaming tables, no windowed aggregation over unbounded streams. |
 | Cloud event queues as Auto-Loader triggers | Bucket events arrive through webhooks (MinIO, Garage, anything that can POST S3 event JSON). SQS, SNS, EventBridge, Event Grid and Pub/Sub are not consumed; only S3 has an instant-webhook trigger, Azure Blob and GCS sources are polled or cron only. |
-| Parallel execution of workflow tasks | The tasks of one run execute one after another (deliberately deferred). |
 | Compliance certifications and a managed SLA | Not attainable for self-hosted software, see section 2. |
 
 ### 1b. Implemented, but with a caveat a technical reader should know
@@ -60,7 +59,6 @@ not been recomputed since (see 1b, last row).
 | Network policy | One global allowlist plus per-recipient rules for Delta Sharing, and now per-user / per-role network policies on top (a specific account, or every account of a role, restricted to chosen address ranges, independent of the global allowlist's own mode). Only ever applies to an authenticated session: the login page itself, SSO callbacks and `/docs` have no identity yet to check it against. |
 | Governance on shared data | A table with a masking policy or row filter cannot be shared through Delta Sharing (recipients receive raw files). The fix is to share a de-identified copy. |
 | Azure Blob and GCS Auto-Loader sources | GCS goes through its S3-compatible interoperability API (HMAC keys), not the native Google Cloud SDK or OAuth service accounts; real GCS was not available to test against, so `scratch/test_autoloader_gcs.py` runs against a throwaway Garage container standing in for GCS's endpoint instead. Azure Blob was tested against a throwaway Azurite emulator, not a real Azure account. Neither is a Delta write target (source only, like every non-S3 mount); neither has an instant bucket-notification trigger (S3 events has no Azure/GCS equivalent here); ADLS Gen2-specific features (hierarchical namespace ACLs) are not used. |
-| `FEATURE_COMPARISON.md` scorecard | Its per-domain scores and totals were last recomputed before most of the work above, so the totals are stale in both directions. Treat the individual rows, not the sum, as the reference until it is recomputed. |
 
 ---
 

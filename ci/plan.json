@@ -168,6 +168,14 @@
   {
    "name": "dashboard_apps",
    "extras": ""
+  },
+  {
+   "name": "login_hardening",
+   "extras": ""
+  },
+  {
+   "name": "kernel_isolation",
+   "extras": ""
   }
  ],
  "ui": [

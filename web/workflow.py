@@ -330,7 +330,18 @@ def execute_task(task: Dict[str, Any], conn, principal=None) -> Dict[str, Any]:
             if not isinstance(pm_params, dict):
                 pm_params = {}
 
-            pm.execute_notebook(input_path, output_path, kernel_name="python3", language="python", parameters=pm_params)
+            # The kernel runs as the job owner's own OS uid, like an interactive local kernel (web/kernel_isolation.py).
+            from web import kernel_isolation
+            run_as = getattr(principal, "username", None) or "anonymous"
+            kernel_name = kernel_isolation.kernelspec_for(run_as) if kernel_isolation.enabled() else "python3"
+            try:
+                pm.execute_notebook(input_path, output_path, kernel_name=kernel_name, language="python", parameters=pm_params)
+            finally:
+                if kernel_isolation.enabled():
+                    try:
+                        kernel_isolation.ingest_history(run_as)
+                    except Exception as exc:
+                        logger.warning(f"could not ingest notebook query history: {exc}")
             duration_sec = round(time.perf_counter() - t0, 3)
 
             params_formatted = json.dumps(pm_params, indent=2) if pm_params else "{}"

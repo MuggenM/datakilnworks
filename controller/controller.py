@@ -61,10 +61,14 @@ def _load_token() -> str:
         return env
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
     try:
-        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)     # the studio (another container) reads it
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)     # the studio reads it as root; its notebook kernels (other uids) must not
         with os.fdopen(fd, "w") as f:
             f.write(secrets.token_urlsafe(32))
     except FileExistsError:
+        pass
+    try:
+        os.chmod(TOKEN_FILE, 0o600)                     # a token file created by an older version was world-readable
+    except OSError:
         pass
     for _ in range(50):
         with open(TOKEN_FILE) as f:

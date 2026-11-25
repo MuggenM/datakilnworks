@@ -200,6 +200,15 @@ def resolve_client(peer: Optional[str], headers: Dict[str, str], cfg: Optional[D
     return {**out, "ip": ip, "text": str(ip) if ip else hops[0][:60], "via_proxy": True}
 
 
+def is_trusted_proxy(peer: Optional[str], cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Is the TCP peer one of the configured trusted proxies (DB list + TRUSTED_PROXIES)? Only then are its forwarding headers believed."""
+    ip = parse_ip(peer)
+    if ip is None:
+        return False
+    cfg = cfg or get_config()
+    return _in(ip, _networks(cfg["trusted_proxies"]) + _env_proxies())
+
+
 def decide(client: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None, path: str = "") -> Tuple[bool, str]:
     """(allowed, why)."""
     cfg = cfg or get_config()

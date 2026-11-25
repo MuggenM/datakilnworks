@@ -157,6 +157,22 @@ def step_bootstrap_and_databases(rep: Report) -> None:
             rep.add(FAIL, f"database: {label}", f"{type(exc).__name__}: {str(exc)[:200]}")
 
 
+def step_kernel_permissions(rep: Report) -> None:
+    """`.metadata` root-only and the data group-writable, so isolated notebook kernels read tables but no secrets."""
+    try:
+        from web import kernel_isolation
+        if not kernel_isolation.enabled():
+            rep.add(WARN, "kernel isolation", "NOTEBOOK_KERNEL_ISOLATION=off: notebook kernels can read the studio's secrets")
+            return
+        if os.geteuid() != 0:
+            rep.add(WARN, "kernel isolation", "not root: permissions left as they are; local notebook kernels will be refused")
+            return
+        res = kernel_isolation.harden_permissions(_dirs()["warehouse"])
+        rep.add(OK, "kernel isolation", f".metadata is root-only; {res['entries']} warehouse entries checked, {res['changed']} changed")
+    except Exception as exc:
+        rep.add(WARN, "kernel isolation", f"{type(exc).__name__}: {str(exc)[:200]}")
+
+
 def step_seed(rep: Report) -> None:
     try:
         from web.dbt_service import ensure_project
@@ -232,6 +248,7 @@ def run(wait_for: Optional[List[str]] = None, wait_timeout: float = 120.0, check
                 step_bootstrap_and_databases(rep)
                 if not rep.failed:
                     step_seed(rep)
+                    step_kernel_permissions(rep)
         except TimeoutError as exc:
             rep.add(FAIL, "lock", str(exc))
     step_environment(rep)
