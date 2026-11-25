@@ -16699,6 +16699,16 @@
                 </select>
               </div>
             </div>
+            <div x-show="authConfig.ldap.encryption && authConfig.ldap.encryption !== 'none'" class="space-y-2" data-testid="ldap-tls-settings">
+              <div>
+                <label class="block text-slate-700 dark:text-slate-300 font-medium mb-1 uppercase text-[10px]">CA certificate (PEM, optional)</label>
+                <textarea x-model="authConfig.ldap.ca_cert_pem" rows="3" placeholder="-----BEGIN CERTIFICATE----- ... (only for a directory with a private CA; otherwise the system's trusted roots are used)" data-testid="ldap-ca-cert" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-dbx-border rounded-lg px-2.5 py-1.5 text-slate-900 dark:text-white text-[10px] font-mono focus:outline-none focus:border-indigo-500"></textarea>
+              </div>
+              <label class="flex items-center space-x-2 text-[11px] text-slate-600 dark:text-slate-400">
+                <input type="checkbox" x-model="authConfig.ldap.tls_skip_verify" data-testid="ldap-tls-skip-verify">
+                <span>Do not verify the server certificate (development only: anyone on the network path could read passwords)</span>
+              </label>
+            </div>
 
             <div class="grid grid-cols-2 gap-3">
               <div>

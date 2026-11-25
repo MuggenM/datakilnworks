@@ -48,6 +48,20 @@ def _cfg_str(cfg: Dict[str, Any], key: str, default: str = "") -> str:
     return (cfg.get(key) or default).strip() if isinstance(cfg.get(key), str) else default
 
 
+def tls_settings(cfg: Dict[str, Any]):
+    """The ldap3 `Tls` for LDAPS and StartTLS: the server certificate is verified (CERT_REQUIRED, hostname included) against the
+    system roots, or only against `ca_cert_pem` when one is configured (a private directory CA). ldap3's own default is CERT_NONE,
+    which let anyone on the path impersonate the directory and collect every password. `tls_skip_verify` (development only) turns
+    the check off and is logged on every connection."""
+    import ssl
+    from ldap3 import Tls
+    if cfg.get("tls_skip_verify") is True:
+        logger.warning("LDAP: tls_skip_verify is on; the directory's certificate is NOT checked (development only)")
+        return Tls(validate=ssl.CERT_NONE)
+    pem = (cfg.get("ca_cert_pem") or "").strip() if isinstance(cfg.get("ca_cert_pem"), str) else ""
+    return Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=pem or None)
+
+
 def _connect(cfg: Dict[str, Any], user: Optional[str] = None, password: Optional[str] = None,
             timeout: int = 5) -> Connection:
     host = _cfg_str(cfg, "server_host")
@@ -56,7 +70,11 @@ def _connect(cfg: Dict[str, Any], user: Optional[str] = None, password: Optional
     port = int(cfg.get("server_port") or 389)
     encryption = _cfg_str(cfg, "encryption", "none").lower()
     use_ssl = encryption == "ssl" or port == 636
-    server = Server(host, port=port, use_ssl=use_ssl, get_info=ALL, connect_timeout=timeout)
+    try:
+        tls = tls_settings(cfg) if (use_ssl or encryption == "starttls") else None
+    except Exception as exc:
+        raise LdapError(f"The LDAP CA certificate is not usable: {exc}") from exc
+    server = Server(host, port=port, use_ssl=use_ssl, tls=tls, get_info=ALL, connect_timeout=timeout)
     try:
         # receive_timeout must be an int: ldap3 struct.packs it, and a float raises struct.error deep inside the
         # library. Without it, a host:port that accepts the TCP connection but never speaks LDAP (a typo'd port
@@ -64,10 +82,13 @@ def _connect(cfg: Dict[str, Any], user: Optional[str] = None, password: Optional
         # can be minutes -- every caller of this module (login included) needs bounded, predictable failure.
         conn = Connection(server, user=user, password=password, authentication=SIMPLE if user else None,
                           auto_bind=False, receive_timeout=timeout)
+        conn.open()
+        if encryption == "starttls" and not use_ssl:
+            # BEFORE the bind: binding first (as this used to) sent the password in cleartext and only then upgraded.
+            if not conn.start_tls():
+                raise LDAPException(conn.result.get("description") or "StartTLS was refused by the server")
         if not conn.bind():
             raise LDAPException(conn.result.get("description") or conn.result.get("message") or "bind failed")
-        if encryption == "starttls":
-            conn.start_tls()
         return conn
     except LdapError:
         raise

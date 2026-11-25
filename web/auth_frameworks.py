@@ -31,6 +31,8 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "server_host": "ldap.company.internal",
         "server_port": 389,
         "encryption": "none",  # none | starttls | ssl
+        "ca_cert_pem": "",       # optional: trust only this CA for LDAPS / StartTLS (else the system roots)
+        "tls_skip_verify": False,  # development only: do not check the directory's certificate
         "base_dn": "dc=company,dc=internal",
         "bind_dn": "cn=lakehouse_svc,ou=Services,dc=company,dc=internal",
         "bind_password": "",
@@ -173,9 +175,12 @@ def test_ldap_connection(ldap_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
         tls_info = None
         if encryption == "ssl" or port == 636:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+            # The same certificate check as the real sign-in (ldap_auth.tls_settings): a test that passes must mean sign-in works.
+            pem = (ldap_cfg.get("ca_cert_pem") or "").strip() if isinstance(ldap_cfg.get("ca_cert_pem"), str) else ""
+            context = ssl.create_default_context(cadata=pem or None)
+            if ldap_cfg.get("tls_skip_verify") is True:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
             ssock = context.wrap_socket(sock, server_hostname=host)
             tls_info = ssock.version()
             ssock.close()
@@ -215,7 +220,7 @@ def test_oidc_discovery(oidc_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         import requests
-        resp = requests.get(discovery_url, timeout=5.0, verify=False)
+        resp = requests.get(discovery_url, timeout=5.0)        # TLS verified, exactly like the real sign-in (web/oidc_auth.py)
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         if resp.status_code == 200:

@@ -15,7 +15,6 @@ import numpy as np
 import duckdb
 import duckrun
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from web.warehouses import sync_catalogs_with_duckrun, load_catalogs
@@ -42,13 +41,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# No CORS: only the studio calls a compute node (server to server, X-Compute-Token); no browser ever should.
 
 
 
