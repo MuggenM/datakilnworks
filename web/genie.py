@@ -12,6 +12,7 @@ import re
 import uuid
 import logging
 import datetime
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 import requests
 
@@ -203,6 +204,10 @@ def get_available_providers() -> Dict[str, Any]:
     }
 
 # ==================== CHAT STORAGE ====================
+# ask_genie runs in a worker thread (the LLM call must not block the event loop), so every read-modify-write of the chats file
+# holds this lock, and the file is replaced atomically: a reader never sees a half-written file (load_chats would return [] and the
+# next save would wipe every chat).
+_CHATS_LOCK = threading.RLock()
 
 def load_chats(user: Optional[str] = None, is_admin: bool = True) -> List[Dict[str, Any]]:
     if not os.path.exists(CHATS_FILE):
@@ -221,10 +226,17 @@ def load_chats(user: Optional[str] = None, is_admin: bool = True) -> List[Dict[s
         return []
 
 def save_chats(chats: List[Dict[str, Any]]):
+    tmp = f"{CHATS_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
-        with open(CHATS_FILE, "w") as f:
-            json.dump({"chats": chats}, f, indent=2)
+        with _CHATS_LOCK:
+            with open(tmp, "w") as f:
+                json.dump({"chats": chats}, f, indent=2)
+            os.replace(tmp, CHATS_FILE)
     except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         logger.error(f"Failed to save genie chats: {e}")
 
 def get_chat(chat_id: str, user: Optional[str] = None, is_admin: bool = True) -> Optional[Dict[str, Any]]:
@@ -237,6 +249,11 @@ def get_chat(chat_id: str, user: Optional[str] = None, is_admin: bool = True) ->
     return None
 
 def create_chat(title: str = "New Exploration", user: str = "admin") -> Dict[str, Any]:
+    with _CHATS_LOCK:
+        return _create_chat_locked(title, user)
+
+
+def _create_chat_locked(title: str, user: str) -> Dict[str, Any]:
     chats = load_chats(user=None, is_admin=True)
     new_chat = {
         "id": f"genie_{uuid.uuid4().hex[:8]}",
@@ -251,6 +268,11 @@ def create_chat(title: str = "New Exploration", user: str = "admin") -> Dict[str
     return new_chat
 
 def delete_chat(chat_id: str, user: Optional[str] = None, is_admin: bool = True) -> bool:
+    with _CHATS_LOCK:
+        return _delete_chat_locked(chat_id, user, is_admin)
+
+
+def _delete_chat_locked(chat_id: str, user: Optional[str], is_admin: bool) -> bool:
     chats = load_chats(user=None, is_admin=True)
     orig_len = len(chats)
     if is_admin or not user:
@@ -886,22 +908,21 @@ def ask_genie(
         "created_at": now_str
     }
 
-    chat["messages"].append(user_msg)
-    chat["messages"].append(assistant_msg)
-    chat["updated_at"] = now_str
-    
-    # Update title if it was default
-    if chat["title"] == "New Exploration" or chat["title"].startswith("New "):
-        chat["title"] = user_prompt[:40] + ("..." if len(user_prompt) > 40 else "")
-
-    chats = load_chats(user=None, is_admin=True)
-    for i, c in enumerate(chats):
-        if c["id"] == chat["id"]:
-            chats[i] = chat
-            break
-    else:
-        chats.insert(0, chat)
-    save_chats(chats)
+    # Append to the chat as it is stored NOW, not to the copy loaded before the LLM call: another question in the same chat may have
+    # been answered meanwhile (asks run concurrently in worker threads), and writing the stale copy back would drop its messages.
+    with _CHATS_LOCK:
+        chats = load_chats(user=None, is_admin=True)
+        stored = next((c for c in chats if c["id"] == chat["id"]), None)
+        if stored is None:          # not in the file (as before this change, the chat is saved with this exchange)
+            stored = chat
+            chats.insert(0, stored)
+        stored["messages"].extend([user_msg, assistant_msg])
+        stored["updated_at"] = now_str
+        # Update title if it was default
+        if stored["title"] == "New Exploration" or stored["title"].startswith("New "):
+            stored["title"] = user_prompt[:40] + ("..." if len(user_prompt) > 40 else "")
+        save_chats(chats)
+        chat = stored
 
     return {
         "chat_id": chat["id"],
