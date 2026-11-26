@@ -4177,14 +4177,16 @@ async def generate_copilot_sql_api(payload: CopilotGenerateRequest):
     if not prompt:
         return {"success": False, "error": "Prompt cannot be empty"}
     from web.copilot import generate_copilot_sql
-    conn = get_duckrun_conn()
-    return generate_copilot_sql(
+    # The LLM call can take a minute: in a worker thread, so the studio keeps answering. Not with the shared connection
+    # (get_duckrun_conn is used by the event loop at the same time); conn=None opens its own read-only one, as Genie does.
+    return await asyncio.to_thread(
+        generate_copilot_sql,
         prompt=prompt,
         current_query=payload.current_query,
         selection=payload.selection,
         provider=payload.provider,
         model=payload.model,
-        conn=conn
+        conn=None,
     )
 
 @app.get("/api/sql/copilot/providers")
@@ -7516,7 +7518,7 @@ class CreateChatPayload(BaseModel):
 @app.get("/api/genie/config")
 async def genie_config_endpoint():
     config = await asyncio.to_thread(get_available_providers)   # probes Ollama / LM Studio over HTTP: off the event loop
-    schema_info = extract_schema_context()
+    schema_info = await asyncio.to_thread(extract_schema_context)  # its own read-only connection, never the shared one
     config["tables"] = [
         {
             "name": t["table_name"],
@@ -7572,7 +7574,7 @@ async def ask_genie_in_chat_endpoint(chat_id: str, payload: GenieAskPayload, req
     username = current_user.get("username", "admin")
     is_admin = current_user.get("role") == "admin"
     try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)
+        res = await asyncio.to_thread(ask_genie, chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)   # LLM call: off the event loop
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
@@ -7590,7 +7592,7 @@ async def quick_ask_genie_endpoint(payload: GenieAskPayload, request: Request):
         new_chat = create_chat(title=payload.prompt[:35] + ("..." if len(payload.prompt) > 35 else ""), user=username)
         chat_id = new_chat["id"]
     try:
-        res = ask_genie(chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)
+        res = await asyncio.to_thread(ask_genie, chat_id, payload.prompt, payload.provider, payload.model, user=username, is_admin=is_admin, principal=current_user)   # LLM call: off the event loop
         return res
     except Exception as e:
         logger.error(f"Genie ask failed: {e}")
