@@ -198,7 +198,12 @@ def _leaf_sources(column: str, sql: str, upstream: Dict[str, str]) -> Optional[L
     from sqlglot import exp
     from sqlglot.lineage import lineage
     try:
-        node = lineage(column, sql, dialect="duckdb", sources=upstream)
+        # `schema` by keyword: sqlglot 30.29 made it a required positional parameter (it had a default of None before); without it
+        # the call raised TypeError, every column fell back to "may use any upstream column" and inherited every source tag.
+        node = lineage(column, sql, schema={}, dialect="duckdb", sources=upstream)
+    except TypeError as exc:                                               # an API change, not unparsable SQL: make the drift visible
+        logger.warning(f"sqlglot lineage API call failed for {column} (sqlglot version drift?): {exc}")
+        return None
     except Exception as exc:
         logger.debug(f"lineage of {column} failed: {exc}")
         return None
@@ -207,8 +212,14 @@ def _leaf_sources(column: str, sql: str, upstream: Dict[str, str]) -> Optional[L
         if n.downstream:
             continue
         src = n.source
-        if isinstance(src, exp.Table) and src.db:
-            out.append((src.catalog or SOURCE_CATALOG, src.db, src.name, n.name.split(".")[-1]))
+        # A leaf that is not a concrete column of a lakehouse table derives from no source column, e.g. count(*) (its leaf is the
+        # query itself), a literal, or a star: it gets no derived column tag, whatever shape a given sqlglot version gives that leaf.
+        if not (isinstance(src, exp.Table) and src.db):
+            continue
+        src_col = n.name.split(".")[-1]
+        if not src_col or src_col == "*" or isinstance(n.expression, exp.Star):
+            continue
+        out.append((src.catalog or SOURCE_CATALOG, src.db, src.name, src_col))
     return out
 
 
