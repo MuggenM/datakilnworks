@@ -20803,9 +20803,15 @@
 
         async pkLoad() {
           this.pk.supported = !!window.PublicKeyCredential;
+          // Only the newest request may set the list: openMfa() does not await its load, so on a busy server its answer (sent before a
+          // passkey was added) could arrive after the reload in pkAdd() and wipe the new passkey from the list.
+          const seq = (this._pkLoadSeq = (this._pkLoadSeq || 0) + 1);
           try {
             const res = await fetch('/api/auth/webauthn/status');
-            if (res.ok) { const d = await res.json(); this.pk.creds = d.credentials || []; this.pk.available = !!d.available; this.pk.eligible = d.eligible !== false; }
+            if (!res.ok) return;
+            const d = await res.json();
+            if (seq !== this._pkLoadSeq) return;
+            this.pk.creds = d.credentials || []; this.pk.available = !!d.available; this.pk.eligible = d.eligible !== false;
           } catch (e) { /* the section stays empty */ }
         },
 
@@ -23296,9 +23302,13 @@
         },
 
         async fetchWorkspaceFileDetail(relPath) {
+          // The tree load that selects the scratchpad can finish after a sign-out: the follow-up request then gets the API gate's 401.
+          // That is not an error (nobody is signed in to show the file to): reset quietly.
+          if (!this.isAuthenticated) { this.workspaceFileDetail = null; return; }
           this.workspaceFileLoading = true;
           try {
             const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(relPath)}`);
+            if (res.status === 401) { this.workspaceFileDetail = null; return; }
             if (!res.ok) throw new Error('Failed to fetch file details');
             const data = await res.json();
             this.workspaceFileDetail = data;

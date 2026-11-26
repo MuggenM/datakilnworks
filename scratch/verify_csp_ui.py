@@ -90,9 +90,21 @@ try:
         v = violations(page)
         dirs = {x["d"] for x in v}
         check("each was reported as a violation (script-src-attr / script-src-elem / connect-src)", {"script-src-attr", "script-src-elem", "connect-src"} <= dirs, v)
-        page.wait_for_timeout(1500)
-        stats = ctx.request.get(f"{BASE}/api/csp-report").json()
-        check("the violations reached /api/csp-report", sum(stats["counts"].values()) >= 3 and any("example.com" in k for k in stats["counts"]), stats)
+        # the browser sends reports on its own schedule: poll the counters for up to 15 s (a wall-clock deadline, whatever UI_SLOW is)
+        reached = lambda s: sum(s["counts"].values()) >= 3 and any("example.com" in k for k in s["counts"])
+        deadline = time.monotonic() + 15
+        while True:
+            stats = ctx.request.get(f"{BASE}/api/csp-report").json()
+            if reached(stats) or time.monotonic() > deadline:
+                break
+            time.sleep(0.5)
+        check("the violations reached /api/csp-report", reached(stats), stats)
+        if not reached(stats):
+            # never sent, or sent and refused (401/403/429 from a gate)? The studio's access log and its "CSP violation" warnings say which.
+            logs = (lambda r: r.stdout + r.stderr)(sh("docker", "logs", NAME))
+            print("    studio log lines about CSP reports:")
+            for line in [ln for ln in logs.splitlines() if "csp-report" in ln or "CSP violation" in ln][-30:] or ["    (none: the browser never reached /api/csp-report)"]:
+                print("      " + line[:300])
         check("the report statistics are admin-only", b.new_context().request.get(f"{BASE}/api/csp-report").status in (401, 403))
 
         print("the code-block copy button (formerly inline onclick)")

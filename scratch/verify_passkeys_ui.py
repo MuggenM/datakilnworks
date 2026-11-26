@@ -12,9 +12,19 @@ def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:300]}" if d and not c else ""))
     if not c: FAIL.append(n)
 sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
+def wait_or_explain(page, selector, what, timeout=10000):
+    """wait_for_selector, but a timeout prints what the page and the studio said (the on-page error, a screenshot, the studio log) first."""
+    try:
+        page.wait_for_selector(selector, timeout=timeout)
+    except Exception:
+        err = page.locator("[data-testid=passkey-error]")
+        print(f"  [FAIL] {what}: {selector} did not appear; on-page error: {err.inner_text()[:300] if err.count() and err.first.is_visible() else '(none shown)'}")
+        shot = os.path.join(os.getenv("ARTIFACT_DIR", "/tmp"), "passkeys_failure.png"); page.screenshot(path=shot); print(f"    screenshot: {shot}")
+        r = sh("docker", "logs", "--tail", "40", "pkui"); print("    studio log (last 40 lines):"); [print("      " + ln[:300]) for ln in (r.stdout + r.stderr).splitlines()[-40:]]
+        raise
 sh("docker", "rm", "-f", "pkui")
 sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "pkui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
-   "-e", "INIT_ADMIN_USERNAME=admin", "-e", f"INIT_ADMIN_PASSWORD_HASH={HASH}", "localspark-lakehouse-notebook", "sh", "-c",
+   "-e", "INIT_ADMIN_USERNAME=admin", "-e", f"INIT_ADMIN_PASSWORD_HASH={HASH}", os.getenv("CI_IMAGE", "localspark-lakehouse-notebook"), "sh", "-c",
    "pip install -q webauthn >/dev/null 2>&1; python -m uvicorn web.app:app --host 0.0.0.0 --port 8891 --no-proxy-headers")
 try:
     for _ in range(150):
@@ -54,7 +64,8 @@ try:
         page.fill("[data-testid=passkey-password]", "wrong"); page.click("[data-testid=passkey-create]"); page.wait_for_selector("[data-testid=passkey-error]", state="visible", timeout=20000)
         page.wait_for_function("() => !Alpine.$data(document.body).pk.busy", timeout=20000)
         check("a wrong password is refused before the browser is asked", "incorrect" in page.locator("[data-testid=passkey-error]").inner_text() and page.locator("[data-testid=passkey-row]").count() == 0)
-        page.fill("[data-testid=passkey-password]", "alicepassword1"); page.click("[data-testid=passkey-create]"); page.wait_for_selector("[data-testid=passkey-row]", timeout=10000)
+        page.fill("[data-testid=passkey-password]", "alicepassword1"); page.click("[data-testid=passkey-create]")
+        wait_or_explain(page, "[data-testid=passkey-row]", "adding a passkey in the dialog")
         check("the passkey is created through the browser and listed", page.locator("[data-testid=passkey-name]").inner_text() == "Virtual laptop key")
         creds = cdp.send("WebAuthn.getCredentials", {"authenticatorId": auth})["credentials"]
         check("the (virtual) authenticator holds a resident credential for the studio", len(creds) == 1 and creds[0]["isResidentCredential"] and creds[0]["rpId"] == "localhost", creds)
@@ -103,7 +114,8 @@ try:
         auth = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {"protocol": "ctap2", "transport": "internal", "hasResidentKey": True, "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})["authenticatorId"]
         page.reload(wait_until="networkidle"); time.sleep(1); ui_login("alice", "alicepassword1"); page.wait_for_function("() => Alpine.$data(document.body).isAuthenticated", timeout=10000)
         ev("() => { Alpine.$data(document.body).openMfa(); }"); page.wait_for_selector("[data-testid=passkeys-section]", state="visible"); page.wait_for_timeout(400)
-        page.click("[data-testid=passkey-add]"); page.fill("[data-testid=passkey-name-input]", "Second key"); page.fill("[data-testid=passkey-password]", "alicepassword1"); page.click("[data-testid=passkey-create]"); page.wait_for_selector("[data-testid=passkey-row]", timeout=10000)
+        page.click("[data-testid=passkey-add]"); page.fill("[data-testid=passkey-name-input]", "Second key"); page.fill("[data-testid=passkey-password]", "alicepassword1"); page.click("[data-testid=passkey-create]")
+        wait_or_explain(page, "[data-testid=passkey-row]", "adding a passkey in the dialog")
         page.click("[data-testid=passkey-remove]"); page.fill("[data-testid=passkey-remove-password]", "wrong"); page.click("[data-testid=passkey-remove-confirm]"); page.wait_for_selector("[data-testid=passkey-error]", state="visible", timeout=15000); page.wait_for_function("() => !Alpine.$data(document.body).pk.busy", timeout=15000)
         check("removing needs the password: a wrong one leaves the passkey in place", page.locator("[data-testid=passkey-row]").count() == 1 and "incorrect" in page.locator("[data-testid=passkey-error]").inner_text())
         page.fill("[data-testid=passkey-remove-password]", "alicepassword1"); page.click("[data-testid=passkey-remove-confirm]"); page.wait_for_timeout(1000)
