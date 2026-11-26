@@ -92,6 +92,8 @@ jobs:
           tags: ${{ env.IMAGE }}:latest
           cache-from: type=gha,scope=image
           cache-to: type=gha,scope=image,mode=max
+      - name: Versions in the image
+        run: ci/print_versions.sh
       - name: Run the test inside the image
         run: ci/run_test.sh "${{ matrix.test.name }}" "${{ matrix.test.extras }}" 2>&1 | tee /tmp/out.txt
       - name: Show why it failed
@@ -121,10 +123,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Playwright and Chromium
+      - name: Playwright and Chromium (pinned in ci/requirements-ui.txt; this installs the Chromium build that Playwright release drives)
         run: |
-          pip install playwright
-          playwright install --with-deps chromium
+          pip install -r ci/requirements-ui.txt
+          python -m playwright install --with-deps chromium
+      - name: Versions (image, Playwright, Chromium)
+        run: ci/print_versions.sh --browser
       - name: Run the browser test (it starts and removes its own throwaway containers)
         env:
           NODE_OPTIONS: --dns-result-order=ipv4first        # Playwright's request client does not fall back from ::1 to 127.0.0.1 on runners without IPv6 loopback
@@ -153,6 +157,8 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           install_only: true
+      - name: Versions in the image
+        run: ci/print_versions.sh
       - name: Install the chart, sign in, run SQL on the compute node, restart, upgrade, misconfigure, uninstall
         run: ci/kind-smoke.sh 2>&1 | tee /tmp/out.txt
       - name: Show why it failed

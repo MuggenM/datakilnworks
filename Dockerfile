@@ -14,7 +14,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install packages
-COPY requirements.txt /tmp/requirements.txt
+COPY requirements.txt requirements-lock.txt /tmp/
 # pip / setuptools / wheel come from the base image and are otherwise never upgraded (pip-audit flags them).
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r /tmp/requirements.txt \

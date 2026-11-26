@@ -19,10 +19,13 @@ NS=dkw
 CHART=deploy/helm/datakilnworks
 ADMIN_HASH='pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d'      # adminpassword123, the throwaway bootstrap password of every test here
 FAILED=0
+DUMPED=0
 PF_PID=""
 step() { echo; echo "=== $*"; }
 ok()   { echo "  [PASS] $*"; }
-bad()  { echo "  [FAIL] $*"; FAILED=1; }
+# The first failure dumps the cluster state right away: at the end of the script the release may already be uninstalled and the pods gone,
+# which made an earlier dump show only the effects of `helm uninstall`. In GitHub Actions each failure is also an ::error annotation.
+bad()  { echo "  [FAIL] $*"; FAILED=1; [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error title=kind smoke::$*"; [ "$DUMPED" -eq 0 ] && { DUMPED=1; dump; }; }
 
 dump() {
   echo "----- diagnostics -----"
@@ -41,7 +44,7 @@ start_pf() {
 }
 cleanup() {
   stop_pf
-  [ "$FAILED" -ne 0 ] && dump
+  [ "$FAILED" -ne 0 ] && [ "$DUMPED" -eq 0 ] && dump
   if [ -z "${USE_CURRENT_CONTEXT:-}" ] && [ -z "${KEEP_CLUSTER:-}" ]; then kind delete cluster --name "$CLUSTER" >/dev/null 2>&1; fi
 }
 trap cleanup EXIT
@@ -63,20 +66,24 @@ kubectl create namespace "$NS" >/dev/null 2>&1
 helm upgrade --install dkw "$CHART" -n "$NS" -f ci/kind-values.yaml --set-string secrets.initAdminPasswordHash="$ADMIN_HASH" --wait --timeout 8m >/dev/null && ok "helm install (waited for readiness)" || bad "helm install did not become ready"
 kubectl rollout status deploy/dkw-studio -n "$NS" --timeout=300s >/dev/null && ok "the studio deployment is ready" || bad "the studio is not ready"
 kubectl rollout status deploy/dkw-compute-node-01 -n "$NS" --timeout=300s >/dev/null && ok "the compute node is ready" || bad "the compute node is not ready"
+# as many volumes as the chart renders (warehouse, notebooks, dbtProject, keys: the keys volume came with DKW_SECRETS_DIR), all bound
+WANT_PVC="$(helm template dkw "$CHART" -n "$NS" -f ci/kind-values.yaml --set-string secrets.initAdminPasswordHash="$ADMIN_HASH" | grep -c '^kind: PersistentVolumeClaim')"
 PHASES="$(kubectl get pvc -n "$NS" -o jsonpath='{.items[*].status.phase}')"
-[ "$PHASES" = "Bound Bound Bound" ] && ok "the three volumes are bound" || bad "volumes: $PHASES"
+BOUND="$(echo "$PHASES" | tr ' ' '\n' | grep -c '^Bound$')"
+[ "$WANT_PVC" -ge 4 ] && [ "$(echo "$PHASES" | wc -w)" -eq "$WANT_PVC" ] && [ "$BOUND" -eq "$WANT_PVC" ] \
+  && ok "the $WANT_PVC volumes are bound" || bad "volumes: expected $WANT_PVC bound, got '$PHASES'"
 INIT_LOG="$(kubectl logs -n "$NS" deploy/dkw-studio -c init 2>&1)"
 echo "$INIT_LOG" | tail -n 4 | sed 's/^/    /'
 echo "$INIT_LOG" | grep -q "init finished: ready" && ok "the init container finished: ready" || bad "the init container did not report ready"
 
 step "Sign in, SQL on studio and compute node, write a table (through the Service)"
-start_pf && python3 ci/smoke_api.py first http://127.0.0.1:18891 || FAILED=1
+if start_pf; then python3 ci/smoke_api.py first http://127.0.0.1:18891 || bad "ci/smoke_api.py first: see its [FAIL] lines above"; else bad "the port-forward to the studio Service did not answer"; fi
 
 step "Data survives a studio pod restart"
 stop_pf
 kubectl delete pod -n "$NS" -l app.kubernetes.io/name=datakilnworks-studio --wait=true >/dev/null
 kubectl rollout status deploy/dkw-studio -n "$NS" --timeout=300s >/dev/null && ok "the studio came back" || bad "the studio did not come back"
-start_pf && python3 ci/smoke_api.py again http://127.0.0.1:18891 || FAILED=1
+if start_pf; then python3 ci/smoke_api.py again http://127.0.0.1:18891 || bad "ci/smoke_api.py again: see its [FAIL] lines above"; else bad "the port-forward to the studio Service did not answer"; fi
 stop_pf
 
 step "helm upgrade"
@@ -86,7 +93,7 @@ kubectl get deploy/dkw-studio -n "$NS" -o jsonpath='{.spec.template.spec.contain
 kubectl rollout status deploy/dkw-studio -n "$NS" --timeout=300s >/dev/null && ok "the upgraded studio is ready" || bad "the upgraded studio is not ready"
 TOKEN_AFTER="$(kubectl get secret -n "$NS" dkw-secrets -o jsonpath='{.data.COMPUTE_TOKEN}' 2>/dev/null)"
 [ -n "$TOKEN_BEFORE" ] && [ "$TOKEN_BEFORE" = "$TOKEN_AFTER" ] && ok "the generated compute token was kept by the upgrade" || bad "the compute token changed or is missing"
-start_pf && python3 ci/smoke_api.py again http://127.0.0.1:18891 || FAILED=1
+if start_pf; then python3 ci/smoke_api.py again http://127.0.0.1:18891 || bad "ci/smoke_api.py again: see its [FAIL] lines above"; else bad "the port-forward to the studio Service did not answer"; fi
 stop_pf
 
 step "A misconfigured install fails readably in the init container"
@@ -106,7 +113,7 @@ helm uninstall bad -n dkw-bad >/dev/null 2>&1
 
 step "Uninstall keeps the data volumes"
 helm uninstall dkw -n "$NS" >/dev/null && ok "uninstalled" || bad "uninstall failed"
-[ "$(kubectl get pvc -n "$NS" --no-headers 2>/dev/null | wc -l)" -ge 3 ] && ok "the volumes were kept (helm.sh/resource-policy: keep)" || bad "the volumes are gone"
+[ "$(kubectl get pvc -n "$NS" --no-headers 2>/dev/null | wc -l)" -ge "$WANT_PVC" ] && ok "the volumes were kept (helm.sh/resource-policy: keep)" || bad "the volumes are gone"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "ALL PASS"; else echo "FAILED"; exit 1; fi

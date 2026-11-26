@@ -1,0 +1,4 @@
+# Playwright for the browser tests (scratch/verify_*_ui.py), pinned: each release drives one specific Chromium build, and
+# `python -m playwright install chromium` downloads exactly that one. Dependabot (.github/dependabot.yml, directory /ci) proposes bumps;
+# CI runs every browser test with them.
+playwright==1.65.2
