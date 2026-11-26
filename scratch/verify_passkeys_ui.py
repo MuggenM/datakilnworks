@@ -8,6 +8,7 @@ import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http://localhost:8117"
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 FAIL = []
+PENDING = {}   # url -> start time of every request the page has open (printed when a wait times out)
 def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:300]}" if d and not c else ""))
     if not c: FAIL.append(n)
@@ -18,6 +19,10 @@ def wait_or_explain(page, selector, what, timeout=10000):
         page.wait_for_selector(selector, timeout=timeout)
     except Exception:
         err = page.locator("[data-testid=passkey-error]")
+        now = time.monotonic(); busy = sorted(((now - t, u) for u, t in PENDING.items()), reverse=True)
+        print(f"  requests still open in the browser ({len(busy)}): " + "; ".join(u[:120] for _, u in busy[:12]))
+        try: print("  pk state: " + str(page.evaluate("() => { const p = Alpine.$data(document.body).pk; return { busy: p.busy, addOpen: p.addOpen, creds: (p.creds || []).length, error: p.error }; }")))
+        except Exception as e: print(f"  pk state: unreadable ({e})")
         print(f"  [FAIL] {what}: {selector} did not appear; on-page error: {err.inner_text()[:300] if err.count() and err.first.is_visible() else '(none shown)'}")
         shot = os.path.join(os.getenv("ARTIFACT_DIR", "/tmp"), "passkeys_failure.png"); page.screenshot(path=shot); print(f"    screenshot: {shot}")
         r = sh("docker", "logs", "--tail", "40", "pkui"); print("    studio log (last 40 lines):"); [print("      " + ln[:300]) for ln in (r.stdout + r.stderr).splitlines()[-40:]]
@@ -36,6 +41,8 @@ try:
     with sync_playwright() as p:
         b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1400, "height": 1000}); page = _ui_slow.apply(ctx.new_page()); errors = []
         page.on("pageerror", lambda e: errors.append(str(e) + " @ " + str(getattr(e, "stack", ""))[:500])); page.on("dialog", lambda d: d.accept())
+        page.on("request", lambda r: PENDING.__setitem__(r.method + " " + r.url.replace(BASE, ""), time.monotonic()))
+        for ev_name in ("requestfinished", "requestfailed"): page.on(ev_name, lambda r: PENDING.pop(r.method + " " + r.url.replace(BASE, ""), None))
         page.on("console", lambda m: errors.append(m.text[:200]) if m.type == "error" and "Failed to load resource" not in m.text else None)
         # Chromium cannot operate the autofill dropdown in automation: a wrapper records every conditional (autofill) request and lets the test "pick the passkey"
         ctx.add_init_script("""(() => { const orig = navigator.credentials.get.bind(navigator.credentials); window.__condCalls = [];
