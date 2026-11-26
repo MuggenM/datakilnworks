@@ -311,7 +311,7 @@ def preview_volume_file(catalog: str, schema: str, volume_name: str, rel_path: s
             raise ValueError(f"Preview is not supported for file extension '.{ext_lower}' (supports CSV, Parquet, JSON).")
 
         df = conn.sql(f"{source_query} LIMIT {max(1, min(limit, 100))}").df()
-        total_count = int(conn.sql(f"SELECT COUNT(*) FROM ({source_query})").fetchone()[0])
+        total_count = int(conn.sql(f"SELECT COUNT(*) FROM ({source_query})").fetchall()[0][0])
         
         columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
         rows = df.fillna("").to_dict(orient="records")

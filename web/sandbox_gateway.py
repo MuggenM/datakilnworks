@@ -77,7 +77,7 @@ def _run(sql: str, user: dict, max_rows: int):
                 table = pa.table({})
             else:
                 batches, rows = [], 0
-                reader = cur.fetch_record_batch(rows_per_batch=65536)
+                reader = cur.to_arrow_reader(65536)   # DuckDB 2.0: the connection has no fetch_record_batch any more
                 for batch in reader:
                     batches.append(batch)
                     rows += batch.num_rows

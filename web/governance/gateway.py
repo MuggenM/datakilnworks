@@ -211,7 +211,7 @@ def mask_arrow(table: pa.Table, catalog: str, schema_name: str, table_name: str,
         select = f"SELECT * REPLACE ({replace})" if specs else "SELECT *"
         where = " AND ".join(f"({p.predicate})" for p in row_specs)
         sql = select + " FROM __gov_in" + (f" WHERE {where}" if where else "")
-        return cur.execute(sql).arrow().read_all()
+        return cur.execute(sql).to_arrow_table()
     finally:
         try:
             cur.unregister("__gov_in")

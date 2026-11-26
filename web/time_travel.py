@@ -207,7 +207,7 @@ def compare_table_versions(
         try:
             # Rows in v2 but not v1 (Added)
             added_query = f"SELECT {col_list_sql} FROM t2 EXCEPT SELECT {col_list_sql} FROM t1"
-            added_cnt_res = conn.sql(f"SELECT COUNT(*) FROM ({added_query})").fetchone()
+            added_cnt_res = conn.sql(f"SELECT COUNT(*) FROM ({added_query})").fetchall()[0]
             added_count = int(added_cnt_res[0]) if added_cnt_res else 0
             added_df = _masked_df(conn.sql(f"{added_query} LIMIT {sample_limit}").df(), user, catalog, schema_name, table_name)
             added_rows = [sanitize_row(r) for r in added_df.to_dict(orient="records")]
@@ -217,7 +217,7 @@ def compare_table_versions(
         try:
             # Rows in v1 but not v2 (Deleted)
             deleted_query = f"SELECT {col_list_sql} FROM t1 EXCEPT SELECT {col_list_sql} FROM t2"
-            deleted_cnt_res = conn.sql(f"SELECT COUNT(*) FROM ({deleted_query})").fetchone()
+            deleted_cnt_res = conn.sql(f"SELECT COUNT(*) FROM ({deleted_query})").fetchall()[0]
             deleted_count = int(deleted_cnt_res[0]) if deleted_cnt_res else 0
             deleted_df = _masked_df(conn.sql(f"{deleted_query} LIMIT {sample_limit}").df(), user, catalog, schema_name, table_name)
             deleted_rows = [sanitize_row(r) for r in deleted_df.to_dict(orient="records")]

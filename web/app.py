@@ -4456,7 +4456,7 @@ def analyze_partition_suitability(df: pd.DataFrame, conn, source_sql: Optional[s
         try:
             exprs = [f'approx_count_distinct("{c}")' for c in df.columns]
             agg_sql = f"SELECT {', '.join(exprs)} FROM {source_sql}"
-            agg_res = conn.sql(agg_sql).fetchone()
+            agg_res = conn.sql(agg_sql).fetchall()[0]
             if agg_res and len(agg_res) == len(df.columns):
                 approx_distinct_map = {col: int(agg_res[i]) for i, col in enumerate(df.columns)}
         except Exception as e:
@@ -4619,7 +4619,7 @@ async def ingest_preview(file: UploadFile = File(...)):
         df = res.df()
 
         # Get total row count estimate
-        count_res = conn.sql(f"SELECT COUNT(*) FROM {source_sql}").fetchone()
+        count_res = conn.sql(f"SELECT COUNT(*) FROM {source_sql}").fetchall()[0]
         total_rows = int(count_res[0]) if count_res else int(len(df))
 
         # Analyze partition suitability with true dataset cardinality
@@ -4717,7 +4717,7 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
         if valid_partition_cols:
             parts_expr = ", ".join(f'"{c}"' for c in valid_partition_cols)
             try:
-                distinct_comb_count = int(conn.sql(f"SELECT COUNT(DISTINCT ({parts_expr})) FROM {source_sql}").fetchone()[0])
+                distinct_comb_count = int(conn.sql(f"SELECT COUNT(DISTINCT ({parts_expr})) FROM {source_sql}").fetchall()[0][0])
             except Exception:
                 distinct_comb_count = None
 
@@ -4759,7 +4759,7 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
                 target_rel = f"{cat['id']}.{schema_clean}.{table_clean}"
 
                 # Compute row count first, then open streaming Arrow reader so cursor is not invalidated
-                row_count = int(conn.sql(f"SELECT COUNT(*) FROM {source_sql}").fetchone()[0])
+                row_count = int(conn.sql(f"SELECT COUNT(*) FROM {source_sql}").fetchall()[0][0])
                 arrow_reader = conn.sql(f"SELECT * FROM {source_sql}").arrow()
 
                 mode = "append" if payload.mode.lower() == "append" else "overwrite"
@@ -4921,7 +4921,7 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
         dt = DeltaTable(dt_path)
         version = dt.version()
         actual_partitions = list(dt.metadata().partition_columns or []) if hasattr(dt, "metadata") else valid_partition_cols
-        row_count = conn.sql(f"SELECT COUNT(*) FROM delta_scan('{dt_path}')").fetchone()[0]
+        row_count = conn.sql(f"SELECT COUNT(*) FROM delta_scan('{dt_path}')").fetchall()[0][0]
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         # Remove temp uploaded file
