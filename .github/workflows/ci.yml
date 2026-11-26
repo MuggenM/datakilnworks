@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Python compiles
@@ -120,7 +120,7 @@ jobs:
           tags: ${{ env.IMAGE }}:latest
           cache-from: type=gha,scope=image
           cache-to: type=gha,scope=image,mode=max
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Playwright and Chromium (pinned in ci/requirements-ui.txt; this installs the Chromium build that Playwright release drives)
