@@ -53,6 +53,14 @@ try:
         b = p.chromium.launch()
         ctx = b.new_context(viewport={"width": 1600, "height": 1000}); ctx.add_init_script(VIOLATIONS_JS.join(["(", ")()"]))
         page = ctx.new_page(); errs = []; page.on("pageerror", lambda e: errs.append(str(e)))
+        # Alpine's x-for throws "Cannot read properties of undefined (reading 'after')" when two items share a :key; just before, it
+        # warns 'x-for ":key" is undefined or invalid' with the <template> element: record that element so a failure names the list
+        def _alpine_warning(m):
+            if m.type == "warning" and "x-for" in m.text:
+                try: where = m.args[1].evaluate("el => el.outerHTML.slice(0, 240)") if len(m.args) > 1 else "?"
+                except Exception as e: where = f"(element unreadable: {e})"
+                errs.append(f"{m.text[:120]} at {where}")
+        page.on("console", _alpine_warning)
         check("admin logs in", ctx.request.post(f"{BASE}/api/auth/login", data={"username": "admin", "password": "adminpassword123"}).ok)
         resp = page.goto(BASE, wait_until="networkidle")
         csp = resp.headers.get("content-security-policy", "")
