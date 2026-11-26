@@ -13,7 +13,7 @@ def check(n, c, d=""):
     if not c: FAIL.append(n)
 sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
 sh("docker", "rm", "-f", "pkui")
-sh("docker", "run", "-d", "--name", "pkui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
+sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "pkui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
    "-e", "INIT_ADMIN_USERNAME=admin", "-e", f"INIT_ADMIN_PASSWORD_HASH={HASH}", "localspark-lakehouse-notebook", "sh", "-c",
    "pip install -q webauthn >/dev/null 2>&1; python -m uvicorn web.app:app --host 0.0.0.0 --port 8891 --no-proxy-headers")
 try:
@@ -43,12 +43,12 @@ try:
             page.fill("input[placeholder='Enter username']", user); page.fill("input[placeholder='Enter password']", pw); page.press("input[placeholder='Enter password']", "Enter")
         who = lambda: ev("() => { const d = Alpine.$data(document.body); return d.isAuthenticated ? d.currentUser.username : null; }")
         def logout():
-            ev("() => Alpine.$data(document.body).logout()"); page.wait_for_timeout(800)
+            ev("() => { Alpine.$data(document.body).logout(); }"); page.wait_for_timeout(800)
 
         print("registration")
         check("the sign-in page offers a passkey button", page.locator("[data-testid=passkey-login]").is_visible())
         ui_login("alice", "alicepassword1"); page.wait_for_function("() => Alpine.$data(document.body).isAuthenticated"); page.wait_for_timeout(600)
-        ev("() => Alpine.$data(document.body).openMfa()"); page.wait_for_selector("[data-testid=passkeys-section]", state="visible"); page.wait_for_timeout(500)
+        ev("() => { Alpine.$data(document.body).openMfa(); }"); page.wait_for_selector("[data-testid=passkeys-section]", state="visible"); page.wait_for_timeout(500)
         check("the security dialog has a passkeys section with an Add button", page.locator("[data-testid=passkey-add]").is_visible())
         page.click("[data-testid=passkey-add]"); page.fill("[data-testid=passkey-name-input]", "Virtual laptop key")
         page.fill("[data-testid=passkey-password]", "wrong"); page.click("[data-testid=passkey-create]"); page.wait_for_selector("[data-testid=passkey-error]", state="visible", timeout=20000)
@@ -102,16 +102,19 @@ try:
         sh("docker", "exec", "-w", "/workspace", "pkui", "python", "-c", "import sys;sys.path.insert(0,'/workspace');from web import auth, mfa, webauthn_auth as w\nu=auth.get_user_by_username('alice');mfa.disable(u['id']);w.delete_all(u['id'])")
         auth = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {"protocol": "ctap2", "transport": "internal", "hasResidentKey": True, "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})["authenticatorId"]
         page.reload(wait_until="networkidle"); time.sleep(1); ui_login("alice", "alicepassword1"); page.wait_for_function("() => Alpine.$data(document.body).isAuthenticated", timeout=10000)
-        ev("() => Alpine.$data(document.body).openMfa()"); page.wait_for_selector("[data-testid=passkeys-section]", state="visible"); page.wait_for_timeout(400)
+        ev("() => { Alpine.$data(document.body).openMfa(); }"); page.wait_for_selector("[data-testid=passkeys-section]", state="visible"); page.wait_for_timeout(400)
         page.click("[data-testid=passkey-add]"); page.fill("[data-testid=passkey-name-input]", "Second key"); page.fill("[data-testid=passkey-password]", "alicepassword1"); page.click("[data-testid=passkey-create]"); page.wait_for_selector("[data-testid=passkey-row]", timeout=10000)
-        page.click("[data-testid=passkey-remove]"); page.fill("[data-testid=passkey-remove-password]", "wrong"); page.click("[data-testid=passkey-remove-confirm]"); page.wait_for_timeout(800)
+        page.click("[data-testid=passkey-remove]"); page.fill("[data-testid=passkey-remove-password]", "wrong"); page.click("[data-testid=passkey-remove-confirm]"); page.wait_for_selector("[data-testid=passkey-error]", state="visible", timeout=15000); page.wait_for_function("() => !Alpine.$data(document.body).pk.busy", timeout=15000)
         check("removing needs the password: a wrong one leaves the passkey in place", page.locator("[data-testid=passkey-row]").count() == 1 and "incorrect" in page.locator("[data-testid=passkey-error]").inner_text())
         page.fill("[data-testid=passkey-remove-password]", "alicepassword1"); page.click("[data-testid=passkey-remove-confirm]"); page.wait_for_timeout(1000)
         check("with the right password it is removed", page.locator("[data-testid=passkey-row]").count() == 0)
         print("passkey policy (administrator)")
         ev("() => Alpine.$data(document.body).mfa.open = false"); logout()
         ui_login("admin", "adminpassword123"); page.wait_for_function("() => Alpine.$data(document.body).isAuthenticated", timeout=10000); page.wait_for_timeout(800)
-        ev("() => { const d = Alpine.$data(document.body); d.showIamModal = true; d.iamTab = 'mfa'; d.loadMfaPolicy(); }"); page.wait_for_selector("[data-testid=passkey-policy-card]", state="visible"); page.wait_for_timeout(800)
+        # wait for the policy load itself: it overwrites the form when it answers, and after a sign-in the page is busy loading its data
+        with page.expect_response(lambda r: r.url.endswith("/api/webauthn/policy") and r.request.method == "GET", timeout=20000):
+            ev("() => { const d = Alpine.$data(document.body); d.showIamModal = true; d.iamTab = 'mfa'; d.loadMfaPolicy(); }")
+        page.wait_for_selector("[data-testid=passkey-policy-card]", state="visible"); page.wait_for_timeout(800)
         check("the two-factor policy tab has a passkey policy card, default 'accept any authenticator'", page.locator("[data-testid=wpol-mode-none]").is_checked() and not page.locator("[data-testid=wpol-roots]").is_visible())
         page.locator("[data-testid=wpol-mode-require]").check(); page.wait_for_timeout(200); page.click("[data-testid=wpol-save]"); page.wait_for_timeout(1000)
         check("'require' without trust roots is refused with the reason", "trust roots" in page.locator("[data-testid=wpol-error]").inner_text(), page.locator("[data-testid=wpol-error]").inner_text() if page.locator("[data-testid=wpol-error]").is_visible() else "no error")

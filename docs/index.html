@@ -1349,14 +1349,14 @@ docker compose ps</code></pre>
 
         <h3 id="security-settings">Security Settings & Trust Boundary</h3>
         <p>
-          Masking is enforced by default. An invalid or expired session is never treated as an administrator. Requests with no credentials at all run as the local admin in single-user mode; set <code>GOVERNANCE_REQUIRE_AUTH=true</code> for any shared deployment.
+          Masking is enforced by default. An invalid or expired session is never treated as an administrator. Requests with no credentials at all are the least-privilege <code>anonymous</code> user; only <code>GOVERNANCE_REQUIRE_AUTH=false</code> (single-user mode, for a studio nobody else can reach) runs them as the local admin.
         </p>
         <div class="table-wrapper">
           <table>
             <thead><tr><th>Setting</th><th>Purpose</th></tr></thead>
             <tbody>
               <tr><td><code>GOVERNANCE_ENFORCEMENT</code></td><td><code>enforce</code> (default) applies masking and statement gating; <code>audit</code> logs what would be masked without changing queries; <code>off</code> disables the gateway.</td></tr>
-              <tr><td><code>GOVERNANCE_REQUIRE_AUTH</code></td><td>Default <code>false</code> (single-user local mode: credential-less requests run as the local admin). <code>true</code> makes them the least-privilege <code>anonymous</code> user. Set it to <code>true</code> for shared deployments.</td></tr>
+              <tr><td><code>GOVERNANCE_REQUIRE_AUTH</code></td><td>Default <code>true</code>: every <code>/api</code> route except the sign-in steps (and the few routes that check their own token, such as an embedded app's data queries and the notebook sandbox's gateway) answers a request without a session with 401, a request without credentials is otherwise the least-privilege <code>anonymous</code> user, and the credential-less <code>X-User</code> header and guest mode are ignored. <code>false</code> is the old single-user mode, in which such a request runs as the local admin, so anyone who can reach the port is admin; use it only on a machine nobody else can reach.</td></tr>
               <tr><td><code>GOVERNANCE_NOTEBOOK_EXECUTION</code></td><td><code>sandbox</code> (default): users a masking policy applies to run notebooks in the notebook sandbox, everyone else in the studio's kernels. <code>exempt</code>: only users no policy applies to may run notebooks. <code>all</code>: everyone uses the studio's kernels (masking is then not enforced for notebook code).</td></tr>
               <tr><td><code>SANDBOX_URL</code>, <code>SANDBOX_TOKEN</code>, <code>SANDBOX_GATEWAY_URL</code></td><td>Where the studio finds the sandbox worker, its token (generated on a volume the studio mounts read-only) and where kernels reach the studio.</td></tr>
               <tr><td><code>SANDBOX_TOKEN_TTL</code>, <code>SANDBOX_MAX_ROWS</code>, <code>SANDBOX_MAX_KERNELS</code></td><td>Lifetime of a kernel's data token (seconds), rows one sandboxed query may return, concurrent sandbox kernels.</td></tr>

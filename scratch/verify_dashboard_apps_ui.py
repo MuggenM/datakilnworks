@@ -14,7 +14,7 @@ def check(n, c, d=""):
     if not c: FAIL.append(n)
 sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
 sh("docker", "rm", "-f", "dapui")
-sh("docker", "run", "-d", "--name", "dapui", "-p", "8118:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
+sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "dapui", "-p", "8118:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
    "-e", "INIT_ADMIN_USERNAME=admin", "-e", f"INIT_ADMIN_PASSWORD_HASH={HASH}", "localspark-lakehouse-notebook", "python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8891", "--no-proxy-headers")
 try:
     for _ in range(90):

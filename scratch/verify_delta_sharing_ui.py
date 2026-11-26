@@ -17,7 +17,7 @@ def http(url, token=None, method="GET", body=None):
         with urllib.request.urlopen(req, timeout=20) as r: return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
     except urllib.error.HTTPError as e: return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
 sh("docker", "rm", "-f", "dshui")
-sh("docker", "run", "-d", "--name", "dshui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
+sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "dshui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
    "-e", "INIT_ADMIN_USERNAME=admin", "-e", f"INIT_ADMIN_PASSWORD_HASH={HASH}", "localspark-lakehouse-notebook", "python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8891", "--no-proxy-headers")
 try:
     for _ in range(90):

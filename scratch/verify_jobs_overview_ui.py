@@ -15,7 +15,7 @@ sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
 def T(tid, deps=(), q="select 1"): return {"id": tid, "name": tid, "type": "sql", "depends_on": list(deps), "parameters": {"query": q}}
 OK, BAD = [T("a"), T("b", ["a"])], [T("a"), T("b", ["a"], "select * from table_zz_missing")]
 sh("docker", "rm", "-f", "ovui")
-sh("docker", "run", "-d", "--name", "ovui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
+sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "ovui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
    "-e", "INIT_ADMIN_USERNAME=admin", "-e", f"INIT_ADMIN_PASSWORD_HASH={HASH}", "localspark-lakehouse-notebook", "python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8891", "--no-proxy-headers")
 try:
     for _ in range(90):

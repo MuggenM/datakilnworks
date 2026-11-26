@@ -21053,7 +21053,7 @@
         },
 
         async onUserChanged() {
-          await this.refreshNotebookAccess();
+          if (this.isAuthenticated) await this.refreshNotebookAccess();
           const username = this.currentUser?.username || 'admin';
           console.log(`[MultiUser] Scoping studio state to user: ${username}`);
 
@@ -21074,6 +21074,8 @@
           this.playgroundResultA = null;
           this.playgroundResultB = null;
 
+          if (!this.isAuthenticated) return;      // signed out: nothing to load, every /api route needs a session
+
           // 3. Parallel fetch across all scoped components
           const tasks = [
             this.fetchWorkspaceTree(false),
@@ -21091,6 +21093,31 @@
           if (typeof this.fetchSavedQueries === 'function') tasks.push(this.fetchSavedQueries());
 
           await Promise.allSettled(tasks);
+          await this.loadCoreData();
+        },
+
+        // The rest of what the views need for the signed-in user (the part onUserChanged does not already fetch). Before the API
+        // required a session, initApp loaded this once at page load, before anyone had signed in, as the credential-less admin.
+        async loadCoreData() {
+          await this.fetchStatus();
+          await Promise.allSettled([
+            this.fetchMounts(),
+            this.fetchRegisteredModels(),
+            this.fetchTraces(),
+            this.fetchSqlWarehouses(),
+            this.fetchAlertsSummary(),
+            this.fetchAlerts(true),
+            this.fetchAutocompleteMetadata(),
+            this.fetchCopilotProviders()
+          ]);
+          if (this.currentView === 'playground') this.initPlayground();
+          if (this.currentView === 'sql') this.initMonaco();
+          if (this.currentView === 'dbt') this.fetchDbtAll();
+          this.loadDashboards();
+          this.fetchJobs();
+          this.fetchGenieConfig();
+          this.fetchAutoloaderPipelines();
+          this.fetchAutoloaderStats();
         },
 
         isCatalogOwner(catalogId) {
@@ -22895,7 +22922,6 @@
 
         async initApp() {
           await this.checkAuth();
-          await this.refreshNotebookAccess();
           this.applyTheme(this.isDarkMode);
           this.$watch('showLoginModal', (open) => { if (open) this.$nextTick(() => this.startConditionalPasskey()); else this.stopConditionalPasskey(); });
           this.$watch('passkeyLoginAvailable', () => { if (this.showLoginModal) this.$nextTick(() => this.startConditionalPasskey()); });
@@ -22981,51 +23007,15 @@
             });
           }
 
-          await this.fetchStatus();
-          // Load core resources concurrently to eliminate initialization lag
-          await Promise.allSettled([
-            this.fetchCatalogs(),
-            this.fetchMounts(),
-            this.fetchRegisteredModels(),
-            this.fetchTraces(),
-            this.fetchSqlWarehouses(),
-            this.fetchWorkspaceTree(),
-            this.fetchSavedQueries(),
-            this.fetchRecents(),
-            this.fetchAlertsSummary(),
-            this.fetchAlerts(true),
-            this.fetchExperimentsSummary(),
-            this.fetchAutocompleteMetadata(),
-            this.fetchCopilotProviders(),
-            this.fetchDbtStatus()
-          ]);
-          if (this.currentView === 'playground') {
-            this.initPlayground();
+          // Data loads only for a signed-in user: every /api route needs a session (`_api_auth_gate`), and the sign-in paths
+          // (finishLogin, the forced password change / MFA enrolment) call onUserChanged themselves once there is one.
+          if (this.isAuthenticated && !this.currentUser?.must_change_password && !this.mfaEnrollmentRequired()) {
+            await this.onUserChanged();
           }
-          if (this.currentView === 'experiments') {
-            this.fetchExperiments();
-            this.fetchRegisteredModels();
-            this.fetchTraces();
-          }
-          if (this.currentView === 'lineage') {
-            this.fetchGlobalLineage();
-          }
-          if (this.currentView === 'sql') {
-            this.initMonaco();
-          }
-          if (this.currentView === 'dbt') {
-            this.fetchDbtAll();
-          }
-          this.loadDashboards();
-          this.fetchHistory();
-          this.fetchJobs();
-          this.fetchGenieConfig();
-          this.fetchGlobalLineage(true);
-          this.fetchAutoloaderPipelines();
-          this.fetchAutoloaderStats();
 
           // Periodic background poll for alerts summary & active statuses (every 20s)
           setInterval(() => {
+            if (!this.isAuthenticated) return;
             this.fetchAlertsSummary();
             if (this.currentView === 'alerts') {
               this.fetchAlerts(true);

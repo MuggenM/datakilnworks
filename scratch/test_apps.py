@@ -177,9 +177,10 @@ def login(username, password):
     return r.cookies
 
 
-admin_cookies = {"X-User": "admin"}  # GOVERNANCE_REQUIRE_AUTH is off in this test, so the dev X-User header works
-bob_cookies = {"X-User": "bob"}
-carol_cookies = {"X-User": "carol"}
+def _bearer(username):  # a real session token (X-User only works in the single-user mode GOVERNANCE_REQUIRE_AUTH=false)
+    from web import auth as _auth
+    return {"Authorization": "Bearer " + _auth.create_access_token(_auth.get_user_by_username(username))}
+admin_cookies, bob_cookies, carol_cookies = _bearer("admin"), _bearer("bob"), _bearer("carol")
 
 r = client.post("/api/apps", data={"name": "HTTP Test App", "visibility": "private"},
                 files={"file": ("a.zip", GOOD_ZIP, "application/zip")}, headers=carol_cookies)

@@ -26,6 +26,9 @@ services:
       - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets
       # Server-side sessions (web/sessions.py): minutes of inactivity after which a session ends (0 = only the 24 h lifetime).
       - SESSION_IDLE_MINUTES=${SESSION_IDLE_MINUTES:-0}
+      # true (default): a request without credentials is the least-privilege `anonymous` user. false = the old single-user mode, in which
+      # such a request runs as the local admin (anyone who can reach the port is admin): only for a studio nobody else can reach.
+      - GOVERNANCE_REQUIRE_AUTH=${GOVERNANCE_REQUIRE_AUTH:-true}
       - WH_STARTER_ENDPOINT=http://compute-node-01:8001
       - WH_ANALYTICS_ENDPOINT=http://compute-node-02:8002
       - WH_ETL_ENDPOINT=http://compute-node-03:8003

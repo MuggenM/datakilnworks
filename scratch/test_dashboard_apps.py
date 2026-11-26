@@ -126,7 +126,11 @@ gov_policies.create_policy({"name": "mask emails for dashboard apps test", "tag_
 warehouses.create_catalog("Finance", "finance", "", None, False, "admin")
 
 client = TestClient(app_module.app)
-H = lambda u: {"X-User": u}
+_TOKENS = {}
+def H(u):  # a real session token per user (X-User only works in the single-user mode GOVERNANCE_REQUIRE_AUTH=false)
+    if u not in _TOKENS:
+        _TOKENS[u] = auth.create_access_token(auth.get_user_by_username(u))
+    return {"Authorization": "Bearer " + _TOKENS[u]}
 
 print("=== samples catalogue and cloning ===")
 r = client.get("/api/dashboard-apps/samples", headers=H("bob"))

@@ -71,7 +71,7 @@ def main():
         r = client.get("/api/governance/status", cookies=admin).json()
         posture = r["posture"]
         check("posture reports enforcement mode, auth and notebook settings", posture["enforcement_mode"] == "enforce"
-              and posture["require_auth"] is False and posture["notebook_execution"] == "sandbox", posture)
+              and posture["require_auth"] is True and posture["notebook_execution"] == "sandbox", posture)
         os.environ["GOVERNANCE_ENFORCEMENT"] = "audit"
         os.environ["GOVERNANCE_NOTEBOOK_EXECUTION"] = "all"
         try:

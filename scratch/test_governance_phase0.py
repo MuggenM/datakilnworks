@@ -86,7 +86,12 @@ def token_for(username, secret=None, expires_in=3600):
 def test_auth_never_fails_open():
     print("\n1. resolve_principal never fails open")
     p, status = resolve()
-    check("no credentials (local mode) -> local admin", p and p["role"] == "admin" and status is None, (p, status))
+    check("no credentials, variable unset (the default) -> anonymous, not admin", p and p["username"] == "anonymous" and p["role"] == "user", (p, status))
+    p, status = resolve(headers={"X-User": "admin"})
+    check("X-User: admin is ignored by default", p and p["username"] == "anonymous", (p, status))
+    os.environ["GOVERNANCE_REQUIRE_AUTH"] = "false"       # the explicit single-user mode for the rest of this section
+    p, status = resolve()
+    check("no credentials (single-user mode) -> local admin", p and p["role"] == "admin" and status is None, (p, status))
 
     good = token_for("analyst_bob")
     p, status = resolve(cookies={auth.COOKIE_NAME: good})
@@ -132,6 +137,7 @@ def test_auth_never_fails_open():
     swallowing = re.findall(r'await get_current_user\(request\)[^\n]*\n(?:[^\n]*\n){0,4}?\s*except Exception:\s*\n\s*(?:pass|user(?:_id)? = )', text)
     check("no endpoint swallows an auth failure (defaults to admin, None or a client-supplied user)", not swallowing, swallowing[:2])
     check("identity defaults of 'admin' are gone", not re.search(r'username = "admin"\n\s*is_admin = True\n\s*try:', text))
+    os.environ.pop("GOVERNANCE_REQUIRE_AUTH", None)
 
 
 def test_require_auth_mode():

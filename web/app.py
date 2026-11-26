@@ -27,7 +27,8 @@ from web.auth import (
     get_current_user, resolve_principal, require_role, create_access_token, verify_password, hash_password,
     get_user_by_username, get_user_by_id, list_users, create_user, update_user, reset_user_password,
     delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db, decode_access_token,
-    session_user as auth_session_user, end_session, current_session_id, revoke_user_sessions
+    session_user as auth_session_user, end_session, current_session_id, revoke_user_sessions,
+    governance_require_auth as auth_governance_require_auth
 )
 from web import auth_frameworks, llm_settings
 from web.compute_auth import compute_headers
@@ -243,6 +244,58 @@ def _gate_session_user(request: Request, token: str) -> Optional[Dict[str, Any]]
     user = auth_session_user(token)
     request.state._dkw_gate_user = (token, user)
     return user
+
+
+# /api/* paths that answer without a session: the steps of signing in (each checks its own one-time token, challenge or IdP
+# response), the session probe and sign-out, the browser's CSP reports, branding needed by the sign-in page, FastAPI's docs pages,
+# and the two routes that authenticate with their own bearer tokens (a sandboxed kernel's gateway token, an embedded app's data
+# token). Everything else is refused without a live session by `_api_auth_gate`. Keep this list short: a route that belongs here
+# must do its own authentication.
+_PUBLIC_API = {
+    ("POST", "/api/auth/login"), ("POST", "/api/auth/login/mfa"), ("POST", "/api/auth/login/webauthn"),
+    ("POST", "/api/auth/login/webauthn/options"), ("GET", "/api/auth/passkey/status"), ("POST", "/api/auth/passkey/options"),
+    ("POST", "/api/auth/passkey/login"), ("POST", "/api/auth/enroll/options"), ("POST", "/api/auth/enroll/verify"),
+    ("GET", "/api/auth/sso"), ("GET", "/api/auth/oidc/login"), ("GET", "/api/auth/oidc/callback"),
+    ("GET", "/api/auth/saml/login"), ("POST", "/api/auth/saml/acs"), ("GET", "/api/auth/saml/logout"),
+    ("GET", "/api/auth/saml/sls"), ("GET", "/api/auth/saml/metadata"),
+    ("GET", "/api/auth/me"), ("POST", "/api/auth/logout"),
+    ("POST", "/api/csp-report"), ("GET", "/api/brand/css"),
+    ("GET", "/api/docs"), ("GET", "/api/docs/oauth2-redirect"), ("GET", "/api/redoc"),
+    ("POST", "/api/sandbox/sql"),
+}
+_PUBLIC_API_PATTERNS = (
+    (("GET",), re.compile(r"/api/brand/assets/[^/]+")),
+    (("POST",), re.compile(r"/api/apps/[^/]+/query")),
+)
+
+
+def is_public_api(method: str, path: str) -> bool:
+    method = "GET" if method == "HEAD" else method
+    if (method, path) in _PUBLIC_API:
+        return True
+    return any(method in methods and rx.fullmatch(path) for methods, rx in _PUBLIC_API_PATTERNS)
+
+
+@app.middleware("http")
+async def _api_auth_gate(request: Request, call_next):
+    """
+    Default deny for /api/*: without a live session (cookie or bearer token, `auth.session_user`) a request is refused with 401
+    before any route runs, unless it is in `_PUBLIC_API`. About 170 routes used to have no authentication check of their own
+    (warehouse create/delete, workspace upload, table restore, dbt model edits, the MLflow API, ...); this closes them and any
+    route added later. Routes keep their own role checks: this only decides "signed in or not". OPTIONS (CORS preflight) passes;
+    in the explicit single-user mode (GOVERNANCE_REQUIRE_AUTH=false) every request is the local admin, so the gate is off there.
+    """
+    path = request.url.path
+    if path.startswith("/api/") and request.method != "OPTIONS" and not is_public_api(request.method, path) \
+            and auth_governance_require_auth():
+        token = request.cookies.get(COOKIE_NAME)
+        header = request.headers.get("Authorization") or ""
+        if not token and header.startswith("Bearer "):
+            token = header[7:].strip()
+        if not token or not _gate_session_user(request, token):
+            return JSONResponse(status_code=401, content={"detail": "Authentication required. Please log in."},
+                                headers={"WWW-Authenticate": "Bearer"})
+    return await call_next(request)
 
 
 @app.middleware("http")

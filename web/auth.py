@@ -709,7 +709,14 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         if user and user.get("is_active", 1) == 1:
             return user
 
-    # If auth db hasn't been initialized or dev fallback, check if guest mode allowed
+    # Guest mode (app setting `allow_guest_mode`, admin-settable) hands the admin account to every caller without credentials,
+    # so, like the credential-less admin above, it only exists in the explicit single-user mode (GOVERNANCE_REQUIRE_AUTH=false).
+    if governance_require_auth():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please log in.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
     conn = get_db_connection()
     try:
         row = conn.execute("SELECT value_json FROM app_settings WHERE key = 'allow_guest_mode'").fetchone()
@@ -729,8 +736,10 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
 
 
 def governance_require_auth() -> bool:
-    """When true, requests without credentials are anonymous (least privilege) instead of the local admin."""
-    return os.getenv("GOVERNANCE_REQUIRE_AUTH", "false").strip().lower() in ("1", "true", "yes", "on")
+    """True (the default) unless GOVERNANCE_REQUIRE_AUTH is explicitly false/0/no/off. When true, a request without credentials is the
+    least-privilege `anonymous` user, the credential-less `X-User` header and guest mode are ignored. Off is the old single-user mode
+    in which such a request runs as the local admin: anyone who can reach the port is admin, so only for a laptop-only install."""
+    return os.getenv("GOVERNANCE_REQUIRE_AUTH", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
 LOCAL_ADMIN = {"role": "admin", "username": "admin", "id": "u_admin_01"}
@@ -753,8 +762,8 @@ async def resolve_principal(request: Request) -> Dict[str, Any]:
 
     - Valid credentials -> that user.
     - Credentials presented but invalid/expired/unknown/inactive -> 401. NEVER admin.
-    - No credentials at all -> the local single-user admin (the documented no-login mode), or the
-      least-privilege `anonymous` user when GOVERNANCE_REQUIRE_AUTH is set.
+    - No credentials at all -> the least-privilege `anonymous` user (default), or the local admin in the explicit
+      single-user mode (GOVERNANCE_REQUIRE_AUTH=false).
     - Unexpected errors propagate (500) instead of silently granting admin.
     """
     try:
