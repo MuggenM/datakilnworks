@@ -52,7 +52,13 @@ try:
     with sync_playwright() as p:
         b = p.chromium.launch()
         ctx = b.new_context(viewport={"width": 1600, "height": 1000}); ctx.add_init_script(VIOLATIONS_JS.join(["(", ")()"]))
-        page = ctx.new_page(); errs = []; page.on("pageerror", lambda e: errs.append(str(e)))
+        page = ctx.new_page(); errs = []; STEP = ["start"]
+        def _page_error(e):
+            errs.append(str(e))
+            if "reading 'after'" in str(e):   # an x-for key clash: record what the result grid was rendering, and where the test was
+                try: errs.append("  state: " + page.evaluate("() => { const d = Alpine.$data(document.body); const r = d.queryResult; return JSON.stringify({ view: d.currentView, executing: d.isExecuting, tab: d.activeSqlTab, columns: r && r.columns, keys: r && Object.keys(r), rows: r && r.rows && r.rows.length }).slice(0, 600); }") + f" (test step: {STEP[0]})")
+                except Exception as x: errs.append(f"  state unreadable: {x} (test step: {STEP[0]})")
+        page.on("pageerror", _page_error)
         # Alpine's x-for throws "Cannot read properties of undefined (reading 'after')" when two items share a :key; just before, it
         # warns 'x-for ":key" is undefined or invalid' with the <template> element: record that element so a failure names the list
         def _alpine_warning(m):
@@ -71,19 +77,22 @@ try:
         views = ["sql", "workspace", "experiments", "dashboards", "jobs", "catalog", "alerts", "queries", "lineage", "sql_warehouses", "playground",
                  "ingest", "genie", "autoloader", "apps", "recents", "history", "governance", "dbt", "compute"]
         for v in views:
+            STEP[0] = f"view {v}"
             page.evaluate(f"() => {{ Alpine.$data(document.body).currentView = '{v}'; }}"); page.wait_for_timeout(1200)
-        page.evaluate("() => { const d = Alpine.$data(document.body); d.currentView = 'sql'; }"); page.wait_for_timeout(1000)
+        STEP[0] = "back to sql, waiting for Monaco"; page.evaluate("() => { const d = Alpine.$data(document.body); d.currentView = 'sql'; }"); page.wait_for_timeout(1000)
         page.wait_for_function("() => window.monaco && window._monacoEditor", timeout=45000)
         check("the Monaco SQL editor loads from cdnjs", page.evaluate("() => !!document.querySelector('.monaco-editor')"))
         page.evaluate("() => { window._monacoEditor.setValue('SELECT 42 AS answer, \\'csp\\' AS word'); }")
+        STEP[0] = "running the test query"
         page.evaluate("() => { const d = Alpine.$data(document.body); (d.runQuery || d.executeQuery || d.runSql).call(d); }"); page.wait_for_timeout(4000)
         check("a query runs and its result is shown", "42" in page.inner_text("body"))
         for name, fn in (("IAM dialog", "openIamModal"), ("two-factor dialog", "openMfa"), ("sessions dialog", "openSessions"), ("settings", "openSettingsModal")):
+            STEP[0] = name
             page.evaluate(f"() => {{ const d = Alpine.$data(document.body); if (d.{fn}) d.{fn}(); }}"); page.wait_for_timeout(1500)
             page.keyboard.press("Escape"); page.wait_for_timeout(400)
         v = violations(page)
         check("no CSP violation across all views, the editor and the dialogs", v == [], v[:8])
-        check("no page errors", not errs, errs[:5])
+        check("no page errors", not errs, errs[:6])
 
         print("the policy blocks injected script")
         page.evaluate("""() => { window.__pwned = 0; const d = document.createElement('div');
