@@ -42,7 +42,7 @@ jobs:
         run: |
           docker compose config -q
           docker compose --profile proxy config -q
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - name: Helm lint and template (default values and the smoke-test values)
         run: |
           # the $ signs below belong to the hash and must not expand
@@ -153,7 +153,7 @@ jobs:
           tags: ${{ env.IMAGE }}:latest
           cache-from: type=gha,scope=image
           cache-to: type=gha,scope=image,mode=max
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - uses: helm/kind-action@v1
         with:
           install_only: true
