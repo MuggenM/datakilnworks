@@ -3,39 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{{ dashboard.get('name', 'Dashboard') }}</title>
+  <title>{{ dashboard_name }}</title>
 
-  <!-- Tailwind CSS -->
   <script src="/static/tailwind.min.js"></script>
-
-  <!-- Alpine.js -->
   <script defer src="/static/alpine.min.js"></script>
-
-  <!-- ECharts -->
   <script src="/static/echarts.min.js"></script>
-
-  <!-- Phosphor Icons -->
   <link rel="stylesheet" href="/static/phosphor-regular.css">
 
   <style>
-    /* Minimal embedded view styles */
-    body {
-      margin: 0;
-      padding: 0;
-      overflow-x: hidden;
-    }
-
-    .dark {
-      background: #0b111e;
-      color: white;
-    }
-
-    /* Auto theme detection */
+    body { margin: 0; padding: 0; overflow-x: hidden; }
+    .dark { background: #0b111e; color: white; }
     @media (prefers-color-scheme: dark) {
-      html[data-theme="auto"] {
-        background: #0b111e;
-        color: white;
-      }
+      html[data-theme="auto"] { background: #0b111e; color: white; }
     }
   </style>
 </head>
@@ -43,25 +22,22 @@
       x-data="embedDashboard()"
       x-init="init()">
 
-  <!-- Minimal Header -->
   <div class="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-700 px-4 py-2 flex items-center justify-between">
     <div class="flex items-center space-x-3">
       <i class="ph ph-chart-line-up text-xl text-indigo-600"></i>
-      <h1 class="text-sm font-bold" x-text="dashboard.name"></h1>
+      <h1 class="text-sm font-bold" x-text="name" data-testid="embed-title"></h1>
     </div>
     <div class="flex items-center space-x-2 text-xs text-slate-500">
       <span x-show="lastRefreshed">
         Last updated: <span x-text="formatTime(lastRefreshed)"></span>
       </span>
-      <button @click="refreshDashboard()" class="p-1 hover:bg-slate-100 dark:hover:bg-slate-800 rounded">
+      <button @click="loadDashboard()" class="p-1 hover:bg-slate-100 dark:hover:bg-slate-800 rounded" title="Refresh">
         <i class="ph ph-arrow-clockwise"></i>
       </button>
     </div>
   </div>
 
-  <!-- Dashboard Content -->
   <div class="p-4">
-    <!-- Loading State -->
     <div x-show="isLoading" class="flex items-center justify-center h-64">
       <div class="text-center">
         <i class="ph ph-spinner text-4xl animate-spin text-indigo-600"></i>
@@ -69,21 +45,13 @@
       </div>
     </div>
 
-    <!-- Dashboard Grid -->
-    <div x-show="!isLoading" class="grid grid-cols-12 gap-4">
-      <template x-for="widget in dashboard.widgets" :key="widget.id">
-        <div :class="getWidgetGridClass(widget)"
+    <p x-show="error" class="text-sm text-red-600" x-text="error" data-testid="embed-error"></p>
+
+    <div x-show="!isLoading" class="grid grid-cols-4 gap-4">
+      <template x-for="widget in widgets" :key="widget.id">
+        <div :class="gridClass(widget)" data-testid="embed-widget"
              class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg p-4 shadow-sm">
-
-          <!-- Widget Header -->
-          <div class="flex items-start justify-between mb-3">
-            <div class="flex-1">
-              <h3 class="font-semibold text-sm" x-text="widget.title"></h3>
-              <p x-show="widget.description" class="text-xs text-slate-500 mt-1" x-text="widget.description"></p>
-            </div>
-          </div>
-
-          <!-- Widget Content -->
+          <h3 class="font-semibold text-sm mb-3" x-text="widget.title"></h3>
           <div :id="'widget-' + widget.id" class="widget-content"></div>
         </div>
       </template>
@@ -91,170 +59,134 @@
   </div>
 
   <script nonce="{{ csp_nonce }}">
+    // Everything below writes data with textContent / DOM nodes only, never as HTML: query results are data, not markup.
+    const DKW_EMBED = {{ {"id": dashboard_id, "name": dashboard_name, "theme": theme} | tojson }};
+    const CHART_TYPES = { bar: 'bar', line: 'line', area: 'line', scatter: 'scatter', pie: 'pie', funnel: 'funnel' };
+
+    function el(tag, cls, text) {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined && text !== null) e.textContent = String(text);
+      return e;
+    }
+
     function embedDashboard() {
       return {
-        dashboard: {{ dashboard | tojson }},
+        name: DKW_EMBED.name,
+        widgets: [],
         isLoading: true,
+        error: '',
         lastRefreshed: null,
-        chartInstances: {},
+        charts: {},
 
         async init() {
-          // Apply theme
-          const theme = '{{ theme }}';
-          if (theme === 'dark') {
-            document.documentElement.classList.add('dark');
-          } else if (theme === 'light') {
-            document.documentElement.classList.remove('dark');
-          }
-          // 'auto' uses system preference via media query
-
+          if (DKW_EMBED.theme === 'dark') document.documentElement.classList.add('dark');
+          else if (DKW_EMBED.theme === 'light') document.documentElement.classList.remove('dark');
+          window.addEventListener('resize', () => Object.values(this.charts).forEach(c => c.resize()));
           await this.loadDashboard();
         },
 
         async loadDashboard() {
           this.isLoading = true;
-
+          this.error = '';
           try {
-            // Execute all widget queries
-            for (const widget of this.dashboard.widgets) {
-              await this.executeWidget(widget);
+            const r = await fetch('/api/dashboards/' + encodeURIComponent(DKW_EMBED.id), { credentials: 'same-origin' });
+            if (!r.ok) {
+              this.error = r.status === 401 ? 'Your session has ended. Sign in again and reload.' : 'The dashboard could not be loaded.';
+              this.widgets = [];
+              return;
             }
-
+            const d = await r.json();
+            this.name = d.name || this.name;
+            Object.values(this.charts).forEach(c => c.dispose());
+            this.charts = {};
+            this.widgets = (d.widgets || []).filter(w => !w.page || !(d.pages || []).length || w.page === d.pages[0].id);
             this.lastRefreshed = new Date();
+            this.isLoading = false;
+            await this.$nextTick();
+            this.widgets.forEach(w => this.renderWidget(w));
           } catch (e) {
             console.error('Error loading dashboard:', e);
+            this.error = 'The dashboard could not be loaded.';
           } finally {
             this.isLoading = false;
           }
         },
 
-        async executeWidget(widget) {
-          try {
-            // Execute query (simplified - you may need to adjust based on your API)
-            const response = await fetch('/api/query/execute', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                sql: widget.sql,
-                warehouse_id: this.dashboard.warehouse_id
-              })
-            });
-
-            const data = await response.json();
-
-            if (data.success) {
-              widget.result = data.result;
-
-              // Render widget
-              await this.$nextTick();
-              this.renderWidget(widget);
-            }
-          } catch (e) {
-            console.error('Error executing widget:', e);
-          }
-        },
-
         renderWidget(widget) {
-          const container = document.getElementById('widget-' + widget.id);
-          if (!container) return;
-
-          const type = widget.visualization_type || 'table';
-
-          if (type === 'table') {
-            this.renderTable(container, widget);
-          } else if (type === 'counter') {
-            this.renderCounter(container, widget);
+          const box = document.getElementById('widget-' + widget.id);
+          if (!box) return;
+          box.replaceChildren();
+          const res = widget.result || {};
+          if (widget.type === 'text') {
+            box.appendChild(el('div', 'text-sm whitespace-pre-wrap', widget.markdown || ''));
+            return;
+          }
+          if (res.success === false) {
+            box.appendChild(el('p', 'text-xs text-red-600', res.error || 'The query failed.'));
+            return;
+          }
+          const rows = res.rows || [];
+          const cols = (res.columns || []).map(c => (typeof c === 'string' ? c : c.name));
+          if (!cols.length && rows[0]) cols.push(...Object.keys(rows[0]));
+          if (widget.type === 'kpi' || widget.type === 'big_number_trendline' || widget.type === 'gauge') {
+            const v = rows[0] ? rows[0][cols[0]] : '';
+            box.appendChild(el('div', 'text-center py-6 text-4xl font-bold text-indigo-600', (widget.unit || '') + this.formatNumber(v)));
+          } else if (CHART_TYPES[widget.type] && cols.length >= 2) {
+            this.renderChart(box, widget, rows, cols);
           } else {
-            this.renderChart(container, widget);
+            this.renderTable(box, rows, cols);
           }
         },
 
-        renderTable(container, widget) {
-          if (!widget.result || !widget.result.rows) return;
-
-          const rows = widget.result.rows;
-          const columns = widget.result.columns || Object.keys(rows[0] || {});
-
-          let html = '<div class="overflow-x-auto"><table class="w-full text-xs">';
-          html += '<thead class="bg-slate-50 dark:bg-slate-800"><tr>';
-          columns.forEach(col => {
-            html += `<th class="px-3 py-2 text-left font-semibold">${col}</th>`;
-          });
-          html += '</tr></thead><tbody>';
-
+        renderTable(box, rows, cols) {
+          const wrap = el('div', 'overflow-x-auto');
+          const t = el('table', 'w-full text-xs');
+          const hr = el('tr', 'bg-slate-50 dark:bg-slate-800');
+          cols.forEach(c => hr.appendChild(el('th', 'px-3 py-2 text-left font-semibold', c)));
+          t.appendChild(el('thead')).appendChild(hr);
+          const tb = t.appendChild(el('tbody'));
           rows.slice(0, 100).forEach((row, i) => {
-            html += `<tr class="${i % 2 === 0 ? 'bg-white dark:bg-slate-900' : 'bg-slate-50 dark:bg-slate-800'}">`;
-            columns.forEach(col => {
-              html += `<td class="px-3 py-2">${row[col] ?? ''}</td>`;
-            });
-            html += '</tr>';
+            const tr = el('tr', i % 2 ? 'bg-slate-50 dark:bg-slate-800' : 'bg-white dark:bg-slate-900');
+            cols.forEach(c => tr.appendChild(el('td', 'px-3 py-2', row[c] ?? '')));
+            tb.appendChild(tr);
           });
-
-          html += '</tbody></table></div>';
-          container.innerHTML = html;
+          wrap.appendChild(t);
+          box.appendChild(wrap);
         },
 
-        renderCounter(container, widget) {
-          if (!widget.result || !widget.result.rows || !widget.result.rows[0]) return;
-
-          const row = widget.result.rows[0];
-          const value = Object.values(row)[0];
-
-          container.innerHTML = `
-            <div class="text-center py-8">
-              <div class="text-4xl font-bold text-indigo-600">${this.formatNumber(value)}</div>
-            </div>
-          `;
-        },
-
-        renderChart(container, widget) {
-          const chart = echarts.init(container, document.documentElement.classList.contains('dark') ? 'dark' : null);
-          this.chartInstances[widget.id] = chart;
-
-          // Basic chart configuration (simplified)
-          const option = {
-            tooltip: { trigger: 'axis' },
-            grid: { left: 50, right: 20, top: 20, bottom: 40 },
-            xAxis: { type: 'category', data: [] },
-            yAxis: { type: 'value' },
-            series: [{ type: 'bar', data: [] }]
-          };
-
-          // Populate with data
-          if (widget.result && widget.result.rows) {
-            const rows = widget.result.rows;
-            const columns = Object.keys(rows[0] || {});
-
-            if (columns.length >= 2) {
-              option.xAxis.data = rows.map(r => r[columns[0]]);
-              option.series[0].data = rows.map(r => r[columns[1]]);
-            }
+        renderChart(box, widget, rows, cols) {
+          const div = el('div');
+          div.style.height = '260px';
+          box.appendChild(div);
+          const chart = echarts.init(div, document.documentElement.classList.contains('dark') ? 'dark' : null);
+          this.charts[widget.id] = chart;
+          const kind = CHART_TYPES[widget.type];
+          const x = rows.map(r => String(r[cols[0]] ?? ''));
+          const y = rows.map(r => r[cols[1]]);
+          let option;
+          if (kind === 'pie' || kind === 'funnel') {
+            option = { tooltip: { trigger: 'item' }, series: [{ type: kind, data: x.map((n, i) => ({ name: n, value: y[i] })) }] };
+          } else {
+            option = {
+              tooltip: { trigger: 'axis' }, grid: { left: 50, right: 20, top: 20, bottom: 40 },
+              xAxis: { type: 'category', data: x }, yAxis: { type: 'value' },
+              series: [{ type: kind, data: y, areaStyle: widget.type === 'area' ? {} : undefined }],
+            };
           }
-
           chart.setOption(option);
-
-          // Resize on window resize
-          window.addEventListener('resize', () => chart.resize());
         },
 
-        async refreshDashboard() {
-          await this.loadDashboard();
+        gridClass(widget) {
+          const w = widget.width;
+          if (typeof w === 'string' && /^col-span-[1-4]$/.test(w)) return w;
+          if (typeof w === 'number') return 'col-span-' + Math.max(1, Math.min(4, Math.round(w / 3)));
+          return 'col-span-2';
         },
 
-        getWidgetGridClass(widget) {
-          const width = widget.width || 6;
-          return `col-span-${Math.min(width, 12)}`;
-        },
-
-        formatTime(date) {
-          return new Date(date).toLocaleTimeString();
-        },
-
-        formatNumber(num) {
-          if (typeof num !== 'number') return num;
-          return num.toLocaleString();
-        }
-      }
+        formatTime(date) { return new Date(date).toLocaleTimeString(); },
+        formatNumber(num) { return typeof num === 'number' ? num.toLocaleString() : (num ?? ''); },
+      };
     }
   </script>
 </body>

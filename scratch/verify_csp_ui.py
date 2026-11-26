@@ -116,10 +116,25 @@ try:
         r = ctx.request.post(f"{BASE}/api/dashboards", data={"name": "CSP dash", "description": "x"})
         did = (r.json().get("dashboard") or r.json()).get("id") if r.ok else None
         if did:
+            payload = "<img src=x onerror=window.__pwned=1>"
+            for w in ({"title": "Rows", "type": "table", "width": "col-span-4",
+                       "query": f"SELECT '{payload}' AS label, 42 AS n UNION ALL SELECT 'b', 7"},
+                      {"title": "Bars", "type": "bar", "width": "col-span-2", "query": "SELECT 'a' AS k, 3 AS v UNION ALL SELECT 'b', 5"}):
+                rw = ctx.request.post(f"{BASE}/api/dashboards/{did}/widgets", data=w)
+                check(f"widget '{w['title']}' added", rw.ok, rw.text()[:200])
             pg = ctx.new_page(); pe = []; pg.on("pageerror", lambda e: pe.append(str(e)))
-            pg.goto(f"{BASE}/embed/dashboard/{did}", wait_until="networkidle"); pg.wait_for_timeout(2000)
+            pg.goto(f"{BASE}/embed/dashboard/{did}", wait_until="networkidle")
+            pg.wait_for_function("() => document.querySelectorAll('[data-testid=embed-widget] td').length >= 4", timeout=30000)
+            pg.wait_for_timeout(800)
             check("a dashboard embed (now without CDNs) renders without a violation", violations(pg) == [] and not pe and "CSP dash" in pg.inner_text("body"), (violations(pg), pe))
+            check("the embed shows the table widget's rows", "42" in pg.inner_text("[data-testid=embed-widget]"))
+            check("an HTML value in the data is shown as text, not run", payload in pg.inner_text("body") and
+                  pg.evaluate("() => !window.__pwned && !document.querySelector('.widget-content img')"))
+            check("the bar widget draws a chart", pg.evaluate("() => !!document.querySelector('.widget-content canvas')"))
             pg.close()
+            anon = b.new_context()
+            check("the embed is refused without a session", anon.request.get(f"{BASE}/embed/dashboard/{did}").status == 401)
+            anon.close()
         else:
             check("a dashboard could be created for the embed check", False, r.text[:200])
 

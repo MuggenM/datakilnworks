@@ -188,6 +188,14 @@
   {
    "name": "secrets_volume",
    "extras": ""
+  },
+  {
+   "name": "mount_credentials",
+   "extras": ""
+  },
+  {
+   "name": "dashboard_embed",
+   "extras": ""
   }
  ],
  "ui": [

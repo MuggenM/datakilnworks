@@ -798,7 +798,11 @@ SELECT name, region FROM warehouse.hr.employees;
 
         <h4 id="iframe-embedding">Responsive Iframe Embedding</h4>
         <p>
-          Any dashboard can be shared or embedded inside third-party portals. The <strong>Embed Modal</strong> generates a responsive snippet:
+          The <strong>Embed Modal</strong> generates an iframe snippet for a minimal, read-only view of a dashboard. The view needs a
+          signed-in session in the same browser and at least view rights on the dashboard (anyone else gets a sign-in notice, and a
+          dashboard they cannot see answers as not found); queries run as the viewer, so masks, row filters and catalog permissions apply.
+          The page may only be framed by pages of this studio itself (<code>frame-ancestors 'self'</code>), not by another site; for
+          others, share access to the dashboard instead.
         </p>
 
         <div class="code-container">
@@ -812,7 +816,7 @@ SELECT name, region FROM warehouse.hr.employees;
           </div>
           <pre><code class="language-html">&lt;!-- DataKilnWorks Responsive Dashboard Embed --&gt;
 &lt;iframe 
-  src="http://localhost:8891/embed/dashboards/executive_kpis?theme=dark" 
+  src="http://localhost:8891/embed/dashboard/dash_executive_lakehouse?theme=dark" 
   width="100%" 
   height="720px" 
   frameborder="0" 
@@ -1358,7 +1362,7 @@ docker compose ps</code></pre>
               <tr><td><code>SANDBOX_TOKEN_TTL</code>, <code>SANDBOX_MAX_ROWS</code>, <code>SANDBOX_MAX_KERNELS</code></td><td>Lifetime of a kernel's data token (seconds), rows one sandboxed query may return, concurrent sandbox kernels.</td></tr>
               <tr><td><code>GOVERNANCE_ALLOWED_PATHS</code></td><td>Extra directories non-admins may read with file functions; everything else outside the governed catalog is blocked.</td></tr>
               <tr><td><code>JWT_SECRET_KEY</code></td><td>Session signing key. If unset, a per-install secret is generated and stored in <code>DKW_SECRETS_DIR</code>.</td></tr>
-              <tr><td><code>DKW_SECRETS_DIR</code>, <code>DKW_COMPUTE_SECRETS_DIR</code></td><td>Where the install's keys live, apart from the data. <code>DKW_SECRETS_DIR</code>: the session signing key, the encryption keys of stored connection credentials and authenticator-app secrets, the Delta Sharing and SAML keys, the LLM API keys and the accounts database (<code>auth.db</code>); only the studio needs it. <code>DKW_COMPUTE_SECRETS_DIR</code>: the compute token and the salt of hash masks, which the compute nodes need too. Docker Compose puts them on the named volumes <code>dkw-secrets</code> and <code>dkw-compute-secrets</code>, so a copy of the warehouse volume can no longer forge a session or decrypt a stored password, and a compute node never holds the session key. On the first start with these set, the files are moved out of <code>warehouse/.metadata</code> automatically (a <code>.moved</code> marker stays behind); a process that later runs without the variable refuses to start instead of generating new keys. Unset, everything stays in <code>.metadata</code> as before. <strong>Back these volumes up</strong> (separately from the data): without them nobody can sign in and stored credentials cannot be decrypted.</td></tr>
+              <tr><td><code>DKW_SECRETS_DIR</code>, <code>DKW_COMPUTE_SECRETS_DIR</code></td><td>Where the install's keys live, apart from the data. <code>DKW_SECRETS_DIR</code>: the session signing key, the encryption keys of stored connection credentials and authenticator-app secrets, the Delta Sharing and SAML keys, the LLM API keys and the accounts database (<code>auth.db</code>); only the studio needs it. <code>DKW_COMPUTE_SECRETS_DIR</code>: the compute token, the salt of hash masks and the key of the storage-mount credentials (stored encrypted in <code>storage_mounts.json</code>), which the compute nodes need too. Docker Compose puts them on the named volumes <code>dkw-secrets</code> and <code>dkw-compute-secrets</code>, so a copy of the warehouse volume can no longer forge a session or decrypt a stored password, and a compute node never holds the session key. On the first start with these set, the files are moved out of <code>warehouse/.metadata</code> automatically (a <code>.moved</code> marker stays behind); a process that later runs without the variable refuses to start instead of generating new keys. Unset, everything stays in <code>.metadata</code> as before. <strong>Back these volumes up</strong> (separately from the data): without them nobody can sign in and stored credentials cannot be decrypted.</td></tr>
               <tr><td><code>SESSION_IDLE_MINUTES</code></td><td>Sessions are kept on the server, so signing out really ends one. With a value above 0 (default 0), a session that has not been used for that many minutes ends too; every session ends after 24 hours anyway.</td></tr>
               <tr><td><code>CSP_MODE</code></td><td>Content-Security-Policy of the studio's pages: <code>enforce</code> (default), <code>report</code> (nothing is blocked, violations are only reported) or <code>off</code>. Violations are counted under <code>GET /api/csp-report</code> (administrators) and logged.</td></tr>
               <tr><td><code>COMPUTE_TOKEN</code></td><td>Shared secret (<code>X-Compute-Token</code>) the studio sends to compute nodes; workers reject requests without it. Generated per install when unset.</td></tr>

@@ -149,6 +149,26 @@ def step_secrets(rep: Report) -> None:
                                  "so a copy of that volume can forge sessions and decrypt stored credentials")
     else:
         rep.add(OK, "secrets", where)
+    _seal_mount_credentials(rep)
+
+
+def _seal_mount_credentials(rep: Report) -> None:
+    """storage_mounts.json: plaintext credentials of an older version are encrypted here (load_mounts does it), once, before a
+    compute node reads the file; a stored ciphertext this init cannot decrypt (mounts.key lost or not mounted) is reported."""
+    from web import mounts
+    if not os.path.exists(mounts.MOUNTS_FILE):
+        return
+    try:
+        loaded = mounts.load_mounts()
+    except Exception as exc:
+        rep.add(WARN, "mount credentials", f"could not read storage_mounts.json: {type(exc).__name__}")
+        return
+    unreadable = [m.get("name") or m.get("id") for m in loaded if (m.get("config") or {}).get(mounts._UNREAD)]
+    if unreadable:
+        rep.add(WARN, "mount credentials", f"the stored credentials of {len(unreadable)} mount(s) cannot be decrypted ({mounts.MOUNTS_KEY} "
+                                           f"missing or different; is DKW_COMPUTE_SECRETS_DIR mounted?): {', '.join(map(str, unreadable))[:300]}")
+    else:
+        rep.add(OK, "mount credentials", "encrypted at rest")
 
 
 def step_bootstrap_and_databases(rep: Report) -> None:

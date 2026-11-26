@@ -85,7 +85,7 @@ def mask_mount_record(mount: Dict[str, Any]) -> Dict[str, Any]:
     """Returns a shallow copy of mount with passwords/secrets masked for API responses."""
     m_copy = dict(mount)
     if "config" in m_copy and isinstance(m_copy["config"], dict):
-        cfg_copy = dict(m_copy["config"])
+        cfg_copy = {k: v for k, v in m_copy["config"].items() if k not in ("secrets_enc", "_secrets_enc_unreadable")}
         for secret_key in ("password", "secret", "token", "pg_password", "s3_secret", "account_key", "connection_string"):
             if secret_key in cfg_copy and cfg_copy[secret_key]:
                 cfg_copy[secret_key] = "********"
@@ -97,6 +97,51 @@ def get_default_mounts() -> List[Dict[str, Any]]:
     return []
 
 
+# ---------------------------------------------------------------- credentials at rest
+# The secret fields of a mount's config are stored Fernet-encrypted in `config.secrets_enc` (key `mounts.key`, resolved by
+# secrets_store: DKW_COMPUTE_SECRETS_DIR, because the compute nodes attach the mounts themselves), so storage_mounts.json on the
+# warehouse volume -- and every copy or backup of it -- no longer holds cloud / database credentials in plaintext. Callers of
+# load_mounts()/save_mounts() still see plain values: only the file changes. An old plaintext file is encrypted on its next load.
+SECRET_KEYS = ("password", "secret", "token", "pg_password", "s3_secret", "account_key", "connection_string")
+MOUNTS_KEY = "mounts.key"
+_SEALED = "secrets_enc"     # in the file
+_UNREAD = "_secrets_enc_unreadable"  # in memory only: a ciphertext this process could not decrypt, written back unchanged
+
+
+def _open_config(cfg: Dict[str, Any]) -> bool:
+    """Decrypts cfg[_SEALED] into the plain fields, in place. Returns True when cfg held plaintext secrets (needs re-saving)."""
+    token = cfg.pop(_SEALED, None)
+    if token:
+        try:
+            import base64
+            from cryptography.fernet import Fernet
+            from web.secrets_store import read_secret
+            key = read_secret(MOUNTS_KEY)   # never mint a key here: a new one could not decrypt anything anyway
+            if not key:
+                raise RuntimeError(f"{MOUNTS_KEY} is missing")
+            plain = json.loads(Fernet(base64.urlsafe_b64encode(bytes.fromhex(key))).decrypt(token.encode("ascii")))
+            for k, v in plain.items():
+                if k in SECRET_KEYS:
+                    cfg[k] = v
+        except Exception as e:
+            # Keep the ciphertext so a later save does not replace the stored credentials with blanks.
+            logger.error("Could not decrypt the stored credentials of a storage mount (%s); the mount will not authenticate", type(e).__name__)
+            cfg[_UNREAD] = token
+        return False
+    return any(cfg.get(k) for k in SECRET_KEYS)
+
+
+def _seal_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out = {k: v for k, v in cfg.items() if k not in SECRET_KEYS and k not in (_SEALED, _UNREAD)}
+    plain = {k: cfg[k] for k in SECRET_KEYS if cfg.get(k)}
+    if plain:
+        from web.secrets_store import encrypt_json
+        out[_SEALED] = encrypt_json(plain, MOUNTS_KEY)
+    elif cfg.get(_UNREAD):
+        out[_SEALED] = cfg[_UNREAD]
+    return out
+
+
 def load_mounts() -> List[Dict[str, Any]]:
     os.makedirs(METADATA_DIR, exist_ok=True)
     if not os.path.exists(MOUNTS_FILE):
@@ -105,20 +150,43 @@ def load_mounts() -> List[Dict[str, Any]]:
         return defaults
     try:
         with open(MOUNTS_FILE, "r") as f:
-            data = json.load(f)
-            return data.get("mounts", [])
+            mounts = json.load(f).get("mounts", [])
     except Exception as e:
         logger.error(f"Failed to load storage_mounts.json: {e}")
         return get_default_mounts()
+    had_plaintext = False
+    for m in mounts:
+        if isinstance(m.get("config"), dict):
+            had_plaintext = _open_config(m["config"]) or had_plaintext
+    if had_plaintext:
+        try:
+            save_mounts(mounts)
+            logger.info("storage_mounts.json: plaintext credentials encrypted")
+        except Exception as e:
+            logger.error("Could not encrypt the credentials in storage_mounts.json: %s", type(e).__name__)
+    return mounts
 
 
 def save_mounts(mounts: List[Dict[str, Any]]):
     os.makedirs(METADATA_DIR, exist_ok=True)
+    stored = []
+    for m in mounts:
+        rec = dict(m)
+        if isinstance(rec.get("config"), dict):
+            rec["config"] = _seal_config(rec["config"])
+        stored.append(rec)
+    tmp = f"{MOUNTS_FILE}.{os.getpid()}.tmp"
     try:
-        with open(MOUNTS_FILE, "w") as f:
-            json.dump({"mounts": mounts, "updated_at": datetime.datetime.now().isoformat()}, f, indent=2)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"mounts": stored, "updated_at": datetime.datetime.now().isoformat()}, f, indent=2)
+        os.replace(tmp, MOUNTS_FILE)
     except Exception as e:
         logger.error(f"Failed to save storage_mounts.json: {e}")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def get_mount(mount_id: str) -> Optional[Dict[str, Any]]:
@@ -143,7 +211,7 @@ def create_or_update_mount(mount_data: Dict[str, Any]) -> Dict[str, Any]:
         "read_only": bool(mount_data.get("read_only", True)),
         "enabled": bool(mount_data.get("enabled", True)),
         "description": mount_data.get("description", "").strip(),
-        "config": dict(mount_data.get("config", {})),
+        "config": {k: v for k, v in dict(mount_data.get("config", {})).items() if k not in ("secrets_enc", "_secrets_enc_unreadable")},
         "status": mount_data.get("status", "ACTIVE"),
         "created_at": mount_data.get("created_at") or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "last_synced_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -155,6 +223,8 @@ def create_or_update_mount(mount_data: Dict[str, Any]) -> Dict[str, Any]:
             val = mount_record["config"].get(secret_key)
             if val == "********" or val is None or val == "":
                 mount_record["config"][secret_key] = old_cfg.get(secret_key, "")
+        if old_cfg.get(_UNREAD):
+            mount_record["config"][_UNREAD] = old_cfg[_UNREAD]
         mounts[existing_idx] = mount_record
     elif mount_data.get("clone_from"):
         source_mount = next((m for m in mounts if m["id"] == mount_data.get("clone_from")), None)

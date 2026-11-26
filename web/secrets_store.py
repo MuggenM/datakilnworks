@@ -6,8 +6,9 @@ Every key file of the install (and the accounts database, auth.db) is resolved b
   DKW_SECRETS_DIR           the signing / encryption keys only the studio needs: jwt_secret (session signing), connections.key and
                             mfa.key (Fernet), sharing.key (Delta Sharing link HMAC), sandbox_gateway_key, saml_sp.key/.crt,
                             llm_config.json (LLM API keys) and auth.db (accounts, password hashes, passkeys, sessions)
-  DKW_COMPUTE_SECRETS_DIR   the two values the compute nodes need as well: compute_token (studio <-> worker) and governance_salt
-                            (the hash masks must give the same result on every node)
+  DKW_COMPUTE_SECRETS_DIR   the values the compute nodes need as well: compute_token (studio <-> worker), governance_salt
+                            (the hash masks must give the same result on every node) and mounts.key (Fernet key of the credentials
+                            in storage_mounts.json: the compute nodes attach the external mounts themselves)
 
 Unset, both fall back to `$WAREHOUSE_DIR/.metadata` (the old location, still what a plain `python` run or a test script gets). Docker
 Compose puts them on their own named volumes (`dkw-secrets` for the studio and init only, `dkw-compute-secrets` also for the compute
@@ -31,7 +32,7 @@ import time
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
 
-COMPUTE_SHARED = frozenset({"compute_token", "governance_salt"})
+COMPUTE_SHARED = frozenset({"compute_token", "governance_salt", "mounts.key"})
 # Every file this module manages (web/init.py migrates all of them before the studio starts; anything else stays in .metadata).
 STUDIO_SECRETS = ("jwt_secret", "connections.key", "mfa.key", "sharing.key", "sandbox_gateway_key", "saml_sp.key", "saml_sp.crt",
                   "llm_config.json", "auth.db")
@@ -182,6 +183,15 @@ def load_or_create_secret(filename: str, nbytes: int = 32) -> str:
             return value
         time.sleep(0.02)
     raise RuntimeError(f"Secret file {path} is empty")
+
+
+def read_secret(filename: str):
+    """The secret in `filename`, or None when it does not exist yet. Never creates one (for readers that must not mint a new key)."""
+    try:
+        with open(secret_path(filename), "r") as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
 
 
 def _fernet(filename: str = "connections.key"):

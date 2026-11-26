@@ -6281,21 +6281,35 @@ async def get_brand_css():
 
 @app.get("/embed/dashboard/{dashboard_id}")
 async def get_embedded_dashboard(dashboard_id: str, request: Request, theme: str = "auto"):
-    """Serve dashboard in embeddable iframe view (minimal UI)."""
+    """Serve a dashboard in a minimal view for an iframe on this studio's own origin (frame-ancestors 'self').
+
+    It needs a real signed-in session with viewer rights on the dashboard, independent of GOVERNANCE_REQUIRE_AUTH (it used to
+    hand the whole dashboard definition, widget SQL included, to anyone who knew an id). The page carries only the name and id:
+    the widgets and their results are loaded by its script from GET /api/dashboards/{id}, governed as the viewer."""
+    from web import dashboard_apps as da
     templates = Jinja2Templates(directory="web/templates")
+    not_found = HTMLResponse(content="<!DOCTYPE html><html><body><h1>Dashboard not found</h1></body></html>", status_code=404)
 
-    # Load dashboard
-    dashboards = load_dashboards_store()
-    dashboard = next((d for d in dashboards if d["id"] == dashboard_id), None)
+    try:
+        user = dict(await get_current_user(request))
+    except HTTPException:
+        return HTMLResponse(status_code=401, content=(
+            "<!DOCTYPE html><html><body style=\"font-family:sans-serif;padding:2rem\"><h1>Sign in required</h1>"
+            "<p>Sign in to Data Kiln Works in this browser, then reload this page.</p>"
+            "<p><a href=\"/\" target=\"_top\">Open Data Kiln Works</a></p></body></html>"))
 
+    dashboard = next((d for d in load_dashboards_store() if d["id"] == dashboard_id), None)
     if not dashboard:
-        return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>", status_code=404)
+        return not_found
+    try:
+        da.require_level(dashboard_id, user, "viewer")
+    except HTTPException:
+        return not_found  # a dashboard the caller cannot see does not exist for them
 
-    # Return embedded view with minimal UI
     return templates.TemplateResponse(request=request, name="embed.html", context={
-        "dashboard": dashboard,
+        "dashboard_name": dashboard.get("name") or "Dashboard",
         "dashboard_id": dashboard_id,
-        "theme": theme,
+        "theme": theme if theme in ("auto", "light", "dark") else "auto",
         "csp_nonce": _csp_nonce(request),
     })
 
