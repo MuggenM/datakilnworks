@@ -1,0 +1,28 @@
+# OPTIONAL: only the studio (and your ingress controller) may reach Gitea's HTTP port; nothing else in the namespace can.
+# Adjust the namespace / pod labels to your release. Requires a CNI that enforces NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gitea-allow-studio
+  namespace: dkw
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gitea
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: datakilnworks-studio      # the studio's pod label in your deployment
+      ports:
+        - protocol: TCP
+          port: 3000
+    # the web UI for people, through the ingress controller's namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000

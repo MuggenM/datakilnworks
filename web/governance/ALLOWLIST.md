@@ -9,7 +9,20 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | Site | Status | Why it does not read governed data |
 | :--- | :--- | :--- |
 | alerts.py::* | sqlite | SQLite alert store; the alert query itself runs in `execute_alert_check`, which is governed as the alert's owner |
+| apps.py::_conn | sqlite | The `apps` metadata table (auth.db, SQLite): id/name/owner/visibility only, no warehouse data |
+| apps.py::create_app | sqlite | Writes the `apps` metadata row; the zip's files go straight to disk, never through DuckDB |
+| apps.py::get_app | sqlite | Reads the `apps` metadata row |
+| apps.py::list_apps | sqlite | Reads the `apps` metadata table |
+| apps.py::update_app_files | sqlite | Updates the `apps` metadata row's `updated_at`; the redeploy zip goes straight to disk |
+| apps.py::update_app_meta | sqlite | Updates the `apps` metadata row (name/visibility) |
+| apps.py::delete_app | sqlite | Deletes the `apps` metadata row; the actual data-reading site, `_run_app_query`, is governed (`gov_gateway.govern_sql`) and is not in this list |
 | autoloader.py::* | sqlite | SQLite checkpoint store |
+| permissions.py::* | sqlite | Catalog ACL store (auth.db, SQLite); the SQL fence itself only parses text with sqlglot and executes nothing |
+| app.py::search_principals_endpoint | sqlite | Looks up users in the SQLite account store for the share dialog |
+| autoloader_s3.py::configure_duckdb | system | Only installs httpfs and an S3 secret on the ingestion's private in-memory connection; runs no data query |
+| autoloader_azure.py::configure_duckdb | system | Only installs the azure extension and a connection-string secret on the ingestion's private in-memory connection; runs no data query |
+| autoloader_gcs.py::configure_duckdb | system | Only installs httpfs and a bucket-scoped gcs secret on the ingestion's private in-memory connection; runs no data query |
+| kernel_isolation.py::sync_duckdb_extensions | system | Only runs `INSTALL <extension>` on a private in-memory connection so isolated notebook kernels find the extensions; runs no data query |
 | autoloader.py::_open_source_reader | system | Reads volume files it was told to ingest; writes tables, never reads tagged tables |
 | experiments.py::* | sqlite | MLflow tracking store |
 | lineage.py::* | sqlite | Lineage graph store (`parse_sql_lineage` only renders SQL text with sqlglot) |
@@ -29,6 +42,7 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | app.py::normalize_uploaded_file | uploaded-file | Repairs an uploaded parquet file |
 | compute_worker.py::execute_query | executor | Executes SQL the studio already rewrote (worker requires the compute token) |
 | compute_worker.py::get_worker_conn | setup | Worker connection setup |
+| compute_worker.py::warmup | executor | Reads operator-listed tables once after a cold start (count(*), result discarded, never returned); no user data leaves the worker |
 | copilot.py::get_autocomplete_metadata | metadata | `SHOW ALL TABLES`: names and types only |
 | dbt_service.py::preview_cte_step | guarded-at-endpoint | The endpoint refuses principals subject to masking |
 | dbt_service.py::preview_dbt_model_data | guarded-at-endpoint | The endpoint refuses principals subject to masking |
@@ -47,3 +61,8 @@ reason it does not need to. `file.py::*` covers every function in a file.
 | warehouses.py::apply_warehouse_compute | setup | `SET threads` / `SET max_memory` |
 | warehouses.py::sync_catalogs_with_duckrun | setup | ATTACH / DETACH of catalogs |
 | workflow.py::init_runs_db | sqlite | Job-run store (SQLite) |
+| workflow.py::_state_get | sqlite | Scheduler bookkeeping (last cron look, table versions) in the run store |
+| app.py::readyz | sqlite | Readiness probe: `SELECT 1 FROM users LIMIT 1` on the accounts database, no user data returned |
+| init.py::step_bootstrap_and_databases | sqlite | Initialisation step: counts accounts (`SELECT COUNT(*) FROM users`) to report the state; no user data |
+| workflow.py::_state_set | sqlite | Scheduler bookkeeping (last cron look, table versions) in the run store |
+| workflow.py::mark_orphaned_runs | sqlite | Marks runs left RUNNING by a dead process as FAILED (metadata only, no user data) |

@@ -31,6 +31,8 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "server_host": "ldap.company.internal",
         "server_port": 389,
         "encryption": "none",  # none | starttls | ssl
+        "ca_cert_pem": "",       # optional: trust only this CA for LDAPS / StartTLS (else the system roots)
+        "tls_skip_verify": False,  # development only: do not check the directory's certificate
         "base_dn": "dc=company,dc=internal",
         "bind_dn": "cn=lakehouse_svc,ou=Services,dc=company,dc=internal",
         "bind_password": "",
@@ -39,6 +41,8 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "group_search_base": "ou=Groups,dc=company,dc=internal",
         "admin_group": "cn=DataAdmins,ou=Groups,dc=company,dc=internal",
         "power_user_group": "cn=DataEngineers,ou=Groups,dc=company,dc=internal",
+        "user_group": "",       # optional: explicit group for the `user` role (else default_role applies)
+        "sync_group": "",       # optional: only members of this group may log in / be synced; empty = everyone
         "default_role": "user"
     },
     "oidc": {
@@ -49,6 +53,7 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "client_secret": "",
         "scopes": "openid email profile groups",
         "redirect_uri": "http://localhost:8891/api/auth/oidc/callback",
+        "username_claim": "preferred_username",   # falls back to a verified `email` claim
         "admin_claim": "groups",
         "admin_value": "LakehouseAdmins",
         "power_user_value": "DataEngineers",
@@ -62,7 +67,20 @@ DEFAULT_AUTH_FRAMEWORK_CONFIG: Dict[str, Any] = {
         "x509_cert": "",
         "attribute_username": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
         "attribute_email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
-        "default_role": "user"
+        "provider_name": "SAML SSO",
+        "idp_entity_id": "",             # the IdP's issuer: responses from any other issuer are refused
+        "sp_base_url": "",               # the studio's public URL (ACS = <it>/api/auth/saml/acs); empty = derived from the request
+        "attribute_display_name": "",
+        "attribute_groups": "groups",    # the assertion attribute that carries group / role values
+        "admin_value": "",
+        "power_user_value": "",
+        "want_assertions_signed": True,
+        "allow_idp_initiated": False,    # off: only responses to a sign-in this studio started are accepted
+        "default_role": "user",
+        "sign_authn_requests": False,    # off by default: most IdPs don't require it; turn on once the SP cert (see the SAML
+                                          # settings page) is registered with the IdP, or a strict IdP may reject the request
+        "require_encrypted_assertions": False,  # reject an assertion that isn't encrypted; decrypting one that is always works
+        "slo_url": ""                    # the IdP's Single Logout Service URL (HTTP-Redirect); blank disables SP-initiated SLO
     }
 }
 
@@ -157,9 +175,12 @@ def test_ldap_connection(ldap_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
         tls_info = None
         if encryption == "ssl" or port == 636:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+            # The same certificate check as the real sign-in (ldap_auth.tls_settings): a test that passes must mean sign-in works.
+            pem = (ldap_cfg.get("ca_cert_pem") or "").strip() if isinstance(ldap_cfg.get("ca_cert_pem"), str) else ""
+            context = ssl.create_default_context(cadata=pem or None)
+            if ldap_cfg.get("tls_skip_verify") is True:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
             ssock = context.wrap_socket(sock, server_hostname=host)
             tls_info = ssock.version()
             ssock.close()
@@ -199,7 +220,7 @@ def test_oidc_discovery(oidc_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         import requests
-        resp = requests.get(discovery_url, timeout=5.0, verify=False)
+        resp = requests.get(discovery_url, timeout=5.0)        # TLS verified, exactly like the real sign-in (web/oidc_auth.py)
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         if resp.status_code == 200:

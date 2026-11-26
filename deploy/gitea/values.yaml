@@ -1,0 +1,82 @@
+# OPTIONAL: a minimal, single-replica Gitea for Data Kiln Works' git integration, as values for the OFFICIAL Gitea chart
+# (https://gitea.com/gitea/helm-chart). We deliberately do not ship our own Gitea chart. Use your existing Gitea if you have one.
+#
+#   helm repo add gitea-charts https://dl.gitea.com/charts/
+#   helm upgrade --install gitea gitea-charts/gitea -n dkw -f deploy/gitea/values.yaml \
+#        --set gitea.admin.existingSecret=gitea-admin      # a Secret with keys: username, password, email (create it first)
+#
+# NOTE: written against the chart's documented value names but NOT tested here (no cluster); run `helm template` and check the
+# result against the chart version you pin before installing. Single replica + SQLite is for small teams / evaluation; for
+# real use switch the database to PostgreSQL (see the chart docs) and back up the PVC.
+
+replicaCount: 1
+
+image:
+  rootless: true                     # runs as an unprivileged user; needs no extra capabilities
+
+# In-cluster access only by default. The studio talks to http://gitea-http.<namespace>.svc:3000 (a ClusterIP service).
+service:
+  http:
+    type: ClusterIP
+    port: 3000
+  ssh:
+    type: ClusterIP                  # only needed if humans push over SSH; the studio uses HTTPS + a token
+    port: 22
+
+# Humans reach the web UI through an ingress with TLS (enable and fill in for your cluster). Leave it off to use `kubectl port-forward`.
+ingress:
+  enabled: false
+  # className: nginx
+  # hosts:
+  #   - host: git.example.internal
+  #     paths:
+  #       - path: /
+  #         pathType: Prefix
+  # tls:
+  #   - secretName: git-example-internal-tls
+  #     hosts: [git.example.internal]
+
+persistence:
+  enabled: true
+  size: 10Gi                         # repositories + LFS + attachments; size for your projects
+  # storageClass: ""
+
+# SQLite + in-memory session/cache/queue: no PostgreSQL or Valkey/Redis sub-charts for a single replica.
+postgresql:
+  enabled: false
+postgresql-ha:
+  enabled: false
+valkey-cluster:
+  enabled: false
+valkey:
+  enabled: false
+redis-cluster:
+  enabled: false
+
+gitea:
+  admin:
+    existingSecret: gitea-admin      # keys: username, password, email
+    passwordMode: keepUpdated
+  config:
+    server:
+      # ROOT_URL is what Gitea prints in clone URLs. Set it to the address people (and the studio) actually use, e.g.
+      # https://git.example.internal/ behind the ingress. It only affects links Gitea shows; the studio uses its own configured URL.
+      # ROOT_URL: https://git.example.internal/
+      DISABLE_SSH: false             # set true if nobody pushes over SSH
+    database:
+      DB_TYPE: sqlite3
+    session:
+      PROVIDER: memory
+    cache:
+      ADAPTER: memory
+    queue:
+      TYPE: level
+    service:
+      DISABLE_REGISTRATION: true     # accounts are created by an administrator (or your identity provider), never self-service
+      REQUIRE_SIGNIN_VIEW: true
+    repository:
+      DEFAULT_BRANCH: main
+    security:
+      INSTALL_LOCK: true
+    webhook:
+      ALLOWED_HOST_LIST: ""          # webhooks to the studio are optional (see the design); if used, list the studio's service host here

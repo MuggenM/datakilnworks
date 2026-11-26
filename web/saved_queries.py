@@ -258,7 +258,8 @@ def get_saved_queries(
     q: Optional[str] = None,
     tag: Optional[str] = None,
     user_id: Optional[str] = None,
-    is_admin: bool = True
+    is_admin: bool = True,
+    shared_ids: Optional[set] = None
 ) -> List[Dict[str, Any]]:
     """Returns saved queries filtered by search keyword, tag, and user ownership."""
     queries = load_saved_queries()
@@ -272,6 +273,7 @@ def get_saved_queries(
             or query.get("owner") == user_id
             or query.get("created_by") == user_id
             or query.get("is_starter")
+            or query.get("id") in (shared_ids or ())          # shared with the user or one of their groups (web/groups.py)
         ]
 
     if tag and tag.lower() != "all":
@@ -391,8 +393,8 @@ def delete_saved_query(query_id: str) -> bool:
     return True
 
 
-def duplicate_saved_query(query_id: str) -> Optional[Dict[str, Any]]:
-    """Clones an existing saved query with a unique ID and 'Copy of' name prefix."""
+def duplicate_saved_query(query_id: str, owner: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Clones an existing saved query with a unique ID and 'Copy of' name prefix (owned by `owner`: the copy is the caller's, not the original's)."""
     target = get_saved_query(query_id)
     if not target:
         return None
@@ -406,6 +408,8 @@ def duplicate_saved_query(query_id: str) -> Optional[Dict[str, Any]]:
         "schema_name": target.get("schema_name", "dbo"),
         "tags": list(target.get("tags", []))
     }
+    if owner:
+        clone_data["owner"] = owner
     return create_saved_query(clone_data)
 
 

@@ -1,4 +1,5 @@
 import os
+import secrets
 import re
 import time
 import math
@@ -23,9 +24,11 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from web.auth import (
-    get_current_user, resolve_principal, require_role, create_access_token, verify_password,
-    get_user_by_username, list_users, create_user, update_user, reset_user_password,
-    delete_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db
+    get_current_user, resolve_principal, require_role, create_access_token, verify_password, hash_password,
+    get_user_by_username, get_user_by_id, list_users, create_user, update_user, reset_user_password,
+    delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db, decode_access_token,
+    session_user as auth_session_user, end_session, current_session_id, revoke_user_sessions,
+    governance_require_auth as auth_governance_require_auth
 )
 from web import auth_frameworks, llm_settings
 from web.compute_auth import compute_headers
@@ -111,13 +114,45 @@ def _log_security_posture():
                        "so column masking does not apply to it.")
 
 
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """Liveness: the process answers. No authentication, no data; exempt from the IP allowlist (a kubelet or load balancer probes it)."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz():
+    """Readiness: the accounts database can be read and the warehouse directory exists. No authentication, no details in the answer."""
+    ok = False
+    try:
+        from web.auth import get_db_connection
+        conn = get_db_connection()
+        try:
+            conn.execute("SELECT 1 FROM users LIMIT 1")
+        finally:
+            conn.close()
+        ok = os.path.isdir(WAREHOUSE_DIR)
+    except Exception:
+        ok = False
+    return JSONResponse(status_code=200 if ok else 503, content={"status": "ready" if ok else "not ready"})
+
+
 @app.on_event("startup")
 async def startup_event():
     _log_security_posture()
+    from web import kernel_isolation
+    kernel_isolation.prepare_studio()
     from web.governance.store import init_governance_db
     init_governance_db()
     asyncio.create_task(_governance_reconcile_loop())
     asyncio.create_task(cron_scheduler_loop())
+    from web import warehouse_lifecycle
+    asyncio.create_task(warehouse_lifecycle.autosuspend_loop(_warehouse_has_active_queries))
+    try:
+        from web.dbt_service import ensure_project
+        ensure_project()
+    except Exception as e_dbt:
+        logger.warning(f"dbt project check failed: {e_dbt}")
     init_auth_db()
     from web.alerts import alerts_scheduler_loop, init_alerts_db
     init_alerts_db()
@@ -145,10 +180,28 @@ async def startup_event():
         asyncio.create_task(autoloader_daemon_loop())
     except Exception as e_al:
         logger.warning(f"Failed to auto-start autoloader daemon on startup: {e_al}")
+    # Streaming ingestion (Kafka / Redpanda) runners
+    try:
+        from web.streaming import streaming_daemon_loop
+        asyncio.create_task(streaming_daemon_loop())
+    except Exception as e_st:
+        logger.warning(f"Failed to start the streaming ingestion daemon: {e_st}")
+    # FIDO Metadata Service cache (model names, certification status, revocation) for WebAuthn passkeys / security keys
+    try:
+        from web.fido_mds import init_db as init_fido_mds_db, mds_refresh_loop
+        init_fido_mds_db()
+        asyncio.create_task(mds_refresh_loop())
+    except Exception as e_mds:
+        logger.warning(f"Failed to start the FIDO Metadata Service refresh loop: {e_mds}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
+    try:
+        from web import streaming
+        streaming.shutdown()
+    except Exception:
+        pass
     from web.scheduled_exports import shutdown_scheduler
     shutdown_scheduler()
 
@@ -156,6 +209,16 @@ from web import sandbox_client, sandbox_gateway
 from web.governance import routes as governance_routes
 app.include_router(governance_routes.router)
 app.include_router(sandbox_gateway.router)
+from web import s3_events as s3_events_module
+from web import delta_sharing as delta_sharing_module
+app.include_router(delta_sharing_module.router)             # /delta-sharing/* : the Delta Sharing protocol for outside recipients (web/delta_sharing.py)
+app.include_router(s3_events_module.router)               # POST /hooks/s3-events : bearer-token receiver for S3 bucket notifications (web/s3_events.py)
+from web import scim as scim_module
+app.include_router(scim_module.router)                    # /scim/v2/* : authenticated by SCIM bearer tokens only (web/scim.py)
+from web import apps as apps_module
+app.include_router(apps_module.router)                    # /apps/* + /api/apps* : embedded HTML apps, sandboxed-iframe only (web/apps.py)
+from web import dashboard_apps as dashboard_apps_module
+app.include_router(dashboard_apps_module.router)          # /api/dashboard-apps* + dashboard spec/widget edit : dashboards with pages and typed parameters (web/dashboard_apps.py)
 
 
 @app.middleware("http")
@@ -168,7 +231,271 @@ async def _sandbox_isolation(request: Request, call_next):
         return JSONResponse(status_code=403, content={"detail": "Notebook sandboxes may only use /api/sandbox/*."})
     return await call_next(request)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_MUST_CHANGE_PASSWORD_ALLOWED = {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me", "/api/auth/login",
+                                 "/api/auth/saml/logout", "/api/auth/saml/sls"}
+
+
+def _gate_session_user(request: Request, token: str) -> Optional[Dict[str, Any]]:
+    """auth.session_user for the gate middlewares, computed once per request (three gates ask)."""
+    cached = getattr(request.state, "_dkw_gate_user", None)
+    if cached is not None and cached[0] == token:
+        return cached[1]
+    user = auth_session_user(token)
+    request.state._dkw_gate_user = (token, user)
+    return user
+
+
+# /api/* paths that answer without a session: the steps of signing in (each checks its own one-time token, challenge or IdP
+# response), the session probe and sign-out, the browser's CSP reports, branding needed by the sign-in page, FastAPI's docs pages,
+# and the two routes that authenticate with their own bearer tokens (a sandboxed kernel's gateway token, an embedded app's data
+# token). Everything else is refused without a live session by `_api_auth_gate`. Keep this list short: a route that belongs here
+# must do its own authentication.
+_PUBLIC_API = {
+    ("POST", "/api/auth/login"), ("POST", "/api/auth/login/mfa"), ("POST", "/api/auth/login/webauthn"),
+    ("POST", "/api/auth/login/webauthn/options"), ("GET", "/api/auth/passkey/status"), ("POST", "/api/auth/passkey/options"),
+    ("POST", "/api/auth/passkey/login"), ("POST", "/api/auth/enroll/options"), ("POST", "/api/auth/enroll/verify"),
+    ("GET", "/api/auth/sso"), ("GET", "/api/auth/oidc/login"), ("GET", "/api/auth/oidc/callback"),
+    ("GET", "/api/auth/saml/login"), ("POST", "/api/auth/saml/acs"), ("GET", "/api/auth/saml/logout"),
+    ("GET", "/api/auth/saml/sls"), ("GET", "/api/auth/saml/metadata"),
+    ("GET", "/api/auth/me"), ("POST", "/api/auth/logout"),
+    ("POST", "/api/csp-report"), ("GET", "/api/brand/css"),
+    ("GET", "/api/docs"), ("GET", "/api/docs/oauth2-redirect"), ("GET", "/api/redoc"),
+    ("POST", "/api/sandbox/sql"),
+}
+_PUBLIC_API_PATTERNS = (
+    (("GET",), re.compile(r"/api/brand/assets/[^/]+")),
+    (("POST",), re.compile(r"/api/apps/[^/]+/query")),
+)
+
+
+def is_public_api(method: str, path: str) -> bool:
+    method = "GET" if method == "HEAD" else method
+    if (method, path) in _PUBLIC_API:
+        return True
+    return any(method in methods and rx.fullmatch(path) for methods, rx in _PUBLIC_API_PATTERNS)
+
+
+@app.middleware("http")
+async def _api_auth_gate(request: Request, call_next):
+    """
+    Default deny for /api/*: without a live session (cookie or bearer token, `auth.session_user`) a request is refused with 401
+    before any route runs, unless it is in `_PUBLIC_API`. About 170 routes used to have no authentication check of their own
+    (warehouse create/delete, workspace upload, table restore, dbt model edits, the MLflow API, ...); this closes them and any
+    route added later. Routes keep their own role checks: this only decides "signed in or not". OPTIONS (CORS preflight) passes;
+    in the explicit single-user mode (GOVERNANCE_REQUIRE_AUTH=false) every request is the local admin, so the gate is off there.
+    """
+    path = request.url.path
+    if path.startswith("/api/") and request.method != "OPTIONS" and not is_public_api(request.method, path) \
+            and auth_governance_require_auth():
+        token = request.cookies.get(COOKIE_NAME)
+        header = request.headers.get("Authorization") or ""
+        if not token and header.startswith("Bearer "):
+            token = header[7:].strip()
+        if not token or not _gate_session_user(request, token):
+            return JSONResponse(status_code=401, content={"detail": "Authentication required. Please log in."},
+                                headers={"WWW-Authenticate": "Bearer"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _must_change_password_gate(request: Request, call_next):
+    """
+    A password an account holder didn't choose themselves (the INIT_ADMIN_* bootstrap, or an admin's reset) must be
+    changed before that session can do anything else -- enforced here, not just in the UI, so a direct API call
+    can't skip it. Only touches /api/*; the SPA shell and static assets stay reachable so the browser can load and
+    show the "change your password" screen in the first place.
+    """
+    path = request.url.path
+    if not path.startswith("/api/") or path in _MUST_CHANGE_PASSWORD_ALLOWED or path.startswith("/api/sandbox/"):
+        return await call_next(request)
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        # The same check as the normal auth layer (auth.session_user: live server-side session, active account, not issued
+        # before the last password change): anything else is left to that layer to reject (401) instead of being misread as
+        # "the current user, who must change their password".
+        user = _gate_session_user(request, token)
+        if user and user.get("must_change_password"):
+            return JSONResponse(status_code=403, content={
+                "detail": "This account's password must be changed before continuing.",
+                "must_change_password": True})
+    return await call_next(request)
+
+# What a user who has to enrol in two-factor authentication (organisation policy, deadline passed) may still call.
+_MFA_ENROLLMENT_ALLOWED = {"/api/auth/change-password", "/api/auth/logout", "/api/auth/me", "/api/auth/login", "/api/auth/login/mfa",
+                           "/api/auth/mfa/status", "/api/auth/mfa/setup", "/api/auth/mfa/enable",
+                           "/api/auth/saml/logout", "/api/auth/saml/sls"}
+
+
+@app.middleware("http")
+async def _mfa_policy_gate(request: Request, call_next):
+    """
+    The organisation may require two-factor authentication (web/mfa_policy.py). A covered account that has not enrolled by its deadline can only
+    enrol: every other /api/* call is refused here, so it cannot be skipped from outside the UI (same shape as the forced password change,
+    including the staleness check of resolve_principal).
+    """
+    path = request.url.path
+    if not path.startswith("/api/") or path in _MFA_ENROLLMENT_ALLOWED or path.startswith("/api/sandbox/") or path.startswith("/api/auth/webauthn/"):
+        return await call_next(request)
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        user = _gate_session_user(request, token)
+        if user:
+            from web import mfa_policy
+            if mfa_policy.is_blocked(user):
+                return JSONResponse(status_code=403, content={
+                    "detail": "Your organisation requires two-factor authentication. Turn it on to continue.", "mfa_enrollment_required": True})
+    return await call_next(request)
+
+# What a request may still do while its own account is blocked by a per-user/role network policy: see it and sign out.
+_NETWORK_POLICY_ALLOWED = {"/api/auth/logout", "/api/auth/me"}
+
+
+@app.middleware("http")
+async def _network_policy_gate(request: Request, call_next):
+    """
+    Per-user or per-role network policy (web/ip_allowlist.py), on top of the global allowlist below. Unlike that one, this can only
+    ever apply to an authenticated session: there is no identity yet to check a per-user policy against for the login page itself,
+    an SSO callback or /docs, so those stay governed by the global allowlist alone. Only ever gates /api/*, mirroring
+    `_must_change_password_gate` (including its staleness check) so the SPA shell can still load and the account holder can see why
+    they are blocked and sign out; a direct API call cannot skip it either.
+    """
+    path = request.url.path
+    if not path.startswith("/api/") or path in _NETWORK_POLICY_ALLOWED or path.startswith("/api/sandbox/"):
+        return await call_next(request)
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        user = _gate_session_user(request, token)
+        if user:
+            from web import ip_allowlist
+            try:
+                ok, policy, client = ip_allowlist.check_user_network(user, request.client.host if request.client else None, dict(request.headers))
+            except Exception as exc:                        # a bug here must not lock everybody out; it is logged loudly
+                logger.error(f"per-user network policy check failed, letting the request through: {exc}", exc_info=True)
+                return await call_next(request)
+            if not ok:
+                ip_allowlist.record("block", client, request.method, path, source="network_policy",
+                                    principal=f"{policy['principal_type']}:{policy['principal_id']}")
+                return JSONResponse(status_code=403, content={
+                    "detail": "Your account's network policy does not allow access from your current address.",
+                    "ip_blocked": True, "your_address": client.get("text", "")})
+    return await call_next(request)
+
+
+_CSRF_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_CSRF_EXEMPT = {"/api/auth/saml/acs"}      # the IdP's own cross-site POST (it carries no session cookie anyway: SameSite=Lax)
+
+
+def _csrf_trusted_hosts() -> set:
+    out = set()
+    for o in (os.getenv("CSRF_TRUSTED_ORIGINS", "") or "").split(","):
+        o = o.strip().lower()
+        if o:
+            from urllib.parse import urlparse
+            out.add(urlparse(o).netloc if "://" in o else o)
+    return out
+
+
+def csrf_verdict(method: str, path: str, headers: Dict[str, str], has_session_cookie: bool) -> Optional[str]:
+    """None = allowed, else the reason a state-changing request is refused as cross-site. Applies only to requests that carry the
+    session cookie (bearer-token clients -- SCIM, Delta Sharing, S3 hooks, apps, the sandbox -- cannot be forged by a browser).
+    Order: Fetch Metadata (`Sec-Fetch-Site`, every current browser), then `Origin`, then `Referer`; a request with none of them is
+    not from a current browser and is let through (SameSite=Lax already keeps the cookie off cross-site POSTs). The expected host
+    is the request's own Host header (a proxy that keeps Host -- Traefik does by default -- needs nothing), plus
+    CSRF_TRUSTED_ORIGINS."""
+    if method.upper() not in _CSRF_METHODS or not has_session_cookie or path in _CSRF_EXEMPT:
+        return None
+    if os.getenv("CSRF_CHECK", "on").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    h = {k.lower(): v for k, v in headers.items()}
+    site = h.get("sec-fetch-site", "").strip().lower()
+    if site in ("same-origin", "none"):
+        return None
+    host = h.get("host", "").strip().lower()
+    allowed = {host} | _csrf_trusted_hosts()
+    from urllib.parse import urlparse
+    origin = h.get("origin", "").strip()
+    if origin:
+        if origin.lower() == "null":
+            return "Origin: null"
+        if urlparse(origin.lower()).netloc in allowed:
+            return None
+        return f"Origin {origin[:100]}"
+    referer = h.get("referer", "").strip()
+    if referer:
+        if urlparse(referer.lower()).netloc in allowed:
+            return None
+        return "Referer from another site"
+    if site in ("same-site", "cross-site"):
+        return f"Sec-Fetch-Site: {site}"
+    return None
+
+
+@app.middleware("http")
+async def _csrf_origin_gate(request: Request, call_next):
+    """Refuses cross-site state-changing requests made with the session cookie (CSRF), beyond what SameSite=Lax already blocks:
+    a sibling subdomain counts as same-site for Lax, but not as same-origin here. See csrf_verdict."""
+    why = csrf_verdict(request.method, request.url.path, dict(request.headers), COOKIE_NAME in request.cookies)
+    if why:
+        logger.warning(f"CSRF: refused {request.method} {request.url.path} ({why})")
+        return JSONResponse(status_code=403, content={"detail": "Cross-site request refused. Reload the page and try again.", "csrf": True})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _ip_allowlist_gate(request: Request, call_next):
+    """
+    Per-deployment IP allowlist (web/ip_allowlist.py). Defined last of the gates so it runs first: an address outside the rules gets a 403 before
+    login, SSO callbacks, the UI shell or /docs are served. Off by default; `monitor` only records what would have been refused.
+    """
+    from web import ip_allowlist
+    try:
+        peer = request.client.host if request.client else None
+        verdict, client, why = ip_allowlist.check_request(peer, dict(request.headers), request.url.path,
+                                                          sandbox_peer=sandbox_client.is_sandbox_peer(peer))
+    except Exception as exc:                                   # a bug here must not lock everybody out; it is logged loudly
+        logger.error(f"IP allowlist check failed, letting the request through: {exc}", exc_info=True)
+        return await call_next(request)
+    if verdict == "allow":
+        return await call_next(request)
+    ip_allowlist.record(verdict, client, request.method, request.url.path)
+    if verdict == "would_block":
+        return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        return JSONResponse(status_code=403, content={"detail": "Access from your network address is not allowed.", "ip_blocked": True, "your_address": client["text"]})
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(status_code=403, content=f"<!doctype html><title>Access denied</title><body style='font-family:sans-serif;margin:3rem'><h2>Access denied</h2><p>This Data Kiln Works Studio only accepts connections from approved networks. Your address is <code>{client['text'] or 'unknown'}</code>.</p><p>Ask an administrator to add it.</p></body>")
+
+
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+}
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Baseline browser hardening on every response, including the gates' own refusals (defined after the IP allowlist gate so it
+    wraps it). `setdefault`: a route that sets its own (web/apps.py: CSP, frame-ancestors) keeps it. HSTS only over https.
+    Every HTML response gets a Content-Security-Policy (web/csp.py) whose script nonce is the one the template rendered
+    (`request.state.csp_nonce`, made here before the route runs)."""
+    from web import csp
+    request.state.csp_nonce = csp.new_nonce()
+    resp = await call_next(request)
+    for k, v in _SECURITY_HEADERS.items():
+        resp.headers.setdefault(k, v)
+    name = csp.header_name()
+    if name and (resp.headers.get("content-type") or "").startswith("text/html") \
+            and "content-security-policy" not in resp.headers and "content-security-policy-report-only" not in resp.headers:
+        resp.headers[name] = csp.policy_for(request.url.path, request.state.csp_nonce)
+    if _request_is_https(request):
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return resp
+
+
+BASE_DIR =os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 UPLOADS_DIR = "/tmp/uploads"
@@ -297,6 +624,7 @@ def scan_delta_tables() -> List[Dict[str, Any]]:
         return tables
 
     for root, dirs, files in os.walk(WAREHOUSE_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]     # .metadata, .dbt (private dbt output), ...: never catalog schemas
         if "_delta_log" in dirs:
             rel = os.path.relpath(root, WAREHOUSE_DIR)
             parts = rel.split(os.sep)
@@ -332,12 +660,16 @@ def scan_delta_tables() -> List[Dict[str, Any]]:
             })
     return tables
 
+def _csp_nonce(request: Request) -> str:
+    return getattr(request.state, "csp_nonce", "") or ""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     resp = templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={"warehouse_dir": WAREHOUSE_DIR}
+        context={"warehouse_dir": WAREHOUSE_DIR, "csp_nonce": _csp_nonce(request)}
     )
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
@@ -394,32 +726,111 @@ class CatalogPermissionRequest(BaseModel):
     permission: str = "READ"  # READ, WRITE, ADMIN
 
 
+# A hash nothing can match, checked whenever no real one is: an unknown username then costs as much time as a wrong password, so
+# response times do not tell which usernames exist.
+_DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(24))
+
+
+def _client_text(request: Request) -> str:
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.resolve_client(request.client.host if request.client else None, dict(request.headers))["text"] or "?"
+    except Exception:
+        return request.client.host if request.client else "?"
+
+
+def _login_failed(username: str, ip: str):
+    from web import login_throttle
+    login_throttle.record_failure(username, ip)
+    return HTTPException(status_code=401, detail="Invalid username or password")
+
+
 @app.post("/api/auth/login")
-async def login_endpoint(payload: LoginRequest):
+async def login_endpoint(payload: LoginRequest, request: Request):
+    from web import login_throttle
+    ip = _client_text(request)
+    wait = login_throttle.retry_after(payload.username, ip)
+    if wait:
+        raise HTTPException(status_code=429, detail=f"Too many failed sign-in attempts. Try again in {wait} seconds.",
+                            headers={"Retry-After": str(wait)})
     u = get_user_by_username(payload.username, include_password_hash=True)
     source = (u.get("auth_source") or "local") if u else None
+    if u and u.get("passwordless"):
+        verify_password(payload.password, _DUMMY_PASSWORD_HASH)
+        raise _login_failed(payload.username, ip)          # a passkey-only account has no password to try (same answer as a wrong one)
     if u and source != "ldap":
         # Every account except an LDAP-provisioned one authenticates against its own stored hash (unchanged from
         # before LDAP support existed). LDAP accounts never have a usable hash by design (see
         # auth.upsert_external_user), so they always fall to the branch below instead.
         if not verify_password(payload.password, u["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+            raise _login_failed(payload.username, ip)
     else:
         # No local account at all, or one already provisioned from LDAP: the only way in is a fresh directory
         # bind-as-user, so credential changes and account locks in LDAP take effect immediately rather than being
         # cached here. See ldap_auth._LOCAL_ACCOUNT_CONFLICT for why an existing *local* username is never reached
         # by this branch's auto-provisioning path.
         from web import ldap_auth
-        ldap_user, reason = ldap_auth.authenticate(payload.username, payload.password)
+        ldap_user, reason = await asyncio.to_thread(ldap_auth.authenticate, payload.username, payload.password)
         if ldap_user is None:
             logger.info(f"LDAP login failed for '{payload.username}': {reason}")
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+            verify_password(payload.password, _DUMMY_PASSWORD_HASH)
+            raise _login_failed(payload.username, ip)
         u = ldap_user
+    login_throttle.record_success(payload.username, ip)
     if u.get("is_active", 1) != 1:
         raise HTTPException(status_code=403, detail="Account is deactivated. Contact an administrator.")
 
+    from web import mfa, webauthn_auth
+    methods = [m for m, on in (("totp", mfa.is_enabled(u["id"])), ("webauthn", webauthn_auth.count(u["id"]) > 0)) if on]     # a passkey counts even if the package is missing: fail closed
+    if methods:
+        # Password was right, but a second factor is required: no session yet, only a short-lived token that is
+        # good for nothing except the second-factor endpoints (/api/auth/login/mfa and /api/auth/login/webauthn*).
+        return JSONResponse(content={"success": False, "mfa_required": True, "mfa_token": mfa.create_mfa_token(u), "mfa_methods": methods})
+    return _session_response(u, request)
+
+
+def _mfa_policy_view(u: Dict[str, Any]) -> Dict[str, Any]:
+    """What the UI needs about the organisation's two-factor policy for this user."""
+    try:
+        from web import mfa_policy
+        st = mfa_policy.user_status(u)
+        return {"required": st["required"], "state": st["state"], "deadline": st["deadline"], "days_left": st["days_left"], "enrolled": st["enrolled"]}
+    except Exception:
+        return {"required": False, "state": "off", "deadline": None, "days_left": None, "enrolled": bool(u.get("mfa_enabled"))}
+
+
+def _request_is_https(request: Optional[Request]) -> bool:
+    """https as the browser sees it: the socket itself, or X-Forwarded-Proto from a trusted proxy (the studio runs with
+    --no-proxy-headers, so uvicorn never rewrites the scheme by itself)."""
+    if request is None:
+        return False
+    if request.url.scheme == "https":
+        return True
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if proto != "https":
+        return False
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.is_trusted_proxy(request.client.host if request.client else None)
+    except Exception:
+        return False
+
+
+def _cookie_secure(request: Optional[Request], hint: bool = False) -> bool:
+    """`Secure` for the session cookie. COOKIE_SECURE=true|false overrides; `auto` (default) = https detected (or `hint`, the SSO
+    paths' own https base URL). Behind a proxy that is not in TRUSTED_PROXIES set COOKIE_SECURE=true."""
+    env = os.getenv("COOKIE_SECURE", "auto").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    return hint or _request_is_https(request)
+
+
+def _session_response(u: Dict[str, Any], request: Optional[Request] = None, method: str = "password") -> JSONResponse:
+    """Records the login and returns the session (cookie + user), shared by every password-based sign-in path."""
     record_user_login(u["id"])
-    token = create_access_token(u)
+    token = create_access_token(u, request=request, method=method)
     safe_user = {
         "id": u["id"],
         "username": u["username"],
@@ -428,18 +839,1043 @@ async def login_endpoint(payload: LoginRequest):
         "email": f"{u['username']}@localspark.lakehouse",
         "role": u["role"],
         "created_at": u["created_at"],
-        "last_login_at": u["last_login_at"]
+        "last_login_at": u["last_login_at"],
+        "must_change_password": bool(u.get("must_change_password")),
+        "passwordless": bool(u.get("passwordless")),
+        "auth_source": u.get("auth_source") or "local",
+        "mfa_enabled": bool(u.get("mfa_enabled")),
+        "mfa_policy": _mfa_policy_view(u)
     }
-    resp = JSONResponse(content={"success": True, "token": token, "user": safe_user})
+    # The session token travels only in the HttpOnly cookie, never in the body: script on the page (an XSS) cannot read it.
+    resp = JSONResponse(content={"success": True, "user": safe_user})
     resp.set_cookie(
         key=COOKIE_NAME,
         value=token,
         max_age=86400,
         httponly=True,
         samesite="lax",
-        secure=False
+        secure=_cookie_secure(request)
     )
     return resp
+
+
+class MfaLoginRequest(BaseModel):
+    mfa_token: str
+    code: str
+
+
+class MfaCodeRequest(BaseModel):
+    code: str
+    password: Optional[str] = None
+
+
+@app.post("/api/auth/login/mfa")
+async def login_mfa_endpoint(payload: MfaLoginRequest, request: Request):
+    """Second step of a two-step sign-in: the mfa_token from /api/auth/login plus a TOTP or backup code."""
+    from web import mfa
+    u = mfa.user_from_mfa_token(payload.mfa_token)
+    if u is None:
+        raise HTTPException(status_code=401, detail="This sign-in expired. Please sign in again.")
+    ok, reason = mfa.verify_login(u["id"], payload.code)
+    if not ok:
+        raise HTTPException(status_code=401 if "not valid" in reason else 429, detail=reason)
+    return _session_response(u, request, "password + authenticator app")
+
+
+# ---------------------------------------------------------------- WebAuthn: passkeys and security keys (web/webauthn_auth.py)
+
+class PasskeyPasswordPayload(BaseModel):
+    password: Optional[str] = None
+    challenge_id: Optional[str] = None               # a passkey-only account confirms with a fresh passkey assertion instead of a password
+    credential: Optional[Dict[str, Any]] = None
+
+
+class PasskeyOnlyUserPayload(BaseModel):
+    username: str
+    display_name: Optional[str] = None
+    role: str = "user"
+
+
+class EnrollOptionsPayload(BaseModel):
+    token: str
+
+
+class EnrollVerifyPayload(BaseModel):
+    token: str
+    challenge_id: str
+    credential: Dict[str, Any]
+    name: str = ""
+
+
+class PasskeyRegisterPayload(BaseModel):
+    challenge_id: str
+    credential: Dict[str, Any]
+    name: str = ""
+
+
+class WebauthnPolicyPayload(BaseModel):
+    mode: str = "none"
+    allowed: Any = []
+    roots_pem: str = ""
+    hardware_roles: List[str] = []
+
+
+class FidoMdsConfigPayload(BaseModel):
+    url: str = ""
+    root_pem: str = ""
+
+
+class PasskeyRenamePayload(BaseModel):
+    name: str
+
+
+class WebauthnLoginOptionsPayload(BaseModel):
+    mfa_token: str
+
+
+class WebauthnLoginPayload(BaseModel):
+    mfa_token: str
+    challenge_id: str
+    credential: Dict[str, Any]
+
+
+class PasskeyLoginPayload(BaseModel):
+    challenge_id: str
+    credential: Dict[str, Any]
+
+
+def _webauthn_error(exc) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+async def _verify_reauth(user: Dict[str, Any], password: Optional[str], payload: Optional[PasskeyPasswordPayload] = None, headers: Optional[Dict[str, str]] = None) -> None:
+    """Adding or removing a passkey needs the account's password, so a stolen session cannot plant or drop a second factor.
+    A passkey-only account has no password: it confirms with a fresh passkey assertion (user verification required)."""
+    from web.auth import verify_password
+    source = user.get("auth_source") or "local"
+    if source in ("oidc", "saml"):
+        raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
+    if user.get("passwordless"):
+        from web import webauthn_auth
+        if not (payload and payload.challenge_id and payload.credential):
+            raise HTTPException(status_code=403, detail="Confirm with your passkey.")
+        try:
+            await asyncio.to_thread(webauthn_auth.finish_authentication, payload.challenge_id, payload.credential, headers or {}, user["id"], True)
+        except webauthn_auth.WebAuthnError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        return
+    if not password:
+        raise HTTPException(status_code=403, detail="Enter your password to confirm.")
+    if source == "local":
+        full = get_user_by_username(user["username"], include_password_hash=True)
+        if not full or not verify_password(password, full["password_hash"]):
+            raise HTTPException(status_code=403, detail="The password is incorrect.")
+    else:
+        from web import ldap_auth
+        ok_user, _ = await asyncio.to_thread(ldap_auth.authenticate, user["username"], password)
+        if ok_user is None:
+            raise HTTPException(status_code=403, detail="The password is incorrect.")
+
+
+@app.get("/api/auth/passkey/status")
+async def passkey_public_status():
+    """Public: whether the sign-in page should offer 'Sign in with a passkey'."""
+    from web import webauthn_auth
+    return {"available": webauthn_auth.passwordless_enabled()}
+
+
+@app.get("/api/auth/webauthn/status")
+async def webauthn_status(request: Request):
+    from web import webauthn_auth, mfa
+    user = await get_current_user(request)
+    rp_id, origins = webauthn_auth.relying_party(dict(request.headers))
+    return {"available": webauthn_auth.available(), "passwordless": webauthn_auth.passwordless_enabled(), "rp_id": rp_id, "origins": origins,
+            "attestation_mode": webauthn_auth.pol_mode(), "passwordless_account": bool(user.get("passwordless")), "eligible": (user.get("auth_source") or "local") not in ("oidc", "saml"), "credentials": webauthn_auth.list_credentials(user["id"]), "totp": mfa.is_enabled(user["id"])}
+
+
+@app.get("/api/webauthn/policy")
+async def get_webauthn_policy(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import webauthn_auth
+    return webauthn_auth.policy_view()
+
+
+@app.put("/api/webauthn/policy")
+async def set_webauthn_policy(payload: WebauthnPolicyPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Which authenticators may be registered: no attestation, record what they prove, or require a verified attestation (and optionally an approved model);
+    `hardware_roles` additionally requires it for the chosen roles even while the mode above stays lenient for everyone else."""
+    from web import webauthn_auth, mfa_policy
+    try:
+        out = await asyncio.to_thread(webauthn_auth.set_policy, payload.mode, payload.allowed, payload.roots_pem, current_user["username"], payload.hardware_roles)
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    mfa_policy._audit(current_user["username"], "WEBAUTHN_POLICY_UPDATE", "webauthn_policy",
+                       {"mode": out["mode"], "approved_models": len(out["allowed"]), "trust_roots": len(out["roots"]), "hardware_roles": out["hardware_roles"]})
+    return out
+
+
+@app.get("/api/webauthn/mds/status")
+async def fido_mds_status(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The FIDO Metadata Service cache's configuration and freshness (web/fido_mds.py)."""
+    from web import fido_mds
+    return fido_mds.config_view() | fido_mds.status()
+
+
+@app.put("/api/webauthn/mds/config")
+async def set_fido_mds_config(payload: FidoMdsConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Sets the pinned trust root (paste the FIDO Alliance's MDS root certificate) and, optionally, a non-default URL, then refreshes immediately
+    so a mistake (an untrusted or unreachable root) is visible right away rather than silently failing on the next scheduled check."""
+    from web import fido_mds, mfa_policy
+    try:
+        out = await asyncio.to_thread(fido_mds.set_config, payload.url, payload.root_pem, current_user["username"])
+    except fido_mds.MdsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    refreshed = await asyncio.to_thread(fido_mds.refresh, True)
+    mfa_policy._audit(current_user["username"], "FIDO_MDS_CONFIG_UPDATE", "fido_mds", {"url": out["effective_url"], "roots": len(out["roots"]), "refresh_error": refreshed.get("last_error")})
+    return {**out, **refreshed}
+
+
+@app.post("/api/webauthn/mds/refresh")
+async def refresh_fido_mds(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import fido_mds, mfa_policy
+    out = await asyncio.to_thread(fido_mds.refresh, True)
+    mfa_policy._audit(current_user["username"], "FIDO_MDS_REFRESH", "fido_mds", {"entry_count": out.get("entry_count"), "error": out.get("last_error")})
+    return out
+
+
+@app.get("/api/webauthn/mds/lookup/{aaguid}")
+async def lookup_fido_mds(aaguid: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import fido_mds
+    entry = fido_mds.lookup(aaguid)
+    if not entry:
+        raise HTTPException(status_code=404, detail="No FIDO MDS entry for this AAGUID (an unknown model, or the cache needs a refresh).")
+    return entry
+
+
+@app.post("/api/auth/webauthn/register/options")
+async def webauthn_register_options(payload: PasskeyPasswordPayload, request: Request):
+    from web import webauthn_auth
+    user = await get_current_user(request)
+    await _verify_reauth(user, payload.password, payload, dict(request.headers))
+    try:
+        return await asyncio.to_thread(webauthn_auth.registration_options, user, dict(request.headers), bool(user.get("passwordless")))
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+
+
+@app.post("/api/auth/webauthn/register/verify")
+async def webauthn_register_verify(payload: PasskeyRegisterPayload, request: Request):
+    from web import webauthn_auth, mfa_policy
+    user = await get_current_user(request)
+    if (user.get("auth_source") or "local") in ("oidc", "saml"):
+        raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
+    try:
+        cred = await asyncio.to_thread(webauthn_auth.finish_registration, user, payload.challenge_id, payload.credential, payload.name, dict(request.headers), bool(user.get("passwordless")))
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    mfa_policy._audit(user["username"], "PASSKEY_ADD", f"user:{user['username']}", {"credential": cred["id"][:12], "name": cred["name"]})
+    return {"success": True, "credential": cred}
+
+
+@app.patch("/api/auth/webauthn/credentials/{credential_id}")
+async def webauthn_rename(credential_id: str, payload: PasskeyRenamePayload, request: Request):
+    from web import webauthn_auth
+    user = await get_current_user(request)
+    try:
+        webauthn_auth.rename(user["id"], credential_id, payload.name)
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    return {"success": True}
+
+
+@app.post("/api/auth/webauthn/credentials/{credential_id}/delete")
+async def webauthn_delete(credential_id: str, payload: PasskeyPasswordPayload, request: Request):
+    from web import webauthn_auth, mfa, mfa_policy
+    user = await get_current_user(request)
+    await _verify_reauth(user, payload.password, payload, dict(request.headers))
+    if credential_id not in [c["id"] for c in webauthn_auth.list_credentials(user["id"])]:
+        raise HTTPException(status_code=404, detail="That passkey does not exist.")
+    if user.get("passwordless") and webauthn_auth.count(user["id"]) == 1:
+        raise HTTPException(status_code=409, detail="This is your only passkey and your account has no password, so removing it would lock you out. Add another passkey first.")
+    last_factor = webauthn_auth.count(user["id"]) == 1 and not mfa.is_enabled(user["id"])
+    if last_factor and not mfa_policy.may_disable_own_mfa(get_user_by_id(user["id"]) or user):
+        raise HTTPException(status_code=409, detail="This is your only second factor and your organisation requires one. Add another passkey or turn on an authenticator app first.")
+    webauthn_auth.delete(user["id"], credential_id)
+    mfa_policy._audit(user["username"], "PASSKEY_REMOVE", f"user:{user['username']}", {"credential": credential_id[:12]})
+    return {"success": True}
+
+
+@app.post("/api/auth/webauthn/reauth/options")
+async def webauthn_reauth_options(request: Request):
+    """A passkey-only account confirms an add / remove with a fresh assertion: the options for it (user verification required)."""
+    from web import webauthn_auth
+    user = await get_current_user(request)
+    if not user.get("passwordless"):
+        raise HTTPException(status_code=400, detail="Confirm with your password instead.")
+    try:
+        return await asyncio.to_thread(webauthn_auth.authentication_options, dict(request.headers), user["id"], True)
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+
+
+# ---- passkey-only accounts: created by an administrator, entered through a single-use enrolment link
+
+@app.post("/api/users/passkey-only")
+async def create_passkey_only_user(payload: PasskeyOnlyUserPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """A local account with no password. The answer carries the enrolment token ONCE (build the link <origin>/?enroll=<token>)."""
+    from web import webauthn_auth, mfa_policy
+    from web.auth import create_passwordless_user
+    if not webauthn_auth.available():
+        raise HTTPException(status_code=400, detail="Passkeys are not available on this server (the webauthn package is not installed).")
+    try:
+        u = await asyncio.to_thread(create_passwordless_user, payload.username, payload.display_name or "", payload.role)
+        enr = await asyncio.to_thread(webauthn_auth.issue_enrollment, u["id"], current_user["username"])
+    except (ValueError, webauthn_auth.WebAuthnError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    mfa_policy._audit(current_user["username"], "PASSKEY_ONLY_USER_CREATE", f"user:{u['username']}", {"role": u["role"]})
+    return {"success": True, "user": u, "enrollment": enr}
+
+
+@app.post("/api/users/{user_id}/passkey-enrollment")
+async def issue_passkey_enrollment(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """A new enrolment link for a passkey-only account (first sign-in, or recovery after every passkey was lost); it replaces an unused earlier one."""
+    from web import webauthn_auth, mfa_policy
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        enr = await asyncio.to_thread(webauthn_auth.issue_enrollment, user_id, current_user["username"])
+    except webauthn_auth.WebAuthnError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    mfa_policy._audit(current_user["username"], "PASSKEY_ENROLL_ISSUE", f"user:{target['username']}", {"expires_at": enr["expires_at"]})
+    return {"success": True, "enrollment": enr}
+
+
+@app.post("/api/users/{user_id}/remove-password")
+async def remove_user_password(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Makes an account passkey-only. Refused unless it already has two passkeys (one lost device must not lock the account out)."""
+    from web import webauthn_auth, mfa_policy
+    from web.auth import set_passwordless
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if (target.get("auth_source") or "local") not in ("local", "ldap"):
+        raise HTTPException(status_code=400, detail="Only local or LDAP accounts can be made passkey-only.")
+    if target.get("passwordless"):
+        raise HTTPException(status_code=400, detail="This account is already passkey-only.")
+    if webauthn_auth.count(user_id) < 2:
+        raise HTTPException(status_code=409, detail="The account needs at least two registered passkeys first, so losing one device does not lock it out.")
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Use another administrator to remove your own password.")
+    await asyncio.to_thread(set_passwordless, user_id, True)
+    mfa_policy._audit(current_user["username"], "USER_PASSWORD_REMOVED", f"user:{target['username']}", {"passkeys": webauthn_auth.count(user_id)})
+    return {"success": True}
+
+
+@app.post("/api/auth/enroll/options")
+async def enroll_options(payload: EnrollOptionsPayload, request: Request):
+    """Public (the token is the credential): the registration options for the account an enrolment link belongs to."""
+    from web import webauthn_auth
+    try:
+        u = await asyncio.to_thread(webauthn_auth.enrollment_user, payload.token)
+        out = await asyncio.to_thread(webauthn_auth.registration_options, u, dict(request.headers), True, "enroll")
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    return {**out, "username": u["username"], "display_name": u.get("display_name") or u["username"]}
+
+
+@app.post("/api/auth/enroll/verify")
+async def enroll_verify(payload: EnrollVerifyPayload, request: Request):
+    """Registers the first passkey of a passkey-only account (user verification required), uses up the link and signs the owner in."""
+    from web import webauthn_auth, mfa_policy
+    try:
+        u = await asyncio.to_thread(webauthn_auth.enrollment_user, payload.token)
+        await asyncio.to_thread(webauthn_auth.finish_registration, u, payload.challenge_id, payload.credential, payload.name, dict(request.headers), True, "enroll")
+        await asyncio.to_thread(webauthn_auth.consume_enrollment, payload.token)
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+    mfa_policy._audit(u["username"], "PASSKEY_ENROLL_USED", f"user:{u['username']}", {})
+    return _session_response(get_user_by_id(u["id"]), request, "passkey enrolment")
+
+
+@app.post("/api/auth/login/webauthn/options")
+async def login_webauthn_options(payload: WebauthnLoginOptionsPayload, request: Request):
+    """Second factor with a passkey / security key: the options for the account the mfa_token names."""
+    from web import mfa, webauthn_auth
+    u = mfa.user_from_mfa_token(payload.mfa_token)
+    if u is None:
+        raise HTTPException(status_code=401, detail="This sign-in expired. Please sign in again.")
+    if webauthn_auth.count(u["id"]) == 0:
+        raise HTTPException(status_code=400, detail="No passkey is registered for this account.")
+    try:
+        return await asyncio.to_thread(webauthn_auth.authentication_options, dict(request.headers), u["id"])
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+
+
+@app.post("/api/auth/login/webauthn")
+async def login_webauthn(payload: WebauthnLoginPayload, request: Request):
+    from web import mfa, webauthn_auth
+    u = mfa.user_from_mfa_token(payload.mfa_token)
+    if u is None:
+        raise HTTPException(status_code=401, detail="This sign-in expired. Please sign in again.")
+    try:
+        await asyncio.to_thread(webauthn_auth.finish_authentication, payload.challenge_id, payload.credential, dict(request.headers), u["id"])
+    except webauthn_auth.WebAuthnError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    return _session_response(u, request, "password + security key")
+
+
+@app.post("/api/auth/passkey/options")
+async def passkey_login_options(request: Request):
+    """Passwordless sign-in, step 1 (public): a challenge for a discoverable passkey; nothing about any account is revealed."""
+    from web import webauthn_auth
+    try:
+        return await asyncio.to_thread(webauthn_auth.authentication_options, dict(request.headers), None)
+    except webauthn_auth.WebAuthnError as exc:
+        raise _webauthn_error(exc)
+
+
+@app.post("/api/auth/passkey/login")
+async def passkey_login(payload: PasskeyLoginPayload, request: Request):
+    """Passwordless sign-in, step 2: a passkey assertion with user verification IS the whole sign-in (possession + PIN / biometric)."""
+    from web import webauthn_auth
+    try:
+        uid = await asyncio.to_thread(webauthn_auth.finish_authentication, payload.challenge_id, payload.credential, dict(request.headers), None)
+    except webauthn_auth.WebAuthnError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    u = get_user_by_id(uid)
+    if not u or u.get("is_active", 1) != 1 or u.get("deleted_at") or (u.get("auth_source") or "local") not in ("local", "ldap"):
+        raise HTTPException(status_code=401, detail="This passkey cannot be used to sign in.")
+    return _session_response(u, request, "passkey")
+
+
+@app.get("/api/auth/mfa/status")
+async def mfa_status(request: Request):
+    from web import mfa
+    user = await get_current_user(request)
+    return mfa.status(user["id"])
+
+
+@app.post("/api/auth/mfa/setup")
+async def mfa_setup(request: Request):
+    """Starts enrolment: returns the secret and otpauth:// URI for the authenticator app (nothing is enabled yet)."""
+    from web import mfa
+    user = await get_current_user(request)
+    if (user.get("auth_source") or "local") in ("oidc", "saml"):
+        raise HTTPException(status_code=403, detail="This account signs in through an external identity provider; use its two-factor settings.")
+    if user.get("passwordless"):
+        raise HTTPException(status_code=400, detail="A passkey-only account signs in with passkeys; an authenticator app is not used.")
+    try:
+        return mfa.begin_setup(user["id"], user["username"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/auth/mfa/enable")
+async def mfa_enable(payload: MfaCodeRequest, request: Request):
+    """Confirms enrolment with a code from the app; returns the backup codes, shown only this once."""
+    from web import mfa
+    user = await get_current_user(request)
+    try:
+        return {"success": True, "backup_codes": mfa.confirm_setup(user["id"], payload.code)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+async def _require_second_factor(request: Request, payload: MfaCodeRequest) -> Dict[str, Any]:
+    """For sensitive MFA changes: a stolen session alone is not enough -- a current code (or backup code) is needed,
+    plus the password for a local account."""
+    from web import mfa
+    from web.auth import verify_password
+    user = await get_current_user(request)
+    if not mfa.is_enabled(user["id"]):
+        raise HTTPException(status_code=400, detail="Two-factor authentication is not enabled.")
+    if (user.get("auth_source") or "local") == "local":
+        full = get_user_by_username(user["username"], include_password_hash=True)
+        if not payload.password or not verify_password(payload.password, full["password_hash"]):
+            raise HTTPException(status_code=403, detail="The password is incorrect.")
+    ok, reason = mfa.verify_login(user["id"], payload.code)
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
+    return user
+
+
+@app.post("/api/auth/mfa/disable")
+async def mfa_disable(payload: MfaCodeRequest, request: Request):
+    from web import mfa
+    user = await _require_second_factor(request, payload)
+    from web import mfa_policy
+    from web import webauthn_auth
+    if not mfa_policy.may_disable_own_mfa(get_user_by_id(user["id"]) or user) and webauthn_auth.count(user["id"]) == 0:      # a registered passkey keeps the account compliant
+        raise HTTPException(status_code=409, detail="Your organisation requires two-factor authentication, so it cannot be turned off. Ask an administrator for an exemption if you need to.")
+    mfa.disable(user["id"])
+    return {"success": True}
+
+
+@app.post("/api/auth/mfa/backup-codes")
+async def mfa_regenerate_backup_codes(payload: MfaCodeRequest, request: Request):
+    """Replaces all backup codes with a fresh set (the old ones stop working)."""
+    from web import mfa
+    user = await _require_second_factor(request, payload)
+    return {"success": True, "backup_codes": mfa.regenerate_backup_codes(user["id"])}
+
+
+@app.post("/api/users/{user_id}/mfa/reset")
+async def admin_reset_mfa(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """A lost device: an administrator switches another user's two-factor authentication off so they can re-enrol."""
+    from web import mfa
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Use 'Disable' in your own two-factor settings.")
+    from web import webauthn_auth
+    removed_keys = webauthn_auth.delete_all(user_id)                  # a lost device: authenticator app AND passkeys / security keys
+    if not mfa.disable(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    if removed_keys:
+        from web import mfa_policy as _mp
+        _mp._audit(current_user["username"], "PASSKEY_RESET", f"user:{user_id}", {"removed": removed_keys})
+    logger.warning(f"MFA reset for user {user_id} by admin {current_user['username']}")
+    return {"success": True}
+
+
+class MfaPolicyPayload(BaseModel):
+    enabled: bool
+    roles: List[str] = ["admin", "power_user", "user"]
+    grace_days: int = 14
+
+
+class MfaExemptPayload(BaseModel):
+    exempt: bool
+    reason: str = ""
+
+
+class MfaExtendPayload(BaseModel):
+    days: int
+
+
+class IpAllowlistPayload(BaseModel):
+    mode: str
+    rules: List[Dict[str, Any]] = []
+    trusted_proxies: List[Dict[str, Any]] = []
+
+
+class IpCheckPayload(BaseModel):
+    ip: str
+
+
+@app.get("/api/ip-allowlist")
+async def get_ip_allowlist_endpoint(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The rules and proxy settings, who the server thinks YOU are (address, proxy, whether you would pass), and what was refused recently."""
+    from web import ip_allowlist
+    peer = request.client.host if request.client else None
+    return {"config": ip_allowlist.get_config(), "me": ip_allowlist.whoami(peer, dict(request.headers)), "activity": ip_allowlist.activity()}
+
+
+@app.put("/api/ip-allowlist")
+async def set_ip_allowlist_endpoint(payload: IpAllowlistPayload, request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Mode off | monitor | enforce, CIDR rules and trusted proxies. Refused when it would block the administrator making the change."""
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.set_config(payload.mode, payload.rules, payload.trusted_proxies, current_user.get("username", "admin"),
+                                       request.client.host if request.client else None, dict(request.headers))
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/ip-allowlist/check")
+async def check_ip_allowlist_endpoint(payload: IpCheckPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.check_address(payload.ip)
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class NetworkPolicyPayload(BaseModel):
+    rules: List[Dict[str, Any]] = []
+
+
+@app.get("/api/network-policies")
+async def list_network_policies_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Every per-user / per-role network policy on top of the global allowlist above."""
+    from web import ip_allowlist
+    return {"policies": ip_allowlist.list_network_policies(), "roles": list(ip_allowlist.NETWORK_POLICY_ROLES)}
+
+
+@app.put("/api/network-policies/{principal_type}/{principal_id}")
+async def set_network_policy_endpoint(principal_type: str, principal_id: str, payload: NetworkPolicyPayload, request: Request,
+                                      current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Restricts one user, or every user of one role, to chosen address ranges. Refused when it would block the administrator
+    making the change (only relevant when the policy is about to apply to them)."""
+    from web import ip_allowlist
+    try:
+        return ip_allowlist.set_network_policy(principal_type, principal_id, payload.rules, current_user,
+                                               request.client.host if request.client else None, dict(request.headers))
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/network-policies/{principal_type}/{principal_id}")
+async def delete_network_policy_endpoint(principal_type: str, principal_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import ip_allowlist
+    try:
+        ok = ip_allowlist.delete_network_policy(principal_type, principal_id, current_user.get("username", "admin"))
+    except ip_allowlist.AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not ok:
+        raise HTTPException(status_code=404, detail="No such policy.")
+    return {"success": True}
+
+
+class ScimConfigPayload(BaseModel):
+    enabled: Optional[bool] = None
+    login_source: Optional[str] = None
+    default_role: Optional[str] = None
+    max_role: Optional[str] = None
+    use_roles_attribute: Optional[bool] = None
+    group_roles: Optional[Dict[str, str]] = None
+    base_url: Optional[str] = None
+
+
+class ScimTokenPayload(BaseModel):
+    name: str
+    expires_days: Optional[int] = None
+
+
+@app.get("/api/scim")
+async def get_scim_endpoint(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """SCIM provisioning settings, the URL to give the identity provider, its tokens (never the secret again), counts and recent requests."""
+    cfg = scim_module.get_config()
+    root = cfg["base_url"] or str(request.base_url).rstrip("/")
+    return {"config": cfg, "base_url": root.rstrip("/") + ("" if root.rstrip("/").endswith("/scim/v2") else "/scim/v2"),
+            "tokens": await asyncio.to_thread(scim_module.list_tokens), "status": await asyncio.to_thread(scim_module.status_summary)}
+
+
+@app.put("/api/scim/config")
+async def put_scim_config_endpoint(payload: ScimConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        return await asyncio.to_thread(scim_module.set_config, payload.dict(exclude_none=True), current_user.get("username", "admin"))
+    except scim_module.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/scim/tokens")
+async def create_scim_token_endpoint(payload: ScimTokenPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Creates a bearer token for the identity provider. The secret is in this response only; the studio keeps just a hash."""
+    try:
+        return await asyncio.to_thread(scim_module.create_token, payload.name, payload.expires_days, current_user.get("username", "admin"))
+    except scim_module.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/scim/tokens/{token_id}")
+async def revoke_scim_token_endpoint(token_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        await asyncio.to_thread(scim_module.revoke_token, token_id, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"success": True}
+
+
+class S3EventTokenPayload(BaseModel):
+    name: str
+
+
+@app.get("/api/autoloader/s3-events")
+async def get_s3_events_endpoint(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The receiver URL, its tokens (never the secret again), what the pipelines received and which pipelines use S3 events."""
+    from web import autoloader
+    root = str(request.base_url).rstrip("/")
+    st = s3_events_module.status()
+    pipes = [{"id": p["id"], "name": p["name"], "source_volume_path": p["source_volume_path"], "enabled": bool(p.get("enabled", 1)), "sweep_seconds": p.get("watch_sweep_seconds"),
+              **(st["pipelines"].get(p["id"]) or {"events": 0, "last_event_at": None, "last_run_at": None})}
+             for p in await asyncio.to_thread(autoloader.list_pipelines) if p.get("s3_events")]
+    return {"receiver_url": root + "/hooks/s3-events", "tokens": await asyncio.to_thread(s3_events_module.list_tokens), "pipelines": pipes, "recent": st["recent"]}
+
+
+@app.post("/api/autoloader/s3-events/tokens")
+async def create_s3_events_token_endpoint(payload: S3EventTokenPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        return await asyncio.to_thread(s3_events_module.create_token, payload.name, current_user.get("username", "admin"))
+    except s3_events_module.EventError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/autoloader/s3-events/tokens/{token_id}")
+async def revoke_s3_events_token_endpoint(token_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    try:
+        await asyncio.to_thread(s3_events_module.revoke_token, token_id, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"success": True}
+
+
+class SharePayload(BaseModel):
+    name: str
+    comment: str = ""
+
+
+class ShareTablePayload(BaseModel):
+    source: str
+    history: bool = False
+    schema_alias: Optional[str] = None
+    table_alias: Optional[str] = None
+
+
+class SharingRecipientPayload(BaseModel):
+    name: str
+    comment: str = ""
+    shares: List[str] = []
+    expires_in_days: Optional[int] = None
+
+
+class SharingSharesPayload(BaseModel):
+    shares: List[str] = []
+
+
+class SharingHistoryPayload(BaseModel):
+    history: bool
+
+
+class SharingIpsPayload(BaseModel):
+    allowed_cidrs: List[str] = []
+
+
+class SharingRotatePayload(BaseModel):
+    expires_in_days: Optional[int] = None
+
+
+def _sharing_call(fn, *args):
+    try:
+        return fn(*args)
+    except delta_sharing_module.SharingError as exc:
+        raise HTTPException(status_code=exc.status if exc.status != 401 else 400, detail=str(exc))
+
+
+@app.get("/api/sharing")
+async def get_sharing_overview(request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Delta Sharing: shares with their tables and recipients, recipients with their state, the profile endpoint and the recent activity."""
+    shares = await asyncio.to_thread(delta_sharing_module.list_shares)
+    for s in shares:                                            # a table whose governance changed since it was added is flagged, not hidden
+        for t in s["tables"]:
+            t["problem"] = await asyncio.to_thread(delta_sharing_module.governance_problem, t["source"])
+    return {"enabled": delta_sharing_module.enabled(), "endpoint": delta_sharing_module.endpoint_for(request), "url_ttl_seconds": delta_sharing_module.URL_TTL,
+            "shares": shares, "recipients": await asyncio.to_thread(delta_sharing_module.list_recipients), "log": await asyncio.to_thread(delta_sharing_module.recent_log, 100)}
+
+
+@app.post("/api/sharing/shares")
+async def create_share_endpoint(payload: SharePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.create_share, payload.name, payload.comment, current_user.get("username", "admin"))
+
+
+@app.delete("/api/sharing/shares/{name}")
+async def delete_share_endpoint(name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.delete_share, name, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.post("/api/sharing/shares/{name}/tables")
+async def add_share_table_endpoint(name: str, payload: ShareTablePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.add_table, name, payload.source, current_user.get("username", "admin"), payload.schema_alias, payload.table_alias, payload.history)
+
+
+@app.delete("/api/sharing/shares/{name}/tables/{schema}/{table}")
+async def remove_share_table_endpoint(name: str, schema: str, table: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.remove_table, name, schema, table, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.put("/api/sharing/shares/{name}/tables/{schema}/{table}/history")
+async def set_share_table_history_endpoint(name: str, schema: str, table: str, payload: SharingHistoryPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.set_table_history, name, schema, table, payload.history, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.put("/api/sharing/recipients/{rid}/ips")
+async def set_recipient_ips_endpoint(rid: str, payload: SharingIpsPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.set_recipient_ips, rid, payload.allowed_cidrs, current_user.get("username", "admin"))
+
+
+def _with_profile(request: Request, res: Dict[str, Any]) -> Dict[str, Any]:
+    res["profile"] = delta_sharing_module.profile(delta_sharing_module.endpoint_for(request), res["token"], res.get("expiration_time"))
+    return res
+
+
+@app.post("/api/sharing/recipients")
+async def create_recipient_endpoint(payload: SharingRecipientPayload, request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Creates a recipient; the token (and the profile file containing it) is in this answer only."""
+    res = await asyncio.to_thread(_sharing_call, delta_sharing_module.create_recipient, payload.name, payload.comment, payload.shares, payload.expires_in_days, current_user.get("username", "admin"))
+    return _with_profile(request, res)
+
+
+@app.post("/api/sharing/recipients/{rid}/rotate")
+async def rotate_recipient_endpoint(rid: str, payload: SharingRotatePayload, request: Request, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    res = await asyncio.to_thread(_sharing_call, delta_sharing_module.rotate_token, rid, payload.expires_in_days, current_user.get("username", "admin"))
+    return _with_profile(request, res)
+
+
+@app.put("/api/sharing/recipients/{rid}/shares")
+async def set_recipient_shares_endpoint(rid: str, payload: SharingSharesPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await asyncio.to_thread(_sharing_call, delta_sharing_module.set_recipient_shares, rid, payload.shares, current_user.get("username", "admin"))
+
+
+@app.post("/api/sharing/recipients/{rid}/revoke")
+async def revoke_recipient_endpoint(rid: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.revoke_recipient, rid, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.delete("/api/sharing/recipients/{rid}")
+async def delete_recipient_endpoint(rid: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    await asyncio.to_thread(_sharing_call, delta_sharing_module.delete_recipient, rid, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+@app.get("/api/mfa/policy")
+async def get_mfa_policy_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import mfa_policy
+    return mfa_policy.get_policy()
+
+
+@app.put("/api/mfa/policy")
+async def set_mfa_policy_endpoint(payload: MfaPolicyPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Require two-factor authentication for the chosen roles (accounts checked by this studio: local and LDAP), with a grace period in days.
+    Refused while you are covered and have not enrolled yourself."""
+    from web import mfa_policy
+    try:
+        return mfa_policy.set_policy(payload.enabled, payload.roles, payload.grace_days, get_user_by_id(current_user["id"]) or current_user)
+    except mfa_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/mfa/stats")
+async def mfa_stats_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Coverage numbers, per-role breakdown, enrolment per week and the users that need attention (overdue, in grace, exempt)."""
+    from web import mfa_policy
+    return await asyncio.to_thread(mfa_policy.stats)
+
+
+@app.post("/api/users/{user_id}/mfa/exempt")
+async def mfa_exempt_endpoint(user_id: str, payload: MfaExemptPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import mfa_policy
+    try:
+        mfa_policy.set_exempt(user_id, payload.exempt, payload.reason, current_user)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except mfa_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"success": True}
+
+
+@app.post("/api/users/{user_id}/mfa/extend")
+async def mfa_extend_endpoint(user_id: str, payload: MfaExtendPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Gives one user more time: their deadline becomes `days` from now (0 removes an extension)."""
+    from web import mfa_policy
+    try:
+        return {"success": True, "deadline": mfa_policy.extend_deadline(user_id, payload.days, current_user)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except mfa_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _oidc_redirect_uri(cfg: Dict[str, Any], request: Request) -> str:
+    """The registered redirect URI is authoritative (it must match the IdP's registration exactly); only when it
+    is blank do we derive one from the request."""
+    return (cfg.get("redirect_uri") or "").strip() or str(request.url_for("oidc_callback"))
+
+
+@app.get("/api/auth/sso")
+async def sso_providers():
+    """Public: which single sign-on buttons the login screen should show (no secrets, no config detail)."""
+    from web import oidc_auth, saml_auth
+    cfg = auth_frameworks.load_raw_config().get("oidc", {})
+    scfg = auth_frameworks.load_raw_config().get("saml", {})
+    return {"oidc": {"enabled": oidc_auth.is_configured(cfg), "provider_name": (cfg.get("provider_name") or "SSO").strip()},
+            "saml": {"enabled": saml_auth.is_configured(scfg), "provider_name": (scfg.get("provider_name") or "SAML SSO").strip()}}
+
+
+def _sso_failure(message: str) -> RedirectResponse:
+    from urllib.parse import quote
+    resp = RedirectResponse(url=f"/?sso_error={quote(message)}", status_code=302)
+    resp.delete_cookie("dkw_oidc", path="/api/auth/oidc")
+    return resp
+
+
+@app.get("/api/auth/oidc/login")
+async def oidc_login(request: Request):
+    """Starts the OpenID Connect authorization-code (PKCE) flow: redirects the browser to the identity provider."""
+    from web import oidc_auth
+    cfg = auth_frameworks.load_raw_config().get("oidc", {})
+    if not oidc_auth.is_configured(cfg):
+        return _sso_failure("OpenID Connect sign-in is not enabled.")
+    redirect_uri = _oidc_redirect_uri(cfg, request)
+    try:
+        url, state_cookie = await asyncio.to_thread(oidc_auth.begin_login, cfg, redirect_uri)
+    except oidc_auth.OidcError as exc:
+        return _sso_failure(str(exc))
+    resp = RedirectResponse(url=url, status_code=302)
+    resp.set_cookie(oidc_auth.STATE_COOKIE, state_cookie, max_age=oidc_auth.STATE_TTL_SECONDS, httponly=True,
+                    samesite="lax", secure=redirect_uri.startswith("https://"), path="/api/auth/oidc")
+    return resp
+
+
+@app.get("/api/auth/oidc/callback", name="oidc_callback")
+async def oidc_callback(request: Request, code: str = "", state: str = "", error: str = "", error_description: str = ""):
+    """The identity provider sends the browser back here: validate, provision the local account, start a session."""
+    from web import oidc_auth
+    cfg = auth_frameworks.load_raw_config().get("oidc", {})
+    if error:
+        logger.info(f"OIDC provider returned an error: {error} {error_description}")
+        return _sso_failure("The identity provider did not complete the sign-in.")
+    redirect_uri = _oidc_redirect_uri(cfg, request)
+    try:
+        u = await asyncio.to_thread(oidc_auth.complete_login, cfg, code, state,
+                                    request.cookies.get(oidc_auth.STATE_COOKIE), redirect_uri)
+    except oidc_auth.OidcError as exc:
+        return _sso_failure(str(exc))
+    record_user_login(u["id"])
+    resp = RedirectResponse(url="/", status_code=302)
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, request=request, method="oidc"), max_age=86400, httponly=True, samesite="lax",
+                    secure=_cookie_secure(request, redirect_uri.startswith("https://")))
+    resp.delete_cookie(oidc_auth.STATE_COOKIE, path="/api/auth/oidc")
+    return resp
+
+
+def _saml_base(cfg: Dict[str, Any], request: Request) -> str:
+    return (cfg.get("sp_base_url") or "").strip().rstrip("/") or f"{request.url.scheme}://{request.url.netloc}"
+
+
+@app.get("/api/auth/saml/login")
+async def saml_login(request: Request):
+    """Starts SAML sign-in: redirects the browser to the identity provider with an AuthnRequest."""
+    from web import saml_auth
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    base = _saml_base(cfg, request)
+    try:
+        url, browser = await asyncio.to_thread(saml_auth.begin_login, cfg, base, base.startswith("https://"))
+    except saml_auth.SamlError as exc:
+        return _sso_failure(str(exc))
+    resp = RedirectResponse(url=url, status_code=302)
+    if browser:   # the ACS is a cross-site POST: only a SameSite=None cookie reaches it, and that needs https
+        resp.set_cookie(saml_auth.STATE_COOKIE, browser, max_age=saml_auth.STATE_TTL_SECONDS, httponly=True, samesite="none", secure=True, path="/api/auth/saml")
+    return resp
+
+
+@app.post("/api/auth/saml/acs")
+async def saml_acs(request: Request):
+    """The identity provider POSTs its signed response here: validate, provision the account, start a session."""
+    from web import saml_auth
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    base = _saml_base(cfg, request)
+    form = await request.form()
+    try:
+        u = await asyncio.to_thread(saml_auth.complete_login, cfg, base, str(form.get("SAMLResponse") or ""), str(form.get("RelayState") or ""),
+                                    request.cookies.get(saml_auth.STATE_COOKIE), base.startswith("https://"))
+    except saml_auth.SamlError as exc:
+        resp = _sso_failure(str(exc))
+        resp.status_code = 303
+        return resp
+    record_user_login(u["id"])
+    saml_session = u.pop("_saml_session", None) or {}
+    resp = RedirectResponse(url="/", status_code=303)             # 303: the browser must GET / after this POST
+    # name_id/session_index ride in the session token (never re-derived later) so Single Logout can name exactly the
+    # session the IdP itself issued.
+    extra = {"saml_name_id": saml_session.get("name_id", ""), "saml_session_index": saml_session.get("session_index", ""),
+             "saml_name_id_format": saml_session.get("name_id_format", "")} if saml_session.get("name_id") else None
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, extra_claims=extra, request=request, method="saml"), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request, base.startswith("https://")))
+    resp.delete_cookie(saml_auth.STATE_COOKIE, path="/api/auth/saml")
+    return resp
+
+
+@app.get("/api/auth/saml/logout")
+async def saml_logout(request: Request):
+    """SP-initiated Single Logout: for a SAML session with SLO configured, redirects to the IdP to end its own SSO
+    session too; otherwise (or on any error) falls back to a plain local sign-out. Always clears the local session."""
+    from web import saml_auth
+    token = request.cookies.get(COOKIE_NAME)
+    payload = decode_access_token(token) if token else None
+    resp = None
+    if payload and payload.get("saml_name_id"):
+        cfg = auth_frameworks.load_raw_config().get("saml", {})
+        base = _saml_base(cfg, request)
+        try:
+            url = await asyncio.to_thread(saml_auth.begin_logout, cfg, base, payload["saml_name_id"],
+                                          payload.get("saml_session_index") or None, payload.get("saml_name_id_format") or None)
+            resp = RedirectResponse(url=url, status_code=302)
+        except saml_auth.SamlError as exc:
+            logger.info(f"SAML SP-initiated logout not started: {exc}")
+    if resp is None:
+        resp = RedirectResponse(url="/", status_code=302)
+    end_session(token, "signed out (SAML)")
+    resp.delete_cookie(COOKIE_NAME)          # the local session ends now regardless of what the IdP round trip does
+    return resp
+
+
+@app.get("/api/auth/saml/sls")
+async def saml_sls(request: Request):
+    """This studio's SingleLogoutService: an IdP-initiated LogoutRequest (validated, answered with a signed
+    LogoutResponse) or the return leg of a LogoutRequest this studio sent (a LogoutResponse, validated against it).
+    Public: the IdP calls it directly, and an IdP-initiated request needs no session here to act on."""
+    from web import saml_auth
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    base = _saml_base(cfg, request)
+    query = dict(request.query_params)
+    result = await asyncio.to_thread(saml_auth.complete_logout, cfg, base, query)
+    if not result.get("error") and result.get("name_id"):
+        from web import sessions
+        indexes = result.get("session_indexes") or [None]
+        ended = sum(sessions.revoke_saml(result["name_id"], idx) for idx in indexes)
+        logger.info(f"SAML IdP-initiated logout ended {ended} session(s)")
+    end_session(request.cookies.get(COOKIE_NAME), "signed out (SAML)")
+    resp = RedirectResponse(url=result["redirect_url"] if result["redirect_url"] else ("/?slo_error=1" if result["error"] else "/?slo=1"),
+                            status_code=302)
+    resp.delete_cookie(COOKIE_NAME)           # reached only via a browser redirect (HTTP-Redirect binding is SLO's only one here)
+    return resp
+
+
+@app.get("/api/auth/saml/metadata")
+async def saml_metadata(request: Request):
+    """Service-provider metadata XML to hand to the identity provider's administrator (public; it holds no secret)."""
+    from web import saml_auth
+    from fastapi.responses import Response
+    cfg = auth_frameworks.load_raw_config().get("saml", {})
+    try:
+        return Response(content=await asyncio.to_thread(saml_auth.metadata_xml, cfg, _saml_base(cfg, request)), media_type="application/samlmetadata+xml")
+    except saml_auth.SamlError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class SamlMetadataImport(BaseModel):
+    url: Optional[str] = ""
+    xml: Optional[str] = ""
+
+
+@app.post("/api/auth/frameworks/saml/import-metadata")
+async def saml_import_metadata_endpoint(payload: SamlMetadataImport, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Reads the IdP's entity id, SSO/SLO URLs and signing certificate from its metadata (URL or pasted XML) for the settings form."""
+    from web import saml_auth
+    try:
+        return await asyncio.to_thread(saml_auth.import_idp_metadata, payload.url or "", payload.xml or "")
+    except saml_auth.SamlError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/auth/frameworks/saml/sp-certificate")
+async def saml_sp_certificate_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """This studio's own SAML signing/decryption certificate (never the private key), to register with the IdP when
+    turning on signed AuthnRequests, encrypted assertions or Single Logout. Auto-generated on first use."""
+    from web import saml_auth
+    return {"certificate": await asyncio.to_thread(saml_auth.sp_certificate_pem)}
+
+
+@app.post("/api/auth/frameworks/saml/rotate-sp-key")
+async def saml_rotate_sp_key_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Discards this studio's SAML signing/decryption keypair; the next use generates a fresh one. Do this only after
+    updating the IdP with the new certificate (from sp-certificate above), or signed requests and encrypted assertions
+    will start failing until it is."""
+    from web import saml_auth
+    await asyncio.to_thread(saml_auth.rotate_sp_key)
+    return {"success": True}
 
 
 @app.post("/api/auth/change-password")
@@ -455,15 +1891,109 @@ async def change_password_endpoint(payload: PasswordChangeRequest, request: Requ
         raise HTTPException(status_code=400, detail=str(exc))
     fresh = get_user_by_username(user["username"])
     resp = JSONResponse(content={"success": True, "message": "Password changed. Other sessions were signed out."})
-    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh), max_age=86400, httponly=True, samesite="lax", secure=False)
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh, request=request, method="password"), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request))
     return resp
+
+
+@app.post("/api/csp-report")
+async def csp_report_endpoint(request: Request):
+    """Content-Security-Policy violation reports from browsers (web/csp.py). Public by necessity (a browser sends them on its own), so it
+    only counts and logs, rate-limited, and never echoes anything back."""
+    from web import csp
+    body = await request.body()
+    if len(body) <= 16384:
+        try:
+            data = json.loads(body or b"{}")
+            reports = data if isinstance(data, list) else [data]
+            for item in reports[:10]:
+                rep = item.get("csp-report") or item.get("body") or item if isinstance(item, dict) else {}
+                if isinstance(rep, dict) and csp.record(rep):
+                    logger.warning(f"CSP violation: {rep.get('effective-directive') or rep.get('violated-directive') or rep.get('effectiveDirective')} "
+                                   f"blocked {str(rep.get('blocked-uri') or rep.get('blockedURL'))[:200]} on {str(rep.get('document-uri') or rep.get('documentURL'))[:200]}")
+        except (ValueError, AttributeError):
+            pass
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+
+@app.get("/api/csp-report")
+async def csp_report_stats_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Violations seen since the studio started (in memory), for an administrator checking the policy."""
+    from web import csp
+    return csp.stats()
 
 
 @app.post("/api/auth/logout")
-async def logout_endpoint():
+async def logout_endpoint(request: Request):
+    """Ends the session on the server (web/sessions.py), so a copy of the token stops working too, then clears the cookie."""
+    token = request.cookies.get(COOKIE_NAME)
+    header = request.headers.get("Authorization") or ""
+    if not token and header.startswith("Bearer "):
+        token = header[7:].strip()
+    end_session(token, "signed out")
     resp = JSONResponse(content={"success": True, "message": "Successfully logged out"})
     resp.delete_cookie(COOKIE_NAME)
     return resp
+
+
+def _session_view(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    keys = ("id", "created_at", "expires_at", "last_seen_at", "revoked_at", "revoked_reason", "ip", "user_agent", "method", "state", "current")
+    return [{k: r.get(k) for k in keys} for r in rows]
+
+
+@app.get("/api/auth/sessions")
+async def my_sessions_endpoint(request: Request, include_ended: bool = False):
+    """The caller's own sessions (devices / browsers signed in), the current one marked."""
+    from web import sessions
+    user = await get_current_user(request)
+    return {"sessions": _session_view(sessions.list_for(user["id"], current_session_id(request), include_ended)),
+            "idle_minutes": sessions.idle_seconds() // 60}
+
+
+@app.post("/api/auth/sessions/{session_id}/revoke")
+async def revoke_my_session_endpoint(session_id: str, request: Request):
+    """Ends one of the caller's own sessions (another browser, a lost laptop). Ending the current one is a sign-out."""
+    from web import sessions
+    user = await get_current_user(request)
+    from web import mfa_policy
+    is_current = session_id == current_session_id(request)
+    if not sessions.revoke(session_id, "ended by the account holder", user_id=user["id"]):
+        raise HTTPException(status_code=404, detail="No such active session.")
+    mfa_policy._audit(user["username"], "SESSION_REVOKE", f"user:{user['username']}", {"session": session_id})
+    resp = JSONResponse(content={"success": True, "current": is_current})
+    if is_current:
+        resp.delete_cookie(COOKIE_NAME)
+    return resp
+
+
+@app.post("/api/auth/sessions/revoke-others")
+async def revoke_my_other_sessions_endpoint(request: Request):
+    """"Sign out everywhere else": ends every session of the caller except the one making this request."""
+    from web import mfa_policy
+    user = await get_current_user(request)
+    n = revoke_user_sessions(user["id"], "ended by the account holder", except_id=current_session_id(request))
+    mfa_policy._audit(user["username"], "SESSION_REVOKE_OTHERS", f"user:{user['username']}", {"count": n})
+    return {"success": True, "ended": n}
+
+
+@app.get("/api/users/{user_id}/sessions")
+async def user_sessions_endpoint(user_id: str, include_ended: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import sessions
+    if not get_user_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"sessions": _session_view(sessions.list_for(user_id, None, include_ended))}
+
+
+@app.post("/api/users/{user_id}/sessions/revoke")
+async def revoke_user_sessions_endpoint(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """An administrator ends every session of an account (a stolen laptop, someone leaving): they must sign in again."""
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    from web import mfa_policy
+    n = revoke_user_sessions(user_id, f"ended by administrator {current_user['username']}")
+    mfa_policy._audit(current_user["username"], "SESSION_REVOKE_ALL", f"user:{target['username']}", {"count": n})
+    return {"success": True, "ended": n}
 
 
 @app.get("/api/auth/me")
@@ -475,6 +2005,7 @@ async def get_current_user_profile(request: Request):
                 current_user["full_name"] = current_user.get("display_name") or current_user.get("username", "admin")
             if "email" not in current_user or not current_user["email"]:
                 current_user["email"] = f"{current_user.get('username', 'admin')}@localspark.lakehouse"
+            current_user["mfa_policy"] = _mfa_policy_view(current_user)
             return {
                 "authenticated": True,
                 "user": current_user,
@@ -496,8 +2027,10 @@ async def get_current_user_profile(request: Request):
 # ==============================================================================
 
 @app.get("/api/users")
-async def get_users_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
-    return {"users": list_users()}
+async def get_users_endpoint(include_deleted: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    membership = groups.memberships_by_user()
+    return {"users": [{**u, "groups": membership.get(u.get("id"), [])} for u in list_users(include_deleted=include_deleted)]}
 
 
 @app.post("/api/users")
@@ -567,9 +2100,17 @@ async def delete_user_endpoint(
         ok = delete_user(user_id)
         if not ok:
             raise HTTPException(status_code=404, detail="User not found")
-        return {"success": True, "message": "User deactivated successfully"}
+        return {"success": True, "message": "User deleted (hidden from the list; restorable by an admin)"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/users/{user_id}/restore")
+async def restore_user_endpoint(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    ok = restore_user(user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"success": True, "message": "User restored"}
 
 
 # ==============================================================================
@@ -723,14 +2264,14 @@ async def test_ldap_bind_endpoint(
     cfg = dict(payload)
     if cfg.get("bind_password") == "••••••••":
         cfg["bind_password"] = auth_frameworks.load_raw_config().get("ldap", {}).get("bind_password", "")
-    return ldap_auth.test_bind_and_search(cfg)
+    return await asyncio.to_thread(ldap_auth.test_bind_and_search, cfg)
 
 
 @app.post("/api/auth/frameworks/ldap/sync")
 async def sync_ldap_users_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
     """Re-resolves every LDAP-provisioned account's role and active status against the directory now."""
     from web import ldap_auth
-    return ldap_auth.sync_all()
+    return await asyncio.to_thread(ldap_auth.sync_all)
 
 
 @app.post("/api/auth/frameworks/oidc/test")
@@ -820,6 +2361,11 @@ async def delete_catalog_endpoint(cat_id: str, request: Request):
 
     try:
         delete_all_catalog_permissions(cat_id)
+        try:
+            from web import groups as _groups
+            _groups.delete_grants_prefix(("table", "schema"), f"{cat_id}.".lower())
+        except Exception as e_grants:
+            logger.warning(f"Could not remove table grants of catalog '{cat_id}': {e_grants}")
     except Exception as e:
         logger.warning(f"Failed cleaning permissions for deleted catalog {cat_id}: {e}")
 
@@ -899,6 +2445,9 @@ class OneLakeMountRequest(BaseModel):
     client_id: str
     client_secret: str
     catalog_id: Optional[str] = None
+    authority: Optional[str] = None       # dev/test only: a non-default AAD authority (a local identity-provider
+                                           # emulator); leave unset for a real tenant. See CLAUDE.md.
+    ca_cert_pem: Optional[str] = None     # dev/test only: trusts this CA container-wide (web.onelake.trust_ca_cert)
 
 @app.post("/api/catalogs/onelake/mount")
 async def mount_onelake_catalog_endpoint(payload: OneLakeMountRequest, request: Request):
@@ -916,7 +2465,9 @@ async def mount_onelake_catalog_endpoint(payload: OneLakeMountRequest, request: 
             tenant_id=payload.tenant_id,
             client_id=payload.client_id,
             client_secret=payload.client_secret,
-            catalog_id=payload.catalog_id
+            catalog_id=payload.catalog_id,
+            authority=payload.authority,
+            ca_cert_pem=payload.ca_cert_pem
         )
 
         # List tables
@@ -1148,8 +2699,10 @@ async def list_cluster_nodes():
 
 @app.get("/api/sql-warehouses")
 async def list_sql_warehouses():
+    from web import container_control, warehouse_lifecycle
     warehouses = load_sql_warehouses()
     ray_status = ray_manager.get_status() if RAY_INSTALLED else {"available": False}
+    control_ok = await asyncio.to_thread(container_control.available)
     for w in warehouses:
         wh_id = w.get("id")
         active_pool = ray_manager.actor_pools.get(wh_id, []) if RAY_INSTALLED else []
@@ -1158,10 +2711,12 @@ async def list_sql_warehouses():
             w["ray_status"] = "RUNNING"
         else:
             w["ray_status"] = "IDLE" if w.get("state") == "RUNNING" else "STOPPED"
+        w["container"] = await asyncio.to_thread(warehouse_lifecycle.describe, w) if control_ok else {"controllable": False}
     return {
         "warehouses": warehouses,
         "cluster_sizes": CLUSTER_SIZES,
-        "ray_telemetry": ray_status
+        "ray_telemetry": ray_status,
+        "container_control": {"available": control_ok, "configured": container_control.configured(), "mode": container_control.suspend_mode()}
     }
 
 @app.post("/api/sql-warehouses")
@@ -1185,7 +2740,8 @@ async def create_sql_warehouse_endpoint(payload: Dict[str, Any]):
         auto_stop_mins=auto_stop,
         is_default=is_def,
         endpoint=endpoint,
-        ray_workers=ray_workers
+        ray_workers=ray_workers,
+        standby={k: payload[k] for k in ("standby_mode", "warm_hold_mins", "warm_tables") if k in payload}
     )
     return wh
 
@@ -1200,16 +2756,22 @@ async def get_sql_warehouse_endpoint(wh_id: str):
 
 @app.put("/api/sql-warehouses/{wh_id}")
 async def update_sql_warehouse_endpoint(wh_id: str, payload: Dict[str, Any]):
-    wh = update_sql_warehouse(wh_id, payload)
+    try:
+        wh = update_sql_warehouse(wh_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not wh:
         raise HTTPException(status_code=404, detail="Warehouse not found")
     return wh
 
 @app.post("/api/sql-warehouses/{wh_id}/start")
-async def start_sql_warehouse_endpoint(wh_id: str):
-    wh = start_sql_warehouse(wh_id)
-    if not wh:
-        raise HTTPException(status_code=404, detail="Warehouse not found")
+async def start_sql_warehouse_endpoint(wh_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """Resumes a warehouse: for a managed one this really starts (or unpauses) its compute-node container and waits for it."""
+    from web import warehouse_lifecycle
+    res = await asyncio.to_thread(warehouse_lifecycle.resume, wh_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404 if res.get("error") == "Warehouse not found" else 502, detail=res.get("error"))
+    wh = res["warehouse"]
     if RAY_INSTALLED and wh.get("ray_workers", 0) > 0:
         try:
             ray_manager.scale_warehouse(wh_id, wh.get("ray_workers", 1))
@@ -1217,20 +2779,18 @@ async def start_sql_warehouse_endpoint(wh_id: str):
             logger.warning(f"Could not autoscale Ray pool for {wh_id}: {e}")
     active_pool = ray_manager.actor_pools.get(wh_id, []) if RAY_INSTALLED else []
     wh["active_ray_workers"] = len(active_pool)
-    return {"success": True, "warehouse": wh}
+    return {"success": True, "warehouse": wh, "container": res.get("container", False), "resume_ms": res.get("resume_ms"), "resume_kind": res.get("resume_kind"), "warning": res.get("warning")}
 
 @app.post("/api/sql-warehouses/{wh_id}/stop")
-async def stop_sql_warehouse_endpoint(wh_id: str):
-    wh = stop_sql_warehouse(wh_id)
-    if not wh:
-        raise HTTPException(status_code=404, detail="Warehouse not found")
-    if RAY_INSTALLED:
-        try:
-            ray_manager.scale_warehouse(wh_id, 0)
-        except Exception as e:
-            logger.warning(f"Could not scale down Ray pool for {wh_id}: {e}")
+async def stop_sql_warehouse_endpoint(wh_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """Suspends a warehouse: for a managed one this really stops (or pauses) its compute-node container."""
+    from web import warehouse_lifecycle
+    res = await asyncio.to_thread(warehouse_lifecycle.suspend, wh_id, "manual")
+    if not res.get("ok"):
+        raise HTTPException(status_code=404 if res.get("error") == "Warehouse not found" else 502, detail=res.get("error"))
+    wh = res["warehouse"]
     wh["active_ray_workers"] = 0
-    return {"success": True, "warehouse": wh}
+    return {"success": True, "warehouse": wh, "container": res.get("container", False)}
 
 @app.delete("/api/sql-warehouses/{wh_id}")
 async def delete_sql_warehouse_endpoint(wh_id: str):
@@ -1333,6 +2893,188 @@ async def execute_distributed_delta_query(wh_id: str, payload: Dict[str, Any], r
     )
     return res
 
+# ==============================================================================
+# DELTA SHALLOW CLONE
+# ==============================================================================
+
+class TableClonePayload(BaseModel):
+    target_table: str
+    target_schema: Optional[str] = None       # default: the source's schema
+    target_catalog: Optional[str] = None      # default: the source's catalog
+    catalog: Optional[str] = "warehouse"      # the source's catalog
+    version: Optional[int] = None
+    timestamp: Optional[str] = None
+    replace: bool = False
+    if_not_exists: bool = False
+
+
+def _clone_table_dir(catalog: str, schema: str, table: str, *, must_exist: bool) -> str:
+    """Local directory of catalog.schema.table for a clone endpoint (mounted/S3 catalogs are not supported)."""
+    if catalog == "warehouse":
+        schema_dir = os.path.join(WAREHOUSE_DIR, schema)
+    else:
+        cat = get_catalog(catalog)
+        if not cat:
+            raise HTTPException(status_code=404, detail=f"Catalog '{catalog}' not found")
+        if cat.get("is_mounted") or not cat.get("path"):
+            raise HTTPException(status_code=400, detail=f"Catalog '{catalog}' is external storage; shallow clone works between local catalogs only.")
+        schema_dir = os.path.join(cat["path"], schema)
+    if not os.path.isdir(schema_dir):
+        raise HTTPException(status_code=404, detail=f"Schema '{schema}' does not exist in catalog '{catalog}'.")
+    path = os.path.join(schema_dir, table)
+    if must_exist and not os.path.isdir(path):
+        raise HTTPException(status_code=404, detail=f"Table {catalog}.{schema}.{table} not found")
+    return path
+
+
+def _copy_table_tags(src: tuple, dst: tuple, actor: str) -> set:
+    """Governance: the clone shares the source's raw files, so it must carry the source's *effective* tags (including
+    ones inherited from its schema/catalog, which the clone may not inherit) before it exists. Returns what was set."""
+    from web.governance import tags as gov_tags
+    if not gov_tags.table_has_any_tags(*src):
+        return set()
+    desired = set()
+    for key, info in gov_tags.effective_table_tags(*src).items():
+        gov_tags.set_tag(catalog=dst[0], schema_name=dst[1], table_name=dst[2], tag_key=key, tag_value=info["value"], actor=actor, source="clone")
+        desired.add((key, ""))
+    from deltalake import DeltaTable
+    cols = [f.name for f in DeltaTable(_clone_table_dir(*src, must_exist=True)).schema().fields]
+    for col, tag_map in gov_tags.effective_tags(*src, cols).items():
+        for key, info in tag_map.items():
+            if info["level"] == "column":
+                gov_tags.set_tag(catalog=dst[0], schema_name=dst[1], table_name=dst[2], column_name=col, tag_key=key,
+                                 tag_value=info["value"], actor=actor, source="clone")
+                desired.add((key, col))
+    return desired
+
+
+def _do_shallow_clone(user: Dict[str, Any], src: tuple, dst: tuple, *, version=None, timestamp=None, replace=False,
+                      if_not_exists=False) -> Dict[str, Any]:
+    """Synchronous; run in a thread. src/dst are (catalog, schema, table). Raises HTTPException."""
+    from web import table_clone
+    from web.governance import tags as gov_tags
+    actor = user.get("username", "admin")
+    from web import table_access
+    if not table_access.can_access_table(user, src[0], src[1], src[2], "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot read '{src[0]}.{src[1]}.{src[2]}'.")
+    if not can_user_access_catalog(user, dst[0], action="WRITE"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot modify catalog '{dst[0]}'.")
+    try:
+        # A clone shares the source's raw files, so it would hand a masked / row-filtered user the unmasked data.
+        gov_gateway.deny_if_subject(user, "Cloning a table")
+    except GovernanceBlocked as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    src_dir = _clone_table_dir(*src, must_exist=True)
+    dst_dir = _clone_table_dir(*dst, must_exist=False)
+    existed = os.path.exists(dst_dir)
+    if existed and if_not_exists:
+        return {"created": False, "message": "Target already exists; nothing to do (IF NOT EXISTS)."}
+    try:
+        desired = _copy_table_tags(src, dst, actor)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not copy the source's governance tags, so no clone was made: {exc}")
+    try:
+        result = table_clone.shallow_clone(src_dir, dst_dir, version=version, timestamp=timestamp, replace=replace,
+                                           if_not_exists=if_not_exists, source_label=".".join(src), actor=actor)
+    except table_clone.CloneError as exc:
+        if not existed:
+            gov_tags.drop_object(*dst, actor=actor)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        if not existed:
+            gov_tags.drop_object(*dst, actor=actor)
+        raise
+    if existed:                                     # replaced: drop tags the old table had that the new one doesn't
+        try:
+            for a in gov_tags.list_assignments(catalog=dst[0]):
+                if a.get("schema_name") == dst[1] and a.get("table_name") == dst[2] and (a["tag_key"], a.get("column_name") or "") not in desired:
+                    gov_tags.unset_tag(catalog=dst[0], schema_name=dst[1], table_name=dst[2], column_name=a.get("column_name") or "",
+                                       tag_key=a["tag_key"], actor=actor)
+        except Exception as exc:
+            logger.warning(f"Could not prune stale tags of replaced table {'.'.join(dst)}: {exc}")
+    try:
+        get_duckrun_conn().refresh()
+    except Exception:
+        pass
+    try:
+        from web.lineage import make_table_id, upsert_node, upsert_edge
+        sid, did = make_table_id(*src), make_table_id(*dst)
+        upsert_node(sid, src[2], "TABLE", catalog=src[0], schema_name=src[1])
+        upsert_node(did, dst[2], "TABLE", catalog=dst[0], schema_name=dst[1])
+        upsert_edge(sid, did, edge_type="TRANSFORMS_TO", query_text=f"CREATE TABLE {'.'.join(dst)} SHALLOW CLONE {'.'.join(src)}")
+    except Exception as exc:
+        logger.warning(f"Could not record clone lineage: {exc}")
+    result["source"], result["target"] = ".".join(src), ".".join(dst)
+    return result
+
+
+@app.post("/api/table/{schema_name}/{table_name}/clone")
+async def clone_table_api(schema_name: str, table_name: str, payload: TableClonePayload, request: Request):
+    """Delta shallow clone: a new table sharing the source's data files (hard links), optionally at a past version."""
+    user = await resolve_principal(request)
+    src_cat = payload.catalog or "warehouse"
+    src = (src_cat, sanitize_identifier(schema_name), sanitize_identifier(table_name))
+    dst = (payload.target_catalog or src_cat, sanitize_identifier(payload.target_schema or schema_name), sanitize_identifier(payload.target_table))
+    return await asyncio.to_thread(_do_shallow_clone, user, src, dst, version=payload.version, timestamp=payload.timestamp,
+                                   replace=payload.replace, if_not_exists=payload.if_not_exists)
+
+
+async def _execute_clone_statement(payload, query: str, stmt: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """`CREATE [OR REPLACE] TABLE t SHALLOW CLONE src [VERSION|TIMESTAMP AS OF ...]` from the SQL editor."""
+    start = time.perf_counter()
+    default_cat = payload.catalog or "warehouse"
+
+    def locate(parts):
+        if len(parts) == 3:
+            return (parts[0], sanitize_identifier(parts[1]), sanitize_identifier(parts[2]))
+        if len(parts) == 2:
+            return (default_cat, sanitize_identifier(parts[0]), sanitize_identifier(parts[1]))
+        raise HTTPException(status_code=400, detail="Name the schema too: schema.table or catalog.schema.table.")
+
+    try:
+        src, dst = locate(stmt["source"]), locate(stmt["target"])
+        result = await asyncio.to_thread(_do_shallow_clone, user, src, dst, version=stmt["version"], timestamp=stmt["timestamp"],
+                                         replace=stmt["replace"], if_not_exists=stmt["if_not_exists"])
+        ok, message = True, result["message"]
+    except HTTPException as exc:
+        ok, message = False, str(exc.detail)
+    elapsed = round((time.perf_counter() - start) * 1000, 2)
+    wh_id = payload.warehouse_id or "wh_starter"
+    qid = log_query(query_text=query, duration_ms=elapsed, rows_produced=0, status="SUCCESS" if ok else "FAILED",
+                    error_message=None if ok else message, client="SQL_EDITOR", is_mutation=True, warehouse_id=wh_id,
+                    catalog=default_cat, user=user.get("username", "admin"), executed_by="Studio (shallow clone)")
+    if not ok:
+        return {"success": False, "query_id": qid, "error": message, "elapsed_ms": elapsed, "warehouse_id": wh_id}
+    return {"success": True, "query_id": qid, "is_mutation": True, "message": message, "elapsed_ms": elapsed, "row_count": 0,
+            "warehouse_id": wh_id, "executed_by": "Studio (shallow clone)"}
+
+
+async def _execute_grant_statement(payload, query: str, stmt: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """`GRANT ... ON ... TO ...`, `REVOKE ... ON ... FROM ...` and `SHOW GRANTS` from the SQL editor."""
+    from web import sql_grants
+    start = time.perf_counter()
+    default_cat = payload.catalog or "warehouse"
+    wh_id = payload.warehouse_id or "wh_starter"
+    is_show = stmt["op"] == "show"
+    try:
+        result = await asyncio.to_thread(sql_grants.run, stmt, query, user, default_cat)
+        ok, message = True, result.get("message", "")
+    except (sql_grants.GrantSqlError, HTTPException) as exc:
+        ok, message, result = False, str(getattr(exc, "detail", exc)), {}
+    elapsed = round((time.perf_counter() - start) * 1000, 2)
+    qid = log_query(query_text=query, duration_ms=elapsed, rows_produced=result.get("row_count", 0) if ok else 0, status="SUCCESS" if ok else "FAILED",
+                    error_message=None if ok else message, client="SQL_EDITOR", is_mutation=not is_show, warehouse_id=wh_id,
+                    catalog=default_cat, user=user.get("username", "admin"), executed_by="Studio (access management)")
+    if not ok:
+        return {"success": False, "query_id": qid, "error": message, "elapsed_ms": elapsed, "warehouse_id": wh_id}
+    if is_show:
+        names = [c["name"] for c in result["columns"]]          # the grid reads row[column name]
+        return {"success": True, "query_id": qid, "is_mutation": False, "masked_columns": [], "columns": result["columns"], "rows": [dict(zip(names, r)) for r in result["rows"]],
+                "row_count": result["row_count"], "elapsed_ms": elapsed, "warehouse_id": wh_id, "executed_by": "Studio (access management)"}
+    return {"success": True, "query_id": qid, "is_mutation": True, "message": message, "elapsed_ms": elapsed, "row_count": 0,
+            "warehouse_id": wh_id, "executed_by": "Studio (access management)"}
+
+
 @app.delete("/api/table/{schema_name}/{table_name}")
 async def drop_table_api(schema_name: str, table_name: str, request: Request, catalog: Optional[str] = "warehouse"):
     schema_clean = sanitize_identifier(schema_name)
@@ -1367,6 +3109,12 @@ async def drop_table_api(schema_name: str, table_name: str, request: Request, ca
         logger.warning(f"Error removing dropped table directory {dt_path}: {e}")
 
     try:
+        from web import groups as _groups
+        _groups.delete_grants_prefix(("table",), f"{target_catalog}.{schema_clean}.{table_clean}".lower())   # a new table of the same name must not inherit access
+    except Exception as e_grants:
+        logger.warning(f"Could not remove table grants of {table_ref}: {e_grants}")
+
+    try:
         from web.governance import tags as gov_tags
         removed = gov_tags.drop_object(target_catalog, schema_clean, table_clean, actor=drop_user.get("username", "system"))
         if removed:
@@ -1383,8 +3131,9 @@ async def drop_table_api(schema_name: str, table_name: str, request: Request, ca
 async def get_table_details(schema_name: str, table_name: str, catalog: Optional[str] = None, request: Request = None):
     cat_id = catalog or "warehouse"
     current_user = await resolve_principal(request)
-    if not can_user_access_catalog(current_user, cat_id, action="READ"):
-        raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
+    from web import table_access
+    if not table_access.can_access_table(current_user, cat_id, schema_name, table_name, "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view '{cat_id}.{schema_name}.{table_name}'.")
     # Check if catalog is an external storage mount
     from web.mounts import load_mounts
     mounts = {m["catalog_name"]: m for m in load_mounts() if m.get("enabled", True)}
@@ -1639,8 +3388,9 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
     cat_id = catalog or "warehouse"
     if request:
         current_user = await resolve_principal(request)
-        if not can_user_access_catalog(current_user, cat_id, action="READ"):
-            raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view catalog '{cat_id}'.")
+        from web import table_access
+        if not table_access.can_access_table(current_user, cat_id, schema_name, table_name, "READ"):
+            raise HTTPException(status_code=403, detail=f"Access denied: User '{current_user.get('username')}' cannot view '{cat_id}.{schema_name}.{table_name}'.")
     conn = get_duckrun_conn()
     sync_catalogs_with_duckrun(conn)
 
@@ -1771,6 +3521,11 @@ async def preview_table(schema_name: str, table_name: str, limit: int = 50, vers
 # Active SQL query registry for query cancellation
 ACTIVE_QUERIES: Dict[str, Dict[str, Any]] = {}
 
+
+def _warehouse_has_active_queries(wh_id: str) -> bool:
+    """True while any SQL-editor query registered for this warehouse is still running (the auto-suspend guard)."""
+    return any(q.get("warehouse_id") == wh_id for q in list(ACTIVE_QUERIES.values()))
+
 class QueryRequest(BaseModel):
     query: str
     warehouse_id: Optional[str] = None
@@ -1786,6 +3541,19 @@ async def execute_sql(payload: QueryRequest, request: Request):
 
     current_user = await resolve_principal(request)
 
+    from web import table_clone
+    clone_stmt = table_clone.parse_clone_sql(query)
+    if clone_stmt:                       # not SQL any engine understands: handled (and governed) here, never dispatched
+        return await _execute_clone_statement(payload, query, clone_stmt, current_user)
+
+    from web import sql_grants
+    try:
+        grant_stmt = sql_grants.parse(query)
+    except sql_grants.GrantSqlError as exc:
+        return {"success": False, "error": str(exc), "warehouse_id": payload.warehouse_id or "wh_starter"}
+    if grant_stmt:                       # GRANT / REVOKE / SHOW GRANTS: access management, not data (see web/sql_grants.py)
+        return await _execute_grant_statement(payload, query, grant_stmt, current_user)
+
     # Enforce zero-trust catalog permissions
     try:
         enforce_sql_permissions(query, current_user, action="READ")
@@ -1798,6 +3566,10 @@ async def execute_sql(payload: QueryRequest, request: Request):
         }
 
     conn = get_duckrun_conn()
+    from web import warehouse_lifecycle
+    # A suspended warehouse (its container stopped by auto-suspend, a manual stop or by hand) is brought back first; concurrent
+    # queries wait for that one resume. If it cannot be resumed the query still runs (the studio executes it locally).
+    resume_info = await asyncio.to_thread(warehouse_lifecycle.ensure_running, payload.warehouse_id)
     wh = apply_warehouse_compute(conn, payload.warehouse_id)
     start_time = time.perf_counter()
 
@@ -1981,6 +3753,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 )
                 res_data["query_id"] = qid
                 res_data["execution_id"] = execution_id
+                res_data.update(_resume_fields(resume_info))
                 res_data["warehouse_name"] = wh["name"] if wh else "Starter"
                 res_data["cluster_size"] = wh.get("cluster_size", "Small") if wh else "Small"
                 return res_data
@@ -2016,6 +3789,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 masked_columns=len(masked_info)
             )
             return {
+                **_resume_fields(resume_info),
                 "success": True,
                 "masked_columns": masked_info,
                 "query_id": qid,
@@ -2048,6 +3822,7 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 executed_by=fallback_note
             )
             return {
+                **_resume_fields(resume_info),
                 "success": True,
                 "query_id": qid,
                 "execution_id": execution_id,
@@ -2115,6 +3890,23 @@ async def execute_sql(payload: QueryRequest, request: Request):
             }
     finally:
         ACTIVE_QUERIES.pop(execution_id, None)
+        if wh and wh.get("id"):
+            from web.warehouses import mark_sql_warehouse_active
+            mark_sql_warehouse_active(wh["id"])         # the auto-suspend idle clock starts when work ends, not when it began
+
+
+def _resume_fields(info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Tells the client why a query was slow (its warehouse was suspended and resumed for it) or that resuming failed."""
+    if not info:
+        return {}
+    if info.get("error"):
+        return {"warehouse_resume_error": info["error"]}
+    out = {"warehouse_resumed_ms": info["resume_ms"]}
+    if info.get("resume_kind"):
+        out["warehouse_resume_kind"] = info["resume_kind"]
+    if info.get("warning"):
+        out["warehouse_resume_warning"] = info["warning"]
+    return out
 
 
 @app.post("/api/sql/cancel/{execution_id}")
@@ -3190,8 +4982,10 @@ async def ingest_create(payload: IngestCommitRequest, request: Request):
 # Dashboards logic and store managed via web.dashboards
 
 @app.get("/api/dashboards")
-async def list_dashboards():
-    dashboards = load_dashboards_store()
+async def list_dashboards(request: Request):
+    from web import dashboard_apps as da
+    user = await resolve_principal(request)
+    dashboards = [d for d in load_dashboards_store() if da.level_for(d["id"], user) in ("viewer", "editor", "owner")]
     return {
         "dashboards": [
             {
@@ -3199,7 +4993,8 @@ async def list_dashboards():
                 "name": d["name"],
                 "description": d.get("description", ""),
                 "created_at": d.get("created_at", ""),
-                "widget_count": len(d.get("widgets", []))
+                "widget_count": len(d.get("widgets", [])),
+                "is_app": bool(d.get("pages")),
             }
             for d in dashboards
         ]
@@ -3207,6 +5002,7 @@ async def list_dashboards():
 
 @app.get("/api/dashboards/{dashboard_id}")
 async def get_dashboard(dashboard_id: str, request: Request, params: Optional[str] = None):
+    from web import dashboard_apps as da
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -3223,14 +5019,11 @@ async def get_dashboard(dashboard_id: str, request: Request, params: Optional[st
             pass
 
     current_user = await resolve_principal(request)
+    my_access = da.require_level(target["id"], current_user, "viewer")
     conn = get_duckrun_conn()
     filter_data = get_dashboard_filter_options(conn, target["id"], principal=current_user)
-    hydrated_widgets = []
-    for w in target.get("widgets", []):
-        w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], parsed_params, principal=current_user)
-        w_copy["result"] = exec_res
-        hydrated_widgets.append(w_copy)
+    declared = target.get("parameters") or []
+    hydrated_widgets = da.hydrate_dashboard(conn, target, parsed_params, current_user)
 
     return {
         "id": target["id"],
@@ -3239,6 +5032,10 @@ async def get_dashboard(dashboard_id: str, request: Request, params: Optional[st
         "created_at": target.get("created_at", ""),
         "filters": filter_data.get("filters", []),
         "filter_options": filter_data.get("options", {}),
+        "parameters": declared,
+        "parameter_options": da.parameter_options(conn, declared, current_user) if declared else {},
+        "pages": target.get("pages", []),
+        "my_access": my_access,
         "widgets": hydrated_widgets
     }
 
@@ -3247,19 +5044,16 @@ class DashboardQueryParams(BaseModel):
 
 @app.post("/api/dashboards/{dashboard_id}/query")
 async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams, request: Request):
+    from web import dashboard_apps as da
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Dashboard not found")
 
     current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "viewer")
     conn = get_duckrun_conn()
-    hydrated_widgets = []
-    for w in target.get("widgets", []):
-        w_copy = dict(w)
-        exec_res = execute_widget_query(conn, w["query"], payload.parameters or {}, principal=current_user)
-        w_copy["result"] = exec_res
-        hydrated_widgets.append(w_copy)
+    hydrated_widgets = da.hydrate_dashboard(conn, target, payload.parameters or {}, current_user)
 
     return {
         "id": target["id"],
@@ -3268,7 +5062,9 @@ async def query_dashboard(dashboard_id: str, payload: DashboardQueryParams, requ
 
 @app.get("/api/dashboards/{dashboard_id}/filters")
 async def get_dashboard_filters(dashboard_id: str, request: Request):
+    from web import dashboard_apps as da
     current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "viewer")
     conn = get_duckrun_conn()
     return get_dashboard_filter_options(conn, dashboard_id, principal=current_user)
 
@@ -3326,13 +5122,19 @@ class WidgetPayload(BaseModel):
     query_source: Optional[str] = "custom"
     saved_query_id: Optional[str] = None
     history_query_id: Optional[str] = None
+    page: Optional[str] = None               # page id, for a dashboard with pages (an app)
+    markdown: Optional[str] = None           # body of a `text` widget
+    filter_dimension: Optional[str] = None   # clicking a chart sets this parameter / filter
 
 @app.post("/api/dashboards/{dashboard_id}/widgets")
 async def add_widget(dashboard_id: str, payload: WidgetPayload, request: Request):
+    from web import dashboard_apps as da
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="Dashboard not found")
+    current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "editor")
 
     widget_id = f"w_{uuid.uuid4().hex[:8]}"
     default_w = "col-span-1" if payload.type in ["kpi", "big_number_trendline"] else ("col-span-4" if payload.type in ["table", "pivot_table", "world_map"] else "col-span-2")
@@ -3350,20 +5152,37 @@ async def add_widget(dashboard_id: str, payload: WidgetPayload, request: Request
         "saved_query_id": payload.saved_query_id,
         "history_query_id": payload.history_query_id
     }
+    if payload.page:
+        new_widget["page"] = payload.page
+    if payload.markdown is not None:
+        new_widget["markdown"] = payload.markdown
+    if payload.filter_dimension:
+        new_widget["filter_dimension"] = payload.filter_dimension
+    if target.get("pages") or target.get("parameters") or payload.type == "text":
+        # An app's widgets are validated like a saved spec (page exists, parameters declared, one read-only query).
+        if target.get("pages") and not new_widget.get("page"):
+            new_widget["page"] = target["pages"][0]["id"]
+        try:
+            new_widget = da.clean_widget(new_widget, target.get("parameters", []), {p["id"] for p in target.get("pages", [])})
+        except da.SpecError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if len(target.get("widgets", [])) >= da.MAX_WIDGETS:
+            raise HTTPException(status_code=400, detail=f"An app can have at most {da.MAX_WIDGETS} widgets.")
 
     if "widgets" not in target:
         target["widgets"] = []
     target["widgets"].append(new_widget)
     save_dashboards_store(dashboards)
 
-    current_user = await resolve_principal(request)
     conn = get_duckrun_conn()
     new_widget_copy = dict(new_widget)
-    new_widget_copy["result"] = execute_widget_query(conn, new_widget["query"], principal=current_user)
+    new_widget_copy["result"] = da.hydrate_widget(conn, new_widget, None, current_user, target.get("parameters") or None)
     return new_widget_copy
 
 @app.delete("/api/dashboards/{dashboard_id}/widgets/{widget_id}")
-async def delete_widget(dashboard_id: str, widget_id: str):
+async def delete_widget(dashboard_id: str, widget_id: str, request: Request):
+    from web import dashboard_apps as da
+    da.require_level(dashboard_id, await resolve_principal(request), "editor")
     dashboards = load_dashboards_store()
     target = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target:
@@ -3383,11 +5202,14 @@ async def export_widget(dashboard_id: str, widget_id: str, request: Request, for
     """
     from fastapi.responses import StreamingResponse
     import io
+    from web import dashboard_apps as da
 
     dashboards = load_dashboards_store()
     target_dashboard = next((d for d in dashboards if d["id"] == dashboard_id), None)
     if not target_dashboard:
         raise HTTPException(status_code=404, detail="Dashboard not found")
+    current_user = await resolve_principal(request)
+    da.require_level(dashboard_id, current_user, "viewer")
 
     target_widget = next((w for w in target_dashboard.get("widgets", []) if w["id"] == widget_id), None)
     if not target_widget:
@@ -3401,11 +5223,9 @@ async def export_widget(dashboard_id: str, widget_id: str, request: Request, for
         except:
             filter_params = {}
 
-    # Execute the query
-    current_user = await resolve_principal(request)
+    # Execute the query as the viewer, with the same typed binding the page used
     conn = get_duckrun_conn()
-    query = target_widget.get("query", "")
-    result = execute_widget_query(conn, query, filter_params, principal=current_user)
+    result = da.hydrate_widget(conn, target_widget, filter_params, current_user, target_dashboard.get("parameters") or None)
 
     if not result.get("success"):
         raise HTTPException(status_code=500, detail=f"Query failed: {result.get('error')}")
@@ -3442,8 +5262,27 @@ async def export_widget(dashboard_id: str, widget_id: str, request: Request, for
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
 
+    elif format.lower() == "json":
+        filename = f"{widget_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        return StreamingResponse(
+            io.BytesIO(df.to_json(orient="records", date_format="iso").encode("utf-8")),
+            media_type="application/json",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    elif format.lower() in ("xlsx", "excel"):
+        output = io.BytesIO()
+        df.to_excel(output, index=False)
+        output.seek(0)
+        filename = f"{widget_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported format: {format}. Use 'csv' or 'parquet'")
+        raise HTTPException(status_code=400, detail=f"Unsupported format: {format}. Use csv, parquet, json or xlsx")
 
 @app.post("/api/dashboards/cache/clear")
 async def clear_dashboard_cache(current_user: dict = Depends(get_current_user)):
@@ -3500,7 +5339,7 @@ async def revoke_share(share_token: str, current_user: dict = Depends(get_curren
     return {"success": True, "message": "Share revoked"}
 
 @app.get("/share/{share_token}")
-async def view_shared_dashboard(share_token: str):
+async def view_shared_dashboard(share_token: str, request: Request):
     """View a shared dashboard (no auth required)."""
     from web.dashboards import get_dashboard_by_share_token
     dashboard = get_dashboard_by_share_token(share_token)
@@ -3509,11 +5348,8 @@ async def view_shared_dashboard(share_token: str):
         raise HTTPException(status_code=404, detail="Share link not found or expired")
 
     # Return the main index page with share token in URL
-    # The frontend will detect the share token and load the dashboard
-    with open("/workspace/web/templates/index.html", "r") as f:
-        html_content = f.read()
-
-    return HTMLResponse(content=html_content)
+    # The frontend will detect the share token and load the dashboard. Rendered (not read raw), so the scripts carry the CSP nonce.
+    return templates.TemplateResponse(request=request, name="index.html", context={"warehouse_dir": WAREHOUSE_DIR, "csp_nonce": _csp_nonce(request)})
 
 @app.get("/api/dashboards/templates")
 async def list_dashboard_templates(current_user: dict = Depends(get_current_user)):
@@ -3699,27 +5535,44 @@ async def get_dashboard_permissions(dashboard_id: str, current_user: dict = Depe
 
     return {"success": True, "permissions": perms}
 
+class DashboardGrantPayload(BaseModel):
+    user: Optional[str] = None
+    role: Optional[str] = None
+    group: Optional[str] = None
+    level: Optional[str] = None
+
+
 @app.post("/api/dashboards/{dashboard_id}/permissions/grant")
 async def grant_dashboard_permission(
     dashboard_id: str,
+    payload: Optional[DashboardGrantPayload] = None,
     user: Optional[str] = None,
     role: Optional[str] = None,
     level: str = "viewer",
+    group: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Grant permission to a user or role."""
+    """Grant permission to a user, a role or a group (`group` = the group's id). Values come from the JSON body (what the UI sends) or, as
+    before, from query parameters."""
     from web.dashboard_permissions import grant_permission, can_manage_permissions
+    if payload:
+        user, role, group, level = payload.user or user, payload.role or role, payload.group or group, payload.level or level
 
     # Check if user can manage permissions
     if not can_manage_permissions(dashboard_id, current_user["username"], current_user["role"]):
         raise HTTPException(status_code=403, detail="You don't have permission to grant permissions")
+    if group:
+        from web import groups
+        if not groups.get_group(group):
+            raise HTTPException(status_code=404, detail="That group does not exist.")
 
     success = grant_permission(
         dashboard_id=dashboard_id,
         user=user,
         role=role,
         level=level,
-        granted_by=current_user["username"]
+        granted_by=current_user["username"],
+        group=group
     )
 
     if not success:
@@ -3730,18 +5583,22 @@ async def grant_dashboard_permission(
 @app.post("/api/dashboards/{dashboard_id}/permissions/revoke")
 async def revoke_dashboard_permission(
     dashboard_id: str,
+    payload: Optional[DashboardGrantPayload] = None,
     user: Optional[str] = None,
     role: Optional[str] = None,
+    group: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Revoke permission from a user or role."""
+    """Revoke permission from a user, a role or a group."""
     from web.dashboard_permissions import revoke_permission, can_manage_permissions
+    if payload:
+        user, role, group = payload.user or user, payload.role or role, payload.group or group
 
     # Check if user can manage permissions
     if not can_manage_permissions(dashboard_id, current_user["username"], current_user["role"]):
         raise HTTPException(status_code=403, detail="You don't have permission to revoke permissions")
 
-    success = revoke_permission(dashboard_id=dashboard_id, user=user, role=role)
+    success = revoke_permission(dashboard_id=dashboard_id, user=user, role=role, group=group)
 
     if not success:
         raise HTTPException(status_code=400, detail="Failed to revoke permission")
@@ -4477,22 +6334,36 @@ async def get_brand_css():
 
 @app.get("/embed/dashboard/{dashboard_id}")
 async def get_embedded_dashboard(dashboard_id: str, request: Request, theme: str = "auto"):
-    """Serve dashboard in embeddable iframe view (minimal UI)."""
+    """Serve a dashboard in a minimal view for an iframe on this studio's own origin (frame-ancestors 'self').
+
+    It needs a real signed-in session with viewer rights on the dashboard, independent of GOVERNANCE_REQUIRE_AUTH (it used to
+    hand the whole dashboard definition, widget SQL included, to anyone who knew an id). The page carries only the name and id:
+    the widgets and their results are loaded by its script from GET /api/dashboards/{id}, governed as the viewer."""
+    from web import dashboard_apps as da
     templates = Jinja2Templates(directory="web/templates")
+    not_found = HTMLResponse(content="<!DOCTYPE html><html><body><h1>Dashboard not found</h1></body></html>", status_code=404)
 
-    # Load dashboard
-    dashboards = load_dashboards_store()
-    dashboard = next((d for d in dashboards if d["id"] == dashboard_id), None)
+    try:
+        user = dict(await get_current_user(request))
+    except HTTPException:
+        return HTMLResponse(status_code=401, content=(
+            "<!DOCTYPE html><html><body style=\"font-family:sans-serif;padding:2rem\"><h1>Sign in required</h1>"
+            "<p>Sign in to Data Kiln Works in this browser, then reload this page.</p>"
+            "<p><a href=\"/\" target=\"_top\">Open Data Kiln Works</a></p></body></html>"))
 
+    dashboard = next((d for d in load_dashboards_store() if d["id"] == dashboard_id), None)
     if not dashboard:
-        return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>", status_code=404)
+        return not_found
+    try:
+        da.require_level(dashboard_id, user, "viewer")
+    except HTTPException:
+        return not_found  # a dashboard the caller cannot see does not exist for them
 
-    # Return embedded view with minimal UI
-    return templates.TemplateResponse("embed.html", {
-        "request": request,
-        "dashboard": dashboard,
+    return templates.TemplateResponse(request=request, name="embed.html", context={
+        "dashboard_name": dashboard.get("name") or "Dashboard",
         "dashboard_id": dashboard_id,
-        "theme": theme
+        "theme": theme if theme in ("auto", "light", "dark") else "auto",
+        "csp_nonce": _csp_nonce(request),
     })
 
 
@@ -4743,15 +6614,35 @@ class SavedQueryUpdateRequest(BaseModel):
     schema_name: Optional[str] = None
     tags: Optional[List[str]] = None
 
+def _saved_query_access(q: Dict[str, Any], user: Dict[str, Any]) -> Optional[str]:
+    """owner | edit | view | None for a user on a saved query. Sharing (web/groups.py) can grant VIEW or EDIT to users and groups; only the
+    owner or an admin changes who it is shared with or deletes it. Starter/default queries are visible to everyone and editable by admins."""
+    from web.groups import permission_of
+    from web.saved_queries import get_default_saved_queries
+    if user.get("role") == "admin":
+        return "owner"
+    name = user.get("username", "")
+    if name and name in (q.get("owner"), q.get("created_by")):
+        return "owner"
+    granted = permission_of(user, "saved_query", q.get("id", ""))
+    if granted == "EDIT":
+        return "edit"
+    if granted == "VIEW" or q.get("is_starter") or q.get("id") in {d["id"] for d in get_default_saved_queries()}:
+        return "view"
+    return None
+
+
 @app.get("/api/queries")
 async def list_saved_queries(request: Request, q: Optional[str] = None, tag: Optional[str] = None):
     from web.saved_queries import get_saved_queries
+    from web import groups
     current_user = await resolve_principal(request)
     username = current_user.get("username", "admin")
     is_admin = current_user.get("role") == "admin"
     try:
-        queries = get_saved_queries(q=q, tag=tag, user_id=username, is_admin=is_admin)
-        return {"queries": queries}
+        queries = get_saved_queries(q=q, tag=tag, user_id=username, is_admin=is_admin,
+                                    shared_ids=groups.granted_ids(current_user, "saved_query", "VIEW"))
+        return {"queries": [{**item, "my_access": _saved_query_access(item, current_user)} for item in queries]}
     except Exception as e:
         logger.error(f"Failed to list saved queries: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -4772,16 +6663,25 @@ async def create_new_saved_query(payload: SavedQueryCreateRequest, request: Requ
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/queries/{query_id}")
-async def get_single_saved_query(query_id: str):
+async def get_single_saved_query(query_id: str, request: Request):
     from web.saved_queries import get_saved_query
+    current_user = await resolve_principal(request)
     q = get_saved_query(query_id)
-    if not q:
+    access = _saved_query_access(q, current_user) if q else None
+    if not q or not access:
         raise HTTPException(status_code=404, detail="Saved query not found")
-    return q
+    return {**q, "my_access": access}
 
 @app.put("/api/queries/{query_id}")
-async def update_existing_saved_query(query_id: str, payload: SavedQueryUpdateRequest):
-    from web.saved_queries import update_saved_query
+async def update_existing_saved_query(query_id: str, payload: SavedQueryUpdateRequest, request: Request):
+    from web.saved_queries import update_saved_query, get_saved_query
+    current_user = await resolve_principal(request)
+    q = get_saved_query(query_id)
+    access = _saved_query_access(q, current_user) if q else None
+    if not q or not access:
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    if access not in ("owner", "edit") or (q.get("is_starter") and current_user.get("role") != "admin"):
+        raise HTTPException(status_code=403, detail="You can view this query but not change it.")
     data_dict = {k: v for k, v in payload.dict().items() if v is not None}
     updated = update_saved_query(query_id, data_dict)
     if not updated:
@@ -4789,17 +6689,30 @@ async def update_existing_saved_query(query_id: str, payload: SavedQueryUpdateRe
     return updated
 
 @app.delete("/api/queries/{query_id}")
-async def delete_existing_saved_query(query_id: str):
-    from web.saved_queries import delete_saved_query
+async def delete_existing_saved_query(query_id: str, request: Request):
+    from web.saved_queries import delete_saved_query, get_saved_query
+    from web import groups
+    current_user = await resolve_principal(request)
+    q = get_saved_query(query_id)
+    access = _saved_query_access(q, current_user) if q else None
+    if not q or not access:
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    if access != "owner":
+        raise HTTPException(status_code=403, detail="Only the owner (or an administrator) can delete a saved query.")
     deleted = delete_saved_query(query_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Saved query not found")
+    groups.delete_grants_for_resource("saved_query", query_id)
     return {"success": True, "deleted_query_id": query_id}
 
 @app.post("/api/queries/{query_id}/duplicate")
-async def duplicate_existing_saved_query(query_id: str):
-    from web.saved_queries import duplicate_saved_query
-    cloned = duplicate_saved_query(query_id)
+async def duplicate_existing_saved_query(query_id: str, request: Request):
+    from web.saved_queries import duplicate_saved_query, get_saved_query
+    current_user = await resolve_principal(request)
+    q = get_saved_query(query_id)
+    if not q or not _saved_query_access(q, current_user):
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    cloned = duplicate_saved_query(query_id, owner=current_user.get("username", "admin"))
     if not cloned:
         raise HTTPException(status_code=404, detail="Saved query not found")
     return cloned
@@ -4838,6 +6751,22 @@ async def list_query_history(
     res["active_user_filter"] = target_user or "ALL"
     return res
 
+class QualifySqlPayload(BaseModel):
+    sql: str
+    catalog: Optional[str] = None
+
+
+@app.post("/api/sql/qualify")
+async def qualify_sql_endpoint(payload: QualifySqlPayload, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Completes table names to catalog.schema.table by editing the text in place (formatting and comments stay). Nothing is executed."""
+    from web import sql_qualify
+    if len(payload.sql) > 200_000:
+        raise HTTPException(status_code=413, detail="The SQL is too large.")
+    try:
+        return await asyncio.to_thread(sql_qualify.qualify, payload.sql, payload.catalog)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
 @app.get("/api/history/{query_id}")
 async def get_single_query_history(query_id: str):
     record = get_query_by_id(query_id)
@@ -4871,10 +6800,42 @@ async def get_history_query_profile(query_id: str, request: Request):
     else:
         return {"success": False, "error": res.get("error", "Profiling unavailable for this query")}
 
+def _audit_history_deletion(actor: str, action: str, detail: Dict[str, Any]) -> None:
+    """The query history is an audit trail, so removing from it is itself recorded (who, how many, which ids; never the SQL)."""
+    from web.governance import store
+    store.init_governance_db()
+    conn = store.get_db()
+    try:
+        store.write_audit(conn, actor, action, "query_history", detail)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class HistoryDeletePayload(BaseModel):
+    query_ids: List[str]
+
+
 @app.delete("/api/history")
-async def clear_history():
+async def clear_history(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Removes the entire history (admins only)."""
+    from web.audit import get_query_history
+    total = get_query_history(limit=1).get("total_count")
     clear_query_history()
+    _audit_history_deletion(current_user.get("username", "admin"), "HISTORY_CLEAR", {"records": total})
     return {"success": True, "message": "Query history cleared"}
+
+@app.post("/api/history/delete")
+async def delete_history_entries(payload: HistoryDeletePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Removes the selected history entries (admins only). Everyone else's history is append-only."""
+    from web.audit import delete_queries
+    if not payload.query_ids:
+        raise HTTPException(status_code=400, detail="No queries selected.")
+    if len(payload.query_ids) > 5000:
+        raise HTTPException(status_code=413, detail="Too many queries in one request (max 5000).")
+    deleted = await asyncio.to_thread(delete_queries, payload.query_ids)
+    _audit_history_deletion(current_user.get("username", "admin"), "HISTORY_DELETE", {"deleted": deleted, "query_ids": payload.query_ids[:200]})
+    return {"success": True, "deleted": deleted}
 
 class ManualLogPayload(BaseModel):
     query_text: str
@@ -4884,7 +6845,7 @@ class ManualLogPayload(BaseModel):
     error_message: Optional[str] = None
     client: Optional[str] = "NOTEBOOK"
     is_mutation: Optional[bool] = False
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 @app.post("/api/history/log")
 async def manual_log_query(payload: ManualLogPayload):
@@ -4896,7 +6857,7 @@ async def manual_log_query(payload: ManualLogPayload):
         error_message=payload.error_message,
         client=payload.client or "NOTEBOOK",
         is_mutation=payload.is_mutation or False,
-        user=payload.user or "martin"
+        user=payload.user or "admin"
     )
     return {"success": True, "query_id": qid}
 
@@ -4904,24 +6865,35 @@ async def manual_log_query(payload: ManualLogPayload):
 
 @app.get("/api/jobs")
 async def list_jobs_endpoint():
+    from web import workflow as _wf
     jobs = load_jobs()
+    recent = _wf.recent_runs_by_job(10)
     enriched = []
     for j in jobs:
         j_copy = dict(j)
         runs = get_job_runs(job_id=j["id"], limit=1)
         j_copy["last_run"] = runs[0] if runs else None
+        j_copy["recent_runs"] = recent.get(j["id"], [])                       # computed for the workflows table; never stored (see save_job_endpoint)
+        j_copy["next_run"] = _wf.next_run_at(j)
+        j_copy["run_as"] = j.get("created_by") or ("system" if j.get("id") in {d["id"] for d in _wf.DEFAULT_JOBS} else "anonymous")
         enriched.append(j_copy)
     return {"jobs": enriched}
 
 @app.post("/api/jobs")
 async def save_job_endpoint(payload: Dict[str, Any], request: Request):
+    from web.workflow import JobValidationError
     user = await resolve_principal(request)
+    for computed in ("last_run", "recent_runs", "next_run", "run_as"):          # fields the list endpoint adds; a client that echoes a job back must not persist them
+        payload.pop(computed, None)
     existing = get_job(payload.get("id")) if payload.get("id") else None
     if existing and existing.get("created_by") and user.get("role") != "admin" and existing["created_by"] != user.get("username"):
         raise HTTPException(status_code=403, detail="Only the job's owner or an admin can change it.")
     # Ownership is server-side: jobs run as their owner, so the client must not be able to name one.
     payload["created_by"] = (existing or {}).get("created_by") or user.get("username")
-    saved = create_or_update_job(payload)
+    try:
+        saved = create_or_update_job(payload)
+    except JobValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return saved
 
 @app.get("/api/jobs/{job_id}")
@@ -4943,14 +6915,65 @@ async def delete_job_endpoint(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"success": True, "deleted_id": job_id}
 
+class JobRunPayload(BaseModel):
+    parameters: Optional[Dict[str, Any]] = None
+    wait: bool = True            # False: return the run id at once and let the run continue (poll /api/jobs/runs/{id}; cancel with /cancel)
+
+
 @app.post("/api/jobs/{job_id}/run")
-async def trigger_job_run_endpoint(job_id: str, request: Request):
+async def trigger_job_run_endpoint(job_id: str, request: Request, payload: Optional[JobRunPayload] = None):
+    """Runs a job now. Parameters must satisfy the job's declared allowed values/patterns; the job itself runs as its owner."""
+    from web import workflow
     await resolve_principal(request)          # authentication only: the job itself runs as its owner
+    payload = payload or JobRunPayload()
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
     try:
-        res = run_pipeline(job_id, trigger="MANUAL")
+        if not payload.wait:
+            if workflow.running_count(job_id) >= int((get_job(job_id).get("max_concurrent_runs") or 1)):
+                raise HTTPException(status_code=409, detail="The maximum number of concurrent runs of this job is already running.")
+            return {"run_id": workflow.start_run_in_background(job_id, trigger="MANUAL", params=payload.parameters), "status": "RUNNING"}
+        res = await asyncio.to_thread(run_pipeline, job_id, "MANUAL", None, None, payload.parameters)
+        if res.get("status") == "SKIPPED":
+            raise HTTPException(status_code=409, detail=res.get("message", "Skipped."))
         return res
+    except workflow.JobValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+def _may_control_run(user: Dict[str, Any], run: Dict[str, Any]) -> bool:
+    job = get_job(run["job_id"]) or {}
+    return user.get("role") == "admin" or not job.get("created_by") or job.get("created_by") == user.get("username")
+
+@app.post("/api/jobs/runs/{run_id}/cancel")
+async def cancel_job_run_endpoint(run_id: str, request: Request):
+    """Stops a running run: nothing further starts and a running SQL statement is interrupted (owner or admin)."""
+    from web import workflow
+    user = await resolve_principal(request)
+    run = get_run_detail(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not _may_control_run(user, run):
+        raise HTTPException(status_code=403, detail="Only the job's owner or an admin can cancel its runs.")
+    if not workflow.cancel_run(run_id):
+        raise HTTPException(status_code=409, detail="That run is not running.")
+    return {"success": True, "run_id": run_id}
+
+@app.post("/api/jobs/runs/{run_id}/repair")
+async def repair_job_run_endpoint(run_id: str, request: Request):
+    """Runs only what did not succeed in a failed or cancelled run, with the same parameters; finished tasks are reused."""
+    from web import workflow
+    await resolve_principal(request)
+    run = get_run_detail(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        return {"run_id": workflow.start_run_in_background(run["job_id"], trigger="REPAIR", repair_of=run_id), "status": "RUNNING"}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 @app.get("/api/jobs/{job_id}/runs")
 async def list_job_runs_endpoint(job_id: str, limit: int = 50):
@@ -4982,7 +7005,265 @@ async def get_dbt_status_endpoint(request: Request):
 @app.get("/api/dbt/models")
 async def list_dbt_models_endpoint():
     from web.dbt_service import list_dbt_models
-    return list_dbt_models()
+    from web import dbt_governance
+    data = list_dbt_models()
+    if dbt_governance.enabled():
+        catalog = dbt_governance._dest_catalog()
+        for m in data.get("models", []):
+            if catalog and m.get("materialization") in dbt_governance.OUTPUT_MATERIALIZATIONS:
+                try:
+                    m["lakehouse_table"] = f'{catalog}.{m["schema"]}.{m.get("alias") or m["name"]}'
+                    m["access"] = dbt_governance.access_state(m["schema"], m.get("alias") or m["name"])
+                except Exception as exc:
+                    logger.debug(f"access state of dbt model {m.get('name')} unavailable: {exc}")
+    return data
+
+class DbtConfigPayload(BaseModel):
+    content: str
+
+
+@app.get("/api/dbt/config")
+async def list_dbt_config_files(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The dbt project's editable configuration files (admins only: they decide what dbt does as the system)."""
+    from web import dbt_config
+    return {"files": [dbt_config.read(n) for n in dbt_config.FILES],
+            "s3_mounts": [{"id": m["id"], "name": m.get("name") or m["id"], "bucket": (m.get("config") or {}).get("bucket"),
+                           "catalog": m.get("catalog_name")} for m in dbt_config.s3_mounts()]}
+
+class DbtSettingsPayload(BaseModel):
+    profiles: str
+    project: str
+    settings: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/dbt/config/settings")
+async def read_dbt_settings(payload: DbtSettingsPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """The few settings the guided form edits, read from the given (possibly unsaved) file texts."""
+    from web import dbt_config
+    try:
+        return dbt_config.read_settings(payload.profiles, payload.project)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read the settings from these files: {exc}")
+
+@app.post("/api/dbt/config/settings/apply")
+async def apply_dbt_settings(payload: DbtSettingsPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Applies the form's settings to the given file texts as minimal text edits (comments kept). Returns the proposed files;
+    nothing is saved until they go through the normal validated save."""
+    from web import dbt_config
+    try:
+        return dbt_config.apply_settings(payload.profiles, payload.project, payload.settings or {})
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/dbt/config/s3-profile/{mount_id}")
+async def dbt_s3_profile_endpoint(mount_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """profiles.yml with its target pointed at an S3 mount (returned for review, not saved)."""
+    from web import dbt_config
+    try:
+        return {"name": "profiles.yml", "content": dbt_config.s3_profile(mount_id)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.get("/api/dbt/config/{name}/versions/{version_id}")
+async def get_dbt_config_version(name: str, version_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import dbt_config
+    try:
+        return dbt_config.read_version(name, version_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+@app.post("/api/dbt/config/{name}/validate")
+async def validate_dbt_config(name: str, payload: DbtConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import dbt_config
+    try:
+        return await asyncio.to_thread(dbt_config.validate, name, payload.content)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+@app.put("/api/dbt/config/{name}")
+async def save_dbt_config(name: str, payload: DbtConfigPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Validates (YAML, cross-checks, and `dbt parse` on a scratch copy), keeps the previous version and audits. Invalid = nothing written."""
+    from web import dbt_config
+    try:
+        return await asyncio.to_thread(dbt_config.save, name, payload.content, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except dbt_config.ConfigError as exc:
+        raise HTTPException(status_code=422, detail={"message": "The configuration was not saved.", "errors": exc.errors})
+
+class GitCommitPayload(BaseModel):
+    message: str
+    branch: Optional[str] = None            # pull-request mode: name of the change branch a first commit opens (default dkw/<user>-<time>)
+
+
+class GitPrPayload(BaseModel):
+    title: Optional[str] = ""
+    body: Optional[str] = ""
+
+
+class GitChangePayload(BaseModel):
+    name: Optional[str] = None
+
+
+async def _git_call(fn, *args):
+    from web import git_sync
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except git_sync.GitError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+def _git_repo(kind: str):
+    from web import git_sync
+    try:
+        return git_sync.get(kind)
+    except git_sync.GitError:
+        raise HTTPException(status_code=404, detail="Unknown repository.")
+
+
+# Two repositories share these routes: `dbt` (the dbt project) and `notebooks` (notebooks/Shared only, never the private Users/ folders).
+# The original un-prefixed paths keep meaning `dbt`.
+@app.get("/api/git/status")
+async def git_status_endpoint(fetch: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Sync state of the dbt project with its remote repository (admins only). `fetch=true` asks the remote first."""
+    return await _git_call(_git_repo("dbt").status, fetch)
+
+@app.post("/api/git/connect")
+async def git_connect_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo("dbt").connect, current_user.get("username", "admin"))
+
+@app.post("/api/git/pull")
+async def git_pull_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo("dbt").pull, current_user.get("username", "admin"))
+
+@app.post("/api/git/commit")
+async def git_commit_endpoint(payload: GitCommitPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo("dbt").commit, current_user.get("username", "admin"), payload.message, payload.branch)
+
+@app.post("/api/git/push")
+async def git_push_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo("dbt").push, current_user.get("username", "admin"))
+
+@app.get("/api/git/repos/{kind}/status")
+async def git_repo_status_endpoint(kind: str, fetch: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).status, fetch)
+
+@app.post("/api/git/repos/{kind}/connect")
+async def git_repo_connect_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).connect, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/pull")
+async def git_repo_pull_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).pull, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/commit")
+async def git_repo_commit_endpoint(kind: str, payload: GitCommitPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).commit, current_user.get("username", "admin"), payload.message, payload.branch)
+
+# Pull-request mode (GIT_MODE=pull_request): change branches and pull requests on the forge (Gitea API).
+@app.post("/api/git/repos/{kind}/change")
+async def git_repo_start_change_endpoint(kind: str, payload: GitChangePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).start_change, current_user.get("username", "admin"), payload.name)
+
+@app.post("/api/git/repos/{kind}/pr")
+async def git_repo_open_pr_endpoint(kind: str, payload: GitPrPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).open_pull_request, current_user.get("username", "admin"), payload.title or "", payload.body or "")
+
+@app.post("/api/git/repos/{kind}/finish")
+async def git_repo_finish_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).finish_change, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/abandon")
+async def git_repo_abandon_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).abandon_change, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/update")
+async def git_repo_update_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).update_from_base, current_user.get("username", "admin"))
+
+@app.post("/api/git/repos/{kind}/push")
+async def git_repo_push_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).push, current_user.get("username", "admin"))
+
+class GitDiscardPayload(BaseModel):
+    path: str
+
+
+class GitResolvePayload(BaseModel):
+    path: str
+    resolution: str
+    choices: Optional[List[Dict[str, Any]]] = None
+    content: Optional[str] = None
+
+
+class GitFinishMergePayload(BaseModel):
+    message: Optional[str] = None
+
+
+@app.get("/api/git/repos/{kind}/diff")
+async def git_repo_diff_endpoint(kind: str, scope: str = "pending", current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Files changed and their counts: `pending` (uncommitted) or `branch` (this change branch against the base, as a reviewer sees it)."""
+    return await _git_call(_git_repo(kind).diff, scope)
+
+@app.get("/api/git/repos/{kind}/diff/file")
+async def git_repo_diff_file_endpoint(kind: str, path: str, scope: str = "pending", current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).diff_file, path, scope)
+
+@app.post("/api/git/repos/{kind}/discard")
+async def git_repo_discard_endpoint(kind: str, payload: GitDiscardPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Throws away the uncommitted change of ONE file (restores it to the last commit, or deletes it when it is new)."""
+    return await _git_call(_git_repo(kind).discard, current_user.get("username", "admin"), payload.path)
+
+@app.post("/api/git/repos/{kind}/merge")
+async def git_repo_merge_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Direct mode, local and remote diverged: merge the remote into the local branch (conflicts are left for the resolver)."""
+    return await _git_call(_git_repo(kind).merge_remote, current_user.get("username", "admin"))
+
+@app.get("/api/git/repos/{kind}/conflicts")
+async def git_repo_conflicts_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).conflicts)
+
+@app.get("/api/git/repos/{kind}/conflicts/file")
+async def git_repo_conflict_file_endpoint(kind: str, path: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).conflict_file, path)
+
+@app.post("/api/git/repos/{kind}/conflicts/resolve")
+async def git_repo_resolve_endpoint(kind: str, payload: GitResolvePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """resolution: ours | theirs | delete | keep | merged (with `choices` per conflict hunk: pick ours/theirs/both/custom, or the whole `content`)."""
+    return await _git_call(_git_repo(kind).resolve_conflict, current_user.get("username", "admin"), payload.path, payload.resolution, payload.choices, payload.content)
+
+@app.post("/api/git/repos/{kind}/merge/finish")
+async def git_repo_finish_merge_endpoint(kind: str, payload: GitFinishMergePayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).finish_merge, current_user.get("username", "admin"), payload.message)
+
+@app.post("/api/git/repos/{kind}/merge/abort")
+async def git_repo_abort_merge_endpoint(kind: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    return await _git_call(_git_repo(kind).abort_merge, current_user.get("username", "admin"))
+
+@app.post("/api/dbt/models/{model_name}/open")
+async def open_dbt_model_endpoint(model_name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """An administrator deliberately opens one dbt table to users (refreshes its carried-over source tags first)."""
+    from web import dbt_governance
+    try:
+        return await asyncio.to_thread(dbt_governance.open_model, model_name, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/dbt/models/{model_name}/close")
+async def close_dbt_model_endpoint(model_name: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import dbt_governance
+    try:
+        return await asyncio.to_thread(dbt_governance.close_model, model_name, current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 @app.get("/api/dbt/models/{model_name}")
 async def get_dbt_model_endpoint(model_name: str):
@@ -5583,7 +7864,7 @@ class RecentRecordPayload(BaseModel):
     title: str
     subtitle: Optional[str] = ""
     metadata: Optional[Dict[str, Any]] = None
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 @app.post("/api/recents")
 async def record_recent_endpoint(payload: RecentRecordPayload, request: Request):
@@ -5691,7 +7972,7 @@ class AlertCreatePayload(BaseModel):
     is_enabled: Optional[bool] = True
     is_muted: Optional[bool] = False
     is_shared: Optional[bool] = True
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 
 class AlertUpdatePayload(BaseModel):
@@ -5707,13 +7988,13 @@ class AlertUpdatePayload(BaseModel):
     is_enabled: Optional[bool] = None
     is_muted: Optional[bool] = None
     is_shared: Optional[bool] = None
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 
 
 @app.get("/api/alerts/summary")
-async def get_alerts_summary_endpoint(request: Request, user: Optional[str] = "martin"):
+async def get_alerts_summary_endpoint(request: Request, user: Optional[str] = "admin"):
     from web.alerts import get_alerts_summary
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     try:
         return get_alerts_summary(user_id=user_id)
     except Exception as e:
@@ -5726,10 +8007,10 @@ async def get_alerts_endpoint(
     request: Request,
     state: Optional[str] = None,
     search: Optional[str] = None,
-    user: Optional[str] = "martin"
+    user: Optional[str] = "admin"
 ):
     from web.alerts import get_alerts
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     try:
         return get_alerts(user_id=user_id, state_filter=state, search=search)
     except Exception as e:
@@ -5741,7 +8022,7 @@ async def get_alerts_endpoint(
 async def create_alert_endpoint(payload: AlertCreatePayload, request: Request):
     from web.alerts import create_alert
     from web.recents import record_recent
-    user_id = request.headers.get("X-User") or payload.user or "martin"
+    user_id = request.headers.get("X-User") or payload.user or "admin"
     try:
         alert = create_alert(payload.dict(), user_id=user_id)
         try:
@@ -5762,10 +8043,10 @@ async def create_alert_endpoint(payload: AlertCreatePayload, request: Request):
 
 
 @app.get("/api/alerts/{alert_id}")
-async def get_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def get_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import get_alert
     from web.recents import record_recent
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     alert = get_alert(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -5786,7 +8067,7 @@ async def get_alert_endpoint(alert_id: str, request: Request, user: Optional[str
 @app.put("/api/alerts/{alert_id}")
 async def update_alert_endpoint(alert_id: str, payload: AlertUpdatePayload, request: Request):
     from web.alerts import update_alert
-    user_id = request.headers.get("X-User") or payload.user or "martin"
+    user_id = request.headers.get("X-User") or payload.user or "admin"
     data = payload.dict(exclude_unset=True)
     alert = update_alert(alert_id, data, user_id=user_id)
     if not alert:
@@ -5795,10 +8076,10 @@ async def update_alert_endpoint(alert_id: str, payload: AlertUpdatePayload, requ
 
 
 @app.delete("/api/alerts/{alert_id}")
-async def delete_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def delete_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import delete_alert
     from web.recents import delete_recent
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     success = delete_alert(alert_id, user_id=user_id)
     if not success:
         raise HTTPException(status_code=404, detail="Alert not found or already deleted")
@@ -5810,9 +8091,9 @@ async def delete_alert_endpoint(alert_id: str, request: Request, user: Optional[
 
 
 @app.post("/api/alerts/{alert_id}/run")
-async def run_alert_check_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def run_alert_check_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import execute_alert_check
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     try:
         result = execute_alert_check(alert_id, triggered_by="manual", user_id=user_id)
         return result
@@ -5822,9 +8103,9 @@ async def run_alert_check_endpoint(alert_id: str, request: Request, user: Option
 
 
 @app.post("/api/alerts/{alert_id}/mute")
-async def toggle_mute_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def toggle_mute_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import toggle_mute_alert
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     alert = toggle_mute_alert(alert_id, user_id=user_id)
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -5832,9 +8113,9 @@ async def toggle_mute_alert_endpoint(alert_id: str, request: Request, user: Opti
 
 
 @app.post("/api/alerts/{alert_id}/toggle")
-async def toggle_enable_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "martin"):
+async def toggle_enable_alert_endpoint(alert_id: str, request: Request, user: Optional[str] = "admin"):
     from web.alerts import toggle_enable_alert
-    user_id = request.headers.get("X-User") or user or "martin"
+    user_id = request.headers.get("X-User") or user or "admin"
     alert = toggle_enable_alert(alert_id, user_id=user_id)
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -6273,7 +8554,7 @@ async def list_studio_experiments():
 async def create_studio_experiment(request: Request):
     from web.experiments import mlflow_create_experiment
     body = await request.json()
-    user_id = request.headers.get("X-User", "martin")
+    user_id = request.headers.get("X-User", "admin")
     try:
         res = mlflow_create_experiment(body.get("name", ""), body.get("artifact_location"), user_id=user_id)
         return res
@@ -6487,8 +8768,9 @@ async def get_table_diff_endpoint(
 ):
     from web.time_travel import resolve_table_path, compare_table_versions
     diff_user = await resolve_principal(request)
-    if not can_user_access_catalog(diff_user, catalog or "warehouse", action="READ"):
-        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
+    from web import table_access
+    if not table_access.can_access_table(diff_user, catalog or "warehouse", schema_name, table_name, "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view '{catalog or 'warehouse'}.{schema_name}.{table_name}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
@@ -6508,7 +8790,7 @@ async def restore_table_endpoint(
     request: Request
 ):
     from web.time_travel import resolve_table_path, restore_table_to_version
-    user = request.headers.get("X-User") or "martin"
+    user = request.headers.get("X-User") or "admin"
     path, cat_id = resolve_table_path(schema_name, table_name, payload.catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
@@ -6536,8 +8818,9 @@ async def preview_table_version_endpoint(
 ):
     from web.time_travel import resolve_table_path, get_version_preview
     preview_user = await resolve_principal(request)
-    if not can_user_access_catalog(preview_user, catalog or "warehouse", action="READ"):
-        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view catalog '{catalog}'.")
+    from web import table_access
+    if not table_access.can_access_table(preview_user, catalog or "warehouse", schema_name, table_name, "READ"):
+        raise HTTPException(status_code=403, detail=f"Access denied: you cannot view '{catalog or 'warehouse'}.{schema_name}.{table_name}'.")
     path, cat_id = resolve_table_path(schema_name, table_name, catalog)
     if not (path.startswith("s3://") or os.path.exists(path)):
         raise HTTPException(status_code=404, detail=f"Table {schema_name}.{table_name} not found")
@@ -7216,15 +9499,397 @@ async def preview_volume_file_endpoint(
 # Auto-Loader Pipeline Endpoints
 # ------------------------------------------------------------------------------
 
+def _pipeline_access(user: Dict[str, Any], pipe: Dict[str, Any]) -> Optional[str]:
+    """manage | run | None. Admins and power users manage every pipeline (as before); a plain user can be given RUN or MANAGE on a
+    pipeline directly or through a group (Share dialog / IAM > Groups)."""
+    from web.groups import permission_of
+    if user.get("role") in ("admin", "power_user") or user.get("username") == pipe.get("created_by"):
+        return "manage"
+    granted = permission_of(user, "pipeline", pipe.get("id", ""))
+    return {"MANAGE": "manage", "RUN": "run"}.get(granted or "")
+
+
 @app.get("/api/autoloader/pipelines")
-async def get_autoloader_pipelines():
+async def get_autoloader_pipelines(request: Request):
     from web.autoloader import list_pipelines
+    current_user = await resolve_principal(request)
     try:
-        pipes = list_pipelines()
+        pipes = [{**p, "my_access": _pipeline_access(current_user, p)} for p in list_pipelines()]
         return {"pipelines": pipes}
     except Exception as e:
         logger.error(f"Error listing autoloader pipelines: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------- Groups (web/groups.py) and generic resource grants
+class GroupPayload(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class GroupMembersPayload(BaseModel):
+    user_ids: List[str]
+
+
+class GrantPayload(BaseModel):
+    principal: str            # user:<id or username> | group:<id>
+    permission: str
+
+
+def _groups_call(fn, *args, **kw):
+    from web import groups
+    try:
+        return fn(*args, **kw)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except groups.GroupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/groups")
+async def list_groups_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    from web import groups
+    return {"groups": groups.list_groups()}
+
+@app.post("/api/groups")
+async def create_group_endpoint(payload: GroupPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    return _groups_call(groups.create_group, payload.name or "", payload.description or "", current_user.get("username", "admin"))
+
+@app.put("/api/groups/{group_id}")
+async def update_group_endpoint(group_id: str, payload: GroupPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    return _groups_call(groups.update_group, group_id, payload.name, payload.description, current_user.get("username", "admin"))
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group_endpoint(group_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    _groups_call(groups.delete_group, group_id, current_user.get("username", "admin"))
+    return {"success": True}
+
+@app.get("/api/groups/{group_id}/members")
+async def list_group_members_endpoint(group_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    if not groups.get_group(group_id):
+        raise HTTPException(status_code=404, detail="Group not found.")
+    return {"members": groups.list_members(group_id)}
+
+@app.post("/api/groups/{group_id}/members")
+async def add_group_members_endpoint(group_id: str, payload: GroupMembersPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    return {"members": _groups_call(groups.add_members, group_id, payload.user_ids, current_user.get("username", "admin"))}
+
+@app.delete("/api/groups/{group_id}/members/{user_id}")
+async def remove_group_member_endpoint(group_id: str, user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import groups
+    _groups_call(groups.remove_member, group_id, user_id, current_user.get("username", "admin"))
+    return {"success": True}
+
+class GroupMappingPayload(BaseModel):
+    source: str = "local"
+    external_ref: Optional[str] = ""
+
+
+@app.put("/api/groups/{group_id}/mapping")
+async def set_group_mapping_endpoint(group_id: str, payload: GroupMappingPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Maps the group to an LDAP group DN / OIDC group value (members then follow the directory), or clears it (source 'local')."""
+    from web import groups
+    return _groups_call(groups.set_mapping, group_id, payload.source, payload.external_ref or "", current_user.get("username", "admin"))
+
+@app.get("/api/groups/directory/ldap")
+async def list_ldap_groups_endpoint(q: str = "", current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """LDAP groups to choose from when mapping (admins only; uses the configured service account)."""
+    from web import ldap_auth
+    try:
+        return {"groups": await asyncio.to_thread(ldap_auth.list_directory_groups, None, q)}
+    except ldap_auth.LdapError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.get("/api/principals")
+async def search_principals_endpoint(q: str = "", current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Users and groups to pick from in a share dialog (at most 20 of each; users need at least 2 typed characters)."""
+    from web import groups
+    from web.auth import get_db_connection
+    q = (q or "").strip().lower()
+    users = []
+    if len(q) >= 2:
+        conn = get_db_connection()
+        try:
+            users = [{"principal": f"user:{r['id']}", "type": "user", "name": r["username"], "display_name": r["display_name"], "auth_source": r["auth_source"]}
+                     for r in conn.execute("SELECT id, username, display_name, auth_source FROM users WHERE deleted_at IS NULL AND is_active = 1 "
+                                           "AND (lower(username) LIKE ? OR lower(display_name) LIKE ?) ORDER BY username LIMIT 20", (f"%{q}%", f"%{q}%"))]
+        finally:
+            conn.close()
+    gs = [{"principal": f"group:{g['id']}", "type": "group", "name": g["name"], "member_count": g["member_count"]}
+          for g in groups.list_groups() if not q or q in g["name"].lower()][:20]
+    return {"users": users, "groups": gs}
+
+
+def _may_manage_grants(user: Dict[str, Any], resource_type: str, resource_id: str) -> bool:
+    if user.get("role") == "admin":
+        return True
+    if resource_type == "saved_query":
+        from web.saved_queries import get_saved_query
+        q = get_saved_query(resource_id)
+        return bool(q) and user.get("username") in (q.get("owner"), q.get("created_by"))
+    if resource_type in ("table", "schema"):
+        # Data access is decided by whoever governs the catalog: an administrator, or the catalog's owner (a power user).
+        return can_user_manage_catalog(user, (resource_id or "").split(".")[0].lower())
+    if resource_type == "pipeline":
+        from web.autoloader import get_pipeline
+        p = get_pipeline(resource_id)
+        return bool(p) and _pipeline_access(user, p) == "manage"
+    if resource_type == "app":
+        from web import apps as apps_module
+        a = apps_module.get_app(resource_id)
+        return bool(a) and apps_module.app_access(user, a) == "manage"
+    return False
+
+
+@app.get("/api/catalogs/{cat_id}/table-grants")
+async def list_catalog_table_grants_endpoint(cat_id: str, request: Request):
+    """Every table- and schema-level grant inside a catalog (for whoever manages the catalog)."""
+    from web import groups
+    current_user = await resolve_principal(request)
+    if not can_user_manage_catalog(current_user, cat_id):
+        raise HTTPException(status_code=403, detail=f"Access denied: you do not have permission to inspect access lists for catalog '{cat_id}'.")
+    return {"grants": groups.list_grants_prefix(("schema", "table"), cat_id.lower() + ".")}
+
+
+@app.get("/api/grants/{resource_type}/{resource_id}")
+async def list_grants_endpoint(resource_type: str, resource_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from web import groups
+    if not _may_manage_grants(current_user, resource_type, resource_id):
+        raise HTTPException(status_code=403, detail="Only the owner or an administrator can see who this is shared with.")
+    return {"permissions": list(groups.RESOURCE_TYPES.get(resource_type, ())), "grants": _groups_call(groups.list_grants, resource_type, resource_id)}
+
+@app.post("/api/grants/{resource_type}/{resource_id}")
+async def set_grant_endpoint(resource_type: str, resource_id: str, payload: GrantPayload, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from web import groups
+    if not _may_manage_grants(current_user, resource_type, resource_id):
+        raise HTTPException(status_code=403, detail="Only the owner or an administrator can share this.")
+    return _groups_call(groups.grant, resource_type, resource_id, payload.principal, payload.permission, current_user.get("username", "admin"))
+
+@app.delete("/api/grants/{resource_type}/{resource_id}")
+async def revoke_grant_endpoint(resource_type: str, resource_id: str, principal: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from web import groups
+    if not _may_manage_grants(current_user, resource_type, resource_id):
+        raise HTTPException(status_code=403, detail="Only the owner or an administrator can change who this is shared with.")
+    if not _groups_call(groups.revoke, resource_type, resource_id, principal, current_user.get("username", "admin")):
+        raise HTTPException(status_code=404, detail="That grant does not exist.")
+    return {"success": True}
+
+
+# ---------------------------------------------------------------- Connections (web/connections.py): HTTP(S)/REST and SFTP sources
+class ConnectionPayload(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    type: Optional[str] = None
+    description: Optional[str] = ""
+    config: Optional[Dict[str, Any]] = None
+    secret: Optional[Dict[str, Any]] = None
+
+
+@app.get("/api/connections")
+async def list_connections_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """Names, types and non-secret settings (never a secret; `has_secret` says whether one is stored)."""
+    from web import connections
+    return {"connections": connections.list_connections()}
+
+@app.post("/api/connections")
+async def create_connection_endpoint(payload: ConnectionPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import connections
+    try:
+        return connections.create_connection(payload.dict(), current_user.get("username", "admin"))
+    except connections.ConnectionError_ as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/connections/test")
+async def test_connection_endpoint(payload: ConnectionPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Tries a definition (saved or not) and reports reachability; for SFTP without a pinned host key, the fingerprint the server presents."""
+    from web import connections, autoloader_conn, streaming
+    try:
+        definition = connections.definition_for_test(payload.dict())
+    except connections.ConnectionError_ as exc:
+        return {"ok": False, "message": str(exc)}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if definition["type"] == "kafka":
+        return await asyncio.to_thread(streaming.test_connection, definition)
+    return await asyncio.to_thread(autoloader_conn.test_connection, definition)
+
+@app.put("/api/connections/{conn_id}")
+async def update_connection_endpoint(conn_id: str, payload: ConnectionPayload, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import connections
+    try:
+        return connections.update_connection(conn_id, payload.dict(), current_user.get("username", "admin"))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except connections.ConnectionError_ as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.delete("/api/connections/{conn_id}")
+async def delete_connection_endpoint(conn_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import connections
+    try:
+        connections.delete_connection(conn_id, current_user.get("username", "admin"))
+        return {"success": True}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except connections.ConnectionError_ as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+# ---------------------------------------------------------------- Streaming ingestion (web/streaming.py): Kafka / Redpanda -> Delta
+class StreamPayload(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    connection: Optional[str] = None
+    topic: Optional[str] = None
+    format: Optional[str] = None
+    starting_offsets: Optional[str] = None
+    target_catalog: Optional[str] = None
+    target_schema: Optional[str] = None
+    target_table: Optional[str] = None
+    max_records: Optional[int] = None
+    max_wait_seconds: Optional[int] = None
+    evolve_schema: Optional[bool] = None
+    enabled: Optional[bool] = None
+
+
+class StreamPreviewPayload(BaseModel):
+    connection: str
+    topic: str
+    format: str = "json"
+    limit: int = 10
+
+
+def _stream_call(fn, *args, **kwargs):
+    from web import streaming
+    try:
+        return fn(*args, **kwargs)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except streaming.StreamBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except streaming.StreamError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+_STREAM_ROLES = ["admin", "power_user"]
+
+@app.get("/api/streams")
+async def list_streams_endpoint(current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return {"streams": streaming.list_streams()}
+
+@app.post("/api/streams")
+async def create_stream_endpoint(payload: StreamPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.create_stream, payload.dict(exclude_none=True), current_user.get("username", "admin"))
+
+@app.get("/api/streams/topics")
+async def stream_topics_endpoint(connection: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Topics visible to a Kafka connection (for the create dialog's dropdown)."""
+    from web import streaming
+    return {"topics": await asyncio.to_thread(_stream_call, streaming.list_topics, connection)}
+
+@app.post("/api/streams/preview")
+async def preview_stream_endpoint(payload: StreamPreviewPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """The newest messages of a topic as the table would receive them; reads only, creates nothing."""
+    from web import streaming
+    return await asyncio.to_thread(_stream_call, streaming.preview, payload.connection, payload.topic, payload.format, payload.limit)
+
+class StreamRewindPayload(BaseModel):
+    start: Dict[str, Any]
+    mode: str = "replace"
+    dry_run: bool = False
+
+
+class StreamMovePayload(BaseModel):
+    connection: Optional[str] = None
+    topic: Optional[str] = None
+    target_catalog: Optional[str] = None
+    target_schema: Optional[str] = None
+    target_table: Optional[str] = None
+    start: Optional[Dict[str, Any]] = None
+    same_cluster: bool = False
+    dry_run: bool = False
+
+
+@app.post("/api/streams/{stream_id}/rewind")
+async def rewind_stream_endpoint(stream_id: str, payload: StreamRewindPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Reads the topic again from earliest / latest / a timestamp / offsets. The stream must be stopped. With mode 'replace' the rows at or after
+    the new position are deleted in the same Delta commit that lowers the recorded offsets (no duplicates); 'keep' appends them again.
+    `dry_run` returns the plan (per-partition positions and the number of rows that would be deleted) and changes nothing."""
+    from web import stream_ops
+    return await asyncio.to_thread(_stream_call, stream_ops.rewind, stream_id, payload.start, payload.mode, payload.dry_run, current_user.get("username", "admin"))
+
+@app.post("/api/streams/{stream_id}/move")
+async def move_stream_endpoint(stream_id: str, payload: StreamMovePayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Changes the connection, topic and/or target table of a stopped stream. Offsets are kept for another connection to the same cluster
+    and a new target table; another topic or cluster needs a `start` position. `dry_run` shows what would happen."""
+    from web import stream_ops
+    changes = {k: v for k, v in payload.dict().items() if k in ("connection", "topic", "target_catalog", "target_schema", "target_table")}
+    return await asyncio.to_thread(_stream_call, stream_ops.move, stream_id, changes, payload.start, payload.same_cluster, payload.dry_run, current_user.get("username", "admin"))
+
+@app.get("/api/streams/{stream_id}")
+async def get_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    s = streaming.get_stream(stream_id, detail=True)
+    if not s:
+        raise HTTPException(status_code=404, detail="Stream not found.")
+    return s
+
+@app.put("/api/streams/{stream_id}")
+async def update_stream_endpoint(stream_id: str, payload: StreamPayload, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.update_stream, stream_id, payload.dict(exclude_none=True), current_user.get("username", "admin"))
+
+@app.post("/api/streams/{stream_id}/start")
+async def start_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.set_enabled, stream_id, True, current_user.get("username", "admin"))
+
+@app.post("/api/streams/{stream_id}/stop")
+async def stop_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    from web import streaming
+    return _stream_call(streaming.set_enabled, stream_id, False, current_user.get("username", "admin"))
+
+@app.delete("/api/streams/{stream_id}")
+async def delete_stream_endpoint(stream_id: str, current_user: Dict[str, Any] = Depends(require_role(_STREAM_ROLES))):
+    """Stops and removes the stream; the Delta table (and its dead-letter table) stay."""
+    from web import streaming
+    await asyncio.to_thread(_stream_call, streaming.delete_stream, stream_id, current_user.get("username", "admin"))
+    return {"success": True}
+
+
+class SourcePreviewPayload(BaseModel):
+    source_volume_path: str
+    source_options: Optional[Dict[str, Any]] = None
+    file_pattern: Optional[str] = "*"
+    limit: Optional[int] = 10
+    source_mount_id: Optional[str] = None
+    sample_file: Optional[str] = None
+
+
+@app.post("/api/autoloader/preview-source")
+async def preview_autoloader_source_endpoint(payload: SourcePreviewPayload, current_user: Dict[str, Any] = Depends(require_role(["admin", "power_user"]))):
+    """The first rows of any source as the pipeline would read them, before it exists: a connection (HTTP file, REST API first page, SFTP file), a local
+    volume folder or an s3:// location. Nothing is created, checkpointed or loaded."""
+    from web import autoloader_conn, autoloader_preview
+    try:
+        if autoloader_conn.is_conn_path(payload.source_volume_path):
+            return await asyncio.to_thread(autoloader_conn.preview, payload.source_volume_path, payload.source_options, payload.file_pattern or "*", payload.limit or 10)
+        return await asyncio.to_thread(autoloader_preview.preview, payload.source_volume_path, payload.file_pattern or "*", payload.source_mount_id, payload.sample_file, payload.limit or 10)
+    except (autoloader_conn.SourceError, autoloader_preview.PreviewError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/autoloader/target-catalogs")
+async def get_autoloader_target_catalogs(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Catalogs a pipeline can load into: writable local catalogs and writable S3 mounts (the create dialog's dropdown)."""
+    from web.autoloader import target_catalogs
+    return {"catalogs": await asyncio.to_thread(target_catalogs)}
 
 
 @app.post("/api/autoloader/pipelines")
@@ -7257,10 +9922,14 @@ async def get_autoloader_pipeline_endpoint(pipeline_id: str):
 @app.put("/api/autoloader/pipelines/{pipeline_id}")
 async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[str, Any], request: Request):
     from web.autoloader import update_pipeline
+    from web.autoloader import get_pipeline as _get_pipe
     current_user = await resolve_principal(request)
 
-    if current_user.get("role") not in ("admin", "power_user"):
-        raise HTTPException(status_code=403, detail="Only admins and power users can modify Auto-Loader pipelines.")
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) != "manage":
+        raise HTTPException(status_code=403, detail="Only admins, power users and users with Manage access can modify Auto-Loader pipelines.")
 
     try:
         pipe = update_pipeline(pipeline_id, payload)
@@ -7273,22 +9942,33 @@ async def update_autoloader_pipeline_endpoint(pipeline_id: str, payload: Dict[st
 
 @app.delete("/api/autoloader/pipelines/{pipeline_id}")
 async def delete_autoloader_pipeline_endpoint(pipeline_id: str, request: Request):
-    from web.autoloader import delete_pipeline
+    from web.autoloader import delete_pipeline, get_pipeline as _get_pipe
+    from web import groups
     current_user = await resolve_principal(request)
 
-    if current_user.get("role") not in ("admin", "power_user"):
-        raise HTTPException(status_code=403, detail="Only admins and power users can delete Auto-Loader pipelines.")
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) != "manage":
+        raise HTTPException(status_code=403, detail="Only admins, power users and users with Manage access can delete Auto-Loader pipelines.")
 
     ok = delete_pipeline(pipeline_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Pipeline not found")
+    groups.delete_grants_for_resource("pipeline", pipeline_id)
     return {"success": True, "message": f"Pipeline '{pipeline_id}' deleted."}
 
 
 @app.post("/api/autoloader/pipelines/{pipeline_id}/run")
 @app.post("/api/autoloader/pipelines/{pipeline_id}/run-now")
-async def run_autoloader_pipeline_now(pipeline_id: str):
-    from web.autoloader import run_pipeline_cycle
+async def run_autoloader_pipeline_now(pipeline_id: str, request: Request):
+    from web.autoloader import run_pipeline_cycle, get_pipeline as _get_pipe
+    current_user = await resolve_principal(request)
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) is None:
+        raise HTTPException(status_code=403, detail="You need Run or Manage access on this pipeline (ask an administrator to add you or one of your groups).")
     try:
         res = run_pipeline_cycle(pipeline_id)
         if "error" in res and res.get("files_found") is None:
@@ -7302,10 +9982,14 @@ async def run_autoloader_pipeline_now(pipeline_id: str):
 @app.post("/api/autoloader/pipelines/{pipeline_id}/reset")
 async def reset_autoloader_pipeline_checkpoints(pipeline_id: str, request: Request):
     from web.autoloader import reset_pipeline_checkpoints
+    from web.autoloader import get_pipeline as _get_pipe
     current_user = await resolve_principal(request)
 
-    if current_user.get("role") not in ("admin", "power_user"):
-        raise HTTPException(status_code=403, detail="Only admins and power users can reset checkpoints.")
+    existing = _get_pipe(pipeline_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if _pipeline_access(current_user, existing) != "manage":
+        raise HTTPException(status_code=403, detail="Only admins, power users and users with Manage access can reset checkpoints.")
 
     res = reset_pipeline_checkpoints(pipeline_id)
     return res

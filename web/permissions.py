@@ -137,27 +137,35 @@ def can_user_access_catalog(user: Dict[str, Any], catalog_id: str, action: str =
     if is_catalog_owner(user, catalog_id):
         return True
 
-    # Standard check against catalog_permissions table
+    # Standard check against catalog_permissions: the user's own grant and the grants of every group they belong to;
+    # the highest one wins (groups only ever add access).
     user_id = user.get("id", "")
     username = user.get("username", "")
+    principals = [user_id, username]
+    try:
+        from web import groups
+        principals += [f"group:{g}" for g in groups.group_ids_for(user)]
+    except Exception as exc:
+        logger.warning(f"group membership unavailable for catalog check: {exc}")
+    principals = [p for p in principals if p]
+    if not principals:
+        return False
 
     conn = get_db_connection()
     try:
-        row = conn.execute("""
-        SELECT permission FROM catalog_permissions 
-        WHERE catalog_id = ? AND (user_id = ? OR user_id = ?)
-        """, (catalog_id, user_id, username)).fetchone()
-
-        if not row:
+        rows = conn.execute(
+            f"SELECT permission FROM catalog_permissions WHERE catalog_id = ? AND user_id IN ({','.join('?' * len(principals))})",
+            (catalog_id, *principals)).fetchall()
+        perms = {r["permission"].upper() for r in rows}
+        if not perms:
             return False
-
-        perm = row["permission"].upper()
-        if action.upper() == "READ":
-            return perm in ("READ", "WRITE", "ADMIN")
-        elif action.upper() == "WRITE":
-            return perm in ("WRITE", "ADMIN")
-        elif action.upper() == "ADMIN":
-            return perm == "ADMIN"
+        act = action.upper()
+        if act == "READ":
+            return bool(perms & {"READ", "WRITE", "ADMIN"})
+        if act == "WRITE":
+            return bool(perms & {"WRITE", "ADMIN"})
+        if act == "ADMIN":
+            return "ADMIN" in perms
         return False
     finally:
         conn.close()
@@ -179,13 +187,20 @@ def list_catalog_permissions(catalog_id: str) -> Dict[str, Any]:
 
         grants = []
         for r in rows:
+            is_group = str(r["user_id"]).startswith("group:")
+            gname = None
+            if is_group:
+                gr = conn.execute("SELECT name FROM user_groups WHERE id = ?", (r["user_id"][len("group:"):],)).fetchone() \
+                    if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_groups'").fetchone() else None
+                gname = gr["name"] if gr else r["user_id"]
             grants.append({
                 "id": r["id"],
                 "catalog_id": r["catalog_id"],
                 "user_id": r["user_id"],
-                "username": r["username"] or r["user_id"],
-                "display_name": r["display_name"] or r["username"] or r["user_id"],
-                "role": r["role"] or "user",
+                "principal_type": "group" if is_group else "user",
+                "username": gname or r["username"] or r["user_id"],
+                "display_name": gname or r["display_name"] or r["username"] or r["user_id"],
+                "role": "group" if is_group else (r["role"] or "user"),
                 "permission": r["permission"],
                 "granted_by": r["granted_by"],
                 "created_at": r["created_at"]
@@ -218,8 +233,14 @@ def grant_catalog_permission(
         raise HTTPException(status_code=400, detail="Invalid permission. Must be READ, WRITE, or ADMIN.")
 
     target_clean = target_user_id.strip()
-    target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
-    effective_user_id = target_user["id"] if target_user else target_clean
+    if target_clean.startswith("group:"):
+        from web import groups
+        if not groups.get_group(target_clean[len("group:"):]):
+            raise HTTPException(status_code=404, detail="That group does not exist.")
+        effective_user_id = target_clean
+    else:
+        target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
+        effective_user_id = target_user["id"] if target_user else target_clean
 
     conn = get_db_connection()
     try:
@@ -259,9 +280,12 @@ def revoke_catalog_permission(
         )
 
     target_clean = target_user_id.strip()
-    target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
-    target_id = target_user["id"] if target_user else target_clean
-    target_name = target_user["username"] if target_user else target_clean
+    if target_clean.startswith("group:"):
+        target_id = target_name = target_clean
+    else:
+        target_user = get_user_by_username(target_clean) or get_user_by_id(target_clean)
+        target_id = target_user["id"] if target_user else target_clean
+        target_name = target_user["username"] if target_user else target_clean
 
     conn = get_db_connection()
     try:
@@ -288,8 +312,21 @@ def filter_catalogs_for_user(catalogs_tree: List[Dict[str, Any]], user: Dict[str
         return annotated
 
     filtered = []
+    try:
+        from web import table_access
+        scope = table_access.granted_scope(user)
+    except Exception as exc:
+        logger.warning(f"table grants unavailable for the catalog listing: {exc}")
+        scope = {}
     for cat in catalogs_tree:
         cat_id = cat.get("id")
+        if not can_user_access_catalog(user, cat_id, action="READ") and cat_id in scope:
+            # Access to some tables or schemas only: show just those, read-only.
+            partial = table_access.prune_catalog(cat, scope[cat_id])
+            if partial["schemas"]:
+                partial.update(user_can_manage=False, user_can_write=False, user_can_delete=False, partial_access=True)
+                filtered.append(partial)
+            continue
         if can_user_access_catalog(user, cat_id, action="READ"):
             # Attach user-specific capability flags to the catalog response
             cat_copy = dict(cat)
@@ -304,14 +341,48 @@ def filter_catalogs_for_user(catalogs_tree: List[Dict[str, Any]], user: Dict[str
 # SQL ZERO-TRUST PARSER & QUERY FENCING
 # ==============================================================================
 
+# A statement starting with one of these only reads; a catalog is referenced in it through a dotted name. Any OTHER statement (USE, ATTACH,
+# DETACH, SET, CALL, PRAGMA, COPY, CREATE, ...) can name a catalog on its own (`USE sales` switches the default catalog for the rest of the
+# request, after which `select * from dbo.customers` reads it with no catalog in sight), so there a bare occurrence of the name counts.
+_QUERY_STARTS = {"select", "with", "from", "values", "table", "explain", "describe", "show", "summarize", "pivot", "unpivot", "("}
+
+
+def _catalogs_from_tokens(sql_query: str, all_catalogs: Set[str]) -> Set[str]:
+    """Catalogs referenced according to the SQL tokenizer. Unlike a regex this cannot be fooled by quoted identifiers (`"sales"."dbo"."t"`),
+    comments or whitespace inside a name (`sales/**/.dbo.t`); string literals are not identifiers. Dotted use (`catalog.schema.table`) counts
+    in every statement; a bare name counts in statements that are not plain queries (see _QUERY_STARTS)."""
+    import sqlglot
+    from sqlglot.tokens import TokenType
+    try:
+        toks = sqlglot.tokenize(sql_query, read="duckdb")
+    except Exception:
+        return set(all_catalogs) if all_catalogs else set()      # cannot tokenize (e.g. unterminated string): assume every catalog is touched
+    found: Set[str] = set()
+    segment_start = 0
+    for i, t in enumerate(toks):
+        if t.token_type == TokenType.SEMICOLON:
+            segment_start = i + 1
+            continue
+        if t.token_type == TokenType.STRING or t.text.lower() not in all_catalogs:
+            continue
+        if i > 0 and toks[i - 1].token_type == TokenType.DOT:
+            continue                                   # `x.catalog`: a schema/column part of another name
+        dotted = i + 1 < len(toks) and toks[i + 1].token_type == TokenType.DOT
+        first = toks[segment_start].text.lower() if segment_start < len(toks) else ""
+        if dotted or first not in _QUERY_STARTS:
+            found.add(t.text.lower())
+    return found
+
+
 def extract_catalogs_from_sql(sql_query: str) -> Set[str]:
     """
     Extracts referenced catalog names from a SQL statement.
     Detects 3-part names (catalog.schema.table), catalog-qualified function calls,
-    or attached catalog references.
+    or attached catalog references. Union of a tokenizer pass (robust against quoting and comments)
+    and the original regexes (which also flag a schema that shares a catalog's name: over-cautious, kept).
     """
     all_catalogs = get_all_catalog_ids()
-    referenced = set()
+    referenced = set(_catalogs_from_tokens(sql_query, all_catalogs))
 
     # Match patterns like: `catalog`.`schema`.`table` or catalog.schema.table
     pattern = re.compile(r'\b([a-zA-Z0-9_]+)\s*\.\s*([a-zA-Z0-9_]+)\s*\.\s*([a-zA-Z0-9_]+)\b')
@@ -334,14 +405,23 @@ def enforce_sql_permissions(sql_query: str, user: Dict[str, Any], action: str = 
     """
     Inspects SQL query and verifies that user has appropriate permissions
     for every referenced catalog. Raises HTTPException(403) if unauthorized.
+
+    A catalog the user has no access to as a whole can still be queried when the statement is one plain SELECT whose every reference to it is
+    a fully qualified table (or schema) the user, or one of their groups, was granted SELECT on (web/table_access.py). Anything that cannot
+    be verified that way is refused.
     """
     if user.get("role") == "admin":
         return
 
     referenced_catalogs = extract_catalogs_from_sql(sql_query)
-    for cat_id in referenced_catalogs:
-        if not can_user_access_catalog(user, cat_id, action=action):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied: User '{user.get('username')}' does not have permission to query catalog '{cat_id}'."
-            )
+    denied = [c for c in sorted(referenced_catalogs) if not can_user_access_catalog(user, c, action=action)]
+    if not denied:
+        return
+    if action.upper() == "READ":
+        from web import table_access
+        if table_access.sql_covered(sql_query, user, denied):
+            return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"Access denied: User '{user.get('username')}' does not have permission to query catalog '{denied[0]}'."
+    )

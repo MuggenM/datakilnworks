@@ -1,0 +1,26 @@
+name: 'localspark_lakehouse'
+version: '1.0.0'
+config-version: 2
+
+profile: 'localspark_dbt'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+on-run-start:
+  - "{{ drop_legacy_duckdb_tables() }}"
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  localspark_lakehouse:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

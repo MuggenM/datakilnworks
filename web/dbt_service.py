@@ -3,17 +3,42 @@ import json
 import uuid
 import datetime
 import subprocess
+import shutil
 import logging
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger("localspark.dbt")
 
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/workspace/dbt_project")
+DBT_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbt_template")
 DBT_RUNS_LOG = os.path.join(DBT_PROJECT_DIR, "logs", "dbt_runs_history.json")
 DBT_DB_PATH = os.path.join(os.getenv("WAREHOUSE_DIR", "/workspace/warehouse"), "dbt_analytics.duckdb")
 
 # In-memory runs cache
 _RUNS_HISTORY: List[Dict[str, Any]] = []
+
+def ensure_project() -> Dict[str, Any]:
+    """A fresh deployment mounts an empty directory (or its own project repo without a profile): seed it from the shipped template.
+    Only files that are missing are created, nothing that exists is ever overwritten, and a directory that already has a
+    dbt_project.yml is left completely alone (it is the deployment's own project)."""
+    if os.path.exists(os.path.join(DBT_PROJECT_DIR, "dbt_project.yml")):
+        return {"seeded": []}
+    seeded = []
+    try:
+        for base, _dirs, files in os.walk(DBT_TEMPLATE_DIR):
+            rel = os.path.relpath(base, DBT_TEMPLATE_DIR)
+            for f in files:
+                dst = os.path.normpath(os.path.join(DBT_PROJECT_DIR, rel, f))
+                if not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy(os.path.join(base, f), dst)
+                    seeded.append(os.path.relpath(dst, DBT_PROJECT_DIR))
+        if seeded:
+            logger.info(f"Seeded the empty dbt project at {DBT_PROJECT_DIR} from the template ({len(seeded)} files).")
+    except Exception as exc:
+        logger.warning(f"Could not seed the dbt project: {exc}")
+    return {"seeded": seeded}
+
 
 def _load_runs_history(user: Optional[str] = None, is_admin: bool = True) -> List[Dict[str, Any]]:
     global _RUNS_HISTORY
@@ -46,22 +71,62 @@ def _save_run_record(record: Dict[str, Any]) -> None:
     except Exception as e:
         logger.warning(f"Failed to persist dbt run record: {e}")
 
+def _package_version(name: str) -> Optional[str]:
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        return None
+
+
+def _profile_output() -> Dict[str, Any]:
+    """The active target's settings from profiles.yml (what dbt will load); {} if it cannot be read."""
+    try:
+        import yaml
+        with open(os.path.join(DBT_PROJECT_DIR, "profiles.yml"), "r", encoding="utf-8") as f:
+            profiles = yaml.safe_load(f) or {}
+        for profile in profiles.values():
+            if isinstance(profile, dict) and isinstance(profile.get("outputs"), dict):
+                target = os.getenv("DBT_TARGET") or profile.get("target")
+                return profile["outputs"].get(target) or next(iter(profile["outputs"].values()), {})
+    except Exception as exc:
+        logger.debug(f"Could not read the dbt profile: {exc}")
+    return {}
+
+
+def _profile_adapter_type() -> Optional[str]:
+    return _profile_output().get("type")
+
+
+def _profile_schema() -> str:
+    """The schema dbt writes to by default (the profile's `schema`; dbt's own default is `main`)."""
+    return str(_profile_output().get("schema") or "main")
+
+
 def get_dbt_status(user: Optional[str] = None, is_admin: bool = True) -> Dict[str, Any]:
     project_exists = os.path.exists(os.path.join(DBT_PROJECT_DIR, "dbt_project.yml"))
     profiles_exists = os.path.exists(os.path.join(DBT_PROJECT_DIR, "profiles.yml"))
 
-    # Check dbt executable
-    dbt_bin = "/usr/local/bin/dbt" if os.path.exists("/usr/local/bin/dbt") else "dbt"
-    version_str = "1.12.4"
-    
+    dbt_version = _package_version("dbt-core")
+    adapter_type = _profile_adapter_type()
+    adapter_version = _package_version("duckrun" if adapter_type == "duckrun" else "dbt-duckdb")
+    if adapter_type == "duckrun":
+        adapter_label = f"duckrun {adapter_version or ''} (DuckDB SQL, Delta Lake tables)".replace("  ", " ")
+    elif adapter_type:
+        adapter_label = f"{adapter_type} {adapter_version or ''}".strip() + " (not duckrun: models are not written as Delta tables)"
+    else:
+        adapter_label = "unknown (profiles.yml unreadable)"
+
     models = list_dbt_models()
     runs = _load_runs_history(user=user, is_admin=is_admin)
     last_run = runs[0] if runs else None
 
     return {
-        "installed": True,
-        "dbt_version": version_str,
-        "adapter": "duckdb (duckrun enabled)",
+        "installed": dbt_version is not None,
+        "dbt_version": dbt_version or "not installed",
+        "adapter": adapter_label,
+        "adapter_type": adapter_type,
+        "uses_duckrun": adapter_type == "duckrun",
         "project_dir": DBT_PROJECT_DIR,
         "project_valid": project_exists and profiles_exists,
         "project_name": "localspark_lakehouse",
@@ -91,6 +156,7 @@ def list_dbt_models() -> Dict[str, Any]:
                     model_list.append({
                         "name": node.get("name"),
                         "unique_id": node_id,
+                        "alias": node.get("alias") or node.get("name"),
                         "path": node.get("original_file_path"),
                         "materialization": config.get("materialized", "view"),
                         "schema": node.get("schema", "main"),
@@ -206,7 +272,8 @@ def get_dbt_model_detail(model_name: str) -> Optional[Dict[str, Any]]:
                 cwd=DBT_PROJECT_DIR,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=30
+                timeout=30,
+                env=__import__("web.dbt_config", fromlist=["dbt_env"]).dbt_env()
             )
             if compiled_path and os.path.exists(compiled_path):
                 with open(compiled_path, "r", encoding="utf-8") as f:
@@ -234,6 +301,15 @@ def get_dbt_model_detail(model_name: str) -> Optional[Dict[str, Any]]:
         "metadata": meta
     }
 
+def _project_sha():
+    """The project's git commit at run time (None when the project is not its own repository), so a run can be traced to code."""
+    try:
+        from web import git_sync
+        return git_sync.head_sha()
+    except Exception:
+        return None
+
+
 def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh: bool = False, target: str = "dev", user: str = "admin") -> Dict[str, Any]:
     run_id = f"run_{uuid.uuid4().hex[:8]}"
     start_time = datetime.datetime.now()
@@ -246,16 +322,25 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
     if target and target.strip():
         cmd.extend(["--target", target.strip()])
 
+    writes_data = action in ("run", "build", "seed", "snapshot")
+    governance = {}
+    if writes_data:
+        # Close the schemas dbt is about to write to *before* the first table exists (see web/dbt_governance.py).
+        from web import dbt_governance
+        governance["before"] = dbt_governance.before_run(actor=user or "dbt")
+
     logger.info(f"Executing dbt command in {DBT_PROJECT_DIR}: {' '.join(cmd)}")
     
     try:
+        from web.dbt_config import dbt_env
         proc = subprocess.run(
             cmd,
             cwd=DBT_PROJECT_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=180
+            timeout=180,
+            env=dbt_env()                       # S3 mounts as DKW_MOUNT_<ID>_* variables, for profiles that land models in a mount
         )
         output = proc.stdout
         exit_code = proc.returncode
@@ -268,6 +353,10 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
         output = f"Execution error: {str(e)}"
         exit_code = 1
         status = "FAILED"
+
+    if writes_data:
+        from web import dbt_governance
+        governance["after"] = dbt_governance.after_run(actor=user or "dbt")
 
     end_time = datetime.datetime.now()
     duration_s = round((end_time - start_time).total_seconds(), 2)
@@ -300,11 +389,26 @@ def run_dbt_cli(action: str = "run", select: Optional[str] = None, full_refresh:
             "pass": pass_count,
             "warn": warn_count,
             "error": error_count
-        }
+        },
+        "governance": governance,
+        "git_sha": _project_sha()
     }
     
     _save_run_record(record)
     return record
+
+def _configure_preview_storage(con) -> None:
+    """Views over Delta tables that dbt landed in an S3 mount need that mount's credentials on the preview connection."""
+    root = str(_profile_output().get("root_path") or "")
+    if not root.lower().startswith("s3://"):
+        return
+    try:
+        from web import autoloader_s3
+        conn = autoloader_s3.resolve_connection({"source_volume_path": root, "source_mount_id": None})
+        autoloader_s3.configure_duckdb(con, conn)
+    except Exception as exc:
+        logger.warning(f"Could not configure S3 access for the dbt preview: {exc}")
+
 
 def preview_dbt_model_data(model_name: str, limit: int = 50) -> Dict[str, Any]:
     """Queries the materialized table/view in dbt_analytics.duckdb."""
@@ -315,12 +419,14 @@ def preview_dbt_model_data(model_name: str, limit: int = 50) -> Dict[str, Any]:
     con = None
     try:
         con = duckdb.connect(DBT_DB_PATH, read_only=True)
-        df = con.execute(f"SELECT * FROM {model_name} LIMIT {limit}").df()
+        _configure_preview_storage(con)
+        rel = f'"{_profile_schema()}"."{model_name}"'          # qualified: an old run may have left a same-named table in `main`
+        df = con.execute(f"SELECT * FROM {rel} LIMIT {limit}").df()
         columns = list(df.columns)
         import numpy as np
         df_clean = df.replace({np.nan: None})
         rows = df_clean.to_dict(orient="records")
-        total_count = con.execute(f"SELECT COUNT(*) FROM {model_name}").fetchone()[0]
+        total_count = con.execute(f"SELECT COUNT(*) FROM {rel}").fetchone()[0]
         return {
             "columns": columns,
             "rows": rows,
@@ -358,6 +464,7 @@ def preview_cte_step(model_name: str, cte_name: str, limit: int = 50) -> Dict[st
 
         con = duckdb.connect(DBT_DB_PATH, read_only=True)
         con.execute("INSTALL delta; LOAD delta;")
+        _configure_preview_storage(con)
         df = con.execute(test_sql).df()
         import numpy as np
         df_clean = df.replace({np.nan: None})

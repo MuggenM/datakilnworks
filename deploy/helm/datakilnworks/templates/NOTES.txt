@@ -1,0 +1,8 @@
+Data Kiln Works is installing.
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "dkw.fullname" . }}-studio
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "dkw.fullname" . }}-studio -c init      # the initialisation result
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "dkw.fullname" . }} 8891:{{ .Values.service.port }}     # then http://localhost:8891
+
+If the pod shows Init:Error the initialisation refused to continue: read its log (usually the bootstrap admin or a volume's owner).
+Sign in as {{ .Values.secrets.initAdminUsername }} (you must change the password at the first sign-in).

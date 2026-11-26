@@ -5,24 +5,87 @@ services:
       dockerfile: Dockerfile
     image: localspark-lakehouse-notebook
     container_name: local-datakilnworks-studio
-    command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    depends_on:
+      datakilnworks-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    command: ["python", "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--reload"]
     ports:
       - "${STUDIO_PORT:-8891}:8000"
-    environment:
+    environment: &studio-env
       - WAREHOUSE_DIR=/workspace/warehouse
+      # Secrets off the warehouse volume (web/secrets_store.py): signing / encryption keys and auth.db on `dkw-secrets` (studio + init only),
+      # compute_token + governance_salt on `dkw-compute-secrets` (also the compute nodes). Moved out of warehouse/.metadata automatically
+      # on the first start; removing these variables afterwards is refused (a `.moved` marker), never answered with fresh keys.
+      - DKW_SECRETS_DIR=/workspace/secrets
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets
+      # Server-side sessions (web/sessions.py): minutes of inactivity after which a session ends (0 = only the 24 h lifetime).
+      - SESSION_IDLE_MINUTES=${SESSION_IDLE_MINUTES:-0}
+      # true (default): a request without credentials is the least-privilege `anonymous` user. false = the old single-user mode, in which
+      # such a request runs as the local admin (anyone who can reach the port is admin): only for a studio nobody else can reach.
+      - GOVERNANCE_REQUIRE_AUTH=${GOVERNANCE_REQUIRE_AUTH:-true}
       - WH_STARTER_ENDPOINT=http://compute-node-01:8001
       - WH_ANALYTICS_ENDPOINT=http://compute-node-02:8002
       - WH_ETL_ENDPOINT=http://compute-node-03:8003
+      # Bootstrap-only: consulted once, only if the users table is empty (a brand-new warehouse volume).
+      # Generate INIT_ADMIN_PASSWORD_HASH with `docker compose exec datakilnworks-studio python -m web.auth hash-password`
+      # and set these in .env -- see web/auth.py::_init_admin_from_env. Never affects an already-seeded warehouse.
+      - INIT_ADMIN_USERNAME=${INIT_ADMIN_USERNAME:-}
+      - INIT_ADMIN_PASSWORD_HASH=${INIT_ADMIN_PASSWORD_HASH:-}
+      - INIT_ADMIN_DISPLAY_NAME=${INIT_ADMIN_DISPLAY_NAME:-}
+      # Idle SQL warehouses are really suspended (their compute-node container stopped) after `auto_stop_mins`, and resumed
+      # by the next query. `pause` freezes the container instead of stopping it (instant resume, memory stays allocated).
+      - WAREHOUSE_SUSPEND_MODE=${WAREHOUSE_SUSPEND_MODE:-stop}
+      # Git sync of the dbt project (Transformations > Project files > Git). Off unless GIT_REMOTE_URL is set. See .env.example.
+      - GIT_REMOTE_URL=${GIT_REMOTE_URL:-}
+      - GIT_BRANCH=${GIT_BRANCH:-main}
+      - GIT_TOKEN=${GIT_TOKEN:-}
+      # direct (default) | pull_request: commit to a change branch and open a pull request on the server (Gitea API) instead of pushing to the base branch
+      - GIT_MODE=${GIT_MODE:-direct}
+      - GIT_API_URL=${GIT_API_URL:-}
+      # gitea | github | gitlab (default: guessed from the host name of the remote URL)
+      - GIT_FORGE=${GIT_FORGE:-}
+      # Git sync of the shared notebooks (Workspace > Git; only notebooks/Shared). The token falls back to GIT_TOKEN.
+      - NOTEBOOKS_GIT_REMOTE_URL=${NOTEBOOKS_GIT_REMOTE_URL:-}
+      - NOTEBOOKS_GIT_BRANCH=${NOTEBOOKS_GIT_BRANCH:-main}
+      - NOTEBOOKS_GIT_TOKEN=${NOTEBOOKS_GIT_TOKEN:-}
+      - NOTEBOOKS_GIT_MODE=${NOTEBOOKS_GIT_MODE:-direct}
+      - NOTEBOOKS_GIT_API_URL=${NOTEBOOKS_GIT_API_URL:-}
+      - NOTEBOOKS_GIT_FORGE=${NOTEBOOKS_GIT_FORGE:-}
+      # IP allowlist (Users & IAM > Network access). TRUSTED_PROXIES: CIDRs of reverse proxies whose X-Forwarded-For is believed (added to the setting).
+      # IP_ALLOWLIST_OVERRIDE=off suspends enforcement (break-glass); MFA_POLICY_OVERRIDE=off does the same for the required-MFA policy.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      - IP_ALLOWLIST_OVERRIDE=${IP_ALLOWLIST_OVERRIDE:-}
+      - MFA_POLICY_OVERRIDE=${MFA_POLICY_OVERRIDE:-}
+      # Passkeys (WebAuthn): RP id / origins default to the request's host; set them only when the studio is reached under several names.
+      - WEBAUTHN_RP_ID=${WEBAUTHN_RP_ID:-}
+      - WEBAUTHN_ORIGINS=${WEBAUTHN_ORIGINS:-}
+      - WEBAUTHN_PASSWORDLESS=${WEBAUTHN_PASSWORDLESS:-on}
+      # Delta Sharing: the public address of the protocol in recipient profiles (blank = the request's origin), and the on/off switch.
+      - DELTA_SHARING_ENDPOINT=${DELTA_SHARING_ENDPOINT:-}
+      - DELTA_SHARING=${DELTA_SHARING:-on}
     volumes:
       - ./notebooks:/workspace/notebooks
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
-      - ./dbt_project:/workspace/dbt_project
+      # The dbt project (models + profiles.yml + dbt_project.yml). In production point DBT_PROJECT_HOST_DIR at a checkout of your OWN
+      # project repository; an empty directory is seeded from web/dbt_template on first start. See .env.example.
+      - ${DBT_PROJECT_HOST_DIR:-./dbt_project}:/workspace/dbt_project
       - ./docs:/workspace/docs
+      - dkw-secrets:/workspace/secrets
+      - dkw-compute-secrets:/workspace/compute-secrets
       - sandbox-secret:/run/sandbox:ro
+      - controller-secret:/run/controller:ro
     networks:
       - default
       - sandbox-net
+      - control-net
+      - proxy-net
     deploy:
       resources:
         limits:
@@ -30,6 +93,64 @@ services:
         reservations:
           memory: 1G
     restart: unless-stopped
+
+  # Optional TLS reverse proxy: `docker compose --profile proxy up -d` (see deploy/traefik/README.md). File provider only: Traefik never gets the Docker
+  # socket. Set DELTA_SHARING_ENDPOINT to the public https address so Delta Sharing profiles and file links use it.
+  traefik:
+    image: traefik:v3.0
+    container_name: local-traefik
+    profiles: ["proxy"]
+    depends_on:
+      - datakilnworks-studio
+    command:
+      - --global.checknewversion=false
+      - --global.sendanonymoususage=false
+      - --api=false
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=:${TRAEFIK_HTTPS_PORT:-8443}
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      # Let's Encrypt (HTTP-01), used only when TRAEFIK_CERT_RESOLVER=le and TRAEFIK_DOMAIN is set; otherwise the certificate comes from
+      # dynamic/certs.yml or Traefik's built-in self-signed one.
+      - --certificatesresolvers.le.acme.email=${TRAEFIK_ACME_EMAIL:-admin@example.com}
+      - --certificatesresolvers.le.acme.storage=/acme/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      - --entrypoints.websecure.http.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-}
+      - --entrypoints.websecure.http.tls.domains[0].main=${TRAEFIK_DOMAIN:-localhost}
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-8080}:80"
+      - "${TRAEFIK_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./deploy/traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./deploy/traefik/certs:/certs:ro
+      - traefik-acme:/acme
+    networks:
+      - proxy-net
+    restart: unless-stopped
+
+  # One-shot initialisation (python -m web.init), same image: validates the bootstrap-admin settings, creates / migrates every database, seeds
+  # the dbt project and checks the volumes BEFORE the studio starts. A misconfiguration fails here with a readable message instead of putting the
+  # studio into a restart loop; on success the studio starts. Every step is idempotent (also run by the studio itself). In Kubernetes the same
+  # command runs as an initContainer (deploy/helm/datakilnworks). `docker compose logs datakilnworks-init` shows the result.
+  datakilnworks-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: localspark-lakehouse-notebook
+    container_name: local-datakilnworks-init
+    command: ["python", "-m", "web.init"]
+    environment: *studio-env
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./warehouse:/workspace/warehouse
+      - ./web:/workspace/web
+      - ${DBT_PROJECT_HOST_DIR:-./dbt_project}:/workspace/dbt_project
+      - dkw-secrets:/workspace/secrets
+      - dkw-compute-secrets:/workspace/compute-secrets
+    restart: "no"
 
   # Runs the notebook kernels of users a masking policy applies to. It has no warehouse mount, is alone with the studio on an
   # internal network (no internet, no compute nodes), and kernels read data only through the studio's governed endpoint.
@@ -71,6 +192,38 @@ services:
           pids: 1024
     restart: unless-stopped
 
+  # The only holder of the Docker socket: lets the studio stop / start / pause / unpause the compute-node containers behind
+  # idle SQL warehouses, and nothing else (no exec, create, remove, images; allow-listed services of this project only,
+  # token-authenticated, alone with the studio on an internal network). See controller/controller.py. Remove this service
+  # (and the docker.sock mount with it) to run without container auto-suspend: warehouses then keep their flag-only behaviour.
+  container-controller:
+    image: localspark-lakehouse-notebook
+    container_name: local-container-controller
+    command: ["python", "-m", "uvicorn", "controller:app", "--app-dir", "/opt/controller", "--host", "0.0.0.0", "--port", "8000"]
+    expose:
+      - "8000"
+    environment:
+      - CONTROLLER_ALLOWED_SERVICES=compute-node-01,compute-node-02,compute-node-03
+    volumes:
+      - ./controller:/opt/controller:ro
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      - controller-secret:/run/controller
+    tmpfs:
+      - /tmp
+    networks:
+      - control-net
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 128
+    restart: unless-stopped
+
   compute-node-01:
     image: localspark-lakehouse-notebook
     depends_on:
@@ -88,9 +241,11 @@ services:
       - MAX_MEMORY=2GB
       - THREADS=2
       - WORKER_PORT=8001
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets     # compute_token + governance_salt only: no session or encryption key here
     volumes:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
+      - dkw-compute-secrets:/workspace/compute-secrets
     deploy:
       resources:
         limits:
@@ -116,9 +271,11 @@ services:
       - MAX_MEMORY=4GB
       - THREADS=4
       - WORKER_PORT=8002
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets     # compute_token + governance_salt only: no session or encryption key here
     volumes:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
+      - dkw-compute-secrets:/workspace/compute-secrets
     deploy:
       resources:
         limits:
@@ -144,9 +301,11 @@ services:
       - MAX_MEMORY=4GB
       - THREADS=4
       - WORKER_PORT=8003
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets     # compute_token + governance_salt only: no session or encryption key here
     volumes:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
+      - dkw-compute-secrets:/workspace/compute-secrets
     deploy:
       resources:
         limits:
@@ -156,9 +315,20 @@ services:
     restart: unless-stopped
 
 networks:
+  # Shared by the studio and the optional Traefik proxy. No fixed subnet on purpose (a fixed one collides with other Docker networks on many
+  # machines and would break the whole stack): set TRUSTED_PROXIES to this network's subnet, see deploy/traefik/README.md.
+  proxy-net:
   sandbox-net:
+    internal: true
+  control-net:
     internal: true
 
 volumes:
+  # Back these up together with ./warehouse (and keep them apart from it): without dkw-secrets nobody can sign in and stored credentials
+  # cannot be decrypted; without dkw-compute-secrets hashed masks change.
+  dkw-secrets:
+  dkw-compute-secrets:
+  traefik-acme:
+  controller-secret:
   sandbox-secret:
   sandbox-state:

@@ -44,7 +44,7 @@ def init_experiments_db():
                     name TEXT UNIQUE NOT NULL,
                     artifact_location TEXT NOT NULL,
                     lifecycle_stage TEXT NOT NULL DEFAULT 'active',
-                    user_id TEXT NOT NULL DEFAULT 'martin',
+                    user_id TEXT NOT NULL DEFAULT 'admin',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -61,7 +61,7 @@ def init_experiments_db():
                     start_time INTEGER NOT NULL,
                     end_time INTEGER DEFAULT NULL,
                     duration_ms REAL DEFAULT 0.0,
-                    user_id TEXT NOT NULL DEFAULT 'martin',
+                    user_id TEXT NOT NULL DEFAULT 'admin',
                     source_type TEXT NOT NULL DEFAULT 'NOTEBOOK',
                     source_name TEXT DEFAULT '',
                     lifecycle_stage TEXT NOT NULL DEFAULT 'active',
@@ -217,7 +217,7 @@ def init_experiments_db():
                 os.makedirs(def_artifact, exist_ok=True)
                 conn.execute(
                     "INSERT INTO experiments (experiment_id, name, artifact_location, lifecycle_stage, user_id, created_at, updated_at) "
-                    "VALUES (?, ?, ?, 'active', 'martin', ?, ?)",
+                    "VALUES (?, ?, ?, 'active', 'admin', ?, ?)",
                     (def_exp_id, "Default", def_artifact, now_str, now_str)
                 )
                 logger.info("Initialized default experiment '0'")
@@ -238,7 +238,7 @@ def init_experiments_db():
 # MLflow 2.0 REST API Service Implementation
 # =========================================================================
 
-def mlflow_create_experiment(name: str, artifact_location: Optional[str] = None, user_id: str = "martin") -> Dict[str, Any]:
+def mlflow_create_experiment(name: str, artifact_location: Optional[str] = None, user_id: str = "admin") -> Dict[str, Any]:
     name = (name or "").strip()
     if not name:
         raise ValueError("Experiment name cannot be empty")
@@ -327,7 +327,7 @@ def mlflow_list_experiments(view_type: str = "ACTIVE_ONLY", user_id: Optional[st
             exp_user = (r["user_id"] or "").strip().lower()
             u_filter = (user_id or "").strip().lower()
             is_owner = bool(u_filter and exp_user == u_filter)
-            is_shared = exp_user in ("0", "default", "shared", "admin", "martin")
+            is_shared = exp_user in ("0", "default", "shared", "admin")
             if not is_admin and u_filter and not (is_owner or is_shared):
                 continue
 
@@ -423,7 +423,7 @@ def mlflow_create_run(
     experiment_id: str,
     run_name: Optional[str] = None,
     start_time: Optional[int] = None,
-    user_id: str = "martin",
+    user_id: str = "admin",
     tags: Optional[List[Dict[str, str]]] = None,
     source_type: str = "NOTEBOOK",
     source_name: str = ""
@@ -1396,7 +1396,7 @@ def seed_demo_experiments() -> Dict[str, Any]:
         ],
         tags=[
             {"key": "framework", "value": "xgboost"},
-            {"key": "mlflow.user", "value": "martin"},
+            {"key": "mlflow.user", "value": "admin"},
             {"key": "candidate_stage", "value": "Production"}
         ]
     )
@@ -1432,7 +1432,7 @@ def seed_demo_experiments() -> Dict[str, Any]:
         ],
         tags=[
             {"key": "framework", "value": "scikit-learn"},
-            {"key": "mlflow.user", "value": "martin"},
+            {"key": "mlflow.user", "value": "admin"},
             {"key": "candidate_stage", "value": "Staging"}
         ]
     )
@@ -1468,7 +1468,7 @@ def seed_demo_experiments() -> Dict[str, Any]:
         ],
         tags=[
             {"key": "framework", "value": "scikit-learn"},
-            {"key": "mlflow.user", "value": "martin"},
+            {"key": "mlflow.user", "value": "admin"},
             {"key": "candidate_stage", "value": "Archived"}
         ]
     )
@@ -1601,7 +1601,7 @@ def seed_default_traces(conn: sqlite3.Connection):
         INSERT OR REPLACE INTO trace_assessments (
             assessment_id, trace_id, source_type, source_id, name, value, rationale, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-    """, (f"asm_{uuid.uuid4().hex[:8]}", tr1_id, "HUMAN", "martin", "groundedness", "thumbs_up", "Accurate mTLS steps with correct server.properties directive", now_str))
+    """, (f"asm_{uuid.uuid4().hex[:8]}", tr1_id, "HUMAN", "admin", "groundedness", "thumbs_up", "Accurate mTLS steps with correct server.properties directive", now_str))
 
     # 2. Trace: SQL Copilot Agent
     tr2_id = "tr_sql_copilot_9e2b"

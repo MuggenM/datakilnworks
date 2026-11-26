@@ -72,7 +72,7 @@ def _log_notebook_query(query_text: str, duration_ms: float, rows: int = 0, stat
                     rows_produced, status, error_message, client,
                     is_mutation, user
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (qid, query_text.strip(), now_str, round(duration_ms, 2), rows, status, err, "NOTEBOOK", 0, "martin"))
+            """, (qid, query_text.strip(), now_str, round(duration_ms, 2), rows, status, err, "NOTEBOOK", 0, "admin"))
     except Exception:
         pass
 

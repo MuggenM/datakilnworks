@@ -548,14 +548,30 @@ def list_dashboard_shares(dashboard_id: Optional[str] = None) -> List[Dict[str, 
 
     return sorted(shares, key=lambda x: x["created_at"], reverse=True)
 
-def execute_widget_query(conn, query: str, params: Optional[Dict[str, Any]] = None, principal=None) -> Dict[str, Any]:
+def execute_widget_query(conn, query: str, params: Optional[Dict[str, Any]] = None, principal=None, bound: bool = False) -> Dict[str, Any]:
     """
     Runs a widget query for `principal` (a user dict or Principal). A missing principal means least privilege, never
     admin. The result cache is keyed by the set of masks the query ran under, so a result computed for an exempt
     viewer is never served to a masked one (and vice versa).
+
+    `bound=True` means `query` already had its parameters substituted by web/dashboard_apps.py (typed, validated
+    literals): the legacy `:name` regex pass is skipped, because it would also rewrite a `:word` inside a value.
+    A viewer is also held to the catalog / table ACLs here, exactly like the SQL editor (a dashboard author's widget
+    must not read a catalog the viewer cannot).
     """
     from web.governance import gateway
-    resolved_query = resolve_query_parameters(query, params)
+    if not (query or "").strip():
+        return {"success": True, "query_id": None, "query_executed": "", "columns": [], "rows": [], "row_count": 0,
+                "elapsed_ms": 0, "error": None, "from_cache": False, "masked_columns": []}
+    resolved_query = query if bound else resolve_query_parameters(query, params)
+    if isinstance(principal, dict) and principal.get("role"):
+        try:
+            from web.permissions import enforce_sql_permissions
+            enforce_sql_permissions(resolved_query, principal, action="READ")
+        except Exception as e:  # HTTPException(403) -> a normal failed widget, not a failed page
+            detail = getattr(e, "detail", None) or str(e)
+            return {"success": False, "query_id": None, "query_executed": resolved_query, "columns": [], "rows": [], "row_count": 0,
+                    "elapsed_ms": 0, "error": detail, "governance_blocked": True, "from_cache": False, "masked_columns": []}
     gov = gateway.govern_sql(resolved_query, principal, client="dashboard")
     if gov.blocked:
         return {"success": False, "query_id": None, "query_executed": resolved_query, "columns": [], "rows": [], "row_count": 0,

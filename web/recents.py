@@ -18,7 +18,7 @@ def init_recents_db():
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS recents (
                     id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL DEFAULT 'martin',
+                    user_id TEXT NOT NULL DEFAULT 'admin',
                     item_type TEXT NOT NULL,
                     item_id TEXT NOT NULL,
                     title TEXT NOT NULL,
@@ -60,7 +60,7 @@ def record_recent(
     title: str,
     subtitle: str = "",
     metadata: Optional[Dict[str, Any]] = None,
-    user_id: str = "martin"
+    user_id: str = "admin"
 ) -> Dict[str, Any]:
     """
     Records or updates a recent item access event for a specific user.
@@ -68,7 +68,7 @@ def record_recent(
     and updates last_accessed_at while preserving pin status.
     """
     init_recents_db()
-    uid = (user_id or "martin").strip().lower()
+    uid = (user_id or "admin").strip().lower()
     itype = item_type.strip().lower()
     iid = item_id.strip()
     clean_title = (title or os.path.basename(iid) or iid).strip()
@@ -125,7 +125,7 @@ def record_recent(
 
 
 def get_recents(
-    user_id: str = "martin",
+    user_id: str = "admin",
     item_type: Optional[str] = None,
     search: Optional[str] = None,
     limit: int = 50
@@ -135,7 +135,7 @@ def get_recents(
     Supports filtering by item_type and fuzzy title/subtitle searching.
     """
     init_recents_db()
-    uid = (user_id or "martin").strip().lower()
+    uid = (user_id or "admin").strip().lower()
     conditions = ["user_id = ?"]
     params: List[Any] = [uid]
 
@@ -177,10 +177,10 @@ def get_recents(
     return results
 
 
-def toggle_pin_recent(item_type: str, item_id: str, user_id: str = "martin") -> Dict[str, Any]:
+def toggle_pin_recent(item_type: str, item_id: str, user_id: str = "admin") -> Dict[str, Any]:
     """Toggles the pinned / favorite status of a recent item."""
     init_recents_db()
-    uid = (user_id or "martin").strip().lower()
+    uid = (user_id or "admin").strip().lower()
     itype = item_type.strip().lower()
     iid = item_id.strip()
 
@@ -211,10 +211,10 @@ def toggle_pin_recent(item_type: str, item_id: str, user_id: str = "martin") -> 
         return {"success": False, "error": str(e)}
 
 
-def delete_recent(item_type: str, item_id: str, user_id: str = "martin") -> bool:
+def delete_recent(item_type: str, item_id: str, user_id: str = "admin") -> bool:
     """Removes a single item from user's recents."""
     init_recents_db()
-    uid = (user_id or "martin").strip().lower()
+    uid = (user_id or "admin").strip().lower()
     itype = item_type.strip().lower()
     iid = item_id.strip()
 
@@ -231,7 +231,7 @@ def delete_recent(item_type: str, item_id: str, user_id: str = "martin") -> bool
 
 
 def clear_recents(
-    user_id: str = "martin",
+    user_id: str = "admin",
     item_type: Optional[str] = None,
     include_pinned: bool = False
 ) -> int:
@@ -240,7 +240,7 @@ def clear_recents(
     Optionally filters by item_type. Returns number of deleted rows.
     """
     init_recents_db()
-    uid = (user_id or "martin").strip().lower()
+    uid = (user_id or "admin").strip().lower()
     conditions = ["user_id = ?"]
     params: List[Any] = [uid]
 

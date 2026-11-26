@@ -143,7 +143,7 @@ def _sandbox_ips() -> frozenset:
 def is_sandbox_peer(client_ip: Optional[str]) -> bool:
     """
     True when the request comes from the sandbox container. Requests without credentials are the local admin in the
-    default single-user mode, so everything a kernel could reach on the studio besides /api/sandbox/* is refused.
+    single-user mode (GOVERNANCE_REQUIRE_AUTH=false), so everything a kernel could reach on the studio besides /api/sandbox/* is refused.
     """
     if not client_ip or not sandbox_url():
         return False

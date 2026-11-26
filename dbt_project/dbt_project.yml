@@ -11,6 +11,9 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
 
+on-run-start:
+  - "{{ drop_legacy_duckdb_tables() }}"
+
 clean-targets:
   - "target"
   - "dbt_packages"

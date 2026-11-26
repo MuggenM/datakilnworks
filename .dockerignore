@@ -1,0 +1,10 @@
+# Keep data, secrets and development leftovers out of the build context (the Dockerfile only copies requirements.txt, config/, web/ and docs/).
+.git
+.env
+warehouse
+notebooks
+dbt_project
+scratch
+**/__pycache__
+**/*.pyc
+web/static/node_modules

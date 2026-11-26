@@ -23,7 +23,7 @@ def init_alerts_db():
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sql_alerts (
                     id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL DEFAULT 'martin',
+                    user_id TEXT NOT NULL DEFAULT 'admin',
                     name TEXT NOT NULL,
                     description TEXT DEFAULT '',
                     query_id TEXT DEFAULT NULL,
@@ -55,7 +55,7 @@ def init_alerts_db():
                 CREATE TABLE IF NOT EXISTS alert_evaluations (
                     id TEXT PRIMARY KEY,
                     alert_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL DEFAULT 'martin',
+                    user_id TEXT NOT NULL DEFAULT 'admin',
                     evaluated_at TEXT NOT NULL,
                     observed_value TEXT,
                     threshold_value TEXT,
@@ -85,7 +85,7 @@ def _seed_default_alerts(conn: sqlite3.Connection):
     defaults = [
         (
             "alt_low_stock_watch",
-            "martin",
+            "admin",
             "Critical Product Low Stock Alert",
             "Monitors warehouse inventory to flag any items falling below safety reorder levels (< 25 units).",
             None,
@@ -110,7 +110,7 @@ def _seed_default_alerts(conn: sqlite3.Connection):
         ),
         (
             "alt_payroll_cap_monitor",
-            "martin",
+            "admin",
             "Executive Payroll Outlier Breach",
             "Validates that no individual base compensation in silver_employees exceeds the $150,000 threshold.",
             None,
@@ -135,7 +135,7 @@ def _seed_default_alerts(conn: sqlite3.Connection):
         ),
         (
             "alt_sensor_temp_critical",
-            "martin",
+            "admin",
             "Lakehouse Sensor Temp Critical Spikes",
             "Monitors telemetry feed to detect equipment operating at critical temperatures above 85°C.",
             None,
@@ -329,7 +329,7 @@ def execute_alert_check(alert_id: str, triggered_by: str = "scheduler", user_id:
         """, (
             eval_id,
             alert_id,
-            user_id or alert.get("user_id", "martin"),
+            user_id or alert.get("user_id", "admin"),
             now_str,
             observed_str,
             str(alert.get("threshold_value", "")),
@@ -458,7 +458,7 @@ async def _run_alert_check_async(alert_id: str):
 # --- CRUD Functions ---
 
 def get_alerts(
-    user_id: str = "martin",
+    user_id: str = "admin",
     state_filter: Optional[str] = None,
     search: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -503,7 +503,7 @@ def get_alert(alert_id: str) -> Optional[Dict[str, Any]]:
         return alert
 
 
-def create_alert(data: Dict[str, Any], user_id: str = "martin") -> Dict[str, Any]:
+def create_alert(data: Dict[str, Any], user_id: str = "admin") -> Dict[str, Any]:
     """Creates a new SQL alert definition."""
     alert_id = f"alt_{uuid.uuid4().hex[:8]}"
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -546,7 +546,7 @@ def create_alert(data: Dict[str, Any], user_id: str = "martin") -> Dict[str, Any
     return get_alert(alert_id) or {"id": alert_id}
 
 
-def update_alert(alert_id: str, data: Dict[str, Any], user_id: str = "martin") -> Optional[Dict[str, Any]]:
+def update_alert(alert_id: str, data: Dict[str, Any], user_id: str = "admin") -> Optional[Dict[str, Any]]:
     """Updates an existing SQL alert definition."""
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -599,7 +599,7 @@ def update_alert(alert_id: str, data: Dict[str, Any], user_id: str = "martin") -
     return get_alert(alert_id)
 
 
-def delete_alert(alert_id: str, user_id: str = "martin") -> bool:
+def delete_alert(alert_id: str, user_id: str = "admin") -> bool:
     """Deletes an alert and its evaluation history."""
     with get_db_connection() as conn:
         conn.execute("DELETE FROM alert_evaluations WHERE alert_id = ?;", (alert_id,))
@@ -607,7 +607,7 @@ def delete_alert(alert_id: str, user_id: str = "martin") -> bool:
         return cur.rowcount > 0
 
 
-def toggle_mute_alert(alert_id: str, user_id: str = "martin") -> Optional[Dict[str, Any]]:
+def toggle_mute_alert(alert_id: str, user_id: str = "admin") -> Optional[Dict[str, Any]]:
     """Toggles muted status for an alert."""
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db_connection() as conn:
@@ -622,7 +622,7 @@ def toggle_mute_alert(alert_id: str, user_id: str = "martin") -> Optional[Dict[s
     return get_alert(alert_id)
 
 
-def toggle_enable_alert(alert_id: str, user_id: str = "martin") -> Optional[Dict[str, Any]]:
+def toggle_enable_alert(alert_id: str, user_id: str = "admin") -> Optional[Dict[str, Any]]:
     """Toggles enabled/disabled status for an alert."""
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db_connection() as conn:
@@ -647,7 +647,7 @@ def get_alert_evaluations(alert_id: str, limit: int = 50) -> List[Dict[str, Any]
         return [dict(r) for r in cur.fetchall()]
 
 
-def get_alerts_summary(user_id: str = "martin") -> Dict[str, Any]:
+def get_alerts_summary(user_id: str = "admin") -> Dict[str, Any]:
     """Returns high-level summary KPIs and list of active triggered alerts for badges and modals."""
     with get_db_connection() as conn:
         cur = conn.execute("""

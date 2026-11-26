@@ -17,13 +17,14 @@ from datetime import timedelta
 import jwt
 from fastapi import Request, HTTPException, Depends, status
 
-from web.secrets_store import load_or_create_secret
+from web.secrets_store import load_or_create_secret, secret_path
 
 logger = logging.getLogger("localspark.auth")
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
-AUTH_DB_FILE = os.path.join(METADATA_DIR, "auth.db")
+# The accounts database lives with the keys (DKW_SECRETS_DIR, web/secrets_store.py), not on the data volume; unset = .metadata as before.
+AUTH_DB_FILE = secret_path("auth.db")
 
 
 
@@ -37,10 +38,43 @@ COOKIE_NAME = "localspark_session"
 
 def get_db_connection() -> sqlite3.Connection:
     """Returns a SQLite connection to the auth database."""
-    os.makedirs(METADATA_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(AUTH_DB_FILE), exist_ok=True)
     conn = sqlite3.connect(AUTH_DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _init_admin_from_env() -> "tuple[str, str, str]":
+    """
+    Reads the bootstrap admin from INIT_ADMIN_USERNAME / INIT_ADMIN_PASSWORD_HASH / INIT_ADMIN_DISPLAY_NAME.
+    Raises SystemExit(1) (logged, not a traceback) if the studio is starting with no accounts at all and no
+    admin is configured -- a fresh deployment with nobody able to log in is a misconfiguration, not something to
+    paper over with a hardcoded default password. Generate the hash with:
+        docker compose exec datakilnworks-studio python -m web.auth hash-password
+    """
+    import re
+    username = (os.getenv("INIT_ADMIN_USERNAME") or "admin").strip().lower()
+    pw_hash = (os.getenv("INIT_ADMIN_PASSWORD_HASH") or "").strip()
+    display_name = (os.getenv("INIT_ADMIN_DISPLAY_NAME") or "Administrator").strip()
+    if not pw_hash:
+        logger.critical(
+            "No admin account exists yet and INIT_ADMIN_PASSWORD_HASH is not set. Generate one with "
+            "`docker compose exec datakilnworks-studio python -m web.auth hash-password`, then set "
+            "INIT_ADMIN_USERNAME (default 'admin') and INIT_ADMIN_PASSWORD_HASH in the environment (e.g. .env) "
+            "and restart. Refusing to start with no way to log in."
+        )
+        raise SystemExit(1)
+    if not re.fullmatch(r"pbkdf2_sha256\$\d+\$[0-9a-f]+\$[0-9a-f]+", pw_hash):
+        logger.critical(
+            "INIT_ADMIN_PASSWORD_HASH is not a hash this build recognises (expected the output of "
+            "`python -m web.auth hash-password`). Refusing to store it as-is: if this is meant to be the plain "
+            "password rather than its hash, every login would then compare against it in the clear."
+        )
+        raise SystemExit(1)
+    if not username or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", username):
+        logger.critical(f"INIT_ADMIN_USERNAME '{username}' is not a usable username.")
+        raise SystemExit(1)
+    return username, pw_hash, display_name or "Administrator"
 
 
 def init_auth_db():
@@ -70,6 +104,50 @@ def init_auth_db():
                 conn.execute("ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'")
             if "password_changed_at" not in existing:
                 conn.execute("ALTER TABLE users ADD COLUMN password_changed_at INTEGER")
+            # `deleted_at` (nullable): soft-deleted, distinct from `is_active`. A deactivated user (is_active=0,
+            # deleted_at NULL) stays in the list, greyed out -- an admin paused them, or LDAP sync no longer found
+            # their directory entry. A deleted user (deleted_at set) is hidden from the list by default and always
+            # implicitly inactive; `list_users(include_deleted=True)` or the UI's "Show deleted users" reveals them.
+            # Two-factor (TOTP) state, owned by web/mfa.py. Never returned by the user getters below.
+            for col, ddl in (("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                             ("totp_last_step", "INTEGER NOT NULL DEFAULT 0"), ("totp_backup", "TEXT"),
+                             ("totp_failures", "INTEGER NOT NULL DEFAULT 0"), ("totp_locked_until", "INTEGER NOT NULL DEFAULT 0")):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+            # Organisation-wide MFA policy (web/mfa_policy.py): when the account enrolled, an administrator's exemption (with reason) and an extended deadline.
+            for col, ddl in (("totp_enrolled_at", "INTEGER"), ("mfa_exempt", "INTEGER NOT NULL DEFAULT 0"), ("mfa_exempt_reason", "TEXT"), ("mfa_deadline_override", "INTEGER")):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+            # SCIM 2.0 provisioning (web/scim.py): only accounts SCIM created (scim_managed = 1) are visible to and changeable by a SCIM client.
+            for col, ddl in (("scim_managed", "INTEGER NOT NULL DEFAULT 0"), ("scim_external_id", "TEXT"), ("scim_extra", "TEXT"), ("scim_modified_at", "TEXT")):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+            if "deleted_at" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+            # WebAuthn passkeys / security keys (web/webauthn_auth.py): the public key of each credential, and the single-use challenges of sign-ins in progress.
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, public_key TEXT NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
+                name TEXT NOT NULL, transports TEXT, device_type TEXT, backed_up INTEGER NOT NULL DEFAULT 0, uv INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(user_id)")
+            if "passwordless" not in existing:                     # passkey-only account: no usable password (web/webauthn_auth.py enrolment links)
+                conn.execute("ALTER TABLE users ADD COLUMN passwordless INTEGER NOT NULL DEFAULT 0")
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_enrollments (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires INTEGER NOT NULL, created_by TEXT, created_at INTEGER NOT NULL, used_at INTEGER)""")
+            for col, ddl in (("aaguid", "TEXT"), ("attestation_fmt", "TEXT"), ("attested", "INTEGER NOT NULL DEFAULT 0")):        # authenticator model / attestation (webauthn_policy)
+                if col not in {r[1] for r in conn.execute("PRAGMA table_info(webauthn_credentials)").fetchall()}:
+                    conn.execute(f"ALTER TABLE webauthn_credentials ADD COLUMN {col} {ddl}")
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_policy (id INTEGER PRIMARY KEY CHECK (id = 1), mode TEXT NOT NULL DEFAULT 'none', allowed TEXT NOT NULL DEFAULT '[]',
+                roots_pem TEXT NOT NULL DEFAULT '', updated_by TEXT, updated_at INTEGER)""")
+            if "hardware_roles" not in {r[1] for r in conn.execute("PRAGMA table_info(webauthn_policy)").fetchall()}:
+                # Per-role requirement (web/webauthn_auth.py): a role in this list may only register a passkey / security key whose
+                # attestation chain verifies (a real hardware authenticator), never a synced passkey -- for example, requiring
+                # administrators to use hardware security keys even while the organisation-wide attestation mode stays lenient.
+                conn.execute("ALTER TABLE webauthn_policy ADD COLUMN hardware_roles TEXT NOT NULL DEFAULT '[]'")
+            conn.execute("INSERT OR IGNORE INTO webauthn_policy (id, mode, allowed, roots_pem) VALUES (1, 'none', '[]', '')")
+            conn.execute("""CREATE TABLE IF NOT EXISTS webauthn_challenges (id TEXT PRIMARY KEY, challenge TEXT NOT NULL, purpose TEXT NOT NULL, user_id TEXT, expires INTEGER NOT NULL)""")
+            # `must_change_password`: set when a password was provided by someone other than the account holder
+            # (the INIT_ADMIN_* bootstrap, or an admin's reset) rather than chosen by them -- cleared the moment
+            # they successfully change it themselves (see reset_user_password).
+            if "must_change_password" not in existing:
+                conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
 
             conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_permissions (
@@ -83,6 +161,10 @@ def init_auth_db():
             );
             """)
 
+            # Server-side sessions (web/sessions.py): every session token names a row, so signing out really ends it.
+            from web import sessions as _sessions
+            _sessions.init_sessions_table(conn)
+
             conn.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -94,66 +176,23 @@ def init_auth_db():
 
             now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            # Seed default users if users table is empty
+            # Bootstrap the first admin from INIT_ADMIN_* environment variables. Only ever considered when the
+            # users table is genuinely empty (bootstrap-only: once any account exists, these variables are never
+            # consulted again, so they can be removed from the environment after the first start without effect,
+            # and an admin who changes their password will never have it silently reverted on the next restart).
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) FROM users")
             count = cur.fetchone()[0]
 
             if count == 0:
-                logger.info("Seeding default multi-user accounts in auth.db...")
-
-                seed_users = [
-                    (
-                        "u_admin_01",
-                        "admin",
-                        hash_password("adminpassword123"),
-                        "System Administrator",
-                        "admin",
-                        1,
-                        now_str
-                    ),
-                    (
-                        "u_power_02",
-                        "lead_engineer",
-                        hash_password("powerpassword123"),
-                        "Lead Data Engineer",
-                        "power_user",
-                        1,
-                        now_str
-                    ),
-                    (
-                        "u_user_03",
-                        "analyst_bob",
-                        hash_password("userpassword123"),
-                        "Bob the Analyst",
-                        "user",
-                        1,
-                        now_str
-                    ),
-                    (
-                        "u_admin_martin",
-                        "martin",
-                        hash_password("adminpassword123"),
-                        "Martin (Admin)",
-                        "admin",
-                        1,
-                        now_str
-                    )
-                ]
-
-                cur.executemany("""
-                INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, seed_users)
-
-            # Ensure martin exists if db was already created
-            cur.execute("SELECT COUNT(*) FROM users WHERE username = 'martin'")
-            if cur.fetchone()[0] == 0:
-                now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                username, pw_hash, display_name = _init_admin_from_env()
+                user_id = f"u_{username}_{secrets.token_hex(4)}"
                 cur.execute("""
-                    INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at)
-                    VALUES ('u_admin_martin', 'martin', ?, 'Martin (Admin)', 'admin', 1, ?)
-                """, (hash_password("adminpassword123"), now_str))
+                    INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at, must_change_password)
+                    VALUES (?, ?, ?, ?, 'admin', 1, ?, 1)
+                """, (user_id, username, pw_hash, display_name, now_str))
+                logger.info(f"Bootstrapped admin account '{username}' from INIT_ADMIN_* environment variables "
+                           "(must_change_password set: it will be required to change it on first login).")
 
             # Seed initial default settings
             conn.execute("""
@@ -204,22 +243,32 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(user: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-    """Encodes a signed JWT access token carrying sub, username, display_name, and role."""
+def create_access_token(user: Dict[str, Any], expires_delta: Optional[timedelta] = None, extra_claims: Optional[Dict[str, Any]] = None,
+                        request: Optional[Request] = None, method: str = "") -> str:
+    """Starts a server-side session (web/sessions.py) and returns the signed JWT that names it (`sid`), carrying sub, username,
+    display_name and role. `extra_claims` (for example a SAML session's name_id/session_index, so Single Logout can later name the
+    session the IdP itself issued) is merged in first, so it can never override the fixed identity/expiry/session claims below.
+    `request` (address, user agent) and `method` (password, oidc, saml, ...) are only recorded for the account holder's session list."""
+    from web import sessions
     now = datetime.datetime.now(datetime.timezone.utc)
     if expires_delta:
         expire = now + expires_delta
     else:
         expire = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-    to_encode = {
+    extra = dict(extra_claims or {})
+    sid = sessions.create(user["id"], int(expire.timestamp()), method=method, meta=sessions.client_meta(request),
+                          saml_name_id=str(extra.get("saml_name_id") or ""), saml_session_index=str(extra.get("saml_session_index") or ""))
+    to_encode = extra
+    to_encode.update({
         "sub": user["id"],
         "username": user["username"],
         "display_name": user["display_name"],
         "role": user["role"],
+        "sid": sid,
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp())
-    }
+    })
 
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
@@ -228,24 +277,94 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
     """Decodes and validates a JWT token, returning payload dict or None if invalid/expired."""
     try:
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        if "purpose" in payload:
+            return None           # single-purpose tokens (MFA step, OIDC state) are never sessions, whatever they are signed with
         return payload
     except Exception:
         return None
+
+
+def session_user(token: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The live user behind a session token, or None. The ONE check every caller uses (get_current_user and the gate middlewares
+    in app.py): valid signature and expiry, not a single-purpose token, a live server-side session (web/sessions.py) that belongs to
+    the token's subject, an active and not deleted account, and not issued before the account's last password change. A token
+    without a `sid` (minted before server-side sessions existed) is refused: signing in again issues one."""
+    if not token:
+        return None
+    payload = decode_access_token(token)
+    if not payload or "sub" not in payload or not payload.get("sid"):
+        return None
+    from web import sessions
+    if not sessions.validate(payload["sid"], payload["sub"]):
+        return None
+    user = get_user_by_id(payload["sub"])
+    if not user or user.get("is_active", 1) != 1 or user.get("deleted_at"):
+        return None
+    changed = user.get("password_changed_at")
+    if changed and int(payload.get("iat", 0)) < int(changed):
+        return None
+    return user
+
+
+def current_session_id(request: Request) -> Optional[str]:
+    """Public id of the session the request is made with (cookie or bearer), or None."""
+    token = request.cookies.get(COOKIE_NAME)
+    header = request.headers.get("Authorization") or ""
+    if not token and header.startswith("Bearer "):
+        token = header[7:].strip()
+    payload = decode_access_token(token) if token else None
+    if not payload or not payload.get("sid"):
+        return None
+    from web import sessions
+    return sessions.public_id_of(payload["sid"])
+
+
+def end_session(token: Optional[str], reason: str = "signed out") -> bool:
+    """Revokes the server-side session behind a token (logout). Signature-checked, expiry ignored: an expired token is harmless anyway."""
+    if not token:
+        return False
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM], options={"verify_exp": False})
+    except Exception:
+        return False
+    if "purpose" in payload or not payload.get("sid"):
+        return False
+    from web import sessions
+    return sessions.revoke_secret(payload["sid"], reason)
+
+
+def revoke_user_sessions(user_id: str, reason: str, except_id: Optional[str] = None) -> int:
+    from web import sessions
+    return sessions.revoke_all(user_id, reason, except_id=except_id)
 
 
 # ==============================================================================
 # USER CRUD OPERATIONS
 # ==============================================================================
 
+_MFA_SECRET_COLUMNS = ("totp_secret", "totp_pending", "totp_last_step", "totp_backup", "totp_failures", "totp_locked_until", "totp_enrolled_at")
+
+
+def _public_user(u: Dict[str, Any]) -> Dict[str, Any]:
+    """A user row without credentials: no password hash and none of the TOTP secret material (the getters feed
+    /api/auth/me and friends). Exposes only whether MFA is on."""
+    u.pop("password_hash", None)
+    for col in _MFA_SECRET_COLUMNS:
+        u.pop(col, None)
+    u["passwordless"] = bool(u.get("passwordless"))
+    passkeys = int(u.pop("webauthn_count", 0) or 0)
+    u["mfa_enabled"] = bool(u.pop("totp_enabled", 0)) or passkeys > 0          # any second factor: an authenticator app or a passkey / security key
+    u["passkey_count"] = passkeys
+    return u
+
+
 def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     """Fetches user record by ID."""
     conn = get_db_connection()
     try:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute("SELECT *, (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users WHERE id = ?", (user_id,)).fetchone()
         if row:
-            u = dict(row)
-            u.pop("password_hash", None)
-            return u
+            return _public_user(dict(row))
         return None
     finally:
         conn.close()
@@ -255,25 +374,33 @@ def get_user_by_username(username: str, include_password_hash: bool = False) -> 
     """Fetches user record by username."""
     conn = get_db_connection()
     try:
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username.strip().lower(),)).fetchone()
+        row = conn.execute("SELECT *, (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users WHERE username = ?", (username.strip().lower(),)).fetchone()
         if row:
-            u = dict(row)
-            if not include_password_hash:
-                u.pop("password_hash", None)
+            u = _public_user(dict(row))
+            if include_password_hash:
+                u["password_hash"] = row["password_hash"]
             return u
         return None
     finally:
         conn.close()
 
 
-def list_users() -> List[Dict[str, Any]]:
-    """Returns all registered users (excluding password hashes)."""
+def list_users(include_deleted: bool = False) -> List[Dict[str, Any]]:
+    """Returns all registered users (excluding password hashes). Soft-deleted ones are omitted unless asked for."""
     conn = get_db_connection()
     try:
-        rows = conn.execute("SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source FROM users ORDER BY created_at ASC").fetchall()
+        where = "" if include_deleted else "WHERE deleted_at IS NULL"
+        rows = conn.execute(
+            f"SELECT id, username, display_name, role, is_active, created_at, last_login_at, auth_source, deleted_at, "
+            f"must_change_password, totp_enabled, mfa_exempt, mfa_exempt_reason, mfa_deadline_override, scim_managed, passwordless, "
+            f"(SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS webauthn_count FROM users {where} ORDER BY created_at ASC").fetchall()
         result = []
         for r in rows:
             d = dict(r)
+            d["passwordless"] = bool(d.get("passwordless"))
+            passkeys = int(d.pop("webauthn_count", 0) or 0)
+            d["mfa_enabled"] = bool(d.pop("totp_enabled", 0)) or passkeys > 0
+            d["passkey_count"] = passkeys
             d["full_name"] = d.get("display_name") or d["username"]
             d["email"] = f"{d['username']}@localspark.lakehouse"
             result.append(d)
@@ -352,10 +479,54 @@ def update_user(user_id: str, display_name: Optional[str] = None, role: Optional
         params.append(user_id)
         with conn:
             conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", params)
+        if is_active is False:
+            revoke_user_sessions(user_id, "account deactivated")
 
         return get_user_by_id(user_id)
     finally:
         conn.close()
+
+
+def create_passwordless_user(username: str, display_name: str, role: str = "user") -> Dict[str, Any]:
+    """A local account WITHOUT a usable password: it signs in with passkeys only. The hash is random and nobody knows it; the account gets in through an
+    enrolment link (web/webauthn_auth.py) that lets its owner register the first passkey."""
+    clean_username = username.strip().lower()
+    if not clean_username or not all(ch.isalnum() or ch in "._-@" for ch in clean_username):
+        raise ValueError("A username has letters, digits and . _ - @ only.")
+    if role not in ("admin", "power_user", "user"):
+        raise ValueError(f"Invalid role '{role}'. Allowed roles: admin, power_user, user")
+    conn = get_db_connection()
+    try:
+        if conn.execute("SELECT id FROM users WHERE username = ?", (clean_username,)).fetchone():
+            raise ValueError(f"Username '{clean_username}' is already taken.")
+        user_id = f"u_{clean_username}_{secrets.token_hex(4)}"
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with conn:
+            conn.execute("INSERT INTO users (id, username, password_hash, display_name, role, is_active, created_at, must_change_password, passwordless) VALUES (?, ?, ?, ?, ?, 1, ?, 0, 1)",
+                         (user_id, clean_username, hash_password(secrets.token_hex(32)), (display_name or "").strip() or clean_username, role, now_str))
+    finally:
+        conn.close()
+    return get_user_by_id(user_id)
+
+
+def set_passwordless(user_id: str, on: bool) -> bool:
+    """Turns an account passkey-only (the password becomes unusable) or, with `on` False, only flags it as having a password again (reset_user_password does that too).
+    Works for a local OR an LDAP-provisioned account: an LDAP account already has an unusable local hash (upsert_external_user), so overwriting it
+    with a fresh random one changes nothing about how it authenticates today, but the `passwordless` flag itself makes `/api/auth/login` refuse it
+    before it ever reaches the LDAP bind (see login_endpoint), so its directory password stops being a way in at all -- the account signs in with
+    a passkey only, exactly like a local passkey-only account. Never for OIDC/SAML: those providers own the whole sign-in exchange already."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            if not on:
+                return conn.execute("UPDATE users SET passwordless = 0 WHERE id = ?", (user_id,)).rowcount > 0
+            done = conn.execute("UPDATE users SET passwordless = 1, password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE id = ? AND COALESCE(auth_source, 'local') IN ('local', 'ldap')",
+                                (hash_password(secrets.token_hex(32)), int(time.time()), user_id)).rowcount > 0
+    finally:
+        conn.close()
+    if done:                                      # after the commit: revoking opens its own connection (inside the transaction it would wait on our own lock)
+        revoke_user_sessions(user_id, "password removed")
+    return done
 
 
 def upsert_external_user(username: str, display_name: str, role: str, auth_source: str) -> Dict[str, Any]:
@@ -377,6 +548,14 @@ def upsert_external_user(username: str, display_name: str, role: str, auth_sourc
         if existing:
             if (existing["auth_source"] or "local") == "local":
                 raise ValueError(f"'{clean_username}' is a local account; it cannot be taken over by {auth_source}.")
+            if existing["deleted_at"]:
+                # An admin's deletion is a deliberate decision; directory activity (a login, a sync) must never
+                # silently undo it. An admin has to restore_user() the account first.
+                raise ValueError(f"'{clean_username}' was deleted; an administrator must restore it before it can sign in again.")
+            if existing["scim_managed"]:
+                # SCIM is authoritative for its accounts: a sign-in through the identity provider must not change their role or name
+                # (or reactivate a deactivated one; the login modules refuse inactive accounts before they get here).
+                return get_user_by_id(existing["id"])
             with conn:
                 conn.execute("UPDATE users SET display_name = ?, role = ?, is_active = 1, auth_source = ? WHERE id = ?",
                             (display_name.strip() or clean_username, role, auth_source, existing["id"]))
@@ -393,22 +572,39 @@ def upsert_external_user(username: str, display_name: str, role: str, auth_sourc
         conn.close()
 
 
-def reset_user_password(user_id: str, new_password: str) -> bool:
-    """Updates password hash for the specified user."""
+def reset_user_password(user_id: str, new_password: str, chosen_by_self: bool = False) -> bool:
+    """
+    Updates the password hash for the specified user. `chosen_by_self` distinguishes who picked the password:
+    False (the default: an admin's reset) sets `must_change_password`, since the account holder didn't choose it
+    themselves; True (only change_own_password should pass this) clears it, since they just did.
+    """
     if len(new_password) < 4:
         raise ValueError("Password must be at least 4 characters long")
     conn = get_db_connection()
     try:
         pw_hash = hash_password(new_password)
         with conn:
-            res = conn.execute("UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
-                               (pw_hash, int(time.time()), user_id))
-            return res.rowcount > 0
+            res = conn.execute(
+                "UPDATE users SET password_hash = ?, password_changed_at = ?, must_change_password = ?, passwordless = 0 WHERE id = ?",
+                (pw_hash, int(time.time()), 0 if chosen_by_self else 1, user_id))
+            changed = res.rowcount > 0
     finally:
         conn.close()
+    if changed:                                   # every earlier session ends (the caller issues a fresh one after a self-service change)
+        revoke_user_sessions(user_id, "password changed" if chosen_by_self else "password reset")
+    return changed
 
 
 MIN_SELF_PASSWORD_LENGTH = 6
+
+
+def _passwordless_row(user_id: str) -> bool:
+    conn = get_db_connection()
+    try:
+        r = conn.execute("SELECT passwordless FROM users WHERE id = ?", (user_id,)).fetchone()
+        return bool(r and r["passwordless"])
+    finally:
+        conn.close()
 
 
 def change_own_password(user_id: str, current_password: str, new_password: str) -> None:
@@ -426,17 +622,22 @@ def change_own_password(user_id: str, current_password: str, new_password: str) 
         raise PermissionError("Account not found or deactivated.")
     if (row["auth_source"] or "local") != "local":
         raise PermissionError("This account signs in through an external identity provider; change the password there.")
+    if _passwordless_row(user_id):
+        raise PermissionError("This account has no password: it signs in with passkeys. Ask an administrator if you need a password.")
     if not verify_password(current_password, row["password_hash"]):
         raise PermissionError("The current password is incorrect.")
     if len(new_password) < MIN_SELF_PASSWORD_LENGTH:
         raise ValueError(f"The new password must be at least {MIN_SELF_PASSWORD_LENGTH} characters long.")
     if new_password == current_password:
         raise ValueError("The new password must differ from the current one.")
-    reset_user_password(user_id, new_password)
+    reset_user_password(user_id, new_password, chosen_by_self=True)
 
 
 def delete_user(user_id: str) -> bool:
-    """Deactivates a user (soft delete). Prevents deleting the primary admin."""
+    """
+    Soft-deletes a user: deactivated and hidden from the list by default (distinct from a plain deactivation, which
+    stays visible, greyed out). Reversible with `restore_user`. Prevents deleting the primary admin.
+    """
     conn = get_db_connection()
     try:
         row = conn.execute("SELECT username, role FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -445,8 +646,23 @@ def delete_user(user_id: str) -> bool:
         if row["username"] == "admin":
             raise ValueError("The primary 'admin' account cannot be deactivated or deleted.")
 
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         with conn:
-            conn.execute("UPDATE users SET is_active = 0 WHERE id = ?", (user_id,))
+            conn.execute("UPDATE users SET is_active = 0, deleted_at = ? WHERE id = ?", (now_str, user_id))
+    finally:
+        conn.close()
+    revoke_user_sessions(user_id, "account deleted")
+    return True
+
+
+def restore_user(user_id: str) -> bool:
+    """Undoes `delete_user`: clears deleted_at and reactivates the account."""
+    conn = get_db_connection()
+    try:
+        if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            return False
+        with conn:
+            conn.execute("UPDATE users SET is_active = 1, deleted_at = NULL WHERE id = ?", (user_id,))
             return True
     finally:
         conn.close()
@@ -482,12 +698,9 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         token = auth_header[7:].strip()
 
     if token:
-        payload = decode_access_token(token)
-        if payload and "sub" in payload:
-            user = get_user_by_id(payload["sub"])
-            changed = user.get("password_changed_at") if user else None
-            if user and user.get("is_active", 1) == 1 and not (changed and int(payload.get("iat", 0)) < int(changed)):
-                return user
+        user = session_user(token)
+        if user:
+            return user
 
     # Fallback to X-User header if supplied. It carries no credential, so it is disabled once auth is required.
     x_user = request.headers.get("X-User")
@@ -496,7 +709,14 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         if user and user.get("is_active", 1) == 1:
             return user
 
-    # If auth db hasn't been initialized or dev fallback, check if guest mode allowed
+    # Guest mode (app setting `allow_guest_mode`, admin-settable) hands the admin account to every caller without credentials,
+    # so, like the credential-less admin above, it only exists in the explicit single-user mode (GOVERNANCE_REQUIRE_AUTH=false).
+    if governance_require_auth():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please log in.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
     conn = get_db_connection()
     try:
         row = conn.execute("SELECT value_json FROM app_settings WHERE key = 'allow_guest_mode'").fetchone()
@@ -516,8 +736,10 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
 
 
 def governance_require_auth() -> bool:
-    """When true, requests without credentials are anonymous (least privilege) instead of the local admin."""
-    return os.getenv("GOVERNANCE_REQUIRE_AUTH", "false").strip().lower() in ("1", "true", "yes", "on")
+    """True (the default) unless GOVERNANCE_REQUIRE_AUTH is explicitly false/0/no/off. When true, a request without credentials is the
+    least-privilege `anonymous` user, the credential-less `X-User` header and guest mode are ignored. Off is the old single-user mode
+    in which such a request runs as the local admin: anyone who can reach the port is admin, so only for a laptop-only install."""
+    return os.getenv("GOVERNANCE_REQUIRE_AUTH", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
 LOCAL_ADMIN = {"role": "admin", "username": "admin", "id": "u_admin_01"}
@@ -540,8 +762,8 @@ async def resolve_principal(request: Request) -> Dict[str, Any]:
 
     - Valid credentials -> that user.
     - Credentials presented but invalid/expired/unknown/inactive -> 401. NEVER admin.
-    - No credentials at all -> the local single-user admin (the documented no-login mode), or the
-      least-privilege `anonymous` user when GOVERNANCE_REQUIRE_AUTH is set.
+    - No credentials at all -> the least-privilege `anonymous` user (default), or the local admin in the explicit
+      single-user mode (GOVERNANCE_REQUIRE_AUTH=false).
     - Unexpected errors propagate (500) instead of silently granting admin.
     """
     try:
@@ -565,5 +787,36 @@ def require_role(allowed_roles: List[str]):
     return role_checker
 
 
-# Auto-initialize database tables on module load
-init_auth_db()
+def _cli() -> None:
+    """`python -m web.auth hash-password`: prints a PBKDF2 hash for INIT_ADMIN_PASSWORD_HASH without ever writing
+    the plaintext to a file or the database. Deliberately does not import/touch the rest of the app or open
+    auth.db, so it works before any bootstrap configuration exists yet (the exact situation it's for)."""
+    import getpass
+    import sys
+    if len(sys.argv) < 2 or sys.argv[1] != "hash-password":
+        print("Usage: python -m web.auth hash-password", file=sys.stderr)
+        raise SystemExit(2)
+    if sys.stdin.isatty():
+        pw = getpass.getpass("New admin password: ")
+        confirm = None if len(pw) < 8 else getpass.getpass("Confirm: ")
+    else:
+        # No terminal (`docker exec` without -it, or a pipe): read the password from the first line of stdin, e.g.
+        #   printf '%s\n' "$PW" | docker exec -i <container> python -m web.auth hash-password
+        pw = sys.stdin.readline().rstrip("\r\n")
+        confirm = pw
+    if len(pw) < 8:
+        print("Use at least 8 characters.", file=sys.stderr)
+        raise SystemExit(1)
+    if confirm != pw:
+        print("Passwords did not match.", file=sys.stderr)
+        raise SystemExit(1)
+    print("\nPaste this line into .env (the single quotes matter: Docker Compose would otherwise treat each $ in the hash as a variable):\n")
+    print(f"INIT_ADMIN_PASSWORD_HASH='{hash_password(pw)}'")
+
+
+if __name__ == "__main__":
+    _cli()
+else:
+    # Auto-initialize database tables on module load (skipped for `python -m web.auth hash-password`, above:
+    # that must work before any bootstrap configuration exists, so it never touches auth.db at all).
+    init_auth_db()

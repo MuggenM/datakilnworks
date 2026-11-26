@@ -82,7 +82,7 @@ def init_workspace_directories():
     os.makedirs(shared_dir, exist_ok=True)
 
     # Seed default user workspaces
-    for u in ["admin", "lead_engineer", "analyst_bob", "martin"]:
+    for u in ["admin", "lead_engineer", "analyst_bob"]:
         init_user_workspace(u)
 
     # Seed sample shared python script in Shared if empty

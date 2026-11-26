@@ -100,6 +100,7 @@ class PolicyIn(BaseModel):
     applies_to_types: Optional[List[str]] = None
     except_roles: List[str] = Field(default_factory=lambda: ["admin"])
     except_users: List[str] = Field(default_factory=list)
+    except_groups: List[str] = Field(default_factory=list)
     priority: int = 100
     enabled: bool = True
 
@@ -114,6 +115,7 @@ class PolicyPatch(BaseModel):
     applies_to_types: Optional[List[str]] = None
     except_roles: Optional[List[str]] = None
     except_users: Optional[List[str]] = None
+    except_groups: Optional[List[str]] = None
     priority: Optional[int] = None
     enabled: Optional[bool] = None
 
@@ -137,6 +139,7 @@ class RowPolicyIn(BaseModel):
     filter_expr: Optional[str] = None
     except_roles: List[str] = Field(default_factory=lambda: ["admin"])
     except_users: List[str] = Field(default_factory=list)
+    except_groups: List[str] = Field(default_factory=list)
     priority: int = 100
     enabled: bool = True
 
@@ -152,6 +155,7 @@ class RowPolicyPatch(BaseModel):
     filter_expr: Optional[str] = None
     except_roles: Optional[List[str]] = None
     except_users: Optional[List[str]] = None
+    except_groups: Optional[List[str]] = None
     priority: Optional[int] = None
     enabled: Optional[bool] = None
 

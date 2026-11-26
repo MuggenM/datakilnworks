@@ -1,0 +1,30 @@
+# Weekly update pull requests for the Python dependencies, the GitHub Actions used by CI and the Docker base image.
+# The supply-chain workflow (.github/workflows/supply-chain.yml) is what fails on a known vulnerability; this keeps the fixes coming.
+version: 2
+updates:
+  # requirements.txt pulls in requirements-lock.txt with `-c`: the exact versions of every package in the image, bumped here as one
+  # grouped pull request that CI verifies (build + every test) before anything reaches the image.
+  - package-ecosystem: pip
+    directory: "/"
+    target-branch: development
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: pip               # ci/requirements-ui.txt: the Playwright version (and so the Chromium build) of the browser tests
+    directory: "/ci"
+    target-branch: development
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: development
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/"
+    target-branch: development
+    schedule:
+      interval: weekly
