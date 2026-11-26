@@ -33,5 +33,5 @@ paramiko>=3.4.0      # Connections: SFTP sources for Auto-Loader (host key pinne
 python3-saml>=1.16.0  # SAML 2.0 single sign-on (SP); xmlsec ships as a manylinux wheel, no system packages needed
 confluent-kafka
 fastavro
-grpcio-tools>=1.73,<1.77
+grpcio-tools>=1.85.3,<1.86
 webauthn>=2.5,<4
