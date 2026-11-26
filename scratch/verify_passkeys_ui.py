@@ -13,17 +13,24 @@ def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:300]}" if d and not c else ""))
     if not c: FAIL.append(n)
 sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
-def wait_or_explain(page, selector, what, timeout=10000):
-    """wait_for_selector, but a timeout prints what the page and the studio said (the on-page error, a screenshot, the studio log) first."""
+ERRORS = []   # page errors and console errors of the main page, printed by wait_or_explain
+
+def wait_or_explain(page, selector, what, timeout=10000, function=None):
+    """wait_for_selector (or wait_for_function when `function` is given), but a timeout prints what the page and the studio said
+    (the open requests, the sign-in and passkey state, page errors, a screenshot, the studio log) first."""
     try:
-        page.wait_for_selector(selector, timeout=timeout)
+        if function: page.wait_for_function(function, timeout=timeout)
+        else: page.wait_for_selector(selector, timeout=timeout)
     except Exception:
         err = page.locator("[data-testid=passkey-error]")
         now = time.monotonic(); busy = sorted(((now - t, u) for u, t in PENDING.items()), reverse=True)
         print(f"  requests still open in the browser ({len(busy)}): " + "; ".join(u[:120] for _, u in busy[:12]))
         try: print("  pk state: " + str(page.evaluate("() => { const p = Alpine.$data(document.body).pk; return { busy: p.busy, addOpen: p.addOpen, creds: (p.creds || []).length, error: p.error }; }")))
         except Exception as e: print(f"  pk state: unreadable ({e})")
-        print(f"  [FAIL] {what}: {selector} did not appear; on-page error: {err.inner_text()[:300] if err.count() and err.first.is_visible() else '(none shown)'}")
+        try: print("  sign-in state: " + str(page.evaluate("() => { const d = Alpine.$data(document.body); const f = d.loginForm || {}; return { authenticated: d.isAuthenticated, user: d.currentUser && d.currentUser.username, loginModal: d.showLoginModal, loading: f.loading, error: f.error, mfaToken: !!f.mfaToken, mfaMethods: f.mfaMethods, username: f.username }; }")))
+        except Exception as e: print(f"  sign-in state: unreadable ({e})")
+        print(f"  page/console errors so far ({len(ERRORS)}): " + " | ".join(e[:200] for e in ERRORS[-8:]))
+        print(f"  [FAIL] {what}: {function or selector} did not {'become true' if function else 'appear'}; on-page error: {err.inner_text()[:300] if err.count() and err.first.is_visible() else '(none shown)'}")
         shot = os.path.join(os.getenv("ARTIFACT_DIR", "/tmp"), "passkeys_failure.png"); page.screenshot(path=shot); print(f"    screenshot: {shot}")
         r = sh("docker", "logs", "--tail", "40", "pkui"); print("    studio log (last 40 lines):"); [print("      " + ln[:300]) for ln in (r.stdout + r.stderr).splitlines()[-40:]]
         raise
@@ -39,7 +46,7 @@ try:
     r = sh("docker", "exec", "-w", "/workspace", "pkui", "python", "-c", "import sys;sys.path.insert(0,'/workspace');from web import auth\nauth.create_user('alice','alicepassword1','Alice','user')\nwith auth.get_db_connection() as c: c.execute('UPDATE users SET must_change_password=0')")
     check("seeded a user", r.returncode == 0, r.stderr[-300:])
     with sync_playwright() as p:
-        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1400, "height": 1000}); page = _ui_slow.apply(ctx.new_page()); errors = []
+        b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1400, "height": 1000}); page = _ui_slow.apply(ctx.new_page()); errors = ERRORS
         page.on("pageerror", lambda e: errors.append(str(e) + " @ " + str(getattr(e, "stack", ""))[:500])); page.on("dialog", lambda d: d.accept())
         page.on("request", lambda r: PENDING.__setitem__(r.method + " " + r.url.replace(BASE, ""), time.monotonic()))
         for ev_name in ("requestfinished", "requestfailed"): page.on(ev_name, lambda r: PENDING.pop(r.method + " " + r.url.replace(BASE, ""), None))
@@ -129,7 +136,7 @@ try:
         check("with the right password it is removed", page.locator("[data-testid=passkey-row]").count() == 0)
         print("passkey policy (administrator)")
         ev("() => Alpine.$data(document.body).mfa.open = false"); logout()
-        ui_login("admin", "adminpassword123"); page.wait_for_function("() => Alpine.$data(document.body).isAuthenticated", timeout=10000); page.wait_for_timeout(800)
+        ui_login("admin", "adminpassword123"); wait_or_explain(page, None, "the administrator signing in after alice signed out", function="() => Alpine.$data(document.body).isAuthenticated"); page.wait_for_timeout(800)
         # wait for the policy load itself: it overwrites the form when it answers, and after a sign-in the page is busy loading its data
         with page.expect_response(lambda r: r.url.endswith("/api/webauthn/policy") and r.request.method == "GET", timeout=20000):
             ev("() => { const d = Alpine.$data(document.body); d.showIamModal = true; d.iamTab = 'mfa'; d.loadMfaPolicy(); }")
