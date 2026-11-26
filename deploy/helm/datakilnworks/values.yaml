@@ -65,6 +65,11 @@ persistence:
     storageClass: ""
     accessMode: ReadWriteOnce
     existingClaim: ""
+  keys:                         # session signing / encryption keys and auth.db (DKW_SECRETS_DIR), studio pod only: kept off the warehouse
+    size: 1Gi                   # volume so a snapshot of it cannot forge sessions or decrypt credentials. Back it up separately, never lose it.
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    existingClaim: ""
 
 # SQL warehouse compute nodes (one Deployment + Service each). The studio finds them through the WH_*_ENDPOINT variables and authenticates with
 # COMPUTE_TOKEN; they are never exposed outside the cluster. Set `computeNodes: []` to run every query inside the studio.

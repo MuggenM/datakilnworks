@@ -76,8 +76,11 @@ def resolve(headers=None, cookies=None):
 
 def token_for(username, secret=None, expires_in=3600):
     user = auth.get_user_by_username(username)
-    payload = {"sub": user["id"], "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=expires_in)}
-    return jwt.encode(payload, secret or auth.JWT_SECRET_KEY, algorithm=auth.JWT_ALGORITHM)
+    token = auth.create_access_token(user, expires_delta=datetime.timedelta(seconds=expires_in))   # a real server-side session
+    if secret is None:
+        return token
+    payload = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    return jwt.encode(payload, secret, algorithm=auth.JWT_ALGORITHM)        # same claims, signed with another key (a forgery)
 
 
 def test_auth_never_fails_open():

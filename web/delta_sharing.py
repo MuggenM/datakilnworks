@@ -724,7 +724,8 @@ def table_metadata(rec, share, schema, table, version=None, fmt: str = "parquet"
 # ---------------------------------------------------------------- signed file URLs
 
 def _key() -> bytes:
-    p = os.path.join(_meta_dir(), "sharing.key")
+    from web.secrets_store import secret_path
+    p = secret_path("sharing.key")
     with _LOCK:
         if not os.path.exists(p):
             fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

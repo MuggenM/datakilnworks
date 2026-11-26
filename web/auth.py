@@ -17,13 +17,14 @@ from datetime import timedelta
 import jwt
 from fastapi import Request, HTTPException, Depends, status
 
-from web.secrets_store import load_or_create_secret
+from web.secrets_store import load_or_create_secret, secret_path
 
 logger = logging.getLogger("localspark.auth")
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
-AUTH_DB_FILE = os.path.join(METADATA_DIR, "auth.db")
+# The accounts database lives with the keys (DKW_SECRETS_DIR, web/secrets_store.py), not on the data volume; unset = .metadata as before.
+AUTH_DB_FILE = secret_path("auth.db")
 
 
 
@@ -37,7 +38,7 @@ COOKIE_NAME = "localspark_session"
 
 def get_db_connection() -> sqlite3.Connection:
     """Returns a SQLite connection to the auth database."""
-    os.makedirs(METADATA_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(AUTH_DB_FILE), exist_ok=True)
     conn = sqlite3.connect(AUTH_DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -160,6 +161,10 @@ def init_auth_db():
             );
             """)
 
+            # Server-side sessions (web/sessions.py): every session token names a row, so signing out really ends it.
+            from web import sessions as _sessions
+            _sessions.init_sessions_table(conn)
+
             conn.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -238,22 +243,29 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(user: Dict[str, Any], expires_delta: Optional[timedelta] = None, extra_claims: Optional[Dict[str, Any]] = None) -> str:
-    """Encodes a signed JWT access token carrying sub, username, display_name, and role. `extra_claims` (for example a
-    SAML session's name_id/session_index, so Single Logout can later name the session the IdP itself issued) is merged
-    in first, so it can never override the fixed identity/expiry claims below."""
+def create_access_token(user: Dict[str, Any], expires_delta: Optional[timedelta] = None, extra_claims: Optional[Dict[str, Any]] = None,
+                        request: Optional[Request] = None, method: str = "") -> str:
+    """Starts a server-side session (web/sessions.py) and returns the signed JWT that names it (`sid`), carrying sub, username,
+    display_name and role. `extra_claims` (for example a SAML session's name_id/session_index, so Single Logout can later name the
+    session the IdP itself issued) is merged in first, so it can never override the fixed identity/expiry/session claims below.
+    `request` (address, user agent) and `method` (password, oidc, saml, ...) are only recorded for the account holder's session list."""
+    from web import sessions
     now = datetime.datetime.now(datetime.timezone.utc)
     if expires_delta:
         expire = now + expires_delta
     else:
         expire = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-    to_encode = dict(extra_claims or {})
+    extra = dict(extra_claims or {})
+    sid = sessions.create(user["id"], int(expire.timestamp()), method=method, meta=sessions.client_meta(request),
+                          saml_name_id=str(extra.get("saml_name_id") or ""), saml_session_index=str(extra.get("saml_session_index") or ""))
+    to_encode = extra
     to_encode.update({
         "sub": user["id"],
         "username": user["username"],
         "display_name": user["display_name"],
         "role": user["role"],
+        "sid": sid,
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp())
     })
@@ -270,6 +282,60 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
         return payload
     except Exception:
         return None
+
+
+def session_user(token: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The live user behind a session token, or None. The ONE check every caller uses (get_current_user and the gate middlewares
+    in app.py): valid signature and expiry, not a single-purpose token, a live server-side session (web/sessions.py) that belongs to
+    the token's subject, an active and not deleted account, and not issued before the account's last password change. A token
+    without a `sid` (minted before server-side sessions existed) is refused: signing in again issues one."""
+    if not token:
+        return None
+    payload = decode_access_token(token)
+    if not payload or "sub" not in payload or not payload.get("sid"):
+        return None
+    from web import sessions
+    if not sessions.validate(payload["sid"], payload["sub"]):
+        return None
+    user = get_user_by_id(payload["sub"])
+    if not user or user.get("is_active", 1) != 1 or user.get("deleted_at"):
+        return None
+    changed = user.get("password_changed_at")
+    if changed and int(payload.get("iat", 0)) < int(changed):
+        return None
+    return user
+
+
+def current_session_id(request: Request) -> Optional[str]:
+    """Public id of the session the request is made with (cookie or bearer), or None."""
+    token = request.cookies.get(COOKIE_NAME)
+    header = request.headers.get("Authorization") or ""
+    if not token and header.startswith("Bearer "):
+        token = header[7:].strip()
+    payload = decode_access_token(token) if token else None
+    if not payload or not payload.get("sid"):
+        return None
+    from web import sessions
+    return sessions.public_id_of(payload["sid"])
+
+
+def end_session(token: Optional[str], reason: str = "signed out") -> bool:
+    """Revokes the server-side session behind a token (logout). Signature-checked, expiry ignored: an expired token is harmless anyway."""
+    if not token:
+        return False
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM], options={"verify_exp": False})
+    except Exception:
+        return False
+    if "purpose" in payload or not payload.get("sid"):
+        return False
+    from web import sessions
+    return sessions.revoke_secret(payload["sid"], reason)
+
+
+def revoke_user_sessions(user_id: str, reason: str, except_id: Optional[str] = None) -> int:
+    from web import sessions
+    return sessions.revoke_all(user_id, reason, except_id=except_id)
 
 
 # ==============================================================================
@@ -413,6 +479,8 @@ def update_user(user_id: str, display_name: Optional[str] = None, role: Optional
         params.append(user_id)
         with conn:
             conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", params)
+        if is_active is False:
+            revoke_user_sessions(user_id, "account deactivated")
 
         return get_user_by_id(user_id)
     finally:
@@ -450,12 +518,15 @@ def set_passwordless(user_id: str, on: bool) -> bool:
     conn = get_db_connection()
     try:
         with conn:
-            if on:
-                return conn.execute("UPDATE users SET passwordless = 1, password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE id = ? AND COALESCE(auth_source, 'local') IN ('local', 'ldap')",
-                                    (hash_password(secrets.token_hex(32)), int(time.time()), user_id)).rowcount > 0
-            return conn.execute("UPDATE users SET passwordless = 0 WHERE id = ?", (user_id,)).rowcount > 0
+            if not on:
+                return conn.execute("UPDATE users SET passwordless = 0 WHERE id = ?", (user_id,)).rowcount > 0
+            done = conn.execute("UPDATE users SET passwordless = 1, password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE id = ? AND COALESCE(auth_source, 'local') IN ('local', 'ldap')",
+                                (hash_password(secrets.token_hex(32)), int(time.time()), user_id)).rowcount > 0
     finally:
         conn.close()
+    if done:                                      # after the commit: revoking opens its own connection (inside the transaction it would wait on our own lock)
+        revoke_user_sessions(user_id, "password removed")
+    return done
 
 
 def upsert_external_user(username: str, display_name: str, role: str, auth_source: str) -> Dict[str, Any]:
@@ -516,9 +587,12 @@ def reset_user_password(user_id: str, new_password: str, chosen_by_self: bool = 
             res = conn.execute(
                 "UPDATE users SET password_hash = ?, password_changed_at = ?, must_change_password = ?, passwordless = 0 WHERE id = ?",
                 (pw_hash, int(time.time()), 0 if chosen_by_self else 1, user_id))
-            return res.rowcount > 0
+            changed = res.rowcount > 0
     finally:
         conn.close()
+    if changed:                                   # every earlier session ends (the caller issues a fresh one after a self-service change)
+        revoke_user_sessions(user_id, "password changed" if chosen_by_self else "password reset")
+    return changed
 
 
 MIN_SELF_PASSWORD_LENGTH = 6
@@ -575,9 +649,10 @@ def delete_user(user_id: str) -> bool:
         now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         with conn:
             conn.execute("UPDATE users SET is_active = 0, deleted_at = ? WHERE id = ?", (now_str, user_id))
-            return True
     finally:
         conn.close()
+    revoke_user_sessions(user_id, "account deleted")
+    return True
 
 
 def restore_user(user_id: str) -> bool:
@@ -623,12 +698,9 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
         token = auth_header[7:].strip()
 
     if token:
-        payload = decode_access_token(token)
-        if payload and "sub" in payload:
-            user = get_user_by_id(payload["sub"])
-            changed = user.get("password_changed_at") if user else None
-            if user and user.get("is_active", 1) == 1 and not (changed and int(payload.get("iat", 0)) < int(changed)):
-                return user
+        user = session_user(token)
+        if user:
+            return user
 
     # Fallback to X-User header if supplied. It carries no credential, so it is disabled once auth is required.
     x_user = request.headers.get("X-User")

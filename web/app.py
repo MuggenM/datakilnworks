@@ -26,7 +26,8 @@ from pydantic import BaseModel
 from web.auth import (
     get_current_user, resolve_principal, require_role, create_access_token, verify_password, hash_password,
     get_user_by_username, get_user_by_id, list_users, create_user, update_user, reset_user_password,
-    delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db, decode_access_token
+    delete_user, restore_user, record_user_login, COOKIE_NAME, get_db_connection, init_auth_db, decode_access_token,
+    session_user as auth_session_user, end_session, current_session_id, revoke_user_sessions
 )
 from web import auth_frameworks, llm_settings
 from web.compute_auth import compute_headers
@@ -234,6 +235,16 @@ _MUST_CHANGE_PASSWORD_ALLOWED = {"/api/auth/change-password", "/api/auth/logout"
                                  "/api/auth/saml/logout", "/api/auth/saml/sls"}
 
 
+def _gate_session_user(request: Request, token: str) -> Optional[Dict[str, Any]]:
+    """auth.session_user for the gate middlewares, computed once per request (three gates ask)."""
+    cached = getattr(request.state, "_dkw_gate_user", None)
+    if cached is not None and cached[0] == token:
+        return cached[1]
+    user = auth_session_user(token)
+    request.state._dkw_gate_user = (token, user)
+    return user
+
+
 @app.middleware("http")
 async def _must_change_password_gate(request: Request, call_next):
     """
@@ -247,18 +258,14 @@ async def _must_change_password_gate(request: Request, call_next):
         return await call_next(request)
     token = request.cookies.get(COOKIE_NAME)
     if token:
-        payload = decode_access_token(token)
-        if payload and "sub" in payload:
-            user = get_user_by_id(payload["sub"])
-            # Mirror resolve_principal's own staleness check: a session issued before the account's last
-            # password change is not this user's live session, so leave it to the normal auth layer to
-            # reject (401) instead of misreading it as "the current user, who must change their password".
-            changed = user.get("password_changed_at") if user else None
-            stale = bool(changed and int(payload.get("iat", 0)) < int(changed))
-            if user and user.get("is_active", 1) == 1 and not stale and user.get("must_change_password"):
-                return JSONResponse(status_code=403, content={
-                    "detail": "This account's password must be changed before continuing.",
-                    "must_change_password": True})
+        # The same check as the normal auth layer (auth.session_user: live server-side session, active account, not issued
+        # before the last password change): anything else is left to that layer to reject (401) instead of being misread as
+        # "the current user, who must change their password".
+        user = _gate_session_user(request, token)
+        if user and user.get("must_change_password"):
+            return JSONResponse(status_code=403, content={
+                "detail": "This account's password must be changed before continuing.",
+                "must_change_password": True})
     return await call_next(request)
 
 # What a user who has to enrol in two-factor authentication (organisation policy, deadline passed) may still call.
@@ -279,16 +286,12 @@ async def _mfa_policy_gate(request: Request, call_next):
         return await call_next(request)
     token = request.cookies.get(COOKIE_NAME)
     if token:
-        payload = decode_access_token(token)
-        if payload and "sub" in payload:
-            user = get_user_by_id(payload["sub"])
-            changed = user.get("password_changed_at") if user else None
-            stale = bool(changed and int(payload.get("iat", 0)) < int(changed))
-            if user and user.get("is_active", 1) == 1 and not user.get("deleted_at") and not stale:
-                from web import mfa_policy
-                if mfa_policy.is_blocked(user):
-                    return JSONResponse(status_code=403, content={
-                        "detail": "Your organisation requires two-factor authentication. Turn it on to continue.", "mfa_enrollment_required": True})
+        user = _gate_session_user(request, token)
+        if user:
+            from web import mfa_policy
+            if mfa_policy.is_blocked(user):
+                return JSONResponse(status_code=403, content={
+                    "detail": "Your organisation requires two-factor authentication. Turn it on to continue.", "mfa_enrollment_required": True})
     return await call_next(request)
 
 # What a request may still do while its own account is blocked by a per-user/role network policy: see it and sign out.
@@ -309,24 +312,20 @@ async def _network_policy_gate(request: Request, call_next):
         return await call_next(request)
     token = request.cookies.get(COOKIE_NAME)
     if token:
-        payload = decode_access_token(token)
-        if payload and "sub" in payload:
-            user = get_user_by_id(payload["sub"])
-            changed = user.get("password_changed_at") if user else None
-            stale = bool(changed and int(payload.get("iat", 0)) < int(changed))
-            if user and user.get("is_active", 1) == 1 and not user.get("deleted_at") and not stale:
-                from web import ip_allowlist
-                try:
-                    ok, policy, client = ip_allowlist.check_user_network(user, request.client.host if request.client else None, dict(request.headers))
-                except Exception as exc:                        # a bug here must not lock everybody out; it is logged loudly
-                    logger.error(f"per-user network policy check failed, letting the request through: {exc}", exc_info=True)
-                    return await call_next(request)
-                if not ok:
-                    ip_allowlist.record("block", client, request.method, path, source="network_policy",
-                                        principal=f"{policy['principal_type']}:{policy['principal_id']}")
-                    return JSONResponse(status_code=403, content={
-                        "detail": "Your account's network policy does not allow access from your current address.",
-                        "ip_blocked": True, "your_address": client.get("text", "")})
+        user = _gate_session_user(request, token)
+        if user:
+            from web import ip_allowlist
+            try:
+                ok, policy, client = ip_allowlist.check_user_network(user, request.client.host if request.client else None, dict(request.headers))
+            except Exception as exc:                        # a bug here must not lock everybody out; it is logged loudly
+                logger.error(f"per-user network policy check failed, letting the request through: {exc}", exc_info=True)
+                return await call_next(request)
+            if not ok:
+                ip_allowlist.record("block", client, request.method, path, source="network_policy",
+                                    principal=f"{policy['principal_type']}:{policy['principal_id']}")
+                return JSONResponse(status_code=403, content={
+                    "detail": "Your account's network policy does not allow access from your current address.",
+                    "ip_blocked": True, "your_address": client.get("text", "")})
     return await call_next(request)
 
 
@@ -426,11 +425,18 @@ _SECURITY_HEADERS = {
 @app.middleware("http")
 async def _security_headers(request: Request, call_next):
     """Baseline browser hardening on every response, including the gates' own refusals (defined after the IP allowlist gate so it
-    wraps it). `setdefault`: a route that sets its own (web/apps.py: CSP, frame-ancestors) keeps it. HSTS only over https. No CSP
-    here yet: the Alpine page evaluates inline expressions, so a useful policy needs Alpine's CSP build first."""
+    wraps it). `setdefault`: a route that sets its own (web/apps.py: CSP, frame-ancestors) keeps it. HSTS only over https.
+    Every HTML response gets a Content-Security-Policy (web/csp.py) whose script nonce is the one the template rendered
+    (`request.state.csp_nonce`, made here before the route runs)."""
+    from web import csp
+    request.state.csp_nonce = csp.new_nonce()
     resp = await call_next(request)
     for k, v in _SECURITY_HEADERS.items():
         resp.headers.setdefault(k, v)
+    name = csp.header_name()
+    if name and (resp.headers.get("content-type") or "").startswith("text/html") \
+            and "content-security-policy" not in resp.headers and "content-security-policy-report-only" not in resp.headers:
+        resp.headers[name] = csp.policy_for(request.url.path, request.state.csp_nonce)
     if _request_is_https(request):
         resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     return resp
@@ -601,12 +607,16 @@ def scan_delta_tables() -> List[Dict[str, Any]]:
             })
     return tables
 
+def _csp_nonce(request: Request) -> str:
+    return getattr(request.state, "csp_nonce", "") or ""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     resp = templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={"warehouse_dir": WAREHOUSE_DIR}
+        context={"warehouse_dir": WAREHOUSE_DIR, "csp_nonce": _csp_nonce(request)}
     )
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
@@ -764,10 +774,10 @@ def _cookie_secure(request: Optional[Request], hint: bool = False) -> bool:
     return hint or _request_is_https(request)
 
 
-def _session_response(u: Dict[str, Any], request: Optional[Request] = None) -> JSONResponse:
+def _session_response(u: Dict[str, Any], request: Optional[Request] = None, method: str = "password") -> JSONResponse:
     """Records the login and returns the session (cookie + user), shared by every password-based sign-in path."""
     record_user_login(u["id"])
-    token = create_access_token(u)
+    token = create_access_token(u, request=request, method=method)
     safe_user = {
         "id": u["id"],
         "username": u["username"],
@@ -816,7 +826,7 @@ async def login_mfa_endpoint(payload: MfaLoginRequest, request: Request):
     ok, reason = mfa.verify_login(u["id"], payload.code)
     if not ok:
         raise HTTPException(status_code=401 if "not valid" in reason else 429, detail=reason)
-    return _session_response(u, request)
+    return _session_response(u, request, "password + authenticator app")
 
 
 # ---------------------------------------------------------------- WebAuthn: passkeys and security keys (web/webauthn_auth.py)
@@ -1131,7 +1141,7 @@ async def enroll_verify(payload: EnrollVerifyPayload, request: Request):
     except webauthn_auth.WebAuthnError as exc:
         raise _webauthn_error(exc)
     mfa_policy._audit(u["username"], "PASSKEY_ENROLL_USED", f"user:{u['username']}", {})
-    return _session_response(get_user_by_id(u["id"]), request)
+    return _session_response(get_user_by_id(u["id"]), request, "passkey enrolment")
 
 
 @app.post("/api/auth/login/webauthn/options")
@@ -1159,7 +1169,7 @@ async def login_webauthn(payload: WebauthnLoginPayload, request: Request):
         await asyncio.to_thread(webauthn_auth.finish_authentication, payload.challenge_id, payload.credential, dict(request.headers), u["id"])
     except webauthn_auth.WebAuthnError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
-    return _session_response(u, request)
+    return _session_response(u, request, "password + security key")
 
 
 @app.post("/api/auth/passkey/options")
@@ -1183,7 +1193,7 @@ async def passkey_login(payload: PasskeyLoginPayload, request: Request):
     u = get_user_by_id(uid)
     if not u or u.get("is_active", 1) != 1 or u.get("deleted_at") or (u.get("auth_source") or "local") not in ("local", "ldap"):
         raise HTTPException(status_code=401, detail="This passkey cannot be used to sign in.")
-    return _session_response(u, request)
+    return _session_response(u, request, "passkey")
 
 
 @app.get("/api/auth/mfa/status")
@@ -1672,7 +1682,7 @@ async def oidc_callback(request: Request, code: str = "", state: str = "", error
         return _sso_failure(str(exc))
     record_user_login(u["id"])
     resp = RedirectResponse(url="/", status_code=302)
-    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u), max_age=86400, httponly=True, samesite="lax",
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, request=request, method="oidc"), max_age=86400, httponly=True, samesite="lax",
                     secure=_cookie_secure(request, redirect_uri.startswith("https://")))
     resp.delete_cookie(oidc_auth.STATE_COOKIE, path="/api/auth/oidc")
     return resp
@@ -1719,7 +1729,7 @@ async def saml_acs(request: Request):
     # session the IdP itself issued.
     extra = {"saml_name_id": saml_session.get("name_id", ""), "saml_session_index": saml_session.get("session_index", ""),
              "saml_name_id_format": saml_session.get("name_id_format", "")} if saml_session.get("name_id") else None
-    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, extra_claims=extra), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request, base.startswith("https://")))
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(u, extra_claims=extra, request=request, method="saml"), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request, base.startswith("https://")))
     resp.delete_cookie(saml_auth.STATE_COOKIE, path="/api/auth/saml")
     return resp
 
@@ -1743,6 +1753,7 @@ async def saml_logout(request: Request):
             logger.info(f"SAML SP-initiated logout not started: {exc}")
     if resp is None:
         resp = RedirectResponse(url="/", status_code=302)
+    end_session(token, "signed out (SAML)")
     resp.delete_cookie(COOKIE_NAME)          # the local session ends now regardless of what the IdP round trip does
     return resp
 
@@ -1757,6 +1768,12 @@ async def saml_sls(request: Request):
     base = _saml_base(cfg, request)
     query = dict(request.query_params)
     result = await asyncio.to_thread(saml_auth.complete_logout, cfg, base, query)
+    if not result.get("error") and result.get("name_id"):
+        from web import sessions
+        indexes = result.get("session_indexes") or [None]
+        ended = sum(sessions.revoke_saml(result["name_id"], idx) for idx in indexes)
+        logger.info(f"SAML IdP-initiated logout ended {ended} session(s)")
+    end_session(request.cookies.get(COOKIE_NAME), "signed out (SAML)")
     resp = RedirectResponse(url=result["redirect_url"] if result["redirect_url"] else ("/?slo_error=1" if result["error"] else "/?slo=1"),
                             status_code=302)
     resp.delete_cookie(COOKIE_NAME)           # reached only via a browser redirect (HTTP-Redirect binding is SLO's only one here)
@@ -1821,15 +1838,109 @@ async def change_password_endpoint(payload: PasswordChangeRequest, request: Requ
         raise HTTPException(status_code=400, detail=str(exc))
     fresh = get_user_by_username(user["username"])
     resp = JSONResponse(content={"success": True, "message": "Password changed. Other sessions were signed out."})
-    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request))
+    resp.set_cookie(key=COOKIE_NAME, value=create_access_token(fresh, request=request, method="password"), max_age=86400, httponly=True, samesite="lax", secure=_cookie_secure(request))
     return resp
+
+
+@app.post("/api/csp-report")
+async def csp_report_endpoint(request: Request):
+    """Content-Security-Policy violation reports from browsers (web/csp.py). Public by necessity (a browser sends them on its own), so it
+    only counts and logs, rate-limited, and never echoes anything back."""
+    from web import csp
+    body = await request.body()
+    if len(body) <= 16384:
+        try:
+            data = json.loads(body or b"{}")
+            reports = data if isinstance(data, list) else [data]
+            for item in reports[:10]:
+                rep = item.get("csp-report") or item.get("body") or item if isinstance(item, dict) else {}
+                if isinstance(rep, dict) and csp.record(rep):
+                    logger.warning(f"CSP violation: {rep.get('effective-directive') or rep.get('violated-directive') or rep.get('effectiveDirective')} "
+                                   f"blocked {str(rep.get('blocked-uri') or rep.get('blockedURL'))[:200]} on {str(rep.get('document-uri') or rep.get('documentURL'))[:200]}")
+        except (ValueError, AttributeError):
+            pass
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+
+@app.get("/api/csp-report")
+async def csp_report_stats_endpoint(current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """Violations seen since the studio started (in memory), for an administrator checking the policy."""
+    from web import csp
+    return csp.stats()
 
 
 @app.post("/api/auth/logout")
-async def logout_endpoint():
+async def logout_endpoint(request: Request):
+    """Ends the session on the server (web/sessions.py), so a copy of the token stops working too, then clears the cookie."""
+    token = request.cookies.get(COOKIE_NAME)
+    header = request.headers.get("Authorization") or ""
+    if not token and header.startswith("Bearer "):
+        token = header[7:].strip()
+    end_session(token, "signed out")
     resp = JSONResponse(content={"success": True, "message": "Successfully logged out"})
     resp.delete_cookie(COOKIE_NAME)
     return resp
+
+
+def _session_view(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    keys = ("id", "created_at", "expires_at", "last_seen_at", "revoked_at", "revoked_reason", "ip", "user_agent", "method", "state", "current")
+    return [{k: r.get(k) for k in keys} for r in rows]
+
+
+@app.get("/api/auth/sessions")
+async def my_sessions_endpoint(request: Request, include_ended: bool = False):
+    """The caller's own sessions (devices / browsers signed in), the current one marked."""
+    from web import sessions
+    user = await get_current_user(request)
+    return {"sessions": _session_view(sessions.list_for(user["id"], current_session_id(request), include_ended)),
+            "idle_minutes": sessions.idle_seconds() // 60}
+
+
+@app.post("/api/auth/sessions/{session_id}/revoke")
+async def revoke_my_session_endpoint(session_id: str, request: Request):
+    """Ends one of the caller's own sessions (another browser, a lost laptop). Ending the current one is a sign-out."""
+    from web import sessions
+    user = await get_current_user(request)
+    from web import mfa_policy
+    is_current = session_id == current_session_id(request)
+    if not sessions.revoke(session_id, "ended by the account holder", user_id=user["id"]):
+        raise HTTPException(status_code=404, detail="No such active session.")
+    mfa_policy._audit(user["username"], "SESSION_REVOKE", f"user:{user['username']}", {"session": session_id})
+    resp = JSONResponse(content={"success": True, "current": is_current})
+    if is_current:
+        resp.delete_cookie(COOKIE_NAME)
+    return resp
+
+
+@app.post("/api/auth/sessions/revoke-others")
+async def revoke_my_other_sessions_endpoint(request: Request):
+    """"Sign out everywhere else": ends every session of the caller except the one making this request."""
+    from web import mfa_policy
+    user = await get_current_user(request)
+    n = revoke_user_sessions(user["id"], "ended by the account holder", except_id=current_session_id(request))
+    mfa_policy._audit(user["username"], "SESSION_REVOKE_OTHERS", f"user:{user['username']}", {"count": n})
+    return {"success": True, "ended": n}
+
+
+@app.get("/api/users/{user_id}/sessions")
+async def user_sessions_endpoint(user_id: str, include_ended: bool = False, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    from web import sessions
+    if not get_user_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"sessions": _session_view(sessions.list_for(user_id, None, include_ended))}
+
+
+@app.post("/api/users/{user_id}/sessions/revoke")
+async def revoke_user_sessions_endpoint(user_id: str, current_user: Dict[str, Any] = Depends(require_role(["admin"]))):
+    """An administrator ends every session of an account (a stolen laptop, someone leaving): they must sign in again."""
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    from web import mfa_policy
+    n = revoke_user_sessions(user_id, f"ended by administrator {current_user['username']}")
+    mfa_policy._audit(current_user["username"], "SESSION_REVOKE_ALL", f"user:{target['username']}", {"count": n})
+    return {"success": True, "ended": n}
 
 
 @app.get("/api/auth/me")
@@ -5175,7 +5286,7 @@ async def revoke_share(share_token: str, current_user: dict = Depends(get_curren
     return {"success": True, "message": "Share revoked"}
 
 @app.get("/share/{share_token}")
-async def view_shared_dashboard(share_token: str):
+async def view_shared_dashboard(share_token: str, request: Request):
     """View a shared dashboard (no auth required)."""
     from web.dashboards import get_dashboard_by_share_token
     dashboard = get_dashboard_by_share_token(share_token)
@@ -5184,11 +5295,8 @@ async def view_shared_dashboard(share_token: str):
         raise HTTPException(status_code=404, detail="Share link not found or expired")
 
     # Return the main index page with share token in URL
-    # The frontend will detect the share token and load the dashboard
-    with open("/workspace/web/templates/index.html", "r") as f:
-        html_content = f.read()
-
-    return HTMLResponse(content=html_content)
+    # The frontend will detect the share token and load the dashboard. Rendered (not read raw), so the scripts carry the CSP nonce.
+    return templates.TemplateResponse(request=request, name="index.html", context={"warehouse_dir": WAREHOUSE_DIR, "csp_nonce": _csp_nonce(request)})
 
 @app.get("/api/dashboards/templates")
 async def list_dashboard_templates(current_user: dict = Depends(get_current_user)):
@@ -6184,11 +6292,11 @@ async def get_embedded_dashboard(dashboard_id: str, request: Request, theme: str
         return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>", status_code=404)
 
     # Return embedded view with minimal UI
-    return templates.TemplateResponse("embed.html", {
-        "request": request,
+    return templates.TemplateResponse(request=request, name="embed.html", context={
         "dashboard": dashboard,
         "dashboard_id": dashboard_id,
-        "theme": theme
+        "theme": theme,
+        "csp_nonce": _csp_nonce(request),
     })
 
 

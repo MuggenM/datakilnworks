@@ -6,16 +6,16 @@
   <title>{{ dashboard.get('name', 'Dashboard') }}</title>
 
   <!-- Tailwind CSS -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="/static/tailwind.min.js"></script>
 
   <!-- Alpine.js -->
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script defer src="/static/alpine.min.js"></script>
 
   <!-- ECharts -->
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="/static/echarts.min.js"></script>
 
   <!-- Phosphor Icons -->
-  <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.0.3/src/regular/style.css">
+  <link rel="stylesheet" href="/static/phosphor-regular.css">
 
   <style>
     /* Minimal embedded view styles */
@@ -90,7 +90,7 @@
     </div>
   </div>
 
-  <script>
+  <script nonce="{{ csp_nonce }}">
     function embedDashboard() {
       return {
         dashboard: {{ dashboard | tojson }},

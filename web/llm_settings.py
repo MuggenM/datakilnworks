@@ -16,7 +16,9 @@ logger = logging.getLogger("localspark.llm_settings")
 
 WAREHOUSE_DIR = os.getenv("WAREHOUSE_DIR", "/workspace/warehouse")
 METADATA_DIR = os.path.join(WAREHOUSE_DIR, ".metadata")
-LLM_CONFIG_FILE = os.path.join(METADATA_DIR, "llm_config.json")
+# Holds LLM API keys: kept with the other secrets (DKW_SECRETS_DIR, web/secrets_store.py), not on the data volume.
+from web.secrets_store import secret_path as _secret_path
+LLM_CONFIG_FILE = _secret_path("llm_config.json")
 
 DEFAULT_LLM_CONFIG = {
     "ollama_host": os.environ.get("OLLAMA_HOST", "http://10.0.2.2:11434"),

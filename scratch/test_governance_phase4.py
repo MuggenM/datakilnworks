@@ -73,8 +73,7 @@ def leaks(obj):
 
 def cookie_for(username):
     user = auth.get_user_by_username(username)
-    token = jwt.encode({"sub": user["id"], "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)},
-                       auth.JWT_SECRET_KEY, algorithm=auth.JWT_ALGORITHM)
+    token = auth.create_access_token(user, expires_delta=datetime.timedelta(hours=1))   # a real server-side session (web/sessions.py)
     return {auth.COOKIE_NAME: token}
 
 

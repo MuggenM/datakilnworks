@@ -5,16 +5,20 @@
   persistentVolumeClaim: {claimName: {{ include "dkw.claim" (dict "root" . "key" "notebooks") }}}
 - name: dbt-project
   persistentVolumeClaim: {claimName: {{ include "dkw.claim" (dict "root" . "key" "dbtProject") }}}
+- name: secrets
+  persistentVolumeClaim: {claimName: {{ include "dkw.claim" (dict "root" . "key" "keys") }}}
 {{- end -}}
 {{- define "dkw.studioMounts" -}}
 - {name: warehouse, mountPath: /workspace/warehouse}
 - {name: notebooks, mountPath: /workspace/notebooks}
 - {name: dbt-project, mountPath: /workspace/dbt_project}
+- {name: secrets, mountPath: /workspace/secrets}
 {{- end -}}
 {{- define "dkw.studioEnv" -}}
 - {name: WAREHOUSE_DIR, value: /workspace/warehouse}
 - {name: NOTEBOOKS_DIR, value: /workspace/notebooks}
 - {name: DBT_PROJECT_DIR, value: /workspace/dbt_project}
+- {name: DKW_SECRETS_DIR, value: /workspace/secrets}  # keys + auth.db on their own volume; compute_token comes from the Secret, governance_salt stays in .metadata (the compute nodes read it)
 - {name: INIT_ADMIN_USERNAME, value: {{ .Values.secrets.initAdminUsername | quote }}}
 - {name: CONTROLLER_URL, value: ""}           # the Docker-socket controller is not part of this chart: no container auto-suspend
 {{- range .Values.computeNodes }}

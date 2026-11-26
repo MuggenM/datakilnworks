@@ -19,6 +19,13 @@ services:
       - "${STUDIO_PORT:-8891}:8000"
     environment: &studio-env
       - WAREHOUSE_DIR=/workspace/warehouse
+      # Secrets off the warehouse volume (web/secrets_store.py): signing / encryption keys and auth.db on `dkw-secrets` (studio + init only),
+      # compute_token + governance_salt on `dkw-compute-secrets` (also the compute nodes). Moved out of warehouse/.metadata automatically
+      # on the first start; removing these variables afterwards is refused (a `.moved` marker), never answered with fresh keys.
+      - DKW_SECRETS_DIR=/workspace/secrets
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets
+      # Server-side sessions (web/sessions.py): minutes of inactivity after which a session ends (0 = only the 24 h lifetime).
+      - SESSION_IDLE_MINUTES=${SESSION_IDLE_MINUTES:-0}
       - WH_STARTER_ENDPOINT=http://compute-node-01:8001
       - WH_ANALYTICS_ENDPOINT=http://compute-node-02:8002
       - WH_ETL_ENDPOINT=http://compute-node-03:8003
@@ -67,6 +74,8 @@ services:
       # project repository; an empty directory is seeded from web/dbt_template on first start. See .env.example.
       - ${DBT_PROJECT_HOST_DIR:-./dbt_project}:/workspace/dbt_project
       - ./docs:/workspace/docs
+      - dkw-secrets:/workspace/secrets
+      - dkw-compute-secrets:/workspace/compute-secrets
       - sandbox-secret:/run/sandbox:ro
       - controller-secret:/run/controller:ro
     networks:
@@ -136,6 +145,8 @@ services:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
       - ${DBT_PROJECT_HOST_DIR:-./dbt_project}:/workspace/dbt_project
+      - dkw-secrets:/workspace/secrets
+      - dkw-compute-secrets:/workspace/compute-secrets
     restart: "no"
 
   # Runs the notebook kernels of users a masking policy applies to. It has no warehouse mount, is alone with the studio on an
@@ -227,9 +238,11 @@ services:
       - MAX_MEMORY=2GB
       - THREADS=2
       - WORKER_PORT=8001
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets     # compute_token + governance_salt only: no session or encryption key here
     volumes:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
+      - dkw-compute-secrets:/workspace/compute-secrets
     deploy:
       resources:
         limits:
@@ -255,9 +268,11 @@ services:
       - MAX_MEMORY=4GB
       - THREADS=4
       - WORKER_PORT=8002
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets     # compute_token + governance_salt only: no session or encryption key here
     volumes:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
+      - dkw-compute-secrets:/workspace/compute-secrets
     deploy:
       resources:
         limits:
@@ -283,9 +298,11 @@ services:
       - MAX_MEMORY=4GB
       - THREADS=4
       - WORKER_PORT=8003
+      - DKW_COMPUTE_SECRETS_DIR=/workspace/compute-secrets     # compute_token + governance_salt only: no session or encryption key here
     volumes:
       - ./warehouse:/workspace/warehouse
       - ./web:/workspace/web
+      - dkw-compute-secrets:/workspace/compute-secrets
     deploy:
       resources:
         limits:
@@ -304,6 +321,10 @@ networks:
     internal: true
 
 volumes:
+  # Back these up together with ./warehouse (and keep them apart from it): without dkw-secrets nobody can sign in and stored credentials
+  # cannot be decrypted; without dkw-compute-secrets hashed masks change.
+  dkw-secrets:
+  dkw-compute-secrets:
   traefik-acme:
   controller-secret:
   sandbox-secret:

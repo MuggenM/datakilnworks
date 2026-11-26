@@ -79,7 +79,8 @@ def otpauth_uri(secret: bytes, account: str) -> str:
 # ---------------------------------------------------------------- key material
 
 def _key_path() -> str:
-    return os.path.join(os.getenv("WAREHOUSE_DIR", "/workspace/warehouse"), ".metadata", "mfa.key")
+    from web.secrets_store import secret_path
+    return secret_path("mfa.key")             # DKW_SECRETS_DIR (web/secrets_store.py): never on the data volume next to auth.db
 
 
 def _key() -> bytes:

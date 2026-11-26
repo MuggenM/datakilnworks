@@ -60,8 +60,7 @@ def check(name, cond, detail=""):
 def cookie_for(username):
     user = auth.get_user_by_username(username)
     now = datetime.datetime.now(datetime.timezone.utc)
-    return {auth.COOKIE_NAME: jwt.encode({"sub": user["id"], "iat": int(now.timestamp()), "exp": now + datetime.timedelta(hours=1)},
-                                         auth.JWT_SECRET_KEY, algorithm=auth.JWT_ALGORITHM)}
+    return {auth.COOKIE_NAME: auth.create_access_token(user, expires_delta=datetime.timedelta(hours=1))}   # a real server-side session
 
 
 def main():

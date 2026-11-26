@@ -1,4 +1,4 @@
-{{- range $key := list "warehouse" "notebooks" "dbtProject" }}
+{{- range $key := list "warehouse" "notebooks" "dbtProject" "keys" }}
 {{- $c := index $.Values.persistence $key }}
 {{- if not $c.existingClaim }}
 ---

@@ -127,6 +127,30 @@ def _resolve(path: str) -> Callable[[], Any]:
     return getattr(importlib.import_module(mod), fn)
 
 
+def step_secrets(rep: Report) -> None:
+    """Keys and the accounts database in their own directories (DKW_SECRETS_DIR / DKW_COMPUTE_SECRETS_DIR, web/secrets_store.py):
+    moved there out of .metadata once, BEFORE the studio or a compute node opens them."""
+    from web import secrets_store
+    try:
+        moved = secrets_store.migrate_all()
+    except secrets_store.SecretMovedError as exc:
+        rep.add(FAIL, "secrets", str(exc))
+        return
+    except Exception as exc:
+        rep.add(FAIL, "secrets", f"could not move the secrets out of .metadata: {type(exc).__name__}: {str(exc)[:300]}")
+        return
+    loc = secrets_store.locations()
+    legacy = os.path.realpath(loc["legacy"])
+    where = f"keys in {loc['secrets']}, compute-node secrets in {loc['compute_secrets']}"
+    if moved:
+        rep.add(OK, "secrets", f"moved {', '.join(moved)} out of {loc['legacy']}; {where}")
+    elif os.path.realpath(loc["secrets"]) == legacy:
+        rep.add(WARN, "secrets", "DKW_SECRETS_DIR is not set: the signing keys and auth.db stay on the warehouse volume (.metadata), "
+                                 "so a copy of that volume can forge sessions and decrypt stored credentials")
+    else:
+        rep.add(OK, "secrets", where)
+
+
 def step_bootstrap_and_databases(rep: Report) -> None:
     """The accounts database first, and with it the bootstrap administrator (only when there is no account at all)."""
     handler = _Collect()
@@ -245,7 +269,9 @@ def run(wait_for: Optional[List[str]] = None, wait_timeout: float = 120.0, check
     if not check_only:
         try:
             with _lock(float(os.getenv("INIT_LOCK_TIMEOUT", "180"))):
-                step_bootstrap_and_databases(rep)
+                step_secrets(rep)
+                if not rep.failed:
+                    step_bootstrap_and_databases(rep)
                 if not rep.failed:
                     step_seed(rep)
                     step_kernel_permissions(rep)

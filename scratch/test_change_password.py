@@ -53,9 +53,12 @@ def check(name, cond, detail=""):
 
 def token_for(username, iat=None):
     user = auth.get_user_by_username(username)
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return jwt.encode({"sub": user["id"], "iat": int(iat if iat is not None else now.timestamp()), "exp": now + datetime.timedelta(hours=1)},
-                      auth.JWT_SECRET_KEY, algorithm=auth.JWT_ALGORITHM)
+    token = auth.create_access_token(user, expires_delta=datetime.timedelta(hours=1))   # a real server-side session
+    if iat is None:
+        return token
+    payload = jwt.decode(token, auth.JWT_SECRET_KEY, algorithms=[auth.JWT_ALGORITHM])
+    payload["iat"] = int(iat)                     # same session, re-signed with the real key but an earlier issue time
+    return jwt.encode(payload, auth.JWT_SECRET_KEY, algorithm=auth.JWT_ALGORITHM)
 
 
 def main():

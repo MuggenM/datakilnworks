@@ -79,7 +79,8 @@ def _pem(text: str) -> str:
 
 
 def _sp_key_paths() -> Tuple[str, str]:
-    return os.path.join(METADATA_DIR, "saml_sp.key"), os.path.join(METADATA_DIR, "saml_sp.crt")
+    from web.secrets_store import secret_path
+    return secret_path("saml_sp.key"), secret_path("saml_sp.crt")
 
 
 def _generate_sp_keypair(key_path: str, cert_path: str):
@@ -297,7 +298,19 @@ def complete_logout(cfg: Dict[str, Any], sp_base: str, query: Dict[str, str]) ->
     if errors:
         logger.warning(f"SAML SLO message rejected: {errors} {auth.get_last_error_reason()}")
         return {"redirect_url": None, "error": True}
-    return {"redirect_url": url, "error": False}
+    out = {"redirect_url": url, "error": False, "name_id": "", "session_indexes": []}
+    if query.get("SAMLRequest"):
+        # A validated IdP-initiated LogoutRequest: name the sessions it ends, so the caller can revoke them server side (also in
+        # browsers other than the one carrying this redirect: the IdP may log the user out of every application at once).
+        try:
+            from onelogin.saml2.logout_request import OneLogin_Saml2_Logout_Request
+            from onelogin.saml2.utils import OneLogin_Saml2_Utils
+            xml = OneLogin_Saml2_Utils.decode_base64_and_inflate(query["SAMLRequest"])
+            out["name_id"] = OneLogin_Saml2_Logout_Request.get_nameid(xml) or ""
+            out["session_indexes"] = list(OneLogin_Saml2_Logout_Request.get_session_indexes(xml) or [])
+        except Exception as exc:
+            logger.warning(f"SAML LogoutRequest NameID could not be read: {exc}")
+    return out
 
 
 def _names(attrs: Dict[str, List[str]], *wanted: str) -> List[str]:

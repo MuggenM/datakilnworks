@@ -7,7 +7,7 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23d95338' stroke-width='2' stroke-linejoin='round'%3E%3Cpolygon points='12,2 21,7.5 21,16.5 12,22 3,16.5 3,7.5' fill='%23d95338' fill-opacity='0.2'/%3E%3Cpath d='M12 2L21 7.5L12 13L3 7.5L12 2Z' fill='%23d95338' fill-opacity='0.3'/%3E%3Cpath d='M12 13V22'/%3E%3Cpath d='M12 7.5L15 12C15.2 13.5 14 15 12 15C10 15 8.8 13.5 9 12L12 7.5Z' fill='%23d95338' stroke='none'/%3E%3C/svg%3E">
   <!-- Tailwind CSS -->
   <script src="/static/tailwind.min.js"></script>
-  <script>
+  <script nonce="{{ csp_nonce }}">
     tailwind.config = {
       darkMode: 'class',
       theme: {
@@ -34,7 +34,7 @@
   <script src="/static/marked.min.js"></script>
   <!-- Highlight.js for SQL and Multi-Language Syntax Color Coding -->
   <script src="/static/highlight.min.js"></script>
-  <script>
+  <script nonce="{{ csp_nonce }}">
     (function() {
       const escapeHtml = function(str) {
         return (str || '')
@@ -83,7 +83,7 @@
                     `<span class="w-2 h-2 rounded-full ${badgeColor} inline-block"></span>` +
                     `<span>${badgeLang}</span>` +
                   `</span>` +
-                  `<button type="button" onclick="navigator.clipboard.writeText(this.closest('.playground-code-block').querySelector('code').innerText); const s = this.querySelector('span'); const orig = s.innerText; s.innerText = 'Copied!'; setTimeout(() => s.innerText = orig, 1500);" class="px-2 py-0.5 rounded text-[10px] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 transition flex items-center space-x-1" title="Copy code snippet">` +
+                  `<button type="button" data-copy-code class="px-2 py-0.5 rounded text-[10px] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 transition flex items-center space-x-1" title="Copy code snippet">` +
                     `<i class="ph ph-copy"></i>` +
                     `<span>Copy</span>` +
                   `</button>` +
@@ -108,8 +108,21 @@
   <link rel="stylesheet" href="/static/phosphor-bold.css">
   <link rel="stylesheet" href="/static/phosphor-fill.css">
   <link rel="stylesheet" href="/static/dag.css">
+  <!-- Copy buttons of rendered code blocks (data-copy-code): one delegated listener, since the CSP refuses inline onclick handlers -->
+  <script nonce="{{ csp_nonce }}">
+    document.addEventListener('click', function (ev) {
+      const btn = ev.target && ev.target.closest && ev.target.closest('[data-copy-code]');
+      if (!btn) return;
+      const block = btn.closest('.playground-code-block');
+      const code = block && block.querySelector('code');
+      if (!code) return;
+      navigator.clipboard.writeText(code.innerText);
+      const label = btn.querySelector('span');
+      if (label) { const orig = label.innerText; label.innerText = 'Copied!'; setTimeout(function () { label.innerText = orig; }, 1500); }
+    });
+  </script>
   <!-- Theme initializer (prevent FOUC) -->
-  <script>
+  <script nonce="{{ csp_nonce }}">
     (function() {
       const savedTheme = localStorage.getItem('dbx_theme');
       if (savedTheme === 'light') {
@@ -1046,6 +1059,12 @@
                       class="w-full flex items-center space-x-2 px-3 py-2 rounded text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-dbx-hover transition text-left">
                 <i class="ph ph-shield-check text-sm text-emerald-500"></i>
                 <span>Two-factor authentication</span>
+              </button>
+
+              <button @click="userMenuOpen = false; openSessions()" data-testid="menu-sessions"
+                      class="w-full flex items-center space-x-2 px-3 py-2 rounded text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-dbx-hover transition text-left">
+                <i class="ph ph-devices text-sm text-sky-500"></i>
+                <span>Signed-in sessions</span>
               </button>
 
               <!-- Admin only: IAM Management -->
@@ -16075,6 +16094,9 @@
                       </button>
                       <button x-show="u.passwordless" @click="issueEnrollmentLink(u)" data-testid="user-enroll-link" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Issue a new enrolment link (first sign-in, or recovery after every passkey was lost)"><i class="ph ph-link"></i></button>
                       <button x-show="!u.passwordless && ['local','ldap'].includes(u.auth_source || 'local') && u.passkey_count >= 2 && u.id !== currentUser.id" @click="removeUserPassword(u)" data-testid="user-remove-password" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Remove the password: the account signs in with passkeys only"><i class="ph ph-password"></i></button>
+                      <button x-show="u.id !== currentUser.id" @click="endUserSessions(u)" data-testid="user-end-sessions" class="px-2 py-1 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-900 dark:hover:bg-dbx-hover dark:text-slate-300 dark:border-dbx-border rounded transition text-[11px] font-medium" title="End every session of this account (they must sign in again)">
+                        <i class="ph ph-sign-out"></i>
+                      </button>
                       <button x-show="u.mfa_enabled && u.id !== currentUser.id" @click="resetUserMfa(u)" class="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900 dark:text-sky-300 dark:border-sky-800 rounded transition text-[11px] font-medium" title="Turn off two-factor authentication and remove passkeys (lost device)">
                         <i class="ph ph-shield-slash"></i>
                       </button>
@@ -18030,6 +18052,41 @@
     </div>
   </div>
 
+  <!-- Modal: the account holder's own signed-in sessions (server-side sessions, web/sessions.py) -->
+  <div x-show="sess.open" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="sess.open = false" data-testid="sessions-modal">
+    <div class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-2xl shadow-2xl p-5 space-y-4 text-xs max-h-[90vh] overflow-y-auto" @click.outside="sess.open = false">
+      <div class="flex items-center justify-between">
+        <h4 class="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-1.5"><i class="ph ph-devices text-sky-500"></i><span>Signed-in sessions</span></h4>
+        <button type="button" @click="sess.open = false" class="text-slate-400 hover:text-slate-900 dark:hover:text-white text-sm"><i class="ph ph-x"></i></button>
+      </div>
+      <p class="text-slate-500 dark:text-slate-400">Every browser or device signed in to your account. Ending a session signs it out immediately, also where a copy of its token was taken.<span x-show="sess.idleMinutes > 0" x-text="' Sessions unused for ' + sess.idleMinutes + ' minutes end on their own.'"></span></p>
+      <div x-show="sess.error" class="text-rose-600 dark:text-rose-400" x-text="sess.error"></div>
+      <div class="border border-slate-200 dark:border-dbx-border rounded-lg divide-y divide-slate-200 dark:divide-dbx-border">
+        <template x-for="row in sess.rows" :key="row.id">
+          <div class="flex items-center justify-between px-3 py-2 gap-3" data-testid="session-row">
+            <div class="min-w-0">
+              <div class="font-medium text-slate-800 dark:text-slate-100 truncate" :title="row.user_agent" x-text="describeUserAgent(row.user_agent)"></div>
+              <div class="text-slate-500 dark:text-slate-400">
+                <span x-text="(row.method || 'sign-in') + ' · ' + (row.ip || 'unknown address')"></span>
+                <span x-text="' · signed in ' + fmtEpoch(row.created_at) + ' · last used ' + fmtEpoch(row.last_seen_at)"></span>
+              </div>
+            </div>
+            <div class="shrink-0">
+              <span x-show="row.current" class="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800" data-testid="session-current">This browser</span>
+              <button x-show="!row.current" type="button" @click="revokeSession(row)" :disabled="!!sess.busy" data-testid="session-revoke"
+                      class="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 dark:bg-rose-950/60 dark:hover:bg-rose-900 dark:text-rose-300 dark:border-rose-800 rounded">Sign out</button>
+            </div>
+          </div>
+        </template>
+        <div x-show="!sess.rows.length && !sess.busy" class="px-3 py-2 text-slate-500">No active sessions.</div>
+      </div>
+      <div class="flex justify-end">
+        <button type="button" @click="revokeOtherSessions()" :disabled="!!sess.busy || sess.rows.filter(r => !r.current).length === 0" data-testid="sessions-revoke-others"
+                class="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-lg font-semibold">Sign out everywhere else</button>
+      </div>
+    </div>
+  </div>
+
   <div x-show="changePasswordOpen" x-cloak class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" @keydown.escape.window="if (!changePasswordForced) changePasswordOpen = false">
     <form @submit.prevent="submitChangePassword()" class="bg-white dark:bg-dbx-panel border border-slate-200 dark:border-dbx-border rounded-2xl w-full max-w-sm shadow-2xl p-5 space-y-4" @click.outside="if (!changePasswordForced) changePasswordOpen = false">
       <div class="flex items-center justify-between border-b border-slate-200 dark:border-dbx-border pb-2">
@@ -18541,7 +18598,7 @@
     <span x-text="toast.message" class="font-medium"></span>
   </div>
 
-  <script>
+  <script nonce="{{ csp_nonce }}">
   // ==========================================
   // CRON UTILITY FUNCTIONS & CALCULATORS
   // ==========================================
@@ -18871,6 +18928,7 @@
         nbGit: { open: false, busy: false, msg: '', branchName: '', prTitle: '', prBody: '', note: '', error: '', git: { configured: false, connected: false, ahead: 0, behind: 0, unpushed: 0, dirty: false, changes: [], head: null, mode: 'direct', on_base: true, remote_has_base: false, pull_request: null } },
         dbtCfg: { open: false, tab: 'profiles.yml', files: { 'profiles.yml': { content: '', orig: '', versions: [] }, 'dbt_project.yml': { content: '', orig: '', versions: [] } }, s3Mounts: [], s3Mount: '', git: { configured: false, connected: false, ahead: 0, behind: 0, unpushed: 0, dirty: false, changes: [], head: null, mode: 'direct', on_base: true, remote_has_base: false, pull_request: null }, gitMsg: '', gitBranchName: '', prTitle: '', prBody: '', gitBusy: false, gitNote: '', gitError: '', settings: null, form: { storage: 'local', schema: '', threads: 2, folders: [] }, applied: [], busy: false, errors: [], warnings: [], ok: null, message: '' },
         cloneModal: { open: false, source: '', schema: '', name: '', catalog: 'warehouse', srcSchema: '', srcTable: '', version: '', replace: false, busy: false, error: '' },
+        sess: { open: false, rows: [], busy: false, error: '', idleMinutes: 0 },
         changePasswordOpen: false,
         changePasswordForced: false,
         changePasswordForm: { current: '', next: '', repeat: '', error: '', busy: false },
@@ -20858,6 +20916,59 @@
           if (!data) return;
           this.mfa.backupCodes = data.backup_codes; this.mfa.action = ''; this.mfa.code = ''; this.mfa.password = '';
           this.mfa.status.backup_codes_remaining = data.backup_codes.length;
+        },
+
+        async openSessions() { this.sess.open = true; this.sess.error = ''; await this.loadSessions(); },
+
+        async loadSessions() {
+          this.sess.busy = true;
+          try {
+            const res = await fetch('/api/auth/sessions');
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { this.sess.error = data.detail || 'Could not load the sessions.'; return; }
+            this.sess.rows = data.sessions || []; this.sess.idleMinutes = data.idle_minutes || 0;
+          } finally { this.sess.busy = false; }
+        },
+
+        async revokeSession(row) {
+          this.sess.busy = true;
+          try {
+            const res = await fetch(`/api/auth/sessions/${encodeURIComponent(row.id)}/revoke`, { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { this.sess.error = data.detail || 'Could not end the session.'; return; }
+            this.showToast('Session signed out.', 'success');
+          } finally { this.sess.busy = false; }
+          await this.loadSessions();
+        },
+
+        async revokeOtherSessions() {
+          if (!confirm('Sign out every other browser and device that is signed in to your account?')) return;
+          this.sess.busy = true;
+          try {
+            const res = await fetch('/api/auth/sessions/revoke-others', { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) { this.sess.error = data.detail || 'Could not end the sessions.'; return; }
+            this.showToast(`${data.ended} other session(s) signed out.`, 'success');
+          } finally { this.sess.busy = false; }
+          await this.loadSessions();
+        },
+
+        async endUserSessions(user) {
+          if (!confirm(`End every session of ${user.username}? They have to sign in again everywhere.`)) return;
+          const res = await fetch(`/api/users/${encodeURIComponent(user.id)}/sessions/revoke`, { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { this.showToast(data.detail || 'Failed to end the sessions', 'error'); return; }
+          this.showToast(`${data.ended} session(s) of ${user.username} ended.`, 'success');
+        },
+
+        fmtEpoch(t) { return t ? new Date(t * 1000).toLocaleString() : ''; },
+
+        describeUserAgent(ua) {
+          if (!ua) return 'Unknown client';
+          const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari'
+            : /curl\//.test(ua) ? 'curl' : /python/i.test(ua) ? 'Python client' : '';
+          const os = /Windows/.test(ua) ? 'Windows' : /Mac OS X/.test(ua) ? 'macOS' : /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Linux/.test(ua) ? 'Linux' : '';
+          return (browser || os) ? [browser, os].filter(Boolean).join(' on ') : ua.slice(0, 60);
         },
 
         async resetUserMfa(user) {

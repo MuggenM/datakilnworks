@@ -173,11 +173,11 @@ def harden_permissions(warehouse_dir: Optional[str] = None) -> Dict[str, int]:
     meta = os.path.join(wd, ".metadata")
     os.makedirs(meta, exist_ok=True)
     os.chmod(meta, 0o700)
+    locked = {os.path.realpath(meta)} | _lock_secrets_dirs()      # never opened to the data group, even when configured inside the warehouse
     changed = 0
     seen = 0
     for root, dirs, files in os.walk(wd):
-        if os.path.abspath(root) == os.path.abspath(wd):
-            dirs[:] = [d for d in dirs if d != ".metadata"]
+        dirs[:] = [d for d in dirs if os.path.realpath(os.path.join(root, d)) not in locked]
         for name, is_dir in [(None, True)] + [(f, False) for f in files]:
             p = root if name is None else os.path.join(root, name)
             try:
@@ -200,6 +200,20 @@ def harden_permissions(warehouse_dir: Optional[str] = None) -> Dict[str, int]:
     return {"entries": seen, "changed": changed}
 
 
+def _lock_secrets_dirs() -> set:
+    """DKW_SECRETS_DIR / DKW_COMPUTE_SECRETS_DIR (web/secrets_store.py) root-only, like `.metadata`. Returns their real paths."""
+    from web import secrets_store
+    out = set()
+    for name in ("", "compute_token"):
+        d = secrets_store.secrets_dir(name)
+        try:
+            os.chmod(d, 0o700)
+        except OSError as exc:
+            logger.error(f"could not restrict {d}: {exc}")
+        out.add(os.path.realpath(d))
+    return out
+
+
 def prepare_studio() -> None:
     """Called at studio start: umask for group-writable data, `.metadata` locked down, home root, data group permissions."""
     os.umask(0o002)
@@ -214,6 +228,7 @@ def prepare_studio() -> None:
     try:
         os.makedirs(META_DIR, exist_ok=True)
         os.chmod(META_DIR, 0o700)
+        _lock_secrets_dirs()
     except OSError as exc:
         logger.error(f"could not restrict {META_DIR}: {exc}")
 

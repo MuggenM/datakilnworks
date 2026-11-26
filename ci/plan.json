@@ -180,6 +180,14 @@
   {
    "name": "csrf",
    "extras": ""
+  },
+  {
+   "name": "sessions",
+   "extras": ""
+  },
+  {
+   "name": "secrets_volume",
+   "extras": ""
   }
  ],
  "ui": [
@@ -206,6 +214,9 @@
   },
   {
    "name": "dashboard_apps_ui"
+  },
+  {
+   "name": "csp_ui"
   }
  ]
 }
