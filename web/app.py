@@ -2688,7 +2688,8 @@ async def test_onelake_connection_endpoint(catalog_id: str):
 
 @app.get("/api/cluster/nodes")
 async def list_cluster_nodes():
-    nodes = get_compute_nodes_status()
+    # blocking HTTP probes (up to 1 s per node and endpoint): never on the event loop, or every other request waits for them
+    nodes = await asyncio.to_thread(get_compute_nodes_status)
     online_cnt = sum(1 for n in nodes if n.get("status") == "ONLINE")
     return {
         "success": True,
@@ -4189,7 +4190,7 @@ async def generate_copilot_sql_api(payload: CopilotGenerateRequest):
 @app.get("/api/sql/copilot/providers")
 async def get_copilot_providers_api():
     from web.genie import get_available_providers
-    return get_available_providers()
+    return await asyncio.to_thread(get_available_providers)   # probes Ollama / LM Studio over HTTP: off the event loop
 
 
 @app.get("/api/workspace/files")
@@ -7514,7 +7515,7 @@ class CreateChatPayload(BaseModel):
 
 @app.get("/api/genie/config")
 async def genie_config_endpoint():
-    config = get_available_providers()
+    config = await asyncio.to_thread(get_available_providers)   # probes Ollama / LM Studio over HTTP: off the event loop
     schema_info = extract_schema_context()
     config["tables"] = [
         {
