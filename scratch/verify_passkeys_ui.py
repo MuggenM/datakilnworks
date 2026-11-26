@@ -2,7 +2,7 @@
 """Passkeys in a REAL browser (Playwright + Chromium's virtual authenticator over CDP; host /usr/bin/python3): register a passkey in the security dialog, sign in
 with it (passwordless), sign in with password + passkey as the second factor, the refusal without user verification, both methods offered together,
 removal with the password. Builds a throwaway studio `pkui` on port 8117 (installs the webauthn package into that container) and removes it."""
-import base64, os, subprocess, sys, time
+import base64, os, re, subprocess, sys, time
 from playwright.sync_api import sync_playwright
 import _ui_slow
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http://localhost:8117"
@@ -17,22 +17,25 @@ ERRORS = []   # page errors and console errors of the main page, printed by wait
 
 def wait_or_explain(page, selector, what, timeout=10000, function=None):
     """wait_for_selector (or wait_for_function when `function` is given), but a timeout prints what the page and the studio said
-    (the open requests, the sign-in and passkey state, page errors, a screenshot, the studio log) first."""
+    (the open requests, the sign-in and passkey state, page errors, a screenshot, the studio log) first. The diagnostic lines carry
+    "[FAIL] |" because ci/annotate.py puts [FAIL] lines into the CI annotation first; anything else is crowded out by the traceback."""
     try:
         if function: page.wait_for_function(function, timeout=timeout)
         else: page.wait_for_selector(selector, timeout=timeout)
     except Exception:
         err = page.locator("[data-testid=passkey-error]")
         now = time.monotonic(); busy = sorted(((now - t, u) for u, t in PENDING.items()), reverse=True)
-        print(f"  requests still open in the browser ({len(busy)}): " + "; ".join(u[:120] for _, u in busy[:12]))
-        try: print("  pk state: " + str(page.evaluate("() => { const p = Alpine.$data(document.body).pk; return { busy: p.busy, addOpen: p.addOpen, creds: (p.creds || []).length, error: p.error }; }")))
-        except Exception as e: print(f"  pk state: unreadable ({e})")
-        try: print("  sign-in state: " + str(page.evaluate("() => { const d = Alpine.$data(document.body); const f = d.loginForm || {}; return { authenticated: d.isAuthenticated, user: d.currentUser && d.currentUser.username, loginModal: d.showLoginModal, loading: f.loading, error: f.error, mfaToken: !!f.mfaToken, mfaMethods: f.mfaMethods, username: f.username }; }")))
-        except Exception as e: print(f"  sign-in state: unreadable ({e})")
-        print(f"  page/console errors so far ({len(ERRORS)}): " + " | ".join(e[:200] for e in ERRORS[-8:]))
+        print(f"  [FAIL] | requests still open in the browser ({len(busy)}): " + "; ".join(u[:120] for _, u in busy[:12]))
+        try: print("  [FAIL] | pk state: " + str(page.evaluate("() => { const p = Alpine.$data(document.body).pk; return { busy: p.busy, addOpen: p.addOpen, creds: (p.creds || []).length, error: p.error }; }")))
+        except Exception as e: print(f"  [FAIL] | pk state: unreadable ({e})")
+        try: print("  [FAIL] | sign-in state: " + str(page.evaluate("() => { const d = Alpine.$data(document.body); const f = d.loginForm || {}; return { authenticated: d.isAuthenticated, user: d.currentUser && d.currentUser.username, loginModal: d.showLoginModal, loading: f.loading, error: f.error, mfaToken: !!f.mfaToken, mfaMethods: f.mfaMethods, username: f.username }; }")))
+        except Exception as e: print(f"  [FAIL] | sign-in state: unreadable ({e})")
+        print(f"  [FAIL] | page/console errors so far ({len(ERRORS)}): " + " | ".join(e[:200] for e in ERRORS[-8:]))
         print(f"  [FAIL] {what}: {function or selector} did not {'become true' if function else 'appear'}; on-page error: {err.inner_text()[:300] if err.count() and err.first.is_visible() else '(none shown)'}")
         shot = os.path.join(os.getenv("ARTIFACT_DIR", "/tmp"), "passkeys_failure.png"); page.screenshot(path=shot); print(f"    screenshot: {shot}")
         r = sh("docker", "logs", "--tail", "40", "pkui"); print("    studio log (last 40 lines):"); [print("      " + ln[:300]) for ln in (r.stdout + r.stderr).splitlines()[-40:]]
+        notable = [ln for ln in (r.stdout + r.stderr).splitlines() if re.search(r"ERROR|Traceback|Exception| [45]\d\d ", ln)]
+        [print("  [FAIL] | studio: " + ln[:300]) for ln in notable[-6:]]
         raise
 sh("docker", "rm", "-f", "pkui")
 sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "pkui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
