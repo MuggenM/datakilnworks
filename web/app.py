@@ -3624,7 +3624,11 @@ async def execute_sql(payload: QueryRequest, request: Request):
                     for ep in endpoints_to_try:
                         try:
                             active_entry["endpoint"] = ep
-                            with httpx.Client(timeout=45.0, headers=compute_headers()) as client:
+                            # 45 s for the query, but only 3 s to connect: a compute node on the compose network connects in
+                            # milliseconds, and a node that is not there (every test studio) must not hold each query for the
+                            # full 45 s before the Ray / local fallback (an unresolvable name can resolve to an address that drops
+                            # packets: a wildcard search domain does that).
+                            with httpx.Client(timeout=httpx.Timeout(45.0, connect=3.0), headers=compute_headers()) as client:
                                 resp = client.post(
                                     f"{ep}/api/compute/execute",
                                     json={
