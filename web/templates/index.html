@@ -23209,6 +23209,8 @@
         async fetchWorkspaceTree(preserveSelection = true) {
           try {
             const res = await fetch('/api/workspace/tree');
+            // started at sign-in, answered after a sign-out: the API gate's 401 is not an error (same as fetchWorkspaceFileDetail)
+            if (res.status === 401 && !this.isAuthenticated) return;
             if (!res.ok) throw new Error('Failed to load workspace tree');
             const data = await res.json();
             this.workspaceTree = data.tree || [];
