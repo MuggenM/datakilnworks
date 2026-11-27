@@ -111,7 +111,7 @@ def suspend(wh_id: str, reason: str = "manual") -> Dict[str, Any]:
 
 def _resume_locked(wh: Dict[str, Any]) -> Dict[str, Any]:
     wh_id, service, started = wh["id"], service_of(wh), time.time()
-    warning, kind = None, "flag"
+    warning, kind, healthy = None, "flag", False
     if service:
         try:
             st = container_control.status(service)
@@ -123,13 +123,18 @@ def _resume_locked(wh: Dict[str, Any]) -> Dict[str, Any]:
                 kind = "cold"
             else:
                 kind = "running"
-            if wh.get("endpoint") and not container_control.wait_healthy(wh["endpoint"], RESUME_TIMEOUT):
+            healthy = not wh.get("endpoint") or container_control.wait_healthy(wh["endpoint"], RESUME_TIMEOUT)
+            if not healthy:
                 warning = f"the worker did not answer within {int(RESUME_TIMEOUT)}s"
             elif kind == "cold" and wh.get("warm_tables"):
                 warning = _warm_up(wh)
         except container_control.ControllerError as exc:
             logger.error(f"Could not resume warehouse {wh_id} ({service}): {exc}")
             return {"ok": False, "error": str(exc)}
+    if healthy:
+        # the worker answered /health: the next query must use it, not skip it as unreachable from before the resume
+        from web import compute_reachability
+        compute_reachability.forget([wh.get("endpoint")])
     ms = round((time.time() - started) * 1000)
     updated = warehouses.mutate_sql_warehouse(wh_id, {"state": "RUNNING", "last_active_at": _now(), "suspended_at": None,
                                                       "suspend_reason": None, "last_resume_ms": ms, "last_resume_kind": kind})

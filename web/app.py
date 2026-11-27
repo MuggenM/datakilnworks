@@ -3621,7 +3621,10 @@ async def execute_sql(payload: QueryRequest, request: Request):
                     elif "compute-node-03" in wh["endpoint"]:
                         endpoints_to_try.append("http://localhost:8003")
 
+                    from web import compute_reachability
                     for ep in endpoints_to_try:
+                        if compute_reachability.is_skipped(ep):     # connect failed < COMPUTE_UNREACHABLE_TTL s ago
+                            continue
                         try:
                             active_entry["endpoint"] = ep
                             # 45 s for the query, but only 3 s to connect: a compute node on the compose network connects in
@@ -3638,9 +3641,12 @@ async def execute_sql(payload: QueryRequest, request: Request):
                                         "execution_id": execution_id
                                     }
                                 )
+                            compute_reachability.mark_reachable(ep)
                             if resp.status_code == 200:
                                 return ("remote", resp.json())
-                        except Exception:
+                        except Exception as e_ep:
+                            if compute_reachability.is_connect_failure(e_ep):
+                                compute_reachability.mark_unreachable(ep)
                             continue
                 except Exception as e_rem:
                     logger.warning(f"Remote compute node dispatch failed for {wh.get('endpoint')}: {e_rem}")

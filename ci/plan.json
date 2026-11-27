@@ -14,6 +14,10 @@
    "extras": ""
   },
   {
+   "name": "compute_reachability",
+   "extras": ""
+  },
+  {
    "name": "dbt_config",
    "extras": "moto[server]"
   },
