@@ -36,14 +36,17 @@ def wait_or_explain(page, selector, what, timeout=10000, function=None):
             return { pwModelLen: (Alpine.$data(document.body).loginForm.password || '').length, pwInputLen: pw ? pw.value.length : null, pwVisible: !!(pw && pw.offsetParent), formValid: f ? f.checkValidity() : null,
                      submitDisabled: b ? b.disabled : null, active: document.activeElement ? (document.activeElement.tagName + ' ' + (document.activeElement.getAttribute('placeholder') || document.activeElement.getAttribute('data-testid') || '')) : null }; }""")))
         except Exception as e: print(f"  [FAIL] | sign-in form: unreadable ({e})")
-        print(f"  [FAIL] | /api/auth requests sent by the page ({len(AUTH_LOG)}): " + "; ".join(AUTH_LOG[-8:]))
+        print(f"  [FAIL] | /api/auth responses the page got: {len(AUTH_LOG)}, the last ones:"); [print("  [FAIL] |   " + a[:110]) for a in AUTH_LOG[-6:]]
+        # what the page saw of the attempt: Enter keydowns (target, cancelled?), submit events, the page's own fetch() calls to /api/auth/login
+        try: [print("  [FAIL] | page trace: " + t[:160]) for t in page.evaluate("() => (window.__dkwTrace || []).slice(-10)")]
+        except Exception as e: print(f"  [FAIL] | page trace: unreadable ({e})")
         print(f"  [FAIL] | page/console errors so far ({len(ERRORS)}): " + " | ".join(e[:200] for e in ERRORS[-8:]))
         print(f"  [FAIL] {what}: {function or selector} did not {'become true' if function else 'appear'}; on-page error: {err.inner_text()[:300] if err.count() and err.first.is_visible() else '(none shown)'}")
         shot = os.path.join(os.getenv("ARTIFACT_DIR", "/tmp"), "passkeys_failure.png"); page.screenshot(path=shot); print(f"    screenshot: {shot}")
         r = sh("docker", "logs", "--tail", "40", "pkui"); print("    studio log (last 40 lines):"); [print("      " + ln[:300]) for ln in (r.stdout + r.stderr).splitlines()[-40:]]
         notable = [ln for ln in (r.stdout + r.stderr).splitlines() if re.search(r"ERROR|Traceback|Exception| [45]\d\d ", ln)]
         [print("  [FAIL] | studio: " + ln[:300]) for ln in notable[-6:]]
-        r = sh("docker", "logs", "pkui"); [print("  [FAIL] | studio auth: " + ln[:200]) for ln in [ln for ln in (r.stdout + r.stderr).splitlines() if "/api/auth/" in ln][-6:]]
+        r = sh("docker", "logs", "pkui"); [print("  [FAIL] | studio auth: " + ln[:150]) for ln in [ln for ln in (r.stdout + r.stderr).splitlines() if "/api/auth/" in ln][-4:]]
         raise
 sh("docker", "rm", "-f", "pkui")
 sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "pkui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
@@ -65,6 +68,14 @@ try:
         page.on("requestfailed", lambda r: AUTH_LOG.append(f"{r.method} {r.url.replace(BASE, '')} failed") if "/api/auth/" in r.url else None)
         page.on("console", lambda m: errors.append(m.text[:200]) if m.type == "error" and "Failed to load resource" not in m.text else None)
         # Chromium cannot operate the autofill dropdown in automation: a wrapper records every conditional (autofill) request and lets the test "pick the passkey"
+        # trace for a sign-in that does not happen: Enter keys, form submits and the page's fetch() of /api/auth/login (printed by wait_or_explain)
+        ctx.add_init_script("""(() => { const T = window.__dkwTrace = []; const t0 = performance.now(); const at = () => Math.round(performance.now() - t0) + 'ms';
+          const who = (el) => el ? (el.tagName + ' ' + (el.getAttribute('placeholder') || el.getAttribute('data-testid') || '')) : 'none';
+          window.addEventListener('keydown', (e) => { if (e.key === 'Enter') T.push(at() + ' keydown Enter on ' + who(e.target)); }, true);
+          window.addEventListener('keydown', (e) => { if (e.key === 'Enter') T.push(at() + ' keydown Enter after handlers: defaultPrevented=' + e.defaultPrevented); });
+          document.addEventListener('submit', (e) => T.push(at() + ' submit event (form shown: ' + !!e.target.offsetParent + ')'), true);
+          const f = window.fetch; window.fetch = function (u, o) { const s = String(u && u.url || u); if (s.indexOf('/api/auth/login') >= 0 || s.indexOf('/api/auth/logout') >= 0) T.push(at() + ' fetch ' + s);
+            return f.apply(this, arguments); }; })();""")
         ctx.add_init_script("""(() => { const orig = navigator.credentials.get.bind(navigator.credentials); window.__condCalls = [];
           navigator.credentials.get = function (opts) { if (opts && opts.mediation === 'conditional') { const rec = { aborted: false, signal: !!opts.signal };
             window.__condCalls.push(rec);
@@ -151,6 +162,8 @@ try:
         check("with the right password it is removed", page.locator("[data-testid=passkey-row]").count() == 0)
         print("passkey policy (administrator)")
         ev("() => Alpine.$data(document.body).mfa.open = false"); logout()
+        check("right after signing out the Sign In button is usable (it stayed disabled until the previous user's data had loaded, so Enter did nothing)",
+              ev("() => !document.querySelector(\"input[placeholder='Enter password']\").form.querySelector('[type=submit]').disabled && !Alpine.$data(document.body).loginForm.loading"))
         ui_login("admin", "adminpassword123"); wait_or_explain(page, None, "the administrator signing in after alice signed out", function="() => Alpine.$data(document.body).isAuthenticated"); page.wait_for_timeout(800)
         # wait for the policy load itself: it overwrites the form when it answers, and after a sign-in the page is busy loading its data
         with page.expect_response(lambda r: r.url.endswith("/api/webauthn/policy") and r.request.method == "GET", timeout=20000):

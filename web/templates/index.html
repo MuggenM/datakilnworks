@@ -20278,6 +20278,9 @@
           this.loginForm.mfaMethods = [];
           this.loginForm.mfaCode = '';
           this.loginForm.error = null;
+          // the sign-in is complete here: the callers' finally runs only after onUserChanged() has loaded every view's data, and until then
+          // a sign-out reopened the dialog with Sign In disabled (and loginWithPasskey refusing), so clear it now
+          this.loginForm.loading = false;
           this.showToast(`Logged in as ${this.currentUser.full_name || this.currentUser.username} (${this.currentUser.role.toUpperCase()})`, 'success');
           if (this.currentUser.must_change_password) { this.openChangePassword(true); return; }   // the server refuses everything else until then; data loads after the change
           if (this.mfaEnrollmentRequired()) { this.openMfa(true); return; }                      // same for a required second factor whose deadline has passed
