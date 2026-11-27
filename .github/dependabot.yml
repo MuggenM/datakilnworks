@@ -11,6 +11,8 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      python-major:
+        update-types: ["major"]
       python-minor-and-patch:
         update-types: ["minor", "patch"]
     # Versions the image cannot install. Dependabot bumps single pins and does not resolve the lock as a whole, so without
@@ -41,16 +43,25 @@ updates:
         versions: [">=30.30"]
       # duckrun pins deltalake exactly (0.5.7: ==1.5.0); move it by hand together with a duckrun release
       - dependency-name: deltalake
-  - package-ecosystem: pip               # ci/requirements-ui.txt: the Playwright version (and so the Chromium build) of the browser tests
+
+  - package-ecosystem: pip                # ci/requirements-ui.txt: the Playwright version (and so the Chromium build) of the browser tests
     directory: "/ci"
     target-branch: development
     schedule:
       interval: weekly
+    groups:
+      ci:
+        patterns: ["*"]
+
   - package-ecosystem: github-actions
     directory: "/"
     target-branch: development
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
   - package-ecosystem: docker
     directory: "/"
     target-branch: development
