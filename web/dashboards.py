@@ -5,6 +5,7 @@ import time
 import uuid
 import hashlib
 import logging
+import duckdb
 from typing import Dict, Any, List, Optional
 from web.audit import log_query
 
@@ -390,7 +391,10 @@ def get_dashboard_filter_options(conn, dashboard_id: str, principal=None) -> Dic
                 vals = ["ALL"] + [str(v) for v in res[dimension].tolist() if v is not None]
                 options[key] = vals
             except Exception as e:
-                logger.warning(f"Could not load options for {key} from {table}: {e}")
+                # The sample dashboard's filters read demo tables that an empty warehouse (every test studio) does not have:
+                # expected, the filter just offers "ALL". Anything else is still worth a warning.
+                missing = isinstance(e, duckdb.CatalogException) and "does not exist" in str(e)
+                (logger.debug if missing else logger.warning)(f"Could not load options for {key} from {table}: {e}")
                 options[key] = ["ALL"]
         else:
             options[key] = ["ALL"]
