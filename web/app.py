@@ -3646,10 +3646,15 @@ async def execute_sql(payload: QueryRequest, request: Request):
                 try:
                     ray_res = ray_manager.execute_query(wh["id"], run_sql)
                     if ray_res and ray_res.get("success"):
+                        # A Ray actor answers with column NAMES and row LISTS; the in-process and compute-node paths (and the SQL editor's
+                        # grid, which reads row[col.name]) use [{"name", "type"}] and row dicts. Without this the grid's x-for got an
+                        # undefined :key and Alpine threw "reading 'after'" (the intermittent verify_csp_ui.py failure).
+                        ray_cols = [c if isinstance(c, dict) else {"name": str(c), "type": ""} for c in (ray_res.get("columns") or [])]
+                        ray_names = [c["name"] for c in ray_cols]
                         return ("remote", {
                             "success": True,
-                            "columns": ray_res.get("columns", []),
-                            "rows": ray_res.get("rows", []),
+                            "columns": ray_cols,
+                            "rows": [dict(zip(ray_names, r)) if isinstance(r, (list, tuple)) else r for r in (ray_res.get("rows") or [])],
                             "row_count": ray_res.get("row_count", 0),
                             "elapsed_ms": ray_res.get("duration_ms", round((time.perf_counter() - start_time) * 1000, 2)),
                             "executed_by": ray_res.get("actor_id", f"ray-worker-{wh['id']}"),
