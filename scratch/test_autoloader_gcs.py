@@ -160,14 +160,15 @@ try:
     # deliberately wrong endpoint failing (proving ENDPOINT really is being applied, not silently defaulting to Google)
     duck = duckdb.connect()
     conn3 = gcs.resolve_connection({"source_volume_path": "gcs://landing/", "source_mount_id": "m_landing"})
-    bad_conn = dict(conn3, endpoint="no-such-host.invalid")
+    # an IP on a closed port, never a made-up hostname: a DNS search domain can resolve one to a real host
+    bad_conn = dict(conn3, endpoint="127.0.0.1:9")
     try:
         gcs.configure_duckdb(duck, bad_conn, "landing")
         duck.execute("SELECT * FROM glob('gcs://landing/**')").fetchall()
         ok = False
     except Exception as e:
-        ok = "no-such-host" in str(e).lower() or "resolve" in str(e).lower()
-    check("configure_duckdb's bucket-scoped secret really does honour a custom ENDPOINT (a wrong one fails to resolve)", ok, str(e) if not ok else "")
+        ok = "127.0.0.1:9" in str(e)
+    check("configure_duckdb's bucket-scoped secret really does honour a custom ENDPOINT (a wrong one is the one dialled)", ok, str(e) if not ok else "")
     duck.close()
 
     mounts.save_mounts([mount("gm1", "landing")])
