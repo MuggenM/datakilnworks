@@ -54,7 +54,7 @@ Includes **Data Kiln Works**—a powerful data lakehouse web workbench with **Da
 
 ### 1. Launch Stack
 ```bash
-cd /home/martin/volumes/datakilnworks
+cd datakilnworks
 docker compose up -d
 ```
 
@@ -339,13 +339,13 @@ docker compose up -d
 ### 22. ⚡ Ray Distributed Compute Engine & Kubernetes Scaling Strategy
 * **Ray-Native Dynamic Compute Orchestration**:
   - Eliminates privileged Docker socket mounts and static worker containers.
-  - Stateful [`DuckDBWorkerActor`](file:///home/martin/volumes/datakilnworks/web/ray_engine.py#L40-L130) pools mapped per SQL Warehouse with isolated memory caps (`max_memory`), thread allocations (`threads`), and in-memory catalog mounting.
-  - Managed by [`RayClusterManager`](file:///home/martin/volumes/datakilnworks/web/ray_engine.py#L139-L382) singleton with round-robin query dispatch and cluster telemetry tracking.
+  - Stateful [`DuckDBWorkerActor`](web/ray_engine.py) pools mapped per SQL Warehouse with isolated memory caps (`max_memory`), thread allocations (`threads`), and in-memory catalog mounting.
+  - Managed by [`RayClusterManager`](web/ray_engine.py) singleton with round-robin query dispatch and cluster telemetry tracking.
 * **Sub-Second Horizontal Scaling on the Fly**:
   - Scale compute workers up, down, or to zero directly from the UI or API (`[-] N w [+]`) in **< 20 milliseconds** without restarting containers or interrupting active sessions.
   - Persistent state synchronization in `warehouse/.metadata/sql_warehouses.json`.
 * **Distributed Map-Reduce / Scatter-Gather over Delta Lake**:
-  - Parallel partition scanning via [`execute_distributed_delta_scan()`](file:///home/martin/volumes/datakilnworks/web/ray_engine.py#L297-L379).
+  - Parallel partition scanning via [`execute_distributed_delta_scan()`](web/ray_engine.py).
   - Inspects Delta transaction logs (`DeltaTable.file_uris()`), slices Parquet files into balanced chunks, executes vectorized DuckDB scans across workers in parallel, and merges Apache Arrow tables with zero copy (`pyarrow.concat_tables`).
   - Tested execution latency: **6.77 ms** for distributed partition scan.
 * **REST APIs & Studio Dashboard Controls**:

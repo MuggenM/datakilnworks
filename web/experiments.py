@@ -614,23 +614,22 @@ def mlflow_log_batch(
 
 
 def _normalize_fs_path(p: Optional[str]) -> Optional[str]:
-    """Translates path between host filesystem and docker container mount if needed."""
+    """Translates a path between the host's project folder and the container's /workspace mount.
+
+    The host folder comes from DKW_HOST_PROJECT_DIR (compose passes the folder it runs in); unset, paths are left as
+    they are."""
     if not p:
         return p
     if os.path.exists(p):
         return p
-    HOST_PREFIX = "/home/martin/volumes/datakilnworks"
-    CONTAINER_PREFIX = "/workspace"
-    if p.startswith(HOST_PREFIX) and os.path.exists(CONTAINER_PREFIX):
-        translated = p.replace(HOST_PREFIX, CONTAINER_PREFIX, 1)
-        if os.path.exists(translated):
-            return translated
-        return translated
-    elif p.startswith(CONTAINER_PREFIX) and os.path.exists(HOST_PREFIX):
-        translated = p.replace(CONTAINER_PREFIX, HOST_PREFIX, 1)
-        if os.path.exists(translated):
-            return translated
-        return translated
+    host_prefix = os.environ.get("DKW_HOST_PROJECT_DIR", "").strip().rstrip("/")
+    container_prefix = "/workspace"
+    if not host_prefix or host_prefix == container_prefix:
+        return p
+    if p.startswith(host_prefix + "/") and os.path.exists(container_prefix):
+        return container_prefix + p[len(host_prefix):]
+    if p.startswith(container_prefix + "/") and os.path.exists(host_prefix):
+        return host_prefix + p[len(container_prefix):]
     return p
 
 
