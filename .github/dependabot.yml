@@ -13,6 +13,34 @@ updates:
     groups:
       python-minor-and-patch:
         update-types: ["minor", "patch"]
+    # Versions the image cannot install. Dependabot bumps single pins and does not resolve the lock as a whole, so without
+    # these it proposes them every week (PR #20 broke the build twice). Lift an entry only together with the cap behind it.
+    ignore:
+      # Python >= 3.12 only; the image is Python 3.11
+      - dependency-name: numpy
+        versions: [">=2.5"]
+      - dependency-name: networkx
+        versions: [">=3.7"]
+      - dependency-name: Deprecated
+        versions: [">=3"]
+      # dbt caps these
+      - dependency-name: protobuf
+        versions: [">=7"]
+      - dependency-name: grpcio-tools       # >= 1.77 pulls protobuf 7 (requirements.txt: <1.77)
+        versions: [">=1.77"]
+      - dependency-name: agate
+        versions: [">=1.10"]
+      - dependency-name: mashumaro
+        versions: [">=3.18"]
+      - dependency-name: pathspec
+        versions: [">=1.1"]
+      # metricflow caps more-itertools < 11, sqlframe 4.10 caps sqlglot < 30.30
+      - dependency-name: more-itertools
+        versions: [">=11"]
+      - dependency-name: sqlglot
+        versions: [">=30.30"]
+      # duckrun pins deltalake exactly (0.5.7: ==1.5.0); move it by hand together with a duckrun release
+      - dependency-name: deltalake
   - package-ecosystem: pip               # ci/requirements-ui.txt: the Playwright version (and so the Chromium build) of the browser tests
     directory: "/ci"
     target-branch: development
