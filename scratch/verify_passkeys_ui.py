@@ -9,6 +9,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); BASE = "http
 HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 FAIL = []
 PENDING = {}   # url -> start time of every request the page has open (printed when a wait times out)
+AUTH_LOG = []  # every /api/auth/ request the page sent, with its outcome (printed when a wait times out)
 def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:300]}" if d and not c else ""))
     if not c: FAIL.append(n)
@@ -30,12 +31,19 @@ def wait_or_explain(page, selector, what, timeout=10000, function=None):
         except Exception as e: print(f"  [FAIL] | pk state: unreadable ({e})")
         try: print("  [FAIL] | sign-in state: " + str(page.evaluate("() => { const d = Alpine.$data(document.body); const f = d.loginForm || {}; return { authenticated: d.isAuthenticated, user: d.currentUser && d.currentUser.username, loginModal: d.showLoginModal, loading: f.loading, error: f.error, mfaToken: !!f.mfaToken, mfaMethods: f.mfaMethods, username: f.username }; }")))
         except Exception as e: print(f"  [FAIL] | sign-in state: unreadable ({e})")
+        # why an Enter in the password field would not submit: an empty/invalid required field, a disabled submit button, focus elsewhere
+        try: print("  [FAIL] | sign-in form: " + str(page.evaluate("""() => { const pw = document.querySelector("input[placeholder='Enter password']"); const f = pw && pw.form; const b = f && f.querySelector("button[type=submit]");
+            return { pwModelLen: (Alpine.$data(document.body).loginForm.password || '').length, pwInputLen: pw ? pw.value.length : null, pwVisible: !!(pw && pw.offsetParent), formValid: f ? f.checkValidity() : null,
+                     submitDisabled: b ? b.disabled : null, active: document.activeElement ? (document.activeElement.tagName + ' ' + (document.activeElement.getAttribute('placeholder') || document.activeElement.getAttribute('data-testid') || '')) : null }; }""")))
+        except Exception as e: print(f"  [FAIL] | sign-in form: unreadable ({e})")
+        print(f"  [FAIL] | /api/auth requests sent by the page ({len(AUTH_LOG)}): " + "; ".join(AUTH_LOG[-8:]))
         print(f"  [FAIL] | page/console errors so far ({len(ERRORS)}): " + " | ".join(e[:200] for e in ERRORS[-8:]))
         print(f"  [FAIL] {what}: {function or selector} did not {'become true' if function else 'appear'}; on-page error: {err.inner_text()[:300] if err.count() and err.first.is_visible() else '(none shown)'}")
         shot = os.path.join(os.getenv("ARTIFACT_DIR", "/tmp"), "passkeys_failure.png"); page.screenshot(path=shot); print(f"    screenshot: {shot}")
         r = sh("docker", "logs", "--tail", "40", "pkui"); print("    studio log (last 40 lines):"); [print("      " + ln[:300]) for ln in (r.stdout + r.stderr).splitlines()[-40:]]
         notable = [ln for ln in (r.stdout + r.stderr).splitlines() if re.search(r"ERROR|Traceback|Exception| [45]\d\d ", ln)]
         [print("  [FAIL] | studio: " + ln[:300]) for ln in notable[-6:]]
+        r = sh("docker", "logs", "pkui"); [print("  [FAIL] | studio auth: " + ln[:200]) for ln in [ln for ln in (r.stdout + r.stderr).splitlines() if "/api/auth/" in ln][-6:]]
         raise
 sh("docker", "rm", "-f", "pkui")
 sh("docker", "run", "-d", *(["--network", os.environ["DOCKER_NETWORK"]] if os.getenv("DOCKER_NETWORK") else []), "--name", "pkui", "-p", "8117:8891", "-v", f"{ROOT}/web:/workspace/web", "-v", f"{ROOT}/docs:/workspace/docs", "-w", "/workspace", "-e", "WAREHOUSE_DIR=/workspace/warehouse",
@@ -53,6 +61,8 @@ try:
         page.on("pageerror", lambda e: errors.append(str(e) + " @ " + str(getattr(e, "stack", ""))[:500])); page.on("dialog", lambda d: d.accept())
         page.on("request", lambda r: PENDING.__setitem__(r.method + " " + r.url.replace(BASE, ""), time.monotonic()))
         for ev_name in ("requestfinished", "requestfailed"): page.on(ev_name, lambda r: PENDING.pop(r.method + " " + r.url.replace(BASE, ""), None))
+        page.on("response", lambda r: AUTH_LOG.append(f"{r.request.method} {r.url.replace(BASE, '')} {r.status}") if "/api/auth/" in r.url else None)
+        page.on("requestfailed", lambda r: AUTH_LOG.append(f"{r.method} {r.url.replace(BASE, '')} failed") if "/api/auth/" in r.url else None)
         page.on("console", lambda m: errors.append(m.text[:200]) if m.type == "error" and "Failed to load resource" not in m.text else None)
         # Chromium cannot operate the autofill dropdown in automation: a wrapper records every conditional (autofill) request and lets the test "pick the passkey"
         ctx.add_init_script("""(() => { const orig = navigator.credentials.get.bind(navigator.credentials); window.__condCalls = [];
@@ -70,7 +80,9 @@ try:
             page.fill("input[placeholder='Enter username']", user); page.fill("input[placeholder='Enter password']", pw); page.press("input[placeholder='Enter password']", "Enter")
         who = lambda: ev("() => { const d = Alpine.$data(document.body); return d.isAuthenticated ? d.currentUser.username : null; }")
         def logout():
-            ev("() => { Alpine.$data(document.body).logout(); }"); page.wait_for_timeout(800)
+            # logout() is async (POST /api/auth/logout, then the form reset and onUserChanged): wait for it to finish, not a fixed time
+            ev("() => { window.__dkwLogoutDone = false; Alpine.$data(document.body).logout().finally(() => { window.__dkwLogoutDone = true; }); }")
+            wait_or_explain(page, None, "signing out", timeout=20000, function="() => window.__dkwLogoutDone === true && !Alpine.$data(document.body).isAuthenticated"); page.wait_for_timeout(300)
 
         print("registration")
         check("the sign-in page offers a passkey button", page.locator("[data-testid=passkey-login]").is_visible())
