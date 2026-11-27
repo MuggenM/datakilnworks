@@ -5,6 +5,8 @@ import sqlite3
 import datetime
 import asyncio
 import logging
+
+import duckdb
 from typing import Optional, Dict, Any, List, Union
 
 from web.audit import get_db_connection, WAREHOUSE_DIR
@@ -77,6 +79,11 @@ def init_alerts_db():
                 _seed_default_alerts(conn)
     except Exception as e:
         logger.error(f"Failed to initialize alerts database: {e}")
+
+
+# The seeded sample alerts query demo tables (dim_products, silver_employees,
+# silver_telemetry) that a fresh warehouse does not have.
+SAMPLE_ALERT_IDS = frozenset({"alt_low_stock_watch", "alt_payroll_cap_monitor", "alt_sensor_temp_critical"})
 
 
 def _seed_default_alerts(conn: sqlite3.Connection):
@@ -300,7 +307,11 @@ def execute_alert_check(alert_id: str, triggered_by: str = "scheduler", user_id:
         new_state = "TRIGGERED" if is_triggered else "OK"
 
     except Exception as e:
-        logger.error(f"Error executing alert check {alert_id}: {e}")
+        # A sample alert whose demo table is missing is expected noise; it still
+        # ends in state ERROR with the message, only the log level drops.
+        missing = (alert_id in SAMPLE_ALERT_IDS and isinstance(e, duckdb.CatalogException)
+                   and "does not exist" in str(e))
+        (logger.debug if missing else logger.error)(f"Error executing alert check {alert_id}: {e}")
         error_msg = str(e)
         new_state = "ERROR"
 
