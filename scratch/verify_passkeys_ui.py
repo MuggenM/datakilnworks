@@ -10,6 +10,10 @@ HASH = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3
 FAIL = []
 PENDING = {}   # url -> start time of every request the page has open (printed when a wait times out)
 AUTH_LOG = []  # every /api/auth/ request the page sent, with its outcome (printed when a wait times out)
+TIMELINE = []  # sign-in/out and workspace-tree requests and console errors of the main page, with times (printed when "no JS errors" fails)
+T0 = time.monotonic()
+def _tl(what): TIMELINE.append(f"{time.monotonic() - T0:7.2f}s {what}")
+_TL_PATHS = ("/api/auth/login", "/api/auth/logout", "/api/auth/passkey/login", "/api/auth/login/webauthn", "/api/workspace/tree")
 def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:300]}" if d and not c else ""))
     if not c: FAIL.append(n)
@@ -67,6 +71,9 @@ try:
         page.on("response", lambda r: AUTH_LOG.append(f"{r.request.method} {r.url.replace(BASE, '')} {r.status}") if "/api/auth/" in r.url else None)
         page.on("requestfailed", lambda r: AUTH_LOG.append(f"{r.method} {r.url.replace(BASE, '')} failed") if "/api/auth/" in r.url else None)
         page.on("console", lambda m: errors.append(m.text[:200]) if m.type == "error" and "Failed to load resource" not in m.text else None)
+        page.on("request", lambda r: _tl(f"sent {r.method} {r.url.replace(BASE, '')}") if any(x in r.url for x in _TL_PATHS) else None)
+        page.on("response", lambda r: _tl(f"answer {r.status} {r.request.method} {r.url.replace(BASE, '')}") if any(x in r.url for x in _TL_PATHS) else None)
+        page.on("console", lambda m: _tl("console error: " + m.text[:120]) if m.type == "error" and "Failed to load resource" not in m.text else None)
         # Chromium cannot operate the autofill dropdown in automation: a wrapper records every conditional (autofill) request and lets the test "pick the passkey"
         # trace for a sign-in that does not happen: Enter keys, form submits and the page's fetch() of /api/auth/login (printed by wait_or_explain)
         ctx.add_init_script("""(() => { const T = window.__dkwTrace = []; const t0 = performance.now(); const at = () => Math.round(performance.now() - t0) + 'ms';
@@ -217,6 +224,9 @@ try:
         ctx2.close()
         errs = [e for e in errors if "dialog" not in e]
         check("no JS errors", not errs, errs)
+        if errs: [print("  [FAIL] | " + line) for line in TIMELINE[-40:]]  # which sign-in/out a failing request belonged to
+        if os.environ.get("ARTIFACT_DIR"):
+            with open(os.path.join(os.environ["ARTIFACT_DIR"], "passkeys_timeline.txt"), "w") as f: f.write("\n".join(TIMELINE) + "\n")
         b.close()
 finally:
     if FAIL: print(sh("docker", "logs", "--tail", "25", "pkui").stderr[-1500:])
