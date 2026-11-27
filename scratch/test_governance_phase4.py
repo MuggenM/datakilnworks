@@ -29,6 +29,9 @@ os.environ["WAREHOUSE_DIR"] = TMP_WAREHOUSE
 os.environ["INIT_ADMIN_USERNAME"] = "admin"
 os.environ["INIT_ADMIN_PASSWORD_HASH"] = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 os.environ["INIT_ADMIN_DISPLAY_NAME"] = "System Administrator"
+# the worker spy answers every dispatch with a ConnectError and records it; without this the studio would skip the
+# "unreachable" worker for 30 s (web/compute_reachability.py) and later queries would never reach the spy
+os.environ["COMPUTE_UNREACHABLE_TTL"] = "0"
 for var in ("GOVERNANCE_REQUIRE_AUTH", "GOVERNANCE_NOTEBOOK_EXECUTION", "JWT_SECRET_KEY", "COMPUTE_TOKEN", "GOVERNANCE_ENFORCEMENT"):
     os.environ.pop(var, None)
 
