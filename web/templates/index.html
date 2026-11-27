@@ -16093,11 +16093,11 @@
                         <i class="ph ph-key"></i>
                       </button>
                       <button x-show="u.passwordless" @click="issueEnrollmentLink(u)" data-testid="user-enroll-link" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Issue a new enrolment link (first sign-in, or recovery after every passkey was lost)"><i class="ph ph-link"></i></button>
-                      <button x-show="!u.passwordless && ['local','ldap'].includes(u.auth_source || 'local') && u.passkey_count >= 2 && u.id !== currentUser.id" @click="removeUserPassword(u)" data-testid="user-remove-password" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Remove the password: the account signs in with passkeys only"><i class="ph ph-password"></i></button>
-                      <button x-show="u.id !== currentUser.id" @click="endUserSessions(u)" data-testid="user-end-sessions" class="px-2 py-1 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-900 dark:hover:bg-dbx-hover dark:text-slate-300 dark:border-dbx-border rounded transition text-[11px] font-medium" title="End every session of this account (they must sign in again)">
+                      <button x-show="!u.passwordless && ['local','ldap'].includes(u.auth_source || 'local') && u.passkey_count >= 2 && u.id !== currentUser?.id" @click="removeUserPassword(u)" data-testid="user-remove-password" class="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800 rounded transition" title="Remove the password: the account signs in with passkeys only"><i class="ph ph-password"></i></button>
+                      <button x-show="u.id !== currentUser?.id" @click="endUserSessions(u)" data-testid="user-end-sessions" class="px-2 py-1 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-900 dark:hover:bg-dbx-hover dark:text-slate-300 dark:border-dbx-border rounded transition text-[11px] font-medium" title="End every session of this account (they must sign in again)">
                         <i class="ph ph-sign-out"></i>
                       </button>
-                      <button x-show="u.mfa_enabled && u.id !== currentUser.id" @click="resetUserMfa(u)" class="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900 dark:text-sky-300 dark:border-sky-800 rounded transition text-[11px] font-medium" title="Turn off two-factor authentication and remove passkeys (lost device)">
+                      <button x-show="u.mfa_enabled && u.id !== currentUser?.id" @click="resetUserMfa(u)" class="px-2 py-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900 dark:text-sky-300 dark:border-sky-800 rounded transition text-[11px] font-medium" title="Turn off two-factor authentication and remove passkeys (lost device)">
                         <i class="ph ph-shield-slash"></i>
                       </button>
                       <button x-show="u.username !== 'admin'" @click="toggleUserActive(u)" class="px-2 py-1 rounded transition text-[11px] font-medium border"
@@ -18878,6 +18878,9 @@
         // RBAC & Authentication State
         currentUser: null,
         isAuthenticated: false,
+        // Bumped when a sign-out starts and on every sign-in (onUserChanged): a load compares it after its fetch and drops an answer
+        // that belongs to an earlier session (a 401 from the revoked session, or the previous user's data). Not shown in the UI.
+        authEpoch: 0,
         showLoginModal: false,
         loginForm: { username: '', password: '', error: null, loading: false, mfaToken: null, mfaCode: '', mfaMethods: [] },
         passkeyLoginAvailable: false,
@@ -21031,6 +21034,7 @@
             window.location.href = '/api/auth/saml/logout';
             return;
           }
+          this.authEpoch++;   // from here on every answer to a request of this session is stale (the POST revokes it)
           try {
             await fetch('/api/auth/logout', { method: 'POST' });
           } catch (e) {}
@@ -21062,6 +21066,7 @@
         },
 
         async onUserChanged() {
+          this.authEpoch++;   // loads started for the previous session drop their answers
           if (this.isAuthenticated) await this.refreshNotebookAccess();
           const username = this.currentUser?.username || 'admin';
           console.log(`[MultiUser] Scoping studio state to user: ${username}`);
@@ -23208,11 +23213,15 @@
         // ==================== WORKSPACE BROWSER METHODS ====================
         async fetchWorkspaceTree(preserveSelection = true) {
           try {
+            const epoch = this.authEpoch;
             const res = await fetch('/api/workspace/tree');
-            // started at sign-in, answered after a sign-out: the API gate's 401 is not an error (same as fetchWorkspaceFileDetail)
+            // started for an earlier session (the user signed out, or another one signed in meanwhile): neither its 401 nor its
+            // tree belongs to the current session, drop it (onUserChanged loads the tree for the new one)
+            if (epoch !== this.authEpoch) return;
             if (res.status === 401 && !this.isAuthenticated) return;
             if (!res.ok) throw new Error('Failed to load workspace tree (HTTP ' + res.status + ')');
             const data = await res.json();
+            if (epoch !== this.authEpoch) return;
             this.workspaceTree = data.tree || [];
             this.userHomePath = data.user_home || ('Users/' + (this.currentUser?.username || 'admin'));
 
@@ -23312,10 +23321,13 @@
           if (!this.isAuthenticated) { this.workspaceFileDetail = null; return; }
           this.workspaceFileLoading = true;
           try {
+            const epoch = this.authEpoch;
             const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(relPath)}`);
+            if (epoch !== this.authEpoch) return;   // answer for an earlier session (see fetchWorkspaceTree)
             if (res.status === 401) { this.workspaceFileDetail = null; return; }
             if (!res.ok) throw new Error('Failed to fetch file details');
             const data = await res.json();
+            if (epoch !== this.authEpoch) return;
             this.workspaceFileDetail = data;
             if (this.workspaceFileDetail?.cells) {
               this.initNotebookCells(this.workspaceFileDetail.cells);

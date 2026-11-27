@@ -90,6 +90,10 @@ try:
               if (opts.signal) opts.signal.addEventListener('abort', () => { rec.aborted = true; reject(new DOMException('aborted', 'AbortError')); }); }); }
             return orig(opts); };
           try { PublicKeyCredential.isConditionalMediationAvailable = async () => true; } catch (e) {} })();""")
+        ctx.add_init_script("""(() => { const f = window.fetch; window.fetch = function (u, o) { const s = String(u && u.url || u); const h = window.__dkwHoldTree;
+            if (!h || h.taken || s.indexOf('/api/workspace/tree') < 0) return f.apply(this, arguments);
+            h.taken = true;
+            return new Promise((r) => { h.send = r; }).then(() => f.call(window, u, o)).then((res) => { h.status = res.status; return new Promise((r) => { h.deliver = () => r(res); }); }); }; })();""")
         cdp = ctx.new_cdp_session(page); cdp.send("WebAuthn.enable")
         auth = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {"protocol": "ctap2", "transport": "internal", "hasResidentKey": True, "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})["authenticatorId"]
         page.goto(BASE, wait_until="networkidle"); time.sleep(1)
@@ -222,6 +226,27 @@ try:
         pg2.screenshot(path="/tmp/passkey_only_dialog.png")
         check("no JS errors on the invited user's side", not [e for e in errors2 if "dialog" not in e], errors2)
         ctx2.close()
+        print("a load of the previous session answering after the next sign-in")
+        # the CI failure "Failed to load workspace tree" (run #75): a tree load started at alice's sign-in is answered only after the
+        # next user signed in. Its answer belongs to alice's session and must be dropped, whatever it is.
+        ws = lambda: ev("() => { const d = Alpine.$data(document.body); return { home: d.userHomePath, alice: !!d.workspaceExpandedDirs['Users/alice'], tree: (d.workspaceTree || []).length }; }")
+        def admin_after_held_alice_load(send_before_logout):
+            ev("() => { Alpine.$data(document.body).showIamModal = false; }"); logout()
+            ev("() => { window.__dkwHoldTree = {}; }")
+            ui_login("alice", "alicepassword1"); page.wait_for_function("() => Alpine.$data(document.body).isAuthenticated && window.__dkwHoldTree.send", timeout=20000)
+            if send_before_logout: ev("() => window.__dkwHoldTree.send()"); page.wait_for_function("() => window.__dkwHoldTree.deliver", timeout=20000)
+            logout()
+            if not send_before_logout: ev("() => window.__dkwHoldTree.send()"); page.wait_for_function("() => window.__dkwHoldTree.deliver", timeout=20000)
+            ui_login("admin", "adminpassword123")
+            page.wait_for_function("() => { const d = Alpine.$data(document.body); return d.isAuthenticated && d.currentUser.username === 'admin' && d.userHomePath === 'Users/admin' && (d.workspaceTree || []).length > 0; }", timeout=30000)
+            before = len(errors); ev("() => window.__dkwHoldTree.deliver()"); page.wait_for_timeout(1500)
+            return ev("() => window.__dkwHoldTree.status"), [e for e in errors[before:] if "dialog" not in e], ws()
+        status, new_errs, state = admin_after_held_alice_load(send_before_logout=False)
+        check("alice's tree request sent after her sign-out gets the 401, and answered after admin signed in it is dropped without an error",
+              status == 401 and not new_errs and state["home"] == "Users/admin", (status, new_errs, state))
+        status, new_errs, state = admin_after_held_alice_load(send_before_logout=True)
+        check("alice's tree answered (200) only after admin signed in does not replace admin's workspace with alice's",
+              status == 200 and not new_errs and state["home"] == "Users/admin" and not state["alice"], (status, new_errs, state))
         errs = [e for e in errors if "dialog" not in e]
         check("no JS errors", not errs, errs)
         if errs: [print("  [FAIL] | " + line) for line in TIMELINE[-40:]]  # which sign-in/out a failing request belonged to
