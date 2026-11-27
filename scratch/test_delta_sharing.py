@@ -114,6 +114,8 @@ for _ in range(100):
     except Exception: time.sleep(0.2)
 import delta_sharing
 os.environ["DELTA_SHARING_URL_TTL"] = "900"; ds.URL_TTL = 900
+_lt = ds.sign_file(rid, "t", "x.parquet").split(".")[0]   # the TTL is read when a link is signed (a default argument froze it at 3 s: the client got 401s on a slow runner)
+check("after raising URL_TTL a new link lives that long", abs(json.loads(base64.urlsafe_b64decode(_lt + "=" * (-len(_lt) % 4)))["e"] - time.time() - 900) < 5)
 pf = TMP + "/acme.share"; json.dump({**prof, "endpoint": "http://127.0.0.1:8931/delta-sharing"}, open(pf, "w"))
 client = delta_sharing.SharingClient(pf)
 check("the client lists shares and tables", [s.name for s in client.list_shares()] == ["partner_share"] and sorted(t.name for t in client.list_all_tables()) == ["orders", "sales_orders"])

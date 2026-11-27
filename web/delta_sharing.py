@@ -203,7 +203,8 @@ def _s3_client(cfg: Dict[str, Any]):
     return autoloader_s3.make_client(conn)
 
 
-def presigned_url(cfg: Dict[str, Any], bucket: str, key: str, ttl: int = URL_TTL) -> str:
+def presigned_url(cfg: Dict[str, Any], bucket: str, key: str, ttl: Optional[int] = None) -> str:
+    ttl = URL_TTL if ttl is None else ttl   # read at call time, like expirationTimestamp (a default of URL_TTL is frozen at import)
     try:
         return _s3_client(cfg).generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl)
     except Exception as exc:
@@ -735,7 +736,8 @@ def _key() -> bytes:
             return f.read()
 
 
-def sign_file(recipient_id: str, share_table_id: str, rel_path: str, ttl: int = URL_TTL) -> str:
+def sign_file(recipient_id: str, share_table_id: str, rel_path: str, ttl: Optional[int] = None) -> str:
+    ttl = URL_TTL if ttl is None else ttl   # read at call time, like expirationTimestamp (a default of URL_TTL is frozen at import)
     body = base64.urlsafe_b64encode(json.dumps({"r": recipient_id, "t": share_table_id, "f": rel_path, "e": int(time.time()) + ttl}, separators=(",", ":")).encode()).decode().rstrip("=")
     sig = base64.urlsafe_b64encode(hmac.new(_key(), body.encode(), hashlib.sha256).digest()).decode().rstrip("=")
     return f"{body}.{sig}"
