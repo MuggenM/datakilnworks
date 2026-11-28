@@ -291,6 +291,11 @@
    "name": "oidc_keycloak",
    "extras": "",
    "services": "idp"
+  },
+  {
+   "name": "onelake_emulator",
+   "extras": "",
+   "services": "fabric"
   }
  ],
  "ui": [

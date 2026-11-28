@@ -113,7 +113,7 @@ check "...and the stack it did not start is still running" $?
 
 echo "secrets_not_in_output: no generated or dummy secret appears in what CI prints"
 bash $S/down.sh >/dev/null 2>&1
-outU="$(bash $S/up.sh ldap git kafka azure s3 sftp idp 2>&1)"; check "up.sh with every profile exits 0" $? "$(echo "$outU" | tail -3)"
+outU="$(bash $S/up.sh ldap git kafka azure s3 sftp idp fabric 2>&1)"; check "up.sh with every profile exits 0" $? "$(echo "$outU" | grep -m1 "did not come up"; echo "$outU" | grep "^fabric-seed-1" | tail -8)"
 outT="$(CI_SERVICES=git CI_SERVICES_UP=0 CI_SERVICES_KEEP=1 CI_TEST_ENV=GIT_HOST=127.0.0.1:9 bash ci/run_test.sh git_sync 2>&1)"; rcT=$?
 [ $rcT -ne 0 ] && echo "$outT" | grep -q "\[FAIL\] Gitea not reachable at 127.0.0.1:9"; check "git_sync against an unreachable Gitea fails (REQUIRE_SERVICES=1)" $? "$(echo "$outT" | tail -3)"
 tf="$(mktemp)"; echo "$outT" > "$tf"; outA="$(python3 ci/annotate.py "$tf" test_git_sync 2>&1)"; rm -f "$tf"

@@ -236,6 +236,74 @@ services:
       - ./seed/idp.py:/seed/idp.py:ro
       - ./out:/out
 
+  # ---------------------------------------------------------------- profile fabric
+  # fabric-emulator (control plane + OneLake, "lite") behind the Entra emulator's token validation, the stand-in for
+  # OneLake mounts (web/onelake.py). Dev credentials are the emulator's own documented quickstart ones (not secrets).
+  # Names: `entra.localhost` is what the Entra emulator's self-signed certificate covers and what it bakes into every
+  # issuer/discovery URL; delta-rs and the studio's OneLake client always dial the REAL OneLake host names on port 443,
+  # so onelake-proxy carries those two names as aliases on this network only (no /etc/hosts anywhere).
+  entra:
+    image: ghcr.io/calvinchengx/entra-emulator:0.9.0
+    profiles: [fabric]
+    <<: *no-search
+    environment:
+      ORIGIN_MODE: compat
+      PUBLIC_ORIGIN: "https://entra.localhost:8443"
+    networks:
+      default:
+        aliases: [entra.localhost]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/entra-emulator", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  fabric:
+    image: ghcr.io/calvinchengx/fabric-emulator:0.40.0
+    profiles: [fabric]
+    <<: *no-search
+    depends_on:
+      entra: {condition: service_healthy}
+    environment:
+      FABRIC_ENTRA_ISSUER: "https://entra.localhost:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/v2.0"
+      FABRIC_ENTRA_JWKS_URL: "https://entra.localhost:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/discovery/v2.0/keys"
+      FABRIC_ENTRA_TLS_INSECURE: "true"        # the emulator's own call to Entra's JWKS (its self-signed certificate)
+      FABRIC_ARM_URL: ""                       # no ARM emulator: the seeded local capacity is enough for a Lakehouse
+      FABRIC_DATA_DIR: ""                      # in memory (the image's default /data needs a volume)
+      FABRIC_TENANT_ADMINS: "00d88624-f0d7-46f6-a641-6232c2608928"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/fabric-emulator", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  onelake-proxy:                                # plain TCP 443 -> fabric:9443 for the real OneLake host names
+    image: alpine/socat:latest@sha256:5ffbd6ae916cbad86a58fabe0d6d5a6fd5c2b47ddf031e82996baac9300e732f
+    profiles: [fabric]
+    <<: *no-search
+    depends_on:
+      fabric: {condition: service_healthy}
+    command: ["TCP-LISTEN:443,fork,reuseaddr", "TCP:fabric:9443"]
+    networks:
+      default:
+        aliases: [onelake.dfs.fabric.microsoft.com, onelake.blob.fabric.microsoft.com]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "443"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  fabric-seed:                                  # workspace, Lakehouse, table `orders`, the certificates (seed/fabric.py)
+    image: ${CI_IMAGE:-localspark-lakehouse-notebook}   # the studio image: the seed writes Delta through deltalake
+    profiles: [fabric]
+    <<: *no-search
+    depends_on:
+      onelake-proxy: {condition: service_healthy}
+    entrypoint: ["python", "-I", "/seed/fabric.py"]
+    volumes:
+      - ./seed/fabric.py:/seed/fabric.py:ro
+      - ./out:/out
+
 volumes:
   lldap-data:
   gitea-data:

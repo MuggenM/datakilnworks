@@ -47,6 +47,7 @@ bash ci/services/test_services_harness.sh   # tests the stack itself
 | `kafka` | `redpanda`, `redpanda2` (a second cluster), `redpanda-sasl` (SCRAM-SHA-256 user `dkwci`); Schema Registry on `redpanda:8081` | `KAFKA`, `KAFKA2`, `REGISTRY`, `SASL_*` | `streaming`, `stream_ops` |
 | `azure` | `azurite` 3.35 (blob, `--skipApiVersionCheck`), the well-known dev account | `AZURITE_HOST` | `autoloader_azure` |
 | `s3` | `garage` (Deuxfleurs Garage v1.0.1, region `garage`): key `test`, may create buckets; stands in for GCS too | `TEST_S3_*`, `S3_*`, `GARAGE_ENDPOINT` | `autoloader_gcs`, `autoloader_preview`, `autoloader_target`, `delta_sharing` |
+| `fabric` | `entra` (Entra emulator 0.9.0, alias `entra.localhost`), `fabric` (fabric-emulator 0.40.0, lite), `onelake-proxy` (aliases `onelake.dfs/blob.fabric.microsoft.com`); workspace `dkwci`, Lakehouse `lake`, table `orders` | `ENTRA_AUTHORITY`, `FABRIC_*`, `FABRIC_CA_PEM_FILE=/services/fabric/ca.pem` | `onelake_emulator` |
 | `idp` | `keycloak` 26.6 (realm `dkw` from `seed/keycloak-realm.json`): alice/alicepw in LakehouseAdmins, bob/bobpw; SAML client `urn:dkw:keycloak-test`, OIDC client `dkw-oidc` (PKCE S256 required) | `KC_URL`, `KC_REALM`, `KC_DESCRIPTOR`, `KC_OIDC_*` | `oidc_keycloak`, browser `saml_keycloak` |
 | `sftp` | `sftp` (atmoz/sftp): `user`/`pass`, folder `/upload`, an ed25519 key pair made at every start | `SFTP_HOST`, `SFTP_KEY=/services/sftp/id` | `connections` |
 

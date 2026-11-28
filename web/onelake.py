@@ -6,6 +6,7 @@ Mount Microsoft Fabric OneLake lakehouses as read-only external catalogs.
 import hashlib
 import os
 import logging
+import re
 import subprocess
 import threading
 from typing import Dict, Any, List, Optional
@@ -16,6 +17,8 @@ from deltalake import DeltaTable
 import pandas as pd
 
 logger = logging.getLogger("datakilnworks.onelake")
+
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 # Global registry of mounted OneLake catalogs
 ONELAKE_CATALOGS: Dict[str, Dict[str, Any]] = {}
@@ -149,8 +152,13 @@ class OneLakeCatalog:
     ):
         self.catalog_id = catalog_id
         self.workspace = workspace
-        # Add .Lakehouse suffix if not already present (Fabric OneLake requirement)
-        self.lakehouse = lakehouse if lakehouse.endswith('.Lakehouse') else f"{lakehouse}.Lakehouse"
+        # A Lakehouse by NAME needs the .Lakehouse item-type suffix in OneLake paths; a Lakehouse by ID (a GUID) is
+        # addressed WITHOUT it (`<workspace id>/<lakehouse id>/Tables/...`): with the suffix the path names nothing
+        # (verified against the Fabric emulator: "<guid>.Lakehouse" -> no table).
+        if lakehouse.endswith('.Lakehouse') or _GUID_RE.match(lakehouse):
+            self.lakehouse = lakehouse
+        else:
+            self.lakehouse = f"{lakehouse}.Lakehouse"
         self.lakehouse_display = lakehouse  # Keep original name for display
         self.credentials = credentials
         self.base_url = f"https://onelake.dfs.fabric.microsoft.com/{workspace}/{self.lakehouse}"
@@ -177,6 +185,11 @@ class OneLakeCatalog:
     def test_connection(self) -> bool:
         """Test if OneLake lakehouse is accessible."""
         try:
+            # The token first, on its own: inside the Data Lake client's pipeline a failing token request (an
+            # untrusted certificate, an unreachable authority) is retried with backoff and the mount took ~2 minutes
+            # to fail; here it fails once, in seconds, with the real reason. The credential caches the token, so the
+            # client below reuses it (no second request against a working tenant).
+            self.credentials.get_bearer_token()
             service_client = self._get_service_client()
             # The ADLS Gen2 filesystem (container) is the WORKSPACE alone -- the lakehouse is a directory
             # within it, not part of the filesystem name (verified directly against a real OneLake-shaped
