@@ -153,11 +153,11 @@ published / approved / needs_reapproval ──withdraw (reason)──> withdrawn
 ## 8. Notifications to the approver team
 
 - One channel per approver team, configured by an admin: a shared mailbox (existing SMTP config, `web/email_reports.py`),
-  a Slack incoming webhook (`web/slack_integration.py`), a Microsoft Teams Workflows webhook, or a generic webhook
+  a Slack incoming webhook (`web/slack_integration.py`), a Microsoft Teams webhook (existing format), or a generic webhook
   (`web/webhook_alerts.py`).
-- **Teams**: the existing `teams` format is the legacy Office 365 connector MessageCard, which Microsoft is retiring; add
-  an Adaptive Card payload for Teams Workflows webhooks. Verify the payload against Microsoft's current documentation
-  and a real Teams channel before relying on it.
+- **Teams**: v1 uses the existing `teams` format of `web/webhook_alerts.py` unchanged (the legacy Office 365 connector
+  MessageCard). Microsoft is retiring those connectors in favour of Workflows webhooks with an Adaptive Card payload;
+  that format is deferred until a Teams channel is available to test it against (decided 2026-11-28).
 - **Content rule**: a signpost only: event, release name, audience name, preparer, and a link to the review page. No
   profile, no column names, no data, no GDPR reference. The link grants nothing by itself: the approver signs in to the
   studio (passkey or the internal SSO) and sees the profile there. No approve/reject action from a message.
@@ -222,7 +222,7 @@ prefixed with `'` (formula injection); each download is audited.
 2. Audiences, `external` and `release_approver` roles, enrolment for externals, expiry and idle timeout, approver gate.
 3. Datasets, `materialize` task, `portal` catalog, governance-version blocking, vacuum on revoke.
 4. Release flow, profile and diff, four-eyes approval, audit trail.
-5. Notifications (email, Slack, Teams Adaptive Card, webhook).
+5. Notifications (email, Slack, the existing Teams format, webhook).
 6. Portal viewer, app validation and `ds.` rewrite, limits, downloads.
 7. Reports; Helm.
 
@@ -237,8 +237,7 @@ prefixed with `'` (formula injection); each download is audited.
 - `scratch/test_portal_releases.py`: state machine; preparer cannot approve; non-member cannot approve; concurrent
   decisions give one 409; profile drift (new column, tag added, mask removed) goes to `needs_reapproval` and publishes
   nothing; audit rows for every transition; reports.
-- `scratch/test_portal_notifications.py`: payloads contain only the allowed fields; failures are audited; Teams card
-  shape.
+- `scratch/test_portal_notifications.py`: payloads contain only the allowed fields; failures are audited.
 - `scratch/verify_portal_ui.py` (Playwright, throwaway studio + portal): enrol a supplier with a virtual authenticator,
   see only the released app, parameters, as-of time, a download with formula escaping, a withdrawn release disappears;
   an approver approves in the studio; an XSS string in a title or cell renders as text.
@@ -252,5 +251,14 @@ the profile JSON layout, how reminders are scheduled (the jobs scheduler or the 
 
 ## 15. Later
 
-Write-back and file uploads into per-audience inboxes (`proposals/app-write-back.md`); on-request refresh with a quota per
-organisation; power users as preparers; an approver team per audience or data domain; the supplier's own SSO.
+- **Retrieval through a REST API** (noted 2026-11-28): an organisation may later want to fetch its released datasets
+  from its own systems instead of the portal page. Same releases, same copies, same audit; authentication by a
+  per-organisation API credential (machine identity, not a person's passkey) with its own expiry, IP rules and rate
+  limits, issued only for `downloadable` datasets. The existing Delta Sharing server (`web/delta_sharing.py`: bearer
+  tokens, per-recipient IP rules, Parquet files) is the first candidate to evaluate, since it already is a REST protocol
+  with client libraries; a plain JSON/CSV endpoint on the portal is the alternative.
+- Write-back and file uploads into per-audience inboxes (`proposals/app-write-back.md`).
+- On-request refresh with a quota per organisation.
+- Power users as preparers; an approver team per audience or data domain.
+- The supplier's own SSO.
+- Teams Adaptive Card notifications (section 8).
