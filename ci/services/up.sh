@@ -34,8 +34,12 @@ dc up -d --wait --wait-timeout "$timeout" $(dc config --services | grep -v -- '-
   || fail "a service is not healthy after ${timeout} s"
 for s in "${seeds[@]}"; do
   dc up -d "$s" >/dev/null 2>&1 || fail "seed $s could not start"
-  code=0; timeout "$timeout" docker compose -p dkwci "${files[@]}" "${profiles[@]}" wait "$s" >/dev/null 2>&1 || code=$?   # wait's status = the seed's
-  [ "$code" -ne 124 ] || fail "seed $s did not finish in ${timeout} s"
-  [ "$code" -eq 0 ] || fail "seed $s exited with $code"
+  cid="$(dc ps -a -q "$s")"; [ -n "$cid" ] || fail "seed $s has no container"
+  # `docker wait`, not `docker compose wait`: older Compose releases wait only for RUNNING containers and fail when a quick
+  # seed has already exited (seen on GitHub's runners with the one-line azure seed)
+  st=0; code="$(timeout "$timeout" docker wait "$cid" 2>&1)" || st=$?
+  [ "$st" -ne 124 ] || fail "seed $s did not finish in ${timeout} s"
+  [ "$st" -eq 0 ] || fail "could not wait for seed $s: $code"
+  [ "$code" = 0 ] || fail "seed $s exited with $code ($(docker inspect -f '{{.State.Status}} {{.State.Error}}' "$cid" 2>&1))"
 done
 echo "dkwci up: $*"

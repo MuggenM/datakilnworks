@@ -82,6 +82,17 @@ t1=$(date +%s); rm -f /tmp/dkwci_unhealthy.yml
 [ $((t1 - t0)) -le 60 ]; check "within 60 s (took $((t1 - t0)) s)" $?
 echo "$out3" | grep -q "lldap"; check "it prints lldap's log lines" $? "$(echo "$out3" | tail -3)"
 
+echo "a failing seed is reported with its exit code"
+bash $S/down.sh >/dev/null 2>&1
+cat > /tmp/dkwci_badseed.yml <<'EOF'
+services:
+  lldap-seed:
+    entrypoint: ["/bin/sh", "-c", "exit 3"]
+    command: []
+EOF
+out6="$(CI_SERVICES_EXTRA_COMPOSE=/tmp/dkwci_badseed.yml bash $S/up.sh ldap 2>&1)"; rc6=$?; rm -f /tmp/dkwci_badseed.yml
+[ $rc6 -ne 0 ] && echo "$out6" | grep -q "seed lldap-seed exited with 3"; check "up.sh exits non-zero naming the seed and its code 3" $? "$(echo "$out6" | grep -m1 'did not come up')"
+
 echo "a refused run_test.sh leaves the running stack alone"
 bash $S/down.sh >/dev/null 2>&1; bash $S/up.sh ldap >/dev/null 2>&1
 CI_SERVICES=ldap bash ci/run_test.sh ci_services_wiring >/dev/null 2>&1; rc5=$?

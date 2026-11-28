@@ -64,7 +64,12 @@ def main():
             page.fill("[data-testid=s3events-token-name]", "MinIO test"); page.click("[data-testid=s3events-token-create]")
             page.wait_for_selector("[data-testid=s3events-secret]", state="visible")
             token = page.locator("[data-testid=s3events-secret]").inner_text().strip()
-            check("a token is shown once and listed", token.startswith("dkw_s3ev_") and page.locator("[data-testid=s3events-token-row]").count() == 1)
+            try:      # the list reloads after the secret is shown: on a slow runner the row came a moment later
+                page.wait_for_function("() => document.querySelectorAll('[data-testid=s3events-token-row]').length === 1", timeout=15000)
+            except Exception:
+                pass
+            check("a token is shown once and listed", token.startswith("dkw_s3ev_") and page.locator("[data-testid=s3events-token-row]").count() == 1,
+                  f"secret {token[:9]!r}..., rows {page.locator('[data-testid=s3events-token-row]').count()}")
             page.screenshot(path="/tmp/s3ev_modal.png"); page.keyboard.press("Escape")
             # a real MinIO that posts to the studio
             mr = sh("docker", "run", "-d", "--name", MINIO, "--network", NET, "-e", "MINIO_NOTIFY_WEBHOOK_ENABLE_dkw=on", "-e", f"MINIO_NOTIFY_WEBHOOK_ENDPOINT_dkw=http://{UI}:8891/hooks/s3-events",
