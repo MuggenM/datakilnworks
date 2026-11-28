@@ -14,6 +14,27 @@ The lists live in `ci/plan.json` (`tests` with optional extra pip packages, `ui`
 non-zero on failure and must not need anything outside the container: tests that need real services (Gitea, Redpanda, a real S3 server, Azurite, lldap,
 Keycloak, SFTP, the Docker socket) stay out of CI; each says how to run it in its docstring.
 
+## Backend services for tests (`ci/services/`)
+
+Tests that need a real outside service get it from one compose stack, `ci/services/docker-compose.yml` (design:
+`proposals/ci-services.md`), with one profile per service. Only test data lives there: every login is a dummy value;
+generated values (tokens, keys) go to the gitignored `ci/services/out/<profile>.env`.
+
+```bash
+ci/services/up.sh ldap            # start profiles from empty volumes, wait for health + seeds; refuses while already up
+CI_SERVICES=ldap ci/run_test.sh ldap_auth   # starts them, runs the test on network dkwci_default with their env files, stops them
+ci/services/down.sh               # remove everything of project dkwci (idempotent)
+bash ci/services/test_services_harness.sh   # tests the stack itself
+```
+
+- Project `dkwci`, no published ports: it never touches other containers, networks or ports on the machine.
+- `CI_SERVICES` sets `REQUIRE_SERVICES=1` in the test: a service the test cannot reach is a failure, not a skip.
+- Every service and every test container on the stack runs with **no DNS search domain** (`dns_search: .`,
+  `--dns-search .`): Docker copies the host's, and where that domain resolves unknown names (this dev machine's does, to
+  an outside host), curl tried `lldap.<domain>` first and connected there instead of to the stack's lldap.
+- Profiles so far: `ldap` (lldap `v0.6.2-alpine`; users jdoe / asmith / bjones in dkw_engineers / dkw_admins /
+  dkw_analysts, group dkw_ops, password `Password123!`, bind `uid=admin,ou=people,dc=example,dc=com` / `adminpassword`).
+
 ## The cluster smoke test (`ci/kind-smoke.sh`)
 
 Creates a kind cluster, loads the image, installs `deploy/helm/datakilnworks` with `ci/kind-values.yaml` (one compute node, small volumes), and checks:

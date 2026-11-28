@@ -1,0 +1,3 @@
+{"id": "jdoe", "email": "jdoe@example.com", "displayName": "John Doe", "password": "Password123!", "groups": ["dkw_engineers"]}
+{"id": "asmith", "email": "asmith@example.com", "displayName": "Alice Smith", "password": "Password123!", "groups": ["dkw_admins"]}
+{"id": "bjones", "email": "bjones@example.com", "displayName": "Bob Jones", "password": "Password123!", "groups": ["dkw_analysts"]}

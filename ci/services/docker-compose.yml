@@ -1,0 +1,61 @@
+# Backend services for the tests (design: proposals/ci-services.md). Test data only: every login here is a dummy value.
+# Start with ci/services/up.sh <profile>..., stop with ci/services/down.sh. Project name dkwci, no published ports:
+# a test reaches a service by its name on the network dkwci_default (ci/run_test.sh with CI_SERVICES joins it).
+# Images are pinned by tag; Dependabot (docker-compose ecosystem) proposes updates.
+name: dkwci
+
+# Every service: no DNS search domain. Docker copies the host's, and on a machine whose search domain resolves unknown names
+# (this dev machine's does, to an outside host) a client that tries `<name>.<domain>` first (curl does) connects there
+# instead of to the service on this network.
+x-no-search: &no-search
+  dns_search: .
+
+services:
+  # ---------------------------------------------------------------- profile ldap
+  lldap:
+    image: lldap/lldap:v0.6.2-alpine           # latest stable release on 2026-11-28
+    profiles: [ldap]
+    <<: *no-search
+    environment:
+      LLDAP_JWT_SECRET: dkwci-test-jwt-secret-not-a-real-one
+      LLDAP_KEY_SEED: dkwci-test-key-seed-not-a-real-one
+      LLDAP_LDAP_BASE_DN: dc=example,dc=com
+      LLDAP_LDAP_USER_PASS: adminpassword
+    volumes:
+      - lldap-data:/data
+    healthcheck:
+      test: ["CMD", "/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  lldap-seed:                                   # users, groups, memberships and passwords through lldap's own bootstrap script
+    image: lldap/lldap:v0.6.2-alpine
+    profiles: [ldap]
+    <<: *no-search
+    depends_on:
+      lldap: {condition: service_healthy}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /app/bootstrap.sh
+        cat > /out/ldap.env <<'ENV'
+        LLDAP_TEST_HOST=lldap
+        LLDAP_BIND_DN=uid=admin,ou=people,dc=example,dc=com
+        LLDAP_BIND_PASSWORD=adminpassword
+        LLDAP_BASE_DN=dc=example,dc=com
+        LLDAP_USER_PASSWORD=Password123!
+        ENV
+    environment:
+      LLDAP_URL: http://lldap:17170
+      LLDAP_ADMIN_USERNAME: admin
+      LLDAP_ADMIN_PASSWORD: adminpassword
+      USER_CONFIGS_DIR: /seed/users
+      GROUP_CONFIGS_DIR: /seed/groups
+    volumes:
+      - ./seed/lldap:/seed:ro
+      - ./out:/out
+
+volumes:
+  lldap-data:
