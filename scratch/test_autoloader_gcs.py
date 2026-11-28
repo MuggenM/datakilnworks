@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Google Cloud Storage as an Auto-Loader source (web/autoloader_gcs.py, web/autoloader_preview.py, web/mounts.py "gcs" mount
 type), throwaway WAREHOUSE_DIR, against a real throwaway Deuxfleurs Garage standing in for GCS's own S3-compatible
-interoperability endpoint (see web/autoloader_gcs.py's module docstring for why; not real GCS, and not in `ci/plan.json` for
-that reason: Google-specific quirks of the interoperability API beyond the ENDPOINT/SCOPE one below are unverified). Run on
-the same docker network as Garage:
+interoperability endpoint (see web/autoloader_gcs.py's module docstring for why; not real GCS:
+Google-specific quirks of the interoperability API beyond the ENDPOINT/SCOPE one below are unverified). In CI it runs on the
+services stack's Garage: `CI_SERVICES=s3 ci/run_test.sh autoloader_gcs`. By hand, on the same docker network as Garage:
   eval "$(scratch/garage_up.sh)"   # prints/exports GARAGE_ENDPOINT, GARAGE_KEY_ID, GARAGE_SECRET_KEY
   docker run --rm --network <the network garage_up.sh used> -e TEST_S3_ENDPOINT="$GARAGE_ENDPOINT" -e TEST_S3_ACCESS_KEY="$GARAGE_KEY_ID" \
      -e TEST_S3_SECRET_KEY="$GARAGE_SECRET_KEY" -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch \
@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="al_gcs_")
 os.environ["WAREHOUSE_DIR"] = TMP
@@ -51,6 +52,8 @@ EP = os.environ.get("TEST_S3_ENDPOINT", "127.0.0.1:9000")
 KEY = os.environ.get("TEST_S3_ACCESS_KEY", "")
 SECRET = os.environ.get("TEST_S3_SECRET_KEY", "")
 REGION = os.environ.get("TEST_S3_REGION", "garage")           # Garage's own s3_region; real GCS uses "auto"
+if not _services.require_or_skip("S3 (Garage, standing in for GCS)", *_services.host_port(EP, 9000)):
+    shutil.rmtree(TMP, ignore_errors=True); sys.exit(0)
 
 
 def mount(mid, bucket, **kw):

@@ -11,11 +11,15 @@ import json, os, shutil, sys, tempfile, threading, time
 TMP = tempfile.mkdtemp(prefix="stream_test_"); os.environ["WAREHOUSE_DIR"] = TMP
 os.environ["INIT_ADMIN_USERNAME"] = "admin"; os.environ["INIT_ADMIN_PASSWORD_HASH"] = "pbkdf2_sha256$100000$" + "0" * 32 + "$" + "0" * 64
 sys.path.insert(0, "/workspace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic, NewPartitions
 from deltalake import DeltaTable
 from web import connections, streaming as st
 BROKER = os.environ.get("KAFKA", "rpt:9092")
+for _svc, _hp, _port in (("Redpanda", BROKER, 9092), ("Schema Registry", os.environ.get("REGISTRY", "http://rpt:8081"), 8081)):
+    if not _services.require_or_skip(_svc, *_services.host_port(_hp, _port)):
+        shutil.rmtree(TMP, ignore_errors=True); sys.exit(0)
 FAIL = []
 def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:400]}" if d and not c else ""))
@@ -392,7 +396,8 @@ dq = wait_for(lambda: (lambda t: t if t is not None and t.num_rows == 2 else Non
 check("unparsable JSON and non-objects are dead-lettered", dq is not None and any("does not match" in e for e in dq["error"].to_pylist()) and any("not an object" in e for e in dq["error"].to_pylist()), dq and dq["error"].to_pylist())
 check("Schema Registry formats need the registry on the connection", "Schema Registry" in (bad_stream(format="protobuf") or "") and "Schema Registry" in (bad_stream(format="jsonschema") or ""))
 
-if os.environ.get("SASL_KAFKA"):
+SASL = os.environ.get("SASL_KAFKA", "")             # optional by hand; ci/services sets it, and then it must be reachable
+if (SASL or os.environ.get("REQUIRE_SERVICES") == "1") and _services.require_or_skip("Redpanda with SASL", *_services.host_port(SASL, 9092)):
     print("SASL broker")
     sc = connections.create_connection({"name": "sasl", "type": "kafka", "config": {"bootstrap_servers": os.environ["SASL_KAFKA"], "security_protocol": "SASL_PLAINTEXT", "sasl_mechanism": "SCRAM-SHA-256",
                                        "username": os.environ["SASL_USER"], "allow_insecure": True}, "secret": {"password": os.environ["SASL_PASSWORD"]}}, "admin")

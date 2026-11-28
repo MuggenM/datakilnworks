@@ -4,11 +4,16 @@
   docker run --rm --network gtest_net -e TOK=$TOK -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook \
      sh -c 'pip install -q dbt-duckdb 2>&1 | tail -0; python /workspace/scratch/test_git_review.py'"""
 import json, os, shutil, subprocess, sys, tempfile, time, requests
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _services  # noqa: E402
+GIT_HOST = os.environ.get("GIT_HOST", "gtest_gitea:3000")       # the throwaway Gitea of scratch/gitea_up.sh; ci/services sets gitea:3000
+if not _services.require_or_skip("Gitea", *_services.host_port(GIT_HOST, 3000)):
+    sys.exit(0)
 TMP = tempfile.mkdtemp(prefix="grv_"); os.environ["WAREHOUSE_DIR"] = os.path.join(TMP, "warehouse"); os.makedirs(os.environ["WAREHOUSE_DIR"])
 proj = os.path.join(TMP, "proj"); shutil.copytree("/workspace/web/dbt_template", proj); os.environ["DBT_PROJECT_DIR"] = proj
 nbroot = os.path.join(TMP, "notebooks"); os.makedirs(os.path.join(nbroot, "Shared")); os.environ["NOTEBOOKS_DIR"] = nbroot
 NBD = os.path.join(nbroot, "Shared")
-TOK = os.environ["TOK"]; H = "http://gtest_gitea:3000"
+TOK = os.environ["TOK"]; H = f"http://{GIT_HOST}"
 os.environ.update({"GIT_REMOTE_URL": f"{H}/ga/dbt-rv.git", "GIT_TOKEN": TOK, "NOTEBOOKS_GIT_REMOTE_URL": f"{H}/ga/nb-rv.git", "NOTEBOOKS_GIT_MODE": "pull_request"})
 sys.path.insert(0, "/workspace")
 from web import git_sync as g, git_review as gr
@@ -21,6 +26,18 @@ def refuses(fn, *a, contains="", **kw):
     except g.GitError as e: return contains.lower() in str(e).lower(), str(e)
     return False, "no error"
 api = lambda m, path, **kw: requests.request(m, f"{H}/api/v1{path}", headers={"Authorization": f"token {TOK}"}, timeout=20, **kw)
+import time  # noqa: E402
+def merge(path, **kw):        # Gitea checks a pull request's mergeability in the background: 405 "try again later" until then
+    for _ in range(60):
+        r = api("POST", path, **kw)
+        if r.status_code != 405: return r
+        time.sleep(0.5)
+    return r
+def wait_branch(repo, branch="main"):   # a pushed branch reaches Gitea's API through a background queue
+    for _ in range(60):
+        if api("GET", f"/repos/{repo}/branches/{branch}").status_code == 200: return True
+        time.sleep(0.5)
+    return False
 NB, D = g.NOTEBOOKS, g.DBT
 def w(rel, text, base=NBD, mode="w"):
     p = os.path.join(base, rel); os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -41,7 +58,7 @@ print("setup: a repository with a few files")
 st = NB.connect("admin")
 w("a.txt", A0); w("b.txt", "b1\nb2\nb3\n"); w("c.txt", "c1\n"); w("g.txt", "g1\ng2\n"); w("nb.ipynb", nbjson(("code", "x = 1\n"), ("markdown", "# title\n")))
 NB.commit("alice", "initial"); NB.push("alice")
-time.sleep(1); check("main is on the server", api("GET", "/repos/ga/nb-rv/branches/main").status_code == 200)
+check("main is on the server", wait_branch("ga/nb-rv"))
 
 print("diff view: pending changes")
 w("a.txt", A0.replace("line 3\n", "line 3 changed\n")); os.remove(os.path.join(NBD, "c.txt")); w("d.txt", "d1\nd2\nd3\n"); w("blob.bin", b"\x00\x01\x02binary", mode="wb")
@@ -131,7 +148,7 @@ ok, m = refuses(NB.finish_merge, "alice", contains="no merge"); check("finishing
 
 print("direct mode: local and remote diverged")
 rm = api("POST", f"/repos/ga/nb-rv/pulls", json={"head": br, "base": "main", "title": "x"}); num = rm.json().get("number")
-api("POST", f"/repos/ga/nb-rv/pulls/{num}/merge", json={"Do": "merge"}) if num else None
+merge(f"/repos/ga/nb-rv/pulls/{num}/merge", json={"Do": "merge"}) if num else None
 os.environ["NOTEBOOKS_GIT_MODE"] = "direct"
 try: NB.abandon_change  # noqa
 except Exception: pass

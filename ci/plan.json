@@ -1,5 +1,5 @@
 {
- "_comment": "tests run inside the built image (ci/run_test.sh); ui = scratch/verify_<name>.py (Playwright, starts its own throwaway containers). Keep out: tests that need real services or a running studio.",
+ "_comment": "tests run inside the built image (ci/run_test.sh); ui = scratch/verify_<name>.py (Playwright, starts its own throwaway containers). \"services\" = profiles of ci/services the test runs against (ci/run_test.sh CI_SERVICES). Keep out: tests that need a running studio.",
  "tests": [
   {
    "name": "autoloader",
@@ -39,7 +39,8 @@
   },
   {
    "name": "delta_sharing",
-   "extras": "delta-sharing"
+   "extras": "delta-sharing",
+   "services": "s3"
   },
   {
    "name": "governance_groups",
@@ -230,6 +231,61 @@
   {
    "name": "llm_off_loop",
    "extras": ""
+  },
+  {
+   "name": "autoloader_azure",
+   "extras": "",
+   "services": "azure"
+  },
+  {
+   "name": "autoloader_gcs",
+   "extras": "",
+   "services": "s3"
+  },
+  {
+   "name": "autoloader_preview",
+   "extras": "",
+   "services": "s3"
+  },
+  {
+   "name": "autoloader_target",
+   "extras": "",
+   "services": "s3"
+  },
+  {
+   "name": "connections",
+   "extras": "",
+   "services": "sftp"
+  },
+  {
+   "name": "git_forges",
+   "extras": "",
+   "services": "git"
+  },
+  {
+   "name": "git_pr_mode",
+   "extras": "",
+   "services": "git"
+  },
+  {
+   "name": "git_review",
+   "extras": "",
+   "services": "git"
+  },
+  {
+   "name": "git_sync",
+   "extras": "",
+   "services": "git"
+  },
+  {
+   "name": "stream_ops",
+   "extras": "",
+   "services": "kafka"
+  },
+  {
+   "name": "streaming",
+   "extras": "",
+   "services": "kafka"
   }
  ],
  "ui": [

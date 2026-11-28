@@ -5,6 +5,7 @@ REQUIRE_SERVICES=1 whenever CI_SERVICES is set, a missing service is a FAILURE: 
 import os
 import socket
 import sys
+import urllib.parse
 
 
 def require_or_skip(name: str, host: str, port: int, timeout: float = 2.0) -> bool:
@@ -26,3 +27,12 @@ def require_or_skip(name: str, host: str, port: int, timeout: float = 2.0) -> bo
         os._exit(1)
     print(f"{name} {why} -- skipping (start it with ci/services/up.sh, or set the test's host variable).")
     return False
+
+
+def host_port(value: str, default_port: int) -> tuple:
+    """`host:port`, a bare `host` or a URL (`http://host:port/...`) -> (host, port). An empty value stays empty."""
+    if "://" in value:
+        u = urllib.parse.urlsplit(value)
+        return u.hostname or "", u.port or {"https": 443, "http": 80}.get(u.scheme, default_port)
+    host, sep, port = value.rpartition(":")
+    return (host, int(port)) if sep else (value, default_port)

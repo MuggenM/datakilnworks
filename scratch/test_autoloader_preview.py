@@ -8,6 +8,7 @@ MinIO. Container names must not use underscores: botocore's endpoint validation 
 import io, json, os, shutil, sys, tempfile, time
 TMP = tempfile.mkdtemp(prefix="alpv_"); os.environ["WAREHOUSE_DIR"] = TMP
 sys.path.insert(0, "/workspace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 import pyarrow as pa, pyarrow.parquet as pq
 from web import autoloader_preview as pv, autoloader, mounts
 FAIL = []
@@ -66,9 +67,9 @@ r = pv.preview(os.path.join(TMP, "many"), "*.csv"); check("a huge folder is scan
 check("the listing is capped", len(pv.preview(D, "*")["files"]) <= pv.LISTED_FILES)
 check("no pipeline, checkpoint or table exists after all of this", not os.path.exists(missing) and not os.path.exists(os.path.join(TMP, ".metadata", "autoloader.db")))
 
-EP = os.environ.get("S3_ENDPOINT")
-if not EP:
-    print("no S3_ENDPOINT: skipping the S3 section")
+EP = os.environ.get("S3_ENDPOINT", "")
+if not _services.require_or_skip("S3 (Garage) for the s3:// section", *_services.host_port(EP, 3900)):
+    pass                                  # the helper printed why (under REQUIRE_SERVICES=1 it fails instead)
 else:
     print("s3:// (Garage)")
     AK = os.environ.get("S3_ACCESS_KEY", "minioadmin"); SK = os.environ.get("S3_SECRET_KEY", "minioadmin")  # defaults kept for an old MinIO-based run

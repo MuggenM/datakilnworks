@@ -57,5 +57,164 @@ services:
       - ./seed/lldap:/seed:ro
       - ./out:/out
 
+  # ---------------------------------------------------------------- profile git
+  gitea:
+    image: gitea/gitea:1.22-rootless
+    profiles: [git]
+    <<: *no-search
+    environment:
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__ROOT_URL: http://gitea:3000
+      GITEA__server__DOMAIN: gitea
+      GITEA__service__DISABLE_REGISTRATION: "true"
+    volumes:
+      - gitea-data:/var/lib/gitea
+      - gitea-config:/etc/gitea
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  git-seed:                                     # user ga, an all-scopes token, the empty repos the four git tests use
+    image: gitea/gitea:1.22-rootless
+    profiles: [git]
+    <<: *no-search
+    depends_on:
+      gitea: {condition: service_healthy}
+    user: root                                  # writes out/git.env; the gitea commands themselves run as `git` (su)
+    entrypoint: ["/bin/sh", "/seed/gitea.sh"]
+    volumes:                                    # the server's own data + config: `gitea admin` works on its database
+      - gitea-data:/var/lib/gitea
+      - gitea-config:/etc/gitea
+      - ./seed/gitea.sh:/seed/gitea.sh:ro
+      - ./out:/out
+
+  # ---------------------------------------------------------------- profile kafka
+  # Two plain clusters (test_stream_ops moves a stream between clusters) and one that requires a SCRAM login.
+  redpanda: &redpanda
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+    profiles: [kafka]
+    <<: *no-search
+    command: [redpanda, start, --smp, "1", --memory, 512M, --overprovisioned, --node-id, "0", --mode, dev-container,
+              --kafka-addr, "internal://0.0.0.0:9092", --advertise-kafka-addr, "internal://redpanda:9092"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9644/v1/status/ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  redpanda2:
+    <<: *redpanda
+    command: [redpanda, start, --smp, "1", --memory, 512M, --overprovisioned, --node-id, "0", --mode, dev-container,
+              --kafka-addr, "internal://0.0.0.0:9092", --advertise-kafka-addr, "internal://redpanda2:9092"]
+
+  redpanda-sasl:
+    <<: *redpanda
+    command: [redpanda, start, --smp, "1", --memory, 512M, --overprovisioned, --node-id, "0", --mode, dev-container,
+              --kafka-addr, "internal://0.0.0.0:9092", --advertise-kafka-addr, "internal://redpanda-sasl:9092",
+              --set, redpanda.enable_sasl=true, --set, 'redpanda.superusers=["dkwci"]']
+
+  kafka-seed:                                   # the SCRAM user of redpanda-sasl
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+    profiles: [kafka]
+    user: root                                  # the image's own user cannot write out/
+    <<: *no-search
+    depends_on:
+      redpanda: {condition: service_healthy}
+      redpanda2: {condition: service_healthy}
+      redpanda-sasl: {condition: service_healthy}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        rpk security user create dkwci -p dkwci-test-password --mechanism SCRAM-SHA-256 -X admin.hosts=redpanda-sasl:9644
+        cat > /out/kafka.env <<'ENV'
+        KAFKA=redpanda:9092
+        KAFKA2=redpanda2:9092
+        REGISTRY=http://redpanda:8081
+        SASL_KAFKA=redpanda-sasl:9092
+        SASL_USER=dkwci
+        SASL_PASSWORD=dkwci-test-password
+        ENV
+    volumes:
+      - ./out:/out
+
+  # ---------------------------------------------------------------- profile azure
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    profiles: [azure]
+    <<: *no-search
+    # --skipApiVersionCheck: a recent azure-storage-blob sends an API version Azurite does not know yet
+    command: [azurite-blob, --blobHost, 0.0.0.0, --skipApiVersionCheck, --location, /data]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "10000"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  azure-seed:                                   # nothing to create (Azurite's account and key are the well-known dev ones)
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    profiles: [azure]
+    <<: *no-search
+    depends_on:
+      azurite: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c", "echo AZURITE_HOST=azurite > /out/azure.env"]
+    volumes:
+      - ./out:/out
+
+  # ---------------------------------------------------------------- profile s3
+  garage:                                       # Deuxfleurs Garage, a real S3 implementation (stands in for S3 and GCS)
+    image: dxflrs/garage:v1.0.1
+    profiles: [s3]
+    <<: *no-search
+    volumes:
+      - ./seed/garage/garage.toml:/etc/garage.toml:ro
+      - garage-data:/tmp
+    healthcheck:
+      test: ["CMD", "/garage", "node", "id", "-q"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  s3-seed:                                      # layout, key `test` (may create buckets), through Garage's admin API
+    image: python:3.11-slim
+    profiles: [s3]
+    <<: *no-search
+    depends_on:
+      garage: {condition: service_healthy}
+    entrypoint: ["python", "-I", "/seed/garage.py"]
+    volumes:
+      - ./seed/garage.py:/seed/garage.py:ro
+      - ./out:/out
+
+  # ---------------------------------------------------------------- profile sftp
+  sftp:                                         # OpenSSH: user/pass `user`/`pass`, folder /upload, plus a key pair made at start
+    image: atmoz/sftp:latest@sha256:0960390462a4441dbb63698d7c185b76a41ffcee7b78ff4adf275f3e66f9c475
+    profiles: [sftp]
+    <<: *no-search
+    command: ["user:pass:::upload"]
+    volumes:
+      - ./seed/sftp.sh:/etc/sftp.d/dkwci-key.sh:ro    # run by the image's entrypoint before sshd starts
+      - ./out:/out
+    healthcheck:
+      test: ["CMD", "bash", "-c", "test -s /out/sftp/id && echo > /dev/tcp/127.0.0.1/22"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  sftp-seed:
+    image: atmoz/sftp:latest@sha256:0960390462a4441dbb63698d7c185b76a41ffcee7b78ff4adf275f3e66f9c475
+    profiles: [sftp]
+    <<: *no-search
+    depends_on:
+      sftp: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c", "printf 'SFTP_HOST=sftp\\nSFTP_KEY=/services/sftp/id\\n' > /out/sftp.env"]
+    volumes:
+      - ./out:/out
+
 volumes:
   lldap-data:
+  gitea-data:
+  gitea-config:
+  garage-data:

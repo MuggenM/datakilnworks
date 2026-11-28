@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Azure Blob Storage as an Auto-Loader source (web/autoloader_azure.py, web/autoloader_preview.py, web/mounts.py "azure" mount
-type), throwaway WAREHOUSE_DIR, against a real throwaway Azurite (Microsoft's official Storage emulator; not real Azure, and not
-in `ci/plan.json` for that reason). Run on the same docker network as Azurite:
+type), throwaway WAREHOUSE_DIR, against a real throwaway Azurite (Microsoft's official Storage emulator; not real Azure).
+In CI it runs on the services stack: `CI_SERVICES=azure ci/run_test.sh autoloader_azure`. By hand, on the same docker network as Azurite:
   docker network create aztest_net
   docker run -d --name aztest_azurite --network aztest_net mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
   docker run --rm --network aztest_net -e AZURITE_HOST=aztest_azurite -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch \
@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="al_azure_")
 os.environ["WAREHOUSE_DIR"] = TMP
@@ -50,6 +51,8 @@ def err(fn, *a, **k):
 ACCOUNT = "devstoreaccount1"
 ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 HOST = os.environ.get("AZURITE_HOST", "127.0.0.1")
+if not _services.require_or_skip("Azurite", HOST, 10000):
+    shutil.rmtree(TMP, ignore_errors=True); sys.exit(0)
 ACCOUNT_URL = f"http://{HOST}:10000/{ACCOUNT}"
 CS = f"DefaultEndpointsProtocol=http;AccountName={ACCOUNT};AccountKey={ACCOUNT_KEY};BlobEndpoint={ACCOUNT_URL};"
 

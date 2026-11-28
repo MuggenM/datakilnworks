@@ -10,6 +10,7 @@ import base64, hashlib, http.server, json, os, shutil, sys, tempfile, threading,
 from urllib.parse import parse_qs, urlparse
 TMP = tempfile.mkdtemp(prefix="conn_test_"); os.environ["WAREHOUSE_DIR"] = TMP
 sys.path.insert(0, "/workspace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 from deltalake import DeltaTable
 from web import autoloader, autoloader_conn, connections
 FAIL = []
@@ -211,8 +212,8 @@ check("the path rules apply to a preview too", ok)
 check("nothing was created: no pipeline, no checkpoint, no staging directory", len(autoloader.list_pipelines()) == hist_before and not any(d.startswith("dkw_preview_") for d in os.listdir(tempfile.gettempdir())))
 
 # ------------------------------------------------------------------ sftp
-SH = os.getenv("SFTP_HOST")
-if SH:
+SH = os.getenv("SFTP_HOST", "")
+if _services.require_or_skip("SFTP server", SH, 22):
     print("sftp")
     import paramiko
     fp = autoloader_conn.discover_host_key(SH, 22)
@@ -255,13 +256,13 @@ if SH:
     connections.update_connection("sftp1", {"config": {"host_key_sha256": wrong}}, "admin")
     r = run(ps); check("a changed host key stops the pipeline with a clear error", "does not match" in last_error(ps) and autoloader.get_pipeline(ps["id"])["status"] == "ERROR", last_error(ps))
     connections.update_connection("sftp1", {"config": {"host_key_sha256": fp}}, "admin")
-    key = os.getenv("SFTP_KEY")
+    key = os.getenv("SFTP_KEY", "")
+    if os.environ.get("REQUIRE_SERVICES") == "1":
+        check("sftp: the key file of the services stack exists", bool(key) and os.path.exists(key), key)
     if key and os.path.exists(key):
         pem = open(key).read()
         kc = connections.create_connection({"name": "sftpkey", "type": "sftp", "config": {**base, "auth": "key", "host_key_sha256": fp}, "secret": {"private_key": pem}}, "admin")
         tr = autoloader_conn.test_connection(connections.definition_for_test({"id": "sftpkey"})); check("sftp: public-key authentication", tr["ok"], tr)
     sf.close(); t.close()
-else:
-    print("sftp: skipped (set SFTP_HOST)")
 srv.shutdown(); shutil.rmtree(TMP, ignore_errors=True)
 print("FAILED: " + ", ".join(FAIL) if FAIL else "ALL PASS"); sys.exit(1 if FAIL else 0)

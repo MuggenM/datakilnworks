@@ -2,12 +2,17 @@
   docker run --rm --network gtest_net -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch \
      -e TOK=<token> localspark-lakehouse-notebook python /workspace/scratch/test_git_sync.py"""
 import os, shutil, subprocess, sys, tempfile
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _services  # noqa: E402
+GIT_HOST = os.environ.get("GIT_HOST", "gtest_gitea:3000")       # the throwaway Gitea of scratch/gitea_up.sh; ci/services sets gitea:3000
+if not _services.require_or_skip("Gitea", *_services.host_port(GIT_HOST, 3000)):
+    sys.exit(0)
 sys.path.insert(0, "/workspace")
 tmp = tempfile.mkdtemp(prefix="gs_")
 os.environ["WAREHOUSE_DIR"] = os.path.join(tmp, "warehouse"); os.makedirs(os.environ["WAREHOUSE_DIR"])
 proj = os.path.join(tmp, "proj"); shutil.copytree("/workspace/web/dbt_template", proj)
 os.environ["DBT_PROJECT_DIR"] = proj
-TOK = os.environ["TOK"]
+TOK = os.environ["TOK"]; H = f"http://{GIT_HOST}"
 from web import git_sync as g
 fails = []
 def check(name, cond, extra=""):
@@ -19,13 +24,13 @@ def refuses(fn, *a, contains=""):
     return False, "no error"
 
 check("unconfigured", g.status()["configured"] is False)
-os.environ["GIT_REMOTE_URL"] = "http://gtest_gitea:3000/ga/dbt-project.git"; os.environ["GIT_TOKEN"] = TOK
+os.environ["GIT_REMOTE_URL"] = f"{H}/ga/dbt-project.git"; os.environ["GIT_TOKEN"] = TOK
 ok, m = refuses(g.commit, "u", "x", contains="connect"); check("commit before connect refused", ok, m)
-os.environ["GIT_REMOTE_URL"] = "http://user:pw@gtest_gitea:3000/ga/dbt-project.git"
+os.environ["GIT_REMOTE_URL"] = f"http://user:pw@{GIT_HOST}/ga/dbt-project.git"
 ok, m = refuses(g.connect, "admin", contains="credentials"); check("credentials in URL refused", ok, m)
 os.environ["GIT_REMOTE_URL"] = "file:///etc"
 ok, m = refuses(g.connect, "admin", contains="http"); check("file:// refused", ok, m)
-os.environ["GIT_REMOTE_URL"] = "http://gtest_gitea:3000/ga/dbt-project.git"
+os.environ["GIT_REMOTE_URL"] = f"{H}/ga/dbt-project.git"
 
 # a project nested inside another repo must not be operated on
 outer = os.path.join(tmp, "outer"); os.makedirs(os.path.join(outer, "inner")); subprocess.run(["git", "init", "-q"], cwd=outer)
@@ -54,7 +59,7 @@ check("head_sha", g.head_sha() == g.status()["head"])
 
 # a developer clones, pushes a change
 dev = os.path.join(tmp, "dev")
-denv = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.http://gtest_gitea:3000/.extraHeader", "GIT_CONFIG_VALUE_0": f"Authorization: token {TOK}",
+denv = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{H}/.extraHeader", "GIT_CONFIG_VALUE_0": f"Authorization: token {TOK}",
         "GIT_AUTHOR_NAME": "dev", "GIT_AUTHOR_EMAIL": "d@d", "GIT_COMMITTER_NAME": "dev", "GIT_COMMITTER_EMAIL": "d@d"}
 def dgit(*a): return subprocess.run(["git", *a], cwd=dev, env=denv, capture_output=True, text=True, check=True)
 subprocess.run(["git", "clone", "-q", os.environ["GIT_REMOTE_URL"], dev], env=denv, check=True)
@@ -101,7 +106,7 @@ check("audited", {"GIT_CONNECT", "GIT_COMMIT", "GIT_PUSH", "GIT_PULL", "GIT_PULL
 import json as _json
 nbroot = os.path.join(tmp, "notebooks"); shared = os.path.join(nbroot, "Shared"); os.makedirs(shared); os.makedirs(os.path.join(nbroot, "Users/alice"))
 os.environ["NOTEBOOKS_DIR"] = nbroot
-os.environ["NOTEBOOKS_GIT_REMOTE_URL"] = "http://gtest_gitea:3000/ga/notebooks.git"
+os.environ["NOTEBOOKS_GIT_REMOTE_URL"] = f"{H}/ga/notebooks.git"
 nb = {"cells": [{"cell_type": "code", "source": ["print(1)"], "execution_count": 7, "metadata": {}, "outputs": [{"output_type": "stream", "name": "stdout", "text": ["SECRET-ROW-DATA\n"]}]}],
       "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
 open(os.path.join(shared, "a.ipynb"), "w").write(_json.dumps(nb))

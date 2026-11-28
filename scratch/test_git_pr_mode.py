@@ -3,10 +3,15 @@
 TOK (a token of user `ga`) and repos ga/dbt-pr and ga/nb-pr created empty (see the docstring of test_git_sync.py for the Gitea setup):
   docker run --rm --network gtest_net -e TOK=<token> -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook sh -c 'pip install -q dbt-duckdb && python /workspace/scratch/test_git_pr_mode.py'"""
 import json, os, shutil, subprocess, sys, tempfile, requests
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _services  # noqa: E402
+GIT_HOST = os.environ.get("GIT_HOST", "gtest_gitea:3000")       # the throwaway Gitea of scratch/gitea_up.sh; ci/services sets gitea:3000
+if not _services.require_or_skip("Gitea", *_services.host_port(GIT_HOST, 3000)):
+    sys.exit(0)
 TMP = tempfile.mkdtemp(prefix="gpr_"); os.environ["WAREHOUSE_DIR"] = os.path.join(TMP, "warehouse"); os.makedirs(os.environ["WAREHOUSE_DIR"])
 proj = os.path.join(TMP, "proj"); shutil.copytree("/workspace/web/dbt_template", proj); os.environ["DBT_PROJECT_DIR"] = proj
 nbroot = os.path.join(TMP, "notebooks"); os.makedirs(os.path.join(nbroot, "Shared")); os.environ["NOTEBOOKS_DIR"] = nbroot
-TOK = os.environ["TOK"]; H = "http://gtest_gitea:3000"
+TOK = os.environ["TOK"]; H = f"http://{GIT_HOST}"
 os.environ.update({"GIT_REMOTE_URL": f"{H}/ga/dbt-pr.git", "GIT_TOKEN": TOK, "GIT_MODE": "pull_request",
                    "NOTEBOOKS_GIT_REMOTE_URL": f"{H}/ga/nb-pr.git", "NOTEBOOKS_GIT_MODE": "pull_request"})
 sys.path.insert(0, "/workspace")
@@ -20,6 +25,18 @@ def refuses(fn, *a, contains=""):
     except g.GitError as e: return contains.lower() in str(e).lower(), str(e)
     return False, "no error"
 api = lambda m, path, **kw: requests.request(m, f"{H}/api/v1{path}", headers={"Authorization": f"token {TOK}"}, timeout=20, **kw)
+import time  # noqa: E402
+def merge(path, **kw):        # Gitea checks a pull request's mergeability in the background: 405 "try again later" until then
+    for _ in range(60):
+        r = api("POST", path, **kw)
+        if r.status_code != 405: return r
+        time.sleep(0.5)
+    return r
+def wait_branch(repo, branch="main"):   # a pushed branch reaches Gitea's API through a background queue
+    for _ in range(60):
+        if api("GET", f"/repos/{repo}/branches/{branch}").status_code == 200: return True
+        time.sleep(0.5)
+    return False
 D = g.DBT
 def write(rel, text, base=proj):
     p = os.path.join(base, rel); os.makedirs(os.path.dirname(p), exist_ok=True); open(p, "w").write(text)
@@ -45,10 +62,7 @@ st = D.connect("admin"); check("connect (empty remote)", st["connected"] and st[
 r = D.commit("alice", "initial project"); check("first commit stays on main (nothing to branch from)", r["current_branch"] == "main" and "started_branch" not in r, r)
 r = D.push("alice"); check("...and may be pushed to the empty remote's main", r["pushed"] and r["pushed_branch"] == "main", r)
 import time
-for _ in range(10):
-    if api("GET", "/repos/ga/dbt-pr/branches/main").status_code == 200: break
-    time.sleep(0.5)
-check("the remote now has main", api("GET", "/repos/ga/dbt-pr/branches/main").status_code == 200)
+check("the remote now has main", wait_branch("ga/dbt-pr"))
 
 print("a change goes through a branch")
 write("models/marts/first.sql", "select 1 as a\n")
@@ -73,7 +87,7 @@ r2 = D.open_pull_request("alice", "again"); check("opening again returns the sam
 st = D.status(fetch=True); check("status shows the pull request", st["pull_request"] and st["pull_request"]["number"] == 1 and st["pull_request"]["url"], st.get("pull_request"))
 
 print("merge on the forge, then finish")
-rm = api("POST", "/repos/ga/dbt-pr/pulls/1/merge", json={"Do": "merge"}); check("(merged on the forge by a reviewer)", rm.status_code in (200, 201, 204), rm.text)
+rm = merge("/repos/ga/dbt-pr/pulls/1/merge", json={"Do": "merge"}); check("(merged on the forge by a reviewer)", rm.status_code in (200, 201, 204), rm.text)
 st = D.status(fetch=True); check("status now says merged", st["pull_request"]["merged"] is True, st.get("pull_request"))
 r = D.finish_change("alice")
 check("finish returns to main with the merged content", r["current_branch"] == "main" and os.path.exists(os.path.join(proj, "models/marts/first.sql")) and r["finished_branch"] == br, r)
@@ -82,7 +96,7 @@ check("local main equals the server's main", D._git(["rev-parse", "main"]) == ap
 
 print("a squash-merged change is recognised through the forge (not through ancestry)")
 write("models/marts/second.sql", "select 2 as b\n"); r = D.commit("bob", "add second"); br2 = r["started_branch"]; D.push("bob"); n2 = D.open_pull_request("bob", "Second")["pull_request"]["number"]
-api("POST", f"/repos/ga/dbt-pr/pulls/{n2}/merge", json={"Do": "squash"})
+merge(f"/repos/ga/dbt-pr/pulls/{n2}/merge", json={"Do": "squash"})
 r = D.finish_change("bob"); check("finish works after a squash merge", r["current_branch"] == "main" and os.path.exists(os.path.join(proj, "models/marts/second.sql")), r)
 
 print("update from base")
@@ -130,12 +144,12 @@ os.environ["GIT_MODE"] = "pull_request"
 print("notebooks use the same machinery")
 N = g.NOTEBOOKS; sh = os.path.join(nbroot, "Shared")
 nb = {"cells": [{"cell_type": "code", "source": ["1"], "execution_count": 1, "metadata": {}, "outputs": [{"output_type": "stream", "name": "stdout", "text": ["SECRET\n"]}]}], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
-write("a.ipynb", json.dumps(nb), sh); N.connect("admin"); N.commit("erin", "first notebook"); N.push("erin")
+write("a.ipynb", json.dumps(nb), sh); N.connect("admin"); N.commit("erin", "first notebook"); N.push("erin"); wait_branch("ga/nb-pr")
 write("b.ipynb", json.dumps(nb), sh); r = N.commit("erin", "second notebook"); nbr = r["started_branch"]; N.push("erin")
 pr = N.open_pull_request("erin", "Second notebook")["pull_request"]; check("notebooks: change branch and pull request", pr["number"] == 1 and api("GET", "/repos/ga/nb-pr/pulls/1").json()["head"]["ref"] == nbr)
 blob = subprocess.run(["git", "show", f"origin/{nbr}:b.ipynb"], cwd=sh, capture_output=True, text=True).stdout
 check("notebooks: outputs are still stripped from what is proposed", "SECRET" not in blob)
-api("POST", "/repos/ga/nb-pr/pulls/1/merge", json={"Do": "merge"}); r = N.finish_change("erin"); check("notebooks: finish", r["current_branch"] == "main" and os.path.exists(os.path.join(sh, "b.ipynb")), r)
+merge("/repos/ga/nb-pr/pulls/1/merge", json={"Do": "merge"}); r = N.finish_change("erin"); check("notebooks: finish", r["current_branch"] == "main" and os.path.exists(os.path.join(sh, "b.ipynb")), r)
 write("c.ipynb", "{ not json", sh); r = N.commit("erin", "broken notebook"); N.push("erin")
 ok, m = refuses(N.open_pull_request, "erin", "bad", contains="not a valid notebook"); check("notebooks: an invalid notebook gets no pull request", ok, m)
 

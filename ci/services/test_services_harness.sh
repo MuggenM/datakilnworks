@@ -82,6 +82,31 @@ t1=$(date +%s); rm -f /tmp/dkwci_unhealthy.yml
 [ $((t1 - t0)) -le 60 ]; check "within 60 s (took $((t1 - t0)) s)" $?
 echo "$out3" | grep -q "lldap"; check "it prints lldap's log lines" $? "$(echo "$out3" | tail -3)"
 
+echo "a refused run_test.sh leaves the running stack alone"
+bash $S/down.sh >/dev/null 2>&1; bash $S/up.sh ldap >/dev/null 2>&1
+CI_SERVICES=ldap bash ci/run_test.sh ci_services_wiring >/dev/null 2>&1; rc5=$?
+[ $rc5 -ne 0 ]; check "run_test.sh exits non-zero while the stack is already up" $?
+docker inspect -f '{{.State.Running}}' "$(docker compose -p dkwci ps -q lldap)" 2>/dev/null | grep -q true
+check "...and the stack it did not start is still running" $?
+
+echo "secrets_not_in_output: no generated or dummy secret appears in what CI prints"
+bash $S/down.sh >/dev/null 2>&1
+outU="$(bash $S/up.sh ldap git kafka azure s3 sftp 2>&1)"; check "up.sh with every profile exits 0" $? "$(echo "$outU" | tail -3)"
+outT="$(CI_SERVICES=git CI_SERVICES_UP=0 CI_SERVICES_KEEP=1 CI_TEST_ENV=GIT_HOST=127.0.0.1:9 bash ci/run_test.sh git_sync 2>&1)"; rcT=$?
+[ $rcT -ne 0 ] && echo "$outT" | grep -q "\[FAIL\] Gitea not reachable at 127.0.0.1:9"; check "git_sync against an unreachable Gitea fails (REQUIRE_SERVICES=1)" $? "$(echo "$outT" | tail -3)"
+tf="$(mktemp)"; echo "$outT" > "$tf"; outA="$(python3 ci/annotate.py "$tf" test_git_sync 2>&1)"; rm -f "$tf"
+outL="$(docker compose -p dkwci logs --no-color --tail 200 2>&1)"          # the workflow's failure step prints exactly this
+secrets="$(grep -hE '^[A-Z0-9_]*(TOK|PASSWORD|SECRET)[A-Z0-9_]*=' $S/out/*.env | cut -d= -f2-; sed -n 2p $S/out/sftp/id)"
+n=0; leaks=""
+while IFS= read -r v; do
+  [ -n "$v" ] || continue; n=$((n + 1))
+  for part in up:"$outU" test:"$outT" annotation:"$outA" logs:"$outL"; do
+    case "${part#*:}" in *"$v"*) leaks="$leaks ${part%%:*}:secret#$n";; esac
+  done
+done <<< "$secrets"
+[ $n -ge 6 ]; check "the env files hold the expected secrets ($n)" $?
+[ -z "$leaks" ]; check "none of them is in up.sh's output, the test's output, its annotation or the services' logs" $? "$leaks"
+
 echo "down leaves nothing"
 bash $S/down.sh >/dev/null 2>&1
 left="$( { docker ps -a --format '{{.Names}}'; docker network ls --format '{{.Name}}'; docker volume ls --format '{{.Name}}'; } | grep '^dkwci' )"

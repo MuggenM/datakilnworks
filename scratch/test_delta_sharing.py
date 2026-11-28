@@ -9,6 +9,7 @@ TMP = tempfile.mkdtemp(prefix="dsh_"); os.environ["WAREHOUSE_DIR"] = TMP + "/war
 os.environ["INIT_ADMIN_USERNAME"] = "admin"; os.environ["INIT_ADMIN_PASSWORD_HASH"] = "pbkdf2_sha256$100000$d08ef6c2826b1edc9dc90b321eea092d$e5fe10db63818165f3fef39c3d8bfb37a2ad54a29c96b4de42ca5605f964d73d"
 os.environ["DELTA_SHARING_URL_TTL"] = "3"
 sys.path.insert(0, "/workspace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 import pandas as pd, requests, uvicorn
 from deltalake import write_deltalake, DeltaTable
 from fastapi.testclient import TestClient
@@ -325,9 +326,9 @@ check("deleting a share removes it from the recipient", anon.get("/delta-sharing
 acts = {x[0] for x in __import__("sqlite3").connect(W + "/.metadata/governance.db").execute("SELECT action FROM governance_audit")}
 check("all administration is audited", {"SHARING_SHARE_CREATE", "SHARING_TABLE_ADD", "SHARING_TABLE_REMOVE", "SHARING_RECIPIENT_CREATE", "SHARING_RECIPIENT_REVOKE", "SHARING_RECIPIENT_ROTATE", "SHARING_RECIPIENT_DELETE", "SHARING_SHARE_DELETE"} <= acts, acts)
 print("S3-mount tables (real Garage, optional)")
-S3_EP = os.environ.get("TEST_S3_ENDPOINT")
-if not S3_EP:
-    print("  (skipped: set TEST_S3_ENDPOINT/TEST_S3_ACCESS_KEY/TEST_S3_SECRET_KEY to a throwaway Garage container -- see scratch/garage_up.sh -- to run this section)")
+S3_EP = os.environ.get("TEST_S3_ENDPOINT", "")   # TEST_S3_* from a throwaway Garage (scratch/garage_up.sh or ci/services profile s3)
+if not _services.require_or_skip("S3 (Garage) for the S3-mount section", *_services.host_port(S3_EP, 3900)):
+    pass                                  # the helper printed why (under REQUIRE_SERVICES=1 it fails instead)
 else:
     import boto3
     from web import mounts

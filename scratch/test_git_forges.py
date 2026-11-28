@@ -3,10 +3,15 @@
 with a THROWAWAY Gitea (scratch/gitea_up.sh) carrying the git traffic:
   docker run --rm --network gtest_net -e TOK=$TOK -v $PWD/web:/workspace/web -v $PWD/scratch:/workspace/scratch localspark-lakehouse-notebook python /workspace/scratch/test_git_forges.py"""
 import base64, json, os, shutil, sys, tempfile, threading, http.server, urllib.parse
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _services  # noqa: E402
+GIT_HOST = os.environ.get("GIT_HOST", "gtest_gitea:3000")       # the throwaway Gitea of scratch/gitea_up.sh; ci/services sets gitea:3000
+if not _services.require_or_skip("Gitea", *_services.host_port(GIT_HOST, 3000)):
+    sys.exit(0)
 TMP = tempfile.mkdtemp(prefix="gfg_"); os.environ["WAREHOUSE_DIR"] = os.path.join(TMP, "warehouse"); os.makedirs(os.environ["WAREHOUSE_DIR"])
 proj = os.path.join(TMP, "proj"); shutil.copytree("/workspace/web/dbt_template", proj); os.environ["DBT_PROJECT_DIR"] = proj
 nbroot = os.path.join(TMP, "notebooks"); os.makedirs(os.path.join(nbroot, "Shared")); os.environ["NOTEBOOKS_DIR"] = nbroot
-TOK = os.environ["TOK"]; H = "http://gtest_gitea:3000"
+TOK = os.environ["TOK"]; H = f"http://{GIT_HOST}"
 sys.path.insert(0, "/workspace")
 from web import git_sync as g
 FAIL = []

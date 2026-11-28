@@ -1,0 +1,17 @@
+# Test configuration of the s3 profile: every secret here is a dummy value.
+metadata_dir = "/tmp/meta"
+data_dir = "/tmp/data"
+db_engine = "sqlite"
+replication_factor = 1
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "0b75a7a6f9fd4008fb6849906eeb8e1884f9aee2e4527079f0229426e0832a47"   # test-only value, not a secret
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "dkwci-test-admin-token"

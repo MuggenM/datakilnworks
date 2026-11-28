@@ -9,11 +9,15 @@ import json, os, shutil, sys, tempfile, time
 TMP = tempfile.mkdtemp(prefix="ops_test_"); os.environ["WAREHOUSE_DIR"] = TMP
 os.environ["INIT_ADMIN_USERNAME"] = "admin"; os.environ["INIT_ADMIN_PASSWORD_HASH"] = "pbkdf2_sha256$100000$" + "0" * 32 + "$" + "0" * 64
 sys.path.insert(0, "/workspace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 from deltalake import DeltaTable
 from web import connections, streaming as st, stream_ops as ops
 B1, B2 = os.environ.get("KAFKA", "rpt:9092"), os.environ.get("KAFKA2", "rpt2:9092")
+for _svc, _hp in (("Redpanda", B1), ("the second Redpanda cluster", B2)):
+    if not _services.require_or_skip(_svc, *_services.host_port(_hp, 9092)):
+        shutil.rmtree(TMP, ignore_errors=True); sys.exit(0)
 FAIL = []
 def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:500]}" if d and not c else ""))

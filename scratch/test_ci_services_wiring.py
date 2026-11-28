@@ -68,6 +68,10 @@ empty = (f"import sys; sys.path.insert(0, {HERE!r}); import _services; "
 e = subprocess.run([sys.executable, "-c", empty], capture_output=True, text=True, env={**os.environ, "REQUIRE_SERVICES": ""})
 check("an unset host is a skip without any connection attempt (never a default name that may reach someone's own server)",
       e.returncode == 0 and "returned False" in e.stdout and "not set" in e.stdout, e.stdout + e.stderr)
+check("host_port: host:port", _services.host_port("redpanda:9092", 1) == ("redpanda", 9092))
+check("host_port: a bare host gets the default port", _services.host_port("azurite", 10000) == ("azurite", 10000))
+check("host_port: a URL", _services.host_port("http://redpanda:8081", 1) == ("redpanda", 8081) and _services.host_port("https://x", 1) == ("x", 443))
+check("host_port: empty stays empty (never a default host)", _services.host_port("", 9092) == ("", 9092))
 for t in ("ldap_auth", "group_sync_ldap"):
     src = open(os.path.join(HERE, f"test_{t}.py")).read()
     check(f"test_{t}.py has no default LDAP host", re.search(r'getenv\("LLDAP_TEST_HOST",\s*"[^"]+"', src) is None)

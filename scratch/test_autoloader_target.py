@@ -11,7 +11,11 @@ Covers: the dropdown source lists local + writable S3 catalogs only; a local sou
 import os, shutil, sys, tempfile
 TMP = tempfile.mkdtemp(prefix="al_target_"); os.environ["WAREHOUSE_DIR"] = TMP
 sys.path.insert(0, "/workspace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _services  # noqa: E402
 EXTERNAL = os.getenv("TEST_S3_ENDPOINT")        # e.g. a throwaway Garage container (a real S3 implementation): host:port, see scratch/garage_up.sh
+if EXTERNAL or os.environ.get("REQUIRE_SERVICES") == "1":                # without one: in-process moto (by hand only)
+    if not _services.require_or_skip("S3 (Garage)", *_services.host_port(EXTERNAL or "", 3900)):
+        shutil.rmtree(TMP, ignore_errors=True); sys.exit(0)
 try:
     from moto.server import ThreadedMotoServer
 except ImportError:

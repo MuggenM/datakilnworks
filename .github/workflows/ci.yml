@@ -37,12 +37,12 @@ jobs:
       - name: Every place that runs SQL is governed (or allow-listed with a reason)
         run: python scratch/test_governance_coverage.py
       - name: Shell scripts
-        run: shellcheck -S error ci/*.sh ci/services/*.sh
+        run: shellcheck -S error ci/*.sh ci/services/*.sh ci/services/seed/*.sh
       - name: Docker Compose files are valid (default and proxy profile)
         run: |
           docker compose config -q
           docker compose --profile proxy config -q
-          docker compose -f ci/services/docker-compose.yml --profile ldap config -q
+          docker compose -f ci/services/docker-compose.yml $(docker compose -f ci/services/docker-compose.yml config --profiles | sed 's/^/--profile /') config -q
       - uses: azure/setup-helm@v5
       - name: Helm lint and template (default values and the smoke-test values)
         run: |
