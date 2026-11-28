@@ -107,9 +107,10 @@ try:
         pg.locator("[data-testid=saml-login]:visible").click(); pg.wait_for_selector("input[name=username]", timeout=20000)
         pg.fill("input[name=username]", "alice"); pg.fill("input[name=password]", "alicepw"); pg.click("input[type=submit], button[type=submit]"); pg.wait_for_url(f"{BASE}/**", timeout=30000); time.sleep(1)
         check("the response was captured", "SAMLResponse" in (captured.get("form") or ""))
-        import requests
-        r = requests.post(f"{BASE}/api/auth/saml/acs", data=captured["form"], headers={"Content-Type": "application/x-www-form-urlencoded"}, allow_redirects=False)
-        check("posting the captured response again is refused", r.status_code == 303 and "sso_error" in r.headers.get("location", ""), (r.status_code, r.headers.get("location")))
+        rq = p.request.new_context()             # a client without the browser's cookies (the CI venv has Playwright only, no requests)
+        r = rq.post(f"{BASE}/api/auth/saml/acs", data=captured["form"], headers={"Content-Type": "application/x-www-form-urlencoded"}, max_redirects=0)
+        check("posting the captured response again is refused", r.status == 303 and "sso_error" in r.headers.get("location", ""), (r.status, r.headers.get("location")))
+        rq.dispose()
         ctx.close()
         check("no page errors", not errs, errs)
         b.close()
