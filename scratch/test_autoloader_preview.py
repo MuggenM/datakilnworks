@@ -56,7 +56,7 @@ check("a path outside the volumes / warehouse is refused", "Invalid volume path"
 write(".metadata/storage_mounts.json", json.dumps([{"config": {"secret": "TOPSECRET"}}])); write(".metadata/x.csv", csv(2))
 e = err(pv.preview, os.path.join(TMP, ".metadata"), "*"); check("a hidden folder (.metadata holds credentials) can never be previewed", e and "Hidden folders" in e, e)
 e = err(pv.preview, os.path.join(TMP, "landing", "..", ".metadata"), "*"); check("...also not through .. or a symlink", e is not None and "TOPSECRET" not in e)
-os.symlink(os.path.join(TMP, ".metadata"), os.path.join(TMP, "landing", "link")); e = err(pv.preview, os.path.join(TMP, "landing", "link"), "*"); check("a symlink into a hidden folder is refused", e and "Hidden" in e, e)
+os.symlink(os.path.join(TMP, ".metadata"), os.path.join(TMP, "landing", "link")); e = err(pv.preview, os.path.join(TMP, "landing", "link"), "*"); check("a symlink into a hidden folder is refused", e and ("Hidden" in e or "symbolic links are not followed" in e) and "TOPSECRET" not in e, e)
 check("an empty path and a mount on a local path are refused", "Enter the source path" in (err(pv.preview, "  ") or "") and "only applies to s3://" in (err(pv.preview, D, "*", "m1") or ""))
 try: autoloader._validate_source(os.path.join(TMP, ".metadata"), 0, None); ok = False
 except ValueError as ex: ok = "Hidden" in str(ex)

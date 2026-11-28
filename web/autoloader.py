@@ -21,6 +21,7 @@ except ImportError:  # requirements.txt ships croniter; guard like web/workflow.
 from deltalake import DeltaTable, write_deltalake
 
 from web.volumes import resolve_volume_posix_path, get_volume_physical_path
+from web import volumes as _vol
 from web import autoloader_s3, autoloader_azure, autoloader_gcs, autoloader_conn
 
 logger = logging.getLogger("localspark.autoloader")
@@ -125,11 +126,21 @@ def init_autoloader_db():
     conn.close()
 
 
-def compute_file_fingerprint(file_path: str) -> str:
+def compute_file_fingerprint(file_path) -> str:
     """
     Computes a fast, unique file fingerprint combining file size, mtime, and a hash of the first 64KB.
     Ensures exactly-once idempotency without reading entire multi-gigabyte files.
+    `file_path` may be an open file descriptor (a volume file opened by `volumes.open_regular_file`).
     """
+    if isinstance(file_path, int):
+        stat = os.fstat(file_path)
+        h = hashlib.sha256()
+        h.update(f"{stat.st_size}_{stat.st_mtime}_".encode("utf-8"))
+        try:
+            h.update(os.pread(file_path, 65536, 0))
+        except OSError:
+            pass
+        return h.hexdigest()
     stat = os.stat(file_path)
     h = hashlib.sha256()
     h.update(f"{stat.st_size}_{stat.st_mtime}_".encode("utf-8"))
@@ -671,11 +682,35 @@ def _looks_like_remote_io_error(err: Exception) -> bool:
                                    "ssl", "secret", "could not resolve", "no such bucket", "extension"))
 
 
+def _quarantine_local(local: "_vol.OpenedFile", file_path: str, err) -> None:
+    """Moves an opened volume file into <source>/_quarantine through directory fds: a `_quarantine` that is a link is refused
+    (it used to be followed, so the bad file landed wherever the link pointed), and only the file that was read is moved."""
+    try:
+        q_fd = _vol._open_dir(local.root_fd, "_quarantine", True)
+    except (OSError, ValueError) as q_err:
+        logger.error(f"Failed to move '{file_path}' to quarantine: {q_err}")
+        return
+    try:
+        now = os.stat(local.name, dir_fd=local.parent_fd, follow_symlinks=False)
+        if (now.st_dev, now.st_ino) != (local.stat.st_dev, local.stat.st_ino):
+            logger.error(f"Not quarantining '{file_path}': it was replaced after it was read.")
+            return
+        dest = f"{local.name}.{int(time.time())}.bad"
+        os.rename(local.name, dest, src_dir_fd=local.parent_fd, dst_dir_fd=q_fd)
+        logger.warning(f"Quarantined corrupt file '{file_path}' -> '_quarantine/{dest}': {err}")
+    except OSError as q_err:
+        logger.error(f"Failed to move '{file_path}' to quarantine: {q_err}")
+    finally:
+        os.close(q_fd)
+
+
 def _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash, file_size,
-                     elapsed_ms, now_iso, err, remote=None, pipeline=None, remote_kind=None) -> Dict[str, Any]:
+                     elapsed_ms, now_iso, err, remote=None, pipeline=None, remote_kind=None, local=None) -> Dict[str, Any]:
     """Moves a malformed file (or copies a remote object) into `_quarantine/`, records it in the checkpoint DB and returns the result."""
     if remote is not None:
         REMOTE_SOURCE_MAP[remote_kind].quarantine(pipeline, remote)
+    elif local is not None:
+        _quarantine_local(local, file_path, err)
     else:
         quarantine_dir = os.path.join(base_source_dir, "_quarantine")
         os.makedirs(quarantine_dir, exist_ok=True)
@@ -782,11 +817,13 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
                         remote: Optional[Any] = None,
                         remote_conn: Optional[Dict[str, Any]] = None,
                         remote_kind: Optional[str] = None,
-                        identity: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
+                        identity: Optional[Tuple[str, str]] = None,
+                        local: Optional["_vol.OpenedFile"] = None) -> Dict[str, Any]:
     """
     Ingests a single file (or, with `remote` + `remote_kind`, one object of a REMOTE_SOURCES backend read in place; or,
     with `identity=(name, hash)`, a file staged from a connection source, whose checkpoint identity is the remote's,
-    not the staged copy's) into the pipeline's target Delta Lake table. Enforces schema evolution and moves corrupt
+    not the staged copy's; or, with `local`, a volume file already opened without following links, which is then read
+    through its fd and never by name) into the pipeline's target Delta Lake table. Enforces schema evolution and moves corrupt
     files into _quarantine.
     """
     start_time = time.perf_counter()
@@ -798,6 +835,10 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
     elif identity is not None:
         file_size = os.stat(file_path).st_size
         rel_path, file_hash = identity
+    elif local is not None:
+        file_size = local.stat.st_size
+        file_hash = compute_file_fingerprint(local.fd)
+        rel_path = os.path.relpath(file_path, base_source_dir).replace("\\", "/")
     else:
         stat = os.stat(file_path)
         file_size = stat.st_size
@@ -821,7 +862,7 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
     try:
         if remote is not None:
             remote_module.configure_duckdb(duck_conn, remote_conn, remote.bucket)
-        reader = _open_source_reader(duck_conn, file_path, ext_lower)
+        reader = _open_source_reader(duck_conn, local.path if local is not None else file_path, ext_lower)
         read_state["opened"] = True
 
         table_exists = _is_delta(target_path, target_so)
@@ -920,6 +961,10 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
 
     except Exception as write_err:
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        if local is not None:                                   # DuckDB read /proc/self/fd/N: name the file in what is stored and shown
+            def _named(e):                                      # only the text is used from here on
+                return e if e is None or local.path not in str(e) else RuntimeError(str(e).replace(local.path, rel_path))
+            write_err, read_state["error"] = _named(write_err), _named(read_state["error"])
         source_err = read_state["error"] or write_err
         remote_io = remote is not None and _looks_like_remote_io_error(source_err)
         if (not read_state["opened"] or read_state["error"] is not None) and not remote_io:
@@ -927,7 +972,7 @@ def process_single_file(pipeline: Dict[str, Any], file_path: str, base_source_di
             # (An S3 access / network / endpoint problem is not the object's fault: it is FAILED and retried instead.)
             return _quarantine_file(pipeline_id, file_path, base_source_dir, rel_path, file_hash,
                                     file_size, elapsed_ms, now_iso, read_state["error"] or write_err,
-                                    remote=remote, pipeline=pipeline, remote_kind=remote_kind)
+                                    remote=remote, pipeline=pipeline, remote_kind=remote_kind, local=local)
         db = get_db()
         db.execute("""
             INSERT OR REPLACE INTO autoloader_file_history (
@@ -1116,10 +1161,20 @@ def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"Invalid source volume path '{pipe['source_volume_path']}': {e}"}
 
-    if not os.path.exists(source_dir):
-        os.makedirs(source_dir, exist_ok=True)
-        return {"pipeline_id": pipeline_id, "files_found": 0, "files_ingested": 0, "rows_ingested": 0}
+    # Every folder from the warehouse down to the source is opened with O_NOFOLLOW (and created when missing, as before):
+    # a source, volume or parent folder that is a symbolic link is refused, never followed.
+    try:
+        src_fd = _vol.open_warehouse_dir(source_dir, create=True)
+    except (OSError, ValueError) as e:
+        return {"error": f"Invalid source volume path '{pipe['source_volume_path']}': {e}"}
+    try:
+        return _scan_local_source(pipe, source_dir, src_fd)
+    finally:
+        os.close(src_fd)
 
+
+def _scan_local_source(pipe: Dict[str, Any], source_dir: str, src_fd: int) -> Dict[str, Any]:
+    pipeline_id = pipe["id"]
     pattern = pipe.get("file_pattern") or "*"
     now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1132,35 +1187,40 @@ def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
     db.commit()
     db.close()
 
-    discovered_files = []
+    # Regular files only: a symbolic link (to a file anywhere the studio can read, e.g. under .metadata, which kernels that
+    # can write the volume cannot) used to be listed and LOADED into the target table. Hidden names, .tmp / .part and
+    # _quarantine are skipped as before (keep in step with autoloader_watch.is_ignored_name).
+    def _accept(f: str) -> bool:
+        return not (f.endswith(".tmp") or f.endswith(".part")) and (pattern == "*" or fnmatch.fnmatch(f.lower(), pattern.lower()))
+
+    discovered = []
     try:
-        for root, dirs, files in os.walk(source_dir):
-            # Skip hidden and quarantine directories
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "_quarantine"]
-            for f in files:
-                if f.startswith(".") or f.endswith(".tmp") or f.endswith(".part"):
-                    continue
-                if fnmatch.fnmatch(f.lower(), pattern.lower()) or pattern == "*":
-                    discovered_files.append(os.path.join(root, f))
+        discovered, _ = _vol.regular_files_below(src_fd, accept=_accept)
     except Exception as scan_err:
         logger.error(f"Error scanning source directory '{source_dir}': {scan_err}")
 
     # Sort files by modification time so older batches are ingested first
-    discovered_files.sort(key=lambda p: os.path.getmtime(p))
+    discovered.sort(key=lambda item: (item[1].st_mtime, item[0]))
 
     files_ingested = 0
     total_rows = 0
     files_quarantined = 0
     results = []
 
-    for fpath in discovered_files:
+    for rel, _st in discovered:
+        fpath = os.path.join(source_dir, rel)
         try:
-            fhash = compute_file_fingerprint(fpath)
+            local = _vol.open_regular_file(src_fd, rel)
+        except (OSError, ValueError) as e:
+            logger.warning(f"AutoLoader [{pipe['name']}]: skipped '{rel}': {e}")
+            continue
+        try:
+            fhash = compute_file_fingerprint(local.fd)
             if fhash in known_hashes:
                 # Already processed exactly once
                 continue
 
-            res = process_single_file(pipe, fpath, source_dir)
+            res = process_single_file(pipe, fpath, source_dir, local=local)
             results.append(res)
 
             if res["status"] == "SUCCESS":
@@ -1171,6 +1231,8 @@ def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
                 files_quarantined += 1
         except Exception as e:
             logger.error(f"Unexpected error processing '{fpath}': {e}")
+        finally:
+            local.close()
 
     # Set status back to IDLE
     final_status = "IDLE" if pipe.get("enabled", 1) else "PAUSED"
@@ -1182,7 +1244,7 @@ def _run_pipeline_cycle_impl(pipeline_id: str) -> Dict[str, Any]:
     return {
         "pipeline_id": pipeline_id,
         "name": pipe["name"],
-        "files_found": len(discovered_files),
+        "files_found": len(discovered),
         "files_ingested": files_ingested,
         "files_quarantined": files_quarantined,
         "rows_ingested": total_rows,

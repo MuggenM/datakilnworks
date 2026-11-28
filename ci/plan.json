@@ -6,6 +6,10 @@
    "extras": ""
   },
   {
+   "name": "autoloader_links",
+   "extras": ""
+  },
+  {
    "name": "autoloader_watch",
    "extras": ""
   },

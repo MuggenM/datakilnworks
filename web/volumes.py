@@ -108,6 +108,126 @@ def open_volume_dir(catalog: str, schema: str, volume_name: str, parts: List[str
         raise
 
 
+def warehouse_parts(path: str) -> List[str]:
+    """The components of `path` below WAREHOUSE_DIR (lexical: the fd walk below never follows a link, so the lexical path IS
+    the path that gets opened). Outside the warehouse or a hidden component is refused."""
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(WAREHOUSE_DIR))
+    if rel == ".":
+        return []
+    parts = rel.split(os.sep)
+    if parts[0] == "..":
+        raise VolumePathError("The folder is outside the warehouse.")
+    if any(p.startswith(".") for p in parts):
+        raise VolumePathError("Hidden folders (such as .metadata) cannot be a source.")
+    return [clean_component(p) for p in parts]
+
+
+def open_warehouse_dir(path: str, create: bool = False) -> int:
+    """A directory fd for a folder below WAREHOUSE_DIR, every component opened with O_NOFOLLOW; the caller closes it.
+    FileNotFoundError when missing and not `create`, VolumePathError for a link or a non-folder on the way."""
+    fd = os.open(WAREHOUSE_DIR, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        for name in warehouse_parts(path):
+            nxt = _open_dir(fd, name, create)
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def regular_files_below(dir_fd: int, accept=None, skip_dirs=("_quarantine",), max_files: Optional[int] = None):
+    """Walks a directory fd and returns ([(relative path, stat)], truncated) for REGULAR files only: symbolic links (to files
+    or folders, dangling or not), hidden names, devices, FIFOs and sockets are left out, and `skip_dirs` are not entered.
+    `accept(name)` filters files; `max_files` caps the accepted ones."""
+    found = []
+    stack = [(os.dup(dir_fd), "")]
+    try:
+        while stack:
+            fd, prefix = stack.pop()
+            try:
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        name = entry.name
+                        if name.startswith("."):
+                            continue
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if stat_mod.S_ISDIR(st.st_mode):
+                            if name in skip_dirs:
+                                continue
+                            try:
+                                stack.append((os.open(name, _DIR_FLAGS, dir_fd=fd), f"{prefix}{name}/"))
+                            except OSError:
+                                continue                # swapped for a link since the scan: not followed
+                        elif stat_mod.S_ISREG(st.st_mode) and (accept is None or accept(name)):
+                            found.append((prefix + name, st))
+                            if max_files is not None and len(found) >= max_files:
+                                return found, True
+            finally:
+                os.close(fd)
+    finally:
+        for fd, _ in stack:
+            os.close(fd)
+    return found, False
+
+
+class OpenedFile:
+    """A regular file opened below a directory fd without following any link. `path` is what DuckDB (or anything else that
+    wants a name) should open: /proc/self/fd/N reopens exactly this file, never whatever sits at the name by then."""
+
+    def __init__(self, root_fd: int, parent_fd: int, fd: int, name: str, st: os.stat_result):
+        self.root_fd, self.parent_fd, self.fd, self.name, self.stat = root_fd, parent_fd, fd, name, st
+
+    @property
+    def path(self) -> str:
+        return f"/proc/self/fd/{self.fd}"
+
+    def close(self):
+        for fd in (self.fd, self.parent_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def open_regular_file(root_fd: int, rel: str) -> OpenedFile:
+    """Opens <root>/<rel> (a path from regular_files_below) with O_NOFOLLOW at every step. A link, a non-regular file or a
+    missing one raises OSError / VolumePathError. O_NONBLOCK: a FIFO swapped in cannot hang the open."""
+    parts = (rel or "").split("/")
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise VolumePathError(f"Invalid path: {rel[:80]!r}")
+    parent = os.dup(root_fd)
+    try:
+        for name in parts[:-1]:
+            nxt = _open_dir(parent, name, False)
+            os.close(parent)
+            parent = nxt
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0), dir_fd=parent)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise VolumePathError(f"'{parts[-1]}' is not a regular file (symbolic links are not followed).") from exc
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise VolumePathError(f"'{parts[-1]}' is not a regular file.")
+        return OpenedFile(root_fd, parent, fd, parts[-1], st)
+    except BaseException:
+        os.close(parent)
+        raise
+
+
 def _name_lock(key: str) -> threading.Lock:
     with _name_locks_guard:
         return _name_locks.setdefault(key, threading.Lock())

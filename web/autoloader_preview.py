@@ -72,49 +72,42 @@ def _pick(cands: List[Dict[str, Any]], sample_file: Optional[str]) -> Dict[str, 
 # ---------------------------------------------------------------- local volume folder
 
 def _local(path: str, pattern: str, sample_file: Optional[str], limit: int) -> Dict[str, Any]:
-    from web.volumes import resolve_volume_posix_path, WAREHOUSE_DIR
+    from web.volumes import resolve_volume_posix_path, open_warehouse_dir, regular_files_below, open_regular_file
     try:
         source_dir = resolve_volume_posix_path(path)
     except Exception as exc:
         raise PreviewError(str(exc))
-    rel = os.path.relpath(os.path.realpath(source_dir), os.path.realpath(WAREHOUSE_DIR))
-    if rel.startswith("..") or any(p.startswith(".") for p in rel.split(os.sep) if p not in (".", "")):
-        raise PreviewError("Hidden folders (such as .metadata) cannot be a source.")
-    if not os.path.isdir(source_dir):
+    # Opened folder by folder with O_NOFOLLOW (a linked source / volume folder is refused, not followed; hidden folders such
+    # as .metadata are refused by name), and only regular files are listed and read: a link in the volume used to be listed
+    # and its target (any file the studio can read) shown here.
+    try:
+        src_fd = open_warehouse_dir(source_dir)
+    except FileNotFoundError:
         raise PreviewError("That folder does not exist yet, so there is nothing to read. (The pipeline creates it on its first run; upload files to the volume first.)")
+    except (OSError, ValueError) as exc:
+        raise PreviewError(str(exc))
     pattern = pattern or "*"
-    found: List[Dict[str, Any]] = []
-    scanned = 0
-    truncated = False
-    for root, dirs, files in os.walk(source_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "_quarantine"]
-        for f in files:
-            if f.startswith(".") or f.endswith(".tmp") or f.endswith(".part"):
-                continue
-            if not (pattern == "*" or fnmatch.fnmatch(f.lower(), pattern.lower())):
-                continue
-            full = os.path.join(root, f)
-            try:
-                st = os.stat(full)
-            except OSError:
-                continue
-            found.append({"path": os.path.relpath(full, source_dir).replace(os.sep, "/"), "full": full, "size": st.st_size, "mtime": st.st_mtime})
-            scanned += 1
-            if scanned >= MAX_LOCAL_SCAN:
-                truncated = True
-                break
-        if truncated:
-            break
-    if not found:
-        raise PreviewError(f"No file in that folder matches '{pattern}'. Files that are hidden, end in .tmp / .part, or sit in _quarantine are ignored.")
-    found.sort(key=lambda c: (c["mtime"], c["path"]))                    # the pipeline ingests older batches first
-    chosen = _pick(found, sample_file)
+    try:
+        accept = lambda f: not (f.endswith(".tmp") or f.endswith(".part")) and (pattern == "*" or fnmatch.fnmatch(f.lower(), pattern.lower()))
+        listing, truncated = regular_files_below(src_fd, accept=accept, max_files=MAX_LOCAL_SCAN)
+        found: List[Dict[str, Any]] = [{"path": rel, "size": st.st_size, "mtime": st.st_mtime} for rel, st in listing]
+        if not found:
+            raise PreviewError(f"No file in that folder matches '{pattern}'. Files that are hidden, end in .tmp / .part, sit in _quarantine or are symbolic links are ignored.")
+        found.sort(key=lambda c: (c["mtime"], c["path"]))                    # the pipeline ingests older batches first
+        chosen = _pick(found, sample_file)
+        try:
+            opened = open_regular_file(src_fd, chosen["path"])
+        except (OSError, ValueError) as exc:
+            raise PreviewError(f"{chosen['path']} could not be opened ({exc}).")
+    finally:
+        os.close(src_fd)
     import duckdb
     duck = duckdb.connect(":memory:")
     try:
-        body = _render(duck, chosen["full"], _ext(chosen["path"]), limit)
+        body = _render(duck, opened.path, _ext(chosen["path"]), limit)
     finally:
         duck.close()
+        opened.close()
     skipped = sum(1 for c in found if _ext(c["path"]) not in READABLE)
     notes = [f"{len(found)}{'+' if truncated else ''} matching file(s). Showing {chosen['path']} ({_size(chosen['size'])}); "
              + ("the one you chose." if sample_file else "the oldest, which the pipeline loads first.")]
