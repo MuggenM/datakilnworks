@@ -13,10 +13,35 @@ AUTH_LOG = []  # every /api/auth/ request the page sent, with its outcome (print
 TIMELINE = []  # sign-in/out and workspace-tree requests and console errors of the main page, with times (printed when "no JS errors" fails)
 T0 = time.monotonic()
 def _tl(what): TIMELINE.append(f"{time.monotonic() - T0:7.2f}s {what}")
-_TL_PATHS = ("/api/auth/login", "/api/auth/logout", "/api/auth/passkey/login", "/api/auth/login/webauthn", "/api/workspace/tree")
+# sign-in/out, the workspace tree, and everything that can end or change a session on the server side (session revoke, account
+# changes such as passkey-only conversion or a password reset, passkey add/remove), so a 401 can be tied to what caused it
+_TL_PATHS = ("/api/auth/login", "/api/auth/logout", "/api/auth/passkey/login", "/api/auth/login/webauthn", "/api/workspace/tree",
+             "/api/auth/sessions", "/api/auth/webauthn/", "/api/auth/enroll/", "/api/auth/me", "/api/users", "/api/notebooks/access")
 def check(n, c, d=""):
     print(f"  [{'PASS' if c else 'FAIL'}] {n}" + (f" -> {str(d)[:300]}" if d and not c else ""))
+    _tl(f"check {'PASS' if c else 'FAIL'}: {n[:100]}")     # what the test was doing at that moment
     if not c: FAIL.append(n)
+
+
+def print_error_windows(before=8.0, after=2.0, max_lines=160):
+    """The timeline around each error (BEFORE seconds before it, AFTER after it), overlapping windows merged: the last 40
+    entries used to be printed, and an error early in the run fell outside them (CI run 46086935122)."""
+    times = [float(line.split("s", 1)[0]) for line in TIMELINE]
+    marks = [t for t, line in zip(times, TIMELINE) if "console error:" in line or "page error:" in line]
+    windows = []
+    for t in marks:
+        if windows and t - before <= windows[-1][1]:
+            windows[-1][1] = t + after
+        else:
+            windows.append([t - before, t + after])
+    printed = 0
+    for i, (lo, hi) in enumerate(windows):
+        print(f"  [FAIL] | --- timeline {lo:.2f}s .. {hi:.2f}s (error window {i + 1} of {len(windows)}) ---")
+        for t, line in zip(times, TIMELINE):
+            if lo <= t <= hi:
+                if printed >= max_lines:
+                    print("  [FAIL] | ... (more in passkeys_timeline.txt under ARTIFACT_DIR)"); return
+                print("  [FAIL] | " + line); printed += 1
 sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
 ERRORS = []   # page errors and console errors of the main page, printed by wait_or_explain
 
@@ -65,7 +90,7 @@ try:
     check("seeded a user", r.returncode == 0, r.stderr[-300:])
     with sync_playwright() as p:
         b = p.chromium.launch(); ctx = b.new_context(viewport={"width": 1400, "height": 1000}); page = _ui_slow.apply(ctx.new_page()); errors = ERRORS
-        page.on("pageerror", lambda e: errors.append(str(e) + " @ " + str(getattr(e, "stack", ""))[:500])); page.on("dialog", lambda d: d.accept())
+        page.on("pageerror", lambda e: (errors.append(str(e) + " @ " + str(getattr(e, "stack", ""))[:500]), _tl("page error: " + str(e)[:120]))); page.on("dialog", lambda d: d.accept())
         page.on("request", lambda r: PENDING.__setitem__(r.method + " " + r.url.replace(BASE, ""), time.monotonic()))
         for ev_name in ("requestfinished", "requestfailed"): page.on(ev_name, lambda r: PENDING.pop(r.method + " " + r.url.replace(BASE, ""), None))
         page.on("response", lambda r: AUTH_LOG.append(f"{r.request.method} {r.url.replace(BASE, '')} {r.status}") if "/api/auth/" in r.url else None)
@@ -249,7 +274,7 @@ try:
               status == 200 and not new_errs and state["home"] == "Users/admin" and not state["alice"], (status, new_errs, state))
         errs = [e for e in errors if "dialog" not in e]
         check("no JS errors", not errs, errs)
-        if errs: [print("  [FAIL] | " + line) for line in TIMELINE[-40:]]  # which sign-in/out a failing request belonged to
+        if errs: print_error_windows()  # which sign-in/out, and which test step, a failing request belonged to
         if os.environ.get("ARTIFACT_DIR"):
             with open(os.path.join(os.environ["ARTIFACT_DIR"], "passkeys_timeline.txt"), "w") as f: f.write("\n".join(TIMELINE) + "\n")
         b.close()
