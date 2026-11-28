@@ -256,11 +256,17 @@ def update_webhook(webhook_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
 def interpolate_template(template: Any, variables: Dict[str, Any]) -> Any:
     """Recursively interpolate variables in template."""
     if isinstance(template, str):
+        # A value that is exactly one placeholder takes the variable as it is: Teams' MessageCard needs `facts` as a
+        # LIST of {name, value}; as a JSON string inside the card it was ignored. Embedded in text, a structured value is
+        # written as JSON (not Python's repr).
+        for key, value in variables.items():
+            if template == f"{{{key}}}" and not isinstance(value, str):
+                return value
         result = template
         for key, value in variables.items():
             placeholder = f"{{{key}}}"
             if placeholder in result:
-                result = result.replace(placeholder, str(value))
+                result = result.replace(placeholder, value if isinstance(value, str) else json.dumps(value))
         return result
     elif isinstance(template, dict):
         return {k: interpolate_template(v, variables) for k, v in template.items()}
@@ -318,7 +324,7 @@ def send_webhook(
         "severity": severity,
         "color": color or severity_colors.get(severity, "3447003"),
         "data": json.dumps(data) if data else "{}",
-        "facts": json.dumps([{"name": k, "value": str(v)} for k, v in (data or {}).items()]),
+        "facts": [{"name": k, "value": str(v)} for k, v in (data or {}).items()],   # a list: see interpolate_template
         "routing_key": webhook.get("auth_token", "")
     }
 

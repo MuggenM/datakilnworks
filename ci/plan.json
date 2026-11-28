@@ -296,6 +296,11 @@
    "name": "onelake_emulator",
    "extras": "",
    "services": "fabric"
+  },
+  {
+   "name": "notifications_delivery",
+   "extras": "",
+   "services": "mail"
   }
  ],
  "ui": [

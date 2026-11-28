@@ -304,6 +304,31 @@ services:
       - ./seed/fabric.py:/seed/fabric.py:ro
       - ./out:/out
 
+  # ---------------------------------------------------------------- profile mail
+  mailpit:                                      # an SMTP sink with an HTTP API to read what arrived
+    image: axllent/mailpit:v1.31.2
+    profiles: [mail]
+    <<: *no-search
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"             # the studio always logs in (sender_password is required); any login is fine here
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"         # ...without TLS, on this network only
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8025/livez"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mail-seed:
+    image: axllent/mailpit:v1.31.2
+    profiles: [mail]
+    <<: *no-search
+    user: root
+    depends_on:
+      mailpit: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c", "printf 'SMTP_HOST=mailpit\nSMTP_PORT=1025\nMAILPIT_API=http://mailpit:8025/api/v1\n' > /out/mail.env"]
+    volumes:
+      - ./out:/out
+
 volumes:
   lldap-data:
   gitea-data:
