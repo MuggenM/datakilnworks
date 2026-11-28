@@ -115,7 +115,7 @@ services:
               --kafka-addr, "internal://0.0.0.0:9092", --advertise-kafka-addr, "internal://redpanda-sasl:9092",
               --set, redpanda.enable_sasl=true, --set, 'redpanda.superusers=["dkwci"]']
 
-  kafka-seed:                                   # the SCRAM user of redpanda-sasl
+  kafka-seed:                                   # the SCRAM user of redpanda-sasl, a cluster id on every cluster
     image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
     profiles: [kafka]
     user: root                                  # the image's own user cannot write out/
@@ -124,20 +124,9 @@ services:
       redpanda: {condition: service_healthy}
       redpanda2: {condition: service_healthy}
       redpanda-sasl: {condition: service_healthy}
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -e
-        rpk security user create dkwci -p dkwci-test-password --mechanism SCRAM-SHA-256 -X admin.hosts=redpanda-sasl:9644
-        cat > /out/kafka.env <<'ENV'
-        KAFKA=redpanda:9092
-        KAFKA2=redpanda2:9092
-        REGISTRY=http://redpanda:8081
-        SASL_KAFKA=redpanda-sasl:9092
-        SASL_USER=dkwci
-        SASL_PASSWORD=dkwci-test-password
-        ENV
+    entrypoint: ["/bin/bash", "/seed/kafka.sh"]
     volumes:
+      - ./seed/kafka.sh:/seed/kafka.sh:ro
       - ./out:/out
 
   # ---------------------------------------------------------------- profile azure
