@@ -28,12 +28,14 @@ bash ci/services/test_services_harness.sh   # tests the stack itself
 ```
 
 - Project `dkwci`, no published ports: it never touches other containers, networks or ports on the machine.
-- `CI_SERVICES` sets `REQUIRE_SERVICES=1` in the test: a service the test cannot reach is a failure, not a skip.
+- `CI_SERVICES` sets `REQUIRE_SERVICES=1` in the test: a service the test cannot reach is a failure, not a skip. Tests
+  check reachability with `scratch/_services.require_or_skip` and have no default host for a service they modify.
+- A `ci/plan.json` entry names its profiles in `"services"`; CI starts them, and `test_ci_services_wiring` checks the wiring.
 - Every service and every test container on the stack runs with **no DNS search domain** (`dns_search: .`,
   `--dns-search .`): Docker copies the host's, and where that domain resolves unknown names (this dev machine's does, to
   an outside host), curl tried `lldap.<domain>` first and connected there instead of to the stack's lldap.
 - Profiles so far: `ldap` (lldap `v0.6.2-alpine`; users jdoe / asmith / bjones in dkw_engineers / dkw_admins /
-  dkw_analysts, group dkw_ops, password `Password123!`, bind `uid=admin,ou=people,dc=example,dc=com` / `adminpassword`).
+  dkw_analysts, u1 in dkw_analysts, u2 and u3 in no group, group dkw_ops, password `Password123!`, bind `uid=admin,ou=people,dc=example,dc=com` / `adminpassword`).
 
 ## The cluster smoke test (`ci/kind-smoke.sh`)
 

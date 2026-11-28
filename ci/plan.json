@@ -10,6 +10,10 @@
    "extras": ""
   },
   {
+   "name": "ci_services_wiring",
+   "extras": ""
+  },
+  {
    "name": "autoloader_watch",
    "extras": ""
   },
@@ -84,6 +88,16 @@
   {
    "name": "group_sync",
    "extras": ""
+  },
+  {
+   "name": "group_sync_ldap",
+   "extras": "",
+   "services": "ldap"
+  },
+  {
+   "name": "ldap_auth",
+   "extras": "",
+   "services": "ldap"
   },
   {
    "name": "init",

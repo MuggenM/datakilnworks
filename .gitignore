@@ -44,10 +44,8 @@ warehouse/.metadata/brand_config.json
 
 warehouse/
 
-# The test and browser-verification scripts in scratch/ are tracked (CI runs them, see ci/). Two are kept out of the repository because they carry the
-# developer's own directory-server login (they run against a real lldap on the developer's machine and skip cleanly without it).
-scratch/test_ldap_auth.py
-scratch/test_group_sync_ldap.py
+# The test and browser-verification scripts in scratch/ are tracked (CI runs them, see ci/); the two LDAP tests run against the
+# lldap of the CI services stack (ci/services) and carry only its dummy logins.
 
 # Claude Code project guidance
 # legacy location of the dbt config history (it now lives in warehouse/.metadata)

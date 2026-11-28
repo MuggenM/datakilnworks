@@ -1,3 +1,6 @@
 {"id": "jdoe", "email": "jdoe@example.com", "displayName": "John Doe", "password": "Password123!", "groups": ["dkw_engineers"]}
 {"id": "asmith", "email": "asmith@example.com", "displayName": "Alice Smith", "password": "Password123!", "groups": ["dkw_admins"]}
 {"id": "bjones", "email": "bjones@example.com", "displayName": "Bob Jones", "password": "Password123!", "groups": ["dkw_analysts"]}
+{"id": "u1", "email": "u1@example.com", "displayName": "Group Sync One", "password": "Password123!", "groups": ["dkw_analysts"]}
+{"id": "u2", "email": "u2@example.com", "displayName": "Group Sync Two", "password": "Password123!"}
+{"id": "u3", "email": "u3@example.com", "displayName": "Group Sync Three", "password": "Password123!"}

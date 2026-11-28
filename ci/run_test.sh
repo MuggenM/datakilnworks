@@ -18,7 +18,7 @@ services_started=""
 cleanup() { rm -rf "$work"; if [ -n "$services_started" ] && [ "${CI_SERVICES_KEEP:-}" != 1 ]; then ci/services/down.sh; fi; }
 trap cleanup EXIT
 mkdir -p "$work/dbt_project" && cp -a dbt_project/. "$work/dbt_project/" 2>/dev/null || true      # the dbt tests write into a project directory: give them a copy
-args=(--rm -v "$PWD/scratch:/workspace/scratch" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/requirements.txt:/workspace/requirements.txt:ro" -v "$PWD/Dockerfile:/workspace/Dockerfile:ro" -v "$work/dbt_project:/workspace/dbt_project" -e PYTHONUNBUFFERED=1)
+args=(--rm -v "$PWD/scratch:/workspace/scratch" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/requirements.txt:/workspace/requirements.txt:ro" -v "$PWD/Dockerfile:/workspace/Dockerfile:ro" -v "$PWD/ci:/workspace/ci:ro" -v "$work/dbt_project:/workspace/dbt_project" -e PYTHONUNBUFFERED=1)
 if [ -n "${CI_SERVICES:-}" ]; then
   if [ "${CI_SERVICES_UP:-}" != 0 ]; then services_started=1; ci/services/up.sh $CI_SERVICES; fi
   args+=(--network dkwci_default --dns-search . -e REQUIRE_SERVICES=1)     # no search domain: see ci/services/docker-compose.yml

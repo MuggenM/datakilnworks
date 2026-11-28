@@ -95,11 +95,20 @@ jobs:
           cache-to: type=gha,scope=image,mode=max
       - name: Versions in the image
         run: ci/print_versions.sh
-      - name: Run the test inside the image
+      - name: Run the test inside the image (with the backend services it names, ci/services)
+        env:
+          CI_SERVICES: ${{ matrix.test.services }}
+          CI_SERVICES_KEEP: "1"                           # stopped by the last step, so a failure can still show their logs
         run: ci/run_test.sh "${{ matrix.test.name }}" "${{ matrix.test.extras }}" 2>&1 | tee /tmp/out.txt
       - name: Show why it failed
         if: failure()
         run: python3 ci/annotate.py /tmp/out.txt "test_${{ matrix.test.name }}"
+      - name: Logs of the backend services
+        if: failure() && matrix.test.services
+        run: docker compose -p dkwci logs --no-color --tail 200
+      - name: Stop the backend services
+        if: always() && matrix.test.services
+        run: ci/services/down.sh
 
   ui:
     name: browser ${{ matrix.ui.name }}
