@@ -431,6 +431,24 @@ def csrf_verdict(method: str, path: str, headers: Dict[str, str], has_session_co
     return None
 
 
+_VOLUME_UPLOAD_PATH = re.compile(r"^/api/volumes/[^/]+/[^/]+/[^/]+/upload$")
+
+
+@app.middleware("http")
+async def _volume_upload_size_gate(request: Request, call_next):
+    """A volume upload larger than VOLUME_UPLOAD_MAX_MB is refused from its Content-Length, before Starlette spools the
+    multipart body to a temporary file (the route's own streaming cap comes after that spooling)."""
+    if request.method == "POST" and _VOLUME_UPLOAD_PATH.match(request.url.path):
+        from web.volumes import max_upload_bytes
+        try:
+            length = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            length = 0
+        if length > max_upload_bytes() + 1024 * 1024:          # 1 MB for the multipart framing and form fields
+            return JSONResponse(status_code=413, content={"detail": f"The file is larger than the upload limit of {max_upload_bytes() // (1024 * 1024)} MB."})
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _csrf_origin_gate(request: Request, call_next):
     """Refuses cross-site state-changing requests made with the session cookie (CSRF), beyond what SameSite=Lax already blocks:
@@ -9377,22 +9395,60 @@ async def mlflow_delete_model_alias(payload: Optional[Dict[str, Any]] = None, na
 # UNITY CATALOG VOLUMES & AUTO-LOADER PIPELINES
 # ==============================================================================
 
-@app.get("/api/volumes")
-async def get_volumes_endpoint(catalog: Optional[str] = None, schema: Optional[str] = None):
-    from web.volumes import list_volumes
+def _volume_errors(exc: Exception, what: str):
+    """Maps the volume module's refusals to HTTP; anything else is logged and answered without internals."""
+    from web.volumes import VolumePathError, VolumeFileExists, VolumeFileTooLarge
+    if isinstance(exc, HTTPException):
+        raise exc
+    if isinstance(exc, VolumeFileTooLarge):
+        raise HTTPException(status_code=413, detail=str(exc))
+    if isinstance(exc, VolumeFileExists):
+        raise HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, (VolumePathError, ValueError)):
+        raise HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="File not found in volume.")
+    logger.error(f"Error {what}: {exc}")
+    raise HTTPException(status_code=500, detail=f"Error {what}.")
+
+
+def _volume_for(user: Dict[str, Any], catalog: str, schema: str, volume_name: str, action: str) -> Dict[str, Any]:
+    """The registered volume, after the caller's catalog check (READ to look, WRITE to change). Names are validated
+    first; an unknown volume or one in a catalog the caller cannot read is 404, so neither can be probed."""
+    from web.volumes import clean_ident, load_volumes_metadata, VolumePathError
+    from web.permissions import can_user_access_catalog
     try:
-        vols = list_volumes(catalog, schema)
-        return {"volumes": vols}
+        cat, sch, vol = clean_ident(catalog, "catalog"), clean_ident(schema, "schema"), clean_ident(volume_name)
+    except VolumePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    rec = next((v for v in load_volumes_metadata() if v.get("catalog") == cat and v.get("schema") == sch and v.get("name") == vol), None)
+    if rec is None or not can_user_access_catalog(user, cat, "READ"):
+        raise HTTPException(status_code=404, detail="Volume not found.")
+    if action != "READ" and not can_user_access_catalog(user, cat, action):
+        raise HTTPException(status_code=403, detail=f"You need {action} access to catalog '{cat}' for this.")
+    return rec
+
+
+@app.get("/api/volumes")
+async def get_volumes_endpoint(request: Request, catalog: Optional[str] = None, schema: Optional[str] = None):
+    from web.volumes import list_volumes
+    from web.permissions import can_user_access_catalog
+    current_user = await resolve_principal(request)
+    try:
+        vols = await asyncio.to_thread(list_volumes, catalog, schema)
     except Exception as e:
-        logger.error(f"Error listing volumes: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _volume_errors(e, "listing volumes")
+    vols = [{k: v for k, v in vol.items() if k != "storage_location"} for vol in vols
+            if can_user_access_catalog(current_user, vol.get("catalog", ""), "READ")]
+    return {"volumes": vols}
 
 
 @app.post("/api/volumes")
 async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
     from web.volumes import create_volume
+    from web.permissions import can_user_access_catalog
     current_user = await resolve_principal(request)
-    
+
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can create volumes.")
 
@@ -9401,6 +9457,8 @@ async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
     name = payload.get("name")
     if not name:
         raise HTTPException(status_code=400, detail="Volume name is required.")
+    if not can_user_access_catalog(current_user, str(cat).strip().lower(), "WRITE"):
+        raise HTTPException(status_code=403, detail=f"You need WRITE access to catalog '{cat}' to create a volume in it.")
 
     try:
         vol = create_volume(
@@ -9412,12 +9470,9 @@ async def create_volume_endpoint(payload: Dict[str, Any], request: Request):
             external_location=payload.get("external_location"),
             owner=current_user.get("username", "admin")
         )
-        return vol
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        return {k: v for k, v in vol.items() if k != "storage_location"}
     except Exception as e:
-        logger.error(f"Error creating volume: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _volume_errors(e, "creating the volume")
 
 
 @app.delete("/api/volumes/{catalog}/{schema}/{volume_name}")
@@ -9427,29 +9482,29 @@ async def delete_volume_endpoint(catalog: str, schema: str, volume_name: str, re
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete volumes.")
-
-    ok = delete_volume(catalog, schema, volume_name)
+    rec = _volume_for(current_user, catalog, schema, volume_name, "WRITE")
+    ok = await asyncio.to_thread(delete_volume, rec["catalog"], rec["schema"], rec["name"])
     if not ok:
         raise HTTPException(status_code=404, detail="Volume not found.")
-    return {"success": True, "message": f"Volume '{catalog}.{schema}.{volume_name}' deleted."}
+    return {"success": True, "message": f"Volume '{rec['catalog']}.{rec['schema']}.{rec['name']}' deleted."}
 
 
 @app.get("/api/volumes/{catalog}/{schema}/{volume_name}/files")
-async def get_volume_files_endpoint(catalog: str, schema: str, volume_name: str, subpath: str = ""):
+async def get_volume_files_endpoint(catalog: str, schema: str, volume_name: str, request: Request, subpath: str = ""):
     from web.volumes import list_volume_files
+    rec = _volume_for(await resolve_principal(request), catalog, schema, volume_name, "READ")
     try:
-        files = list_volume_files(catalog, schema, volume_name, subpath=subpath)
-        return {
-            "catalog": catalog,
-            "schema": schema,
-            "volume_name": volume_name,
-            "volume_path": f"/Volumes/{catalog}/{schema}/{volume_name}",
-            "subpath": subpath,
-            "files": files
-        }
+        files = await asyncio.to_thread(list_volume_files, rec["catalog"], rec["schema"], rec["name"], subpath)
     except Exception as e:
-        logger.error(f"Error listing volume files: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _volume_errors(e, "listing volume files")
+    return {
+        "catalog": rec["catalog"],
+        "schema": rec["schema"],
+        "volume_name": rec["name"],
+        "volume_path": f"/Volumes/{rec['catalog']}/{rec['schema']}/{rec['name']}",
+        "subpath": subpath,
+        "files": files
+    }
 
 
 @app.post("/api/volumes/{catalog}/{schema}/{volume_name}/upload")
@@ -9457,17 +9512,23 @@ async def upload_volume_file_endpoint(
     catalog: str,
     schema: str,
     volume_name: str,
+    request: Request,
     file: UploadFile = File(...),
-    subpath: str = Form("")
+    subpath: str = Form(""),
+    overwrite: str = Form("")
 ):
+    """Streams the upload into the volume (VOLUME_UPLOAD_MAX_MB, default 1024). An existing name is 409 unless
+    `overwrite` is true; the catalog needs WRITE access (the default `warehouse` catalog is writable for every user)."""
     from web.volumes import upload_file_to_volume
+    rec = _volume_for(await resolve_principal(request), catalog, schema, volume_name, "WRITE")
     try:
-        content = await file.read()
-        res = upload_file_to_volume(catalog, schema, volume_name, file.filename, content, subpath=subpath)
-        return res
+        return await asyncio.to_thread(
+            upload_file_to_volume, rec["catalog"], rec["schema"], rec["name"], file.filename or "", None, subpath,
+            file.file, str(overwrite).strip().lower() in ("1", "true", "yes", "on"))
     except Exception as e:
-        logger.error(f"Error uploading file to volume: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _volume_errors(e, "uploading the file")
+    finally:
+        await file.close()
 
 
 @app.delete("/api/volumes/{catalog}/{schema}/{volume_name}/files")
@@ -9483,15 +9544,14 @@ async def delete_volume_file_endpoint(
 
     if current_user.get("role") not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Only admins and power users can delete files from volumes.")
-
+    rec = _volume_for(current_user, catalog, schema, volume_name, "WRITE")
     try:
-        ok = delete_file_from_volume(catalog, schema, volume_name, path)
-        if not ok:
-            raise HTTPException(status_code=404, detail="File not found in volume.")
-        return {"success": True, "message": f"Deleted '{path}'"}
+        ok = await asyncio.to_thread(delete_file_from_volume, rec["catalog"], rec["schema"], rec["name"], path)
     except Exception as e:
-        logger.error(f"Error deleting volume file: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _volume_errors(e, "deleting the volume file")
+    if not ok:
+        raise HTTPException(status_code=404, detail="File not found in volume.")
+    return {"success": True, "message": f"Deleted '{path}'"}
 
 
 @app.get("/api/volumes/{catalog}/{schema}/{volume_name}/preview")
@@ -9500,17 +9560,15 @@ async def preview_volume_file_endpoint(
     schema: str,
     volume_name: str,
     path: str,
+    request: Request,
     limit: int = 10
 ):
     from web.volumes import preview_volume_file
+    rec = _volume_for(await resolve_principal(request), catalog, schema, volume_name, "READ")
     try:
-        res = preview_volume_file(catalog, schema, volume_name, path, limit=limit)
-        return res
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="File not found")
+        return await asyncio.to_thread(preview_volume_file, rec["catalog"], rec["schema"], rec["name"], path, limit)
     except Exception as e:
-        logger.error(f"Error previewing volume file: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        _volume_errors(e, "previewing the volume file")
 
 
 # ------------------------------------------------------------------------------

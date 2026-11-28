@@ -4,7 +4,11 @@ import time
 import shutil
 import hashlib
 import logging
-from typing import Dict, Any, List, Optional
+import re
+import stat as stat_mod
+import threading
+import uuid
+from typing import Dict, Any, List, Optional, BinaryIO
 import duckdb
 
 logger = logging.getLogger("localspark.volumes")
@@ -16,6 +20,97 @@ VOLUMES_METADATA_FILE = os.path.join(METADATA_DIR, "volumes.json")
 
 os.makedirs(VOLUMES_ROOT, exist_ok=True)
 os.makedirs(METADATA_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------------------------------------------- path safety
+# Every file operation walks from WAREHOUSE_DIR down to the target one component at a time through directory file descriptors
+# opened with O_NOFOLLOW: a symbolic link anywhere below the warehouse (notebook kernels can create them: the warehouse is
+# group-writable) is refused, never followed, and a directory swapped for a link between a check and the use cannot redirect
+# the operation (there is no separate check). Names are validated first: catalog / schema / volume segments used to be joined
+# into the path unchecked, so `/api/volumes/%2e%2e/%2e%2e/<dir>/upload` wrote anywhere the studio process could write.
+
+class VolumePathError(ValueError):
+    """A name or path that is not allowed (400)."""
+
+
+class VolumeFileExists(VolumePathError):
+    """The target name exists and overwriting was not asked for (409)."""
+
+
+class VolumeFileTooLarge(VolumePathError):
+    """The upload is larger than VOLUME_UPLOAD_MAX_MB (413)."""
+
+
+IDENT_RE = re.compile(r"^[a-z0-9_]{1,128}$")
+_CHUNK = 1024 * 1024
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_name_locks: Dict[str, threading.Lock] = {}
+_name_locks_guard = threading.Lock()
+
+
+def max_upload_bytes() -> int:
+    """Read on every call (a default argument would freeze it at import)."""
+    try:
+        mb = float(os.environ.get("VOLUME_UPLOAD_MAX_MB", "1024"))
+    except ValueError:
+        mb = 1024.0
+    return int(max(0.0, mb) * 1024 * 1024)
+
+
+def clean_ident(value: str, what: str = "name") -> str:
+    """catalog / schema / volume name: lower case, '-' becomes '_', then only [a-z0-9_]."""
+    v = (value or "").strip().lower().replace("-", "_")
+    if not IDENT_RE.match(v):
+        raise VolumePathError(f"Invalid volume {what}: use letters, digits and underscores only.")
+    return v
+
+
+def clean_component(part: str) -> str:
+    """One file or folder name inside a volume. Hidden names (Auto Loader ignores them, and they include
+    upload temp files) and anything that could move up or sideways are refused."""
+    if (not part or part in (".", "..") or part.startswith(".") or "/" in part or "\\" in part or "\x00" in part
+            or len(part.encode("utf-8", "surrogateescape")) > 255 or any(ord(ch) < 32 for ch in part)):
+        raise VolumePathError(f"Invalid file or folder name: {part[:80]!r}")
+    return part
+
+
+def split_path(rel: str) -> List[str]:
+    return [clean_component(p) for p in (rel or "").replace("\\", "/").split("/") if p]
+
+
+def _open_dir(parent_fd: int, name: str, create: bool) -> int:
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, 0o777, dir_fd=parent_fd)        # umask (002 in the studio) and the setgid parent decide the mode
+        except FileExistsError:
+            pass
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:                                  # ELOOP: a symbolic link; ENOTDIR: a file where a folder should be
+        raise VolumePathError(f"'{name}' is not a folder (symbolic links are not followed).") from exc
+
+
+def open_volume_dir(catalog: str, schema: str, volume_name: str, parts: List[str], create: bool = False) -> int:
+    """A directory fd for <volume>/<parts...>; the caller closes it. FileNotFoundError when missing and not create."""
+    chain = ["volumes", clean_ident(catalog, "catalog"), clean_ident(schema, "schema"), clean_ident(volume_name)] + list(parts)
+    fd = os.open(WAREHOUSE_DIR, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        for name in chain:
+            nxt = _open_dir(fd, name, create)
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _name_lock(key: str) -> threading.Lock:
+    with _name_locks_guard:
+        return _name_locks.setdefault(key, threading.Lock())
 
 
 def load_volumes_metadata() -> List[Dict[str, Any]]:
@@ -42,10 +137,7 @@ def save_volumes_metadata(volumes: List[Dict[str, Any]]):
 
 def get_volume_physical_path(catalog: str, schema: str, volume_name: str) -> str:
     """Returns the canonical on-disk storage directory for a managed volume."""
-    cat_clean = catalog.strip().lower().replace("-", "_")
-    sch_clean = schema.strip().lower().replace("-", "_")
-    vol_clean = volume_name.strip().lower().replace("-", "_")
-    return os.path.join(VOLUMES_ROOT, cat_clean, sch_clean, vol_clean)
+    return os.path.join(VOLUMES_ROOT, clean_ident(catalog, "catalog"), clean_ident(schema, "schema"), clean_ident(volume_name))
 
 
 def resolve_volume_posix_path(posix_path: str) -> str:
@@ -86,19 +178,21 @@ def list_volumes(catalog: Optional[str] = None, schema: Optional[str] = None) ->
             continue
         
         # Verify physical directory exists and calculate file count and size
-        phys = v.get("storage_location") or get_volume_physical_path(v["catalog"], v["schema"], v["name"])
-        os.makedirs(phys, exist_ok=True)
+        try:
+            phys = get_volume_physical_path(v["catalog"], v["schema"], v["name"])
+        except VolumePathError:
+            continue
         
         file_count = 0
         total_bytes = 0
         try:
-            for root, dirs, files in os.walk(phys):
+            for root, dirs, files in os.walk(phys):            # os.walk does not follow directory links
                 # Skip quarantine and hidden dirs in top-level count
                 dirs[:] = [d for d in dirs if not d.startswith(".") and d != "_quarantine"]
                 for f in files:
-                    if not f.startswith("."):
+                    fp = os.path.join(root, f)
+                    if not f.startswith(".") and not os.path.islink(fp):
                         file_count += 1
-                        fp = os.path.join(root, f)
                         try:
                             total_bytes += os.path.getsize(fp)
                         except OSError:
@@ -125,12 +219,16 @@ def create_volume(
     owner: str = "admin"
 ) -> Dict[str, Any]:
     """Creates a new Unity Catalog volume."""
-    cat_clean = catalog.strip().lower().replace("-", "_")
-    sch_clean = schema.strip().lower().replace("-", "_")
-    vol_clean = name.strip().lower().replace("-", "_")
-    
-    if not cat_clean or not sch_clean or not vol_clean:
-        raise ValueError("Catalog, schema, and volume name are required.")
+    cat_clean = clean_ident(catalog, "catalog")
+    sch_clean = clean_ident(schema, "schema")
+    vol_clean = clean_ident(name)
+    if volume_type.upper() == "EXTERNAL" and external_location:
+        # The file routes always use the managed path; an external location is recorded only, and must not point the
+        # volume listing (which walks it) at an arbitrary directory of the studio's file system.
+        loc = os.path.realpath(external_location)
+        rel = os.path.relpath(loc, os.path.realpath(WAREHOUSE_DIR))
+        if rel.startswith("..") or any(p.startswith(".") for p in rel.split(os.sep) if p and p != "."):
+            raise VolumePathError("An external location must be a non-hidden folder inside the warehouse.")
 
     all_vols = load_volumes_metadata()
     for v in all_vols:
@@ -161,9 +259,9 @@ def create_volume(
 
 def delete_volume(catalog: str, schema: str, name: str) -> bool:
     """Deletes a volume record and optionally purges managed files."""
-    cat_clean = catalog.strip().lower()
-    sch_clean = schema.strip().lower()
-    vol_clean = name.strip().lower()
+    cat_clean = clean_ident(catalog, "catalog")
+    sch_clean = clean_ident(schema, "schema")
+    vol_clean = clean_ident(name)
 
     all_vols = load_volumes_metadata()
     target = None
@@ -180,155 +278,207 @@ def delete_volume(catalog: str, schema: str, name: str) -> bool:
     save_volumes_metadata(remaining)
     # If managed volume, purge physical directory
     if target.get("volume_type") == "MANAGED":
-        phys = target.get("storage_location") or get_volume_physical_path(cat_clean, sch_clean, vol_clean)
-        if os.path.exists(phys):
+        try:
+            # fd-based all the way down: a link planted for volumes/<catalog>/<schema> cannot redirect the removal
+            fd = os.open(WAREHOUSE_DIR, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                shutil.rmtree(phys)
-            except Exception as e:
-                logger.warning(f"Could not purge physical volume directory {phys}: {e}")
+                for part in ("volumes", cat_clean, sch_clean):
+                    nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
+                    os.close(fd)
+                    fd = nxt
+                st = os.stat(vol_clean, dir_fd=fd, follow_symlinks=False)
+                if stat_mod.S_ISDIR(st.st_mode):
+                    shutil.rmtree(vol_clean, dir_fd=fd)
+                else:
+                    os.unlink(vol_clean, dir_fd=fd)
+            finally:
+                os.close(fd)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Could not purge physical volume directory of {cat_clean}.{sch_clean}.{vol_clean}: {e}")
 
     logger.info(f"Deleted volume {cat_clean}.{sch_clean}.{vol_clean}")
     return True
 
 
 def list_volume_files(catalog: str, schema: str, volume_name: str, subpath: str = "") -> List[Dict[str, Any]]:
-    """Lists files and folders inside a specified volume or subfolder."""
-    base_dir = get_volume_physical_path(catalog, schema, volume_name)
-    if not os.path.exists(base_dir):
-        os.makedirs(base_dir, exist_ok=True)
+    """Lists files and folders inside a volume or one of its folders. Symbolic links and hidden names are not listed."""
+    parts = split_path(subpath)
+    try:
+        fd = open_volume_dir(catalog, schema, volume_name, parts, create=not parts)
+    except FileNotFoundError:
         return []
-
-    target_dir = os.path.join(base_dir, subpath.strip().lstrip("/"))
-    if os.path.commonpath([os.path.abspath(base_dir), os.path.abspath(target_dir)]) != os.path.abspath(base_dir):
-        raise ValueError("Invalid subpath: directory traversal detected.")
-
-    if not os.path.exists(target_dir):
-        return []
-
+    cat, sch, vol = clean_ident(catalog, "catalog"), clean_ident(schema, "schema"), clean_ident(volume_name)
+    prefix = "/".join(parts)
     items = []
     try:
-        with os.scandir(target_dir) as entries:
+        with os.scandir(fd) as entries:
             for entry in entries:
-                if entry.name.startswith("."):
+                if entry.name.startswith(".") or entry.is_symlink():
                     continue
-                stat = entry.stat()
-                rel_to_vol = os.path.relpath(entry.path, base_dir).replace("\\", "/")
-                is_dir = entry.is_dir()
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                is_dir = stat_mod.S_ISDIR(st.st_mode)
+                if not is_dir and not stat_mod.S_ISREG(st.st_mode):
+                    continue
+                rel_to_vol = f"{prefix}/{entry.name}" if prefix else entry.name
                 _, ext = os.path.splitext(entry.name)
-                
                 items.append({
                     "name": entry.name,
                     "relative_path": rel_to_vol,
-                    "posix_path": f"/Volumes/{catalog.lower()}/{schema.lower()}/{volume_name.lower()}/{rel_to_vol}".rstrip("/"),
+                    "posix_path": f"/Volumes/{cat}/{sch}/{vol}/{rel_to_vol}",
                     "is_directory": is_dir,
-                    "size_bytes": 0 if is_dir else stat.st_size,
+                    "size_bytes": 0 if is_dir else st.st_size,
                     "extension": ext.lower().lstrip("."),
-                    "modified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                    "modified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
                     "is_quarantine": entry.name == "_quarantine"
                 })
-    except Exception as e:
-        logger.error(f"Error scanning volume directory {target_dir}: {e}")
-
+    finally:
+        os.close(fd)
     # Folders first, then alphabetical by name
     return sorted(items, key=lambda x: (not x["is_directory"], x["name"].lower()))
 
 
-def upload_file_to_volume(catalog: str, schema: str, volume_name: str, filename: str, content_bytes: bytes, subpath: str = "") -> Dict[str, Any]:
-    """Saves uploaded binary content into a volume directory."""
-    base_dir = get_volume_physical_path(catalog, schema, volume_name)
-    os.makedirs(base_dir, exist_ok=True)
-
-    target_dir = os.path.join(base_dir, subpath.strip().lstrip("/"))
-    if os.path.commonpath([os.path.abspath(base_dir), os.path.abspath(target_dir)]) != os.path.abspath(base_dir):
-        raise ValueError("Invalid subpath: directory traversal detected.")
-    os.makedirs(target_dir, exist_ok=True)
-
-    clean_filename = os.path.basename(filename.strip())
-    dest_path = os.path.join(target_dir, clean_filename)
-    
-    with open(dest_path, "wb") as f:
-        f.write(content_bytes)
-
-    stat = os.stat(dest_path)
-    rel_path = os.path.relpath(dest_path, base_dir).replace("\\", "/")
-    posix_path = f"/Volumes/{catalog.lower()}/{schema.lower()}/{volume_name.lower()}/{rel_path}"
-
+def upload_file_to_volume(catalog: str, schema: str, volume_name: str, filename: str, content_bytes: Optional[bytes] = None,
+                          subpath: str = "", stream: Optional[BinaryIO] = None, overwrite: bool = False) -> Dict[str, Any]:
+    """Stores an upload in a volume: written to a hidden temp file first (Auto Loader ignores hidden names) and renamed
+    into place when complete, so a half-written file is never ingested and the file watcher sees one IN_MOVED_TO.
+    An existing name is refused unless overwrite (VolumeFileExists); more than VOLUME_UPLOAD_MAX_MB is refused
+    (VolumeFileTooLarge) and leaves nothing behind."""
+    name = clean_component((filename or "").strip())
+    parts = split_path(subpath)
+    cat, sch, vol = clean_ident(catalog, "catalog"), clean_ident(schema, "schema"), clean_ident(volume_name)
+    limit = max_upload_bytes()
+    dir_fd = open_volume_dir(cat, sch, vol, parts, create=True)
+    tmp = f".upload-{uuid.uuid4().hex}.part"
+    size = 0
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o666, dir_fd=dir_fd)
+        try:
+            with os.fdopen(out, "wb", closefd=True) as f:
+                if content_bytes is not None:
+                    chunks = (content_bytes[i:i + _CHUNK] for i in range(0, len(content_bytes), _CHUNK))
+                else:
+                    chunks = iter(lambda: stream.read(_CHUNK), b"")
+                for chunk in chunks:
+                    size += len(chunk)
+                    if size > limit:
+                        raise VolumeFileTooLarge(f"The file is larger than the upload limit of {limit // (1024 * 1024)} MB.")
+                    f.write(chunk)
+            with _name_lock(f"{cat}/{sch}/{vol}/{'/'.join(parts)}/{name}"):
+                try:
+                    existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    existing = None
+                if existing is not None:
+                    if not overwrite:
+                        raise VolumeFileExists(f"'{name}' already exists in this folder.")
+                    if not stat_mod.S_ISREG(existing.st_mode):
+                        raise VolumeFileExists(f"'{name}' exists and is not a file; it cannot be replaced by an upload.")
+                os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)   # replaces a file, never writes through a link
+            tmp = None
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    finally:
+        os.close(dir_fd)
+    rel_path = "/".join(parts + [name])
     return {
         "success": True,
-        "name": clean_filename,
+        "name": name,
         "relative_path": rel_path,
-        "posix_path": posix_path,
-        "physical_path": dest_path,
-        "size_bytes": stat.st_size,
-        "modified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
+        "posix_path": f"/Volumes/{cat}/{sch}/{vol}/{rel_path}",
+        "size_bytes": st.st_size,
+        "replaced": existing is not None,
     }
 
 
 def delete_file_from_volume(catalog: str, schema: str, volume_name: str, rel_path: str) -> bool:
-    """Deletes a file or directory from inside a volume."""
-    base_dir = get_volume_physical_path(catalog, schema, volume_name)
-    target_path = os.path.join(base_dir, rel_path.strip().lstrip("/"))
-    
-    if os.path.commonpath([os.path.abspath(base_dir), os.path.abspath(target_path)]) != os.path.abspath(base_dir):
-        raise ValueError("Invalid path: directory traversal detected.")
-
-    if not os.path.exists(target_path):
+    """Deletes a file or folder inside a volume (never the volume root). A symbolic link is removed itself, never followed."""
+    parts = split_path(rel_path)
+    if not parts:
+        raise VolumePathError("Choose a file or folder inside the volume.")
+    try:
+        dir_fd = open_volume_dir(catalog, schema, volume_name, parts[:-1])
+    except FileNotFoundError:
         return False
-
-    if os.path.isdir(target_path):
-        shutil.rmtree(target_path)
-    else:
-        os.remove(target_path)
-    return True
+    try:
+        try:
+            st = os.stat(parts[-1], dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if stat_mod.S_ISDIR(st.st_mode):
+            shutil.rmtree(parts[-1], dir_fd=dir_fd)         # fd-based: does not follow links inside the tree
+        else:
+            os.unlink(parts[-1], dir_fd=dir_fd)
+        return True
+    finally:
+        os.close(dir_fd)
 
 
 def preview_volume_file(catalog: str, schema: str, volume_name: str, rel_path: str, limit: int = 10) -> Dict[str, Any]:
     """
-    Parses a CSV, Parquet, or JSON file stored in a volume using DuckDB
-    and returns column metadata and preview rows.
+    Parses a CSV, Parquet, or JSON file stored in a volume using DuckDB and returns column metadata and preview rows.
+    The file is opened here (O_NOFOLLOW, through the checked directory chain) and DuckDB reads that open file through
+    /proc/self/fd, with the path as a bound parameter: no path string is ever pasted into SQL (a quote in a file or
+    folder name used to end the literal and run the rest as SQL), and no link can be swapped in after the check.
     """
-    base_dir = get_volume_physical_path(catalog, schema, volume_name)
-    file_path = os.path.join(base_dir, rel_path.strip().lstrip("/"))
-    
-    if os.path.commonpath([os.path.abspath(base_dir), os.path.abspath(file_path)]) != os.path.abspath(base_dir):
-        raise ValueError("Invalid file path: directory traversal detected.")
-
-    if not os.path.exists(file_path) or os.path.isdir(file_path):
+    parts = split_path(rel_path)
+    if not parts:
         raise FileNotFoundError(f"File not found: {rel_path}")
-
-    _, ext = os.path.splitext(file_path)
+    _, ext = os.path.splitext(parts[-1])
     ext_lower = ext.lower().lstrip(".")
-    
+    readers = {"csv": "read_csv_auto", "tsv": "read_csv_auto", "txt": "read_csv_auto", "parquet": "read_parquet",
+               "json": "read_json_auto", "jsonl": "read_json_auto", "ndjson": "read_json_auto"}
+    if ext_lower not in readers:
+        raise ValueError(f"Preview is not supported for file extension '.{ext_lower}' (supports CSV, Parquet, JSON).")
+    try:
+        dir_fd = open_volume_dir(catalog, schema, volume_name, parts[:-1])
+    except FileNotFoundError:
+        raise FileNotFoundError(f"File not found: {rel_path}")
+    try:
+        try:
+            file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dir_fd)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {rel_path}")
+        except OSError as exc:
+            raise VolumePathError("Symbolic links are not followed.") from exc
+    finally:
+        os.close(dir_fd)
     conn = duckdb.connect(":memory:")
     try:
-        if ext_lower in ("csv", "tsv", "txt"):
-            source_query = f"SELECT * FROM read_csv_auto('{file_path}')"
-        elif ext_lower == "parquet":
-            source_query = f"SELECT * FROM read_parquet('{file_path}')"
-        elif ext_lower in ("json", "jsonl", "ndjson"):
-            source_query = f"SELECT * FROM read_json_auto('{file_path}')"
-        else:
-            raise ValueError(f"Preview is not supported for file extension '.{ext_lower}' (supports CSV, Parquet, JSON).")
+        if not stat_mod.S_ISREG(os.fstat(file_fd).st_mode):
+            raise FileNotFoundError(f"File not found: {rel_path}")
+        source = f"/proc/self/fd/{file_fd}"
+        reader = readers[ext_lower]
+        n = max(1, min(int(limit), 100))
+        df = conn.execute(f"SELECT * FROM {reader}(?) LIMIT ?", [source, n]).df()
+        total_count = int(conn.execute(f"SELECT COUNT(*) FROM {reader}(?)", [source]).fetchone()[0])
 
-        df = conn.sql(f"{source_query} LIMIT {max(1, min(limit, 100))}").df()
-        total_count = int(conn.sql(f"SELECT COUNT(*) FROM ({source_query})").fetchall()[0][0])
-        
         columns = [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
         rows = df.fillna("").to_dict(orient="records")
-
+        rel = "/".join(parts)
         return {
             "success": True,
-            "filename": os.path.basename(file_path),
-            "relative_path": rel_path,
-            "posix_path": f"/Volumes/{catalog.lower()}/{schema.lower()}/{volume_name.lower()}/{rel_path}",
+            "filename": parts[-1],
+            "relative_path": rel,
+            "posix_path": f"/Volumes/{clean_ident(catalog, 'catalog')}/{clean_ident(schema, 'schema')}/{clean_ident(volume_name)}/{rel}",
             "extension": ext_lower,
             "columns": columns,
             "total_rows": total_count,
             "sample_rows": rows,
-            "preview_limit": limit
+            "preview_limit": n
         }
     finally:
         conn.close()
+        os.close(file_fd)
 
 
 def ensure_default_volumes():

@@ -30118,17 +30118,21 @@
         async uploadVolumeFile(event) {
           const file = event.target.files?.[0];
           if (!file || !this.selectedVolume) return;
-          const formData = new FormData();
-          formData.append('file', file);
+          const url = `/api/volumes/${this.selectedVolume.catalog}/${this.selectedVolume.schema}/${this.selectedVolume.name}/upload`;
+          const send = (overwrite) => {
+            const formData = new FormData();
+            formData.append('file', file);
+            if (overwrite) formData.append('overwrite', 'true');
+            return fetch(url, { method: 'POST', body: formData });
+          };
           this.isUploadingVolumeFile = true;
           try {
-            const res = await fetch(`/api/volumes/${this.selectedVolume.catalog}/${this.selectedVolume.schema}/${this.selectedVolume.name}/upload`, {
-              method: 'POST',
-              body: formData
-            });
-            const data = await res.json();
+            let res = await send(false);
+            // an existing name is refused (409) unless the user confirms replacing it
+            if (res.status === 409 && confirm(`'${file.name}' already exists in this volume. Replace it?`)) res = await send(true);
+            const data = await res.json().catch(() => ({}));
             if (res.ok) {
-              this.showToast(`Uploaded '${file.name}' to volume.`, 'success');
+              this.showToast(`${data.replaced ? 'Replaced' : 'Uploaded'} '${file.name}' in the volume.`, 'success');
               await this.fetchVolumeFiles(this.selectedVolume);
               await this.fetchVolumes();
             } else {
