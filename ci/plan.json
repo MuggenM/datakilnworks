@@ -286,6 +286,11 @@
    "name": "streaming",
    "extras": "",
    "services": "kafka"
+  },
+  {
+   "name": "oidc_keycloak",
+   "extras": "",
+   "services": "idp"
   }
  ],
  "ui": [
@@ -315,6 +320,11 @@
   },
   {
    "name": "csp_ui"
+  },
+  {
+   "name": "saml_keycloak",
+   "services": "idp",
+   "publish": "keycloak:8180:8080"
   }
  ]
 }

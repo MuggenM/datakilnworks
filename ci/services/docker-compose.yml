@@ -202,6 +202,40 @@ services:
     volumes:
       - ./out:/out
 
+  # ---------------------------------------------------------------- profile idp
+  # Keycloak for SAML and OIDC: realm dkw from seed/keycloak-realm.json (users alice/alicepw in LakehouseAdmins and
+  # bob/bobpw, SAML client urn:dkw:keycloak-test, OIDC client dkw-oidc). Its URLs (issuer, login page) are built from
+  # KC_HOSTNAME: the service name, or http://localhost:<port> when up.sh publishes it for a browser on the host
+  # (CI_SERVICES_PUBLISH=keycloak:8180:8080 sets DKWCI_PUBLISHED_KEYCLOAK).
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.6.0
+    profiles: [idp]
+    <<: *no-search
+    command: [start-dev, --import-realm]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: dkwci-test-admin-password
+      KC_HOSTNAME: ${DKWCI_PUBLISHED_KEYCLOAK:-http://keycloak:8080}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./seed/keycloak-realm.json:/opt/keycloak/data/import/dkw.json:ro
+    healthcheck:                                # no curl in the image: plain HTTP over bash's /dev/tcp to the management port
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\r\n\r\n' >&3 && grep -q UP <&3"]
+      interval: 3s
+      timeout: 5s
+      retries: 80
+
+  idp-seed:
+    image: python:3.11-slim
+    profiles: [idp]
+    <<: *no-search
+    depends_on:
+      keycloak: {condition: service_healthy}
+    entrypoint: ["python", "-I", "/seed/idp.py"]
+    volumes:
+      - ./seed/idp.py:/seed/idp.py:ro
+      - ./out:/out
+
 volumes:
   lldap-data:
   gitea-data:

@@ -139,14 +139,31 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: Versions (image, Playwright, Chromium)
         run: ci/print_versions.sh --browser
+      - name: Start the backend services it names (ci/services; "publish" = ports on 127.0.0.1 for the browser)
+        if: matrix.ui.services
+        env:
+          CI_SERVICES_PUBLISH: ${{ matrix.ui.publish }}
+        run: ci/services/up.sh ${{ matrix.ui.services }}
       - name: Run the browser test (it starts and removes its own throwaway containers)
         env:
           NODE_OPTIONS: --dns-result-order=ipv4first        # Playwright's request client does not fall back from ::1 to 127.0.0.1 on runners without IPv6 loopback
           UI_SLOW: "3"                                        # fixed sleeps in the browser scripts are scaled (scratch/_ui_slow.py): a shared runner is several times slower
-        run: python "scratch/verify_${{ matrix.ui.name }}.py" 2>&1 | tee /tmp/out.txt
+          SERVICES: ${{ matrix.ui.services }}
+        run: |
+          if [ -n "$SERVICES" ]; then             # the services' env files, and a missing service fails instead of skipping
+            export REQUIRE_SERVICES=1
+            for p in $SERVICES; do set -a; . "ci/services/out/$p.env"; set +a; done
+          fi
+          python "scratch/verify_${{ matrix.ui.name }}.py" 2>&1 | tee /tmp/out.txt
       - name: Show why it failed
         if: failure()
         run: python3 ci/annotate.py /tmp/out.txt "browser ${{ matrix.ui.name }}"
+      - name: Logs of the backend services
+        if: failure() && matrix.ui.services
+        run: docker compose -p dkwci logs --no-color --tail 200
+      - name: Stop the backend services
+        if: always() && matrix.ui.services
+        run: ci/services/down.sh
 
   kind:
     name: Helm chart on a real cluster (kind)

@@ -93,6 +93,17 @@ EOF
 out6="$(CI_SERVICES_EXTRA_COMPOSE=/tmp/dkwci_badseed.yml bash $S/up.sh ldap 2>&1)"; rc6=$?; rm -f /tmp/dkwci_badseed.yml
 [ $rc6 -ne 0 ] && echo "$out6" | grep -q "seed lldap-seed exited with 3"; check "up.sh exits non-zero naming the seed and its code 3" $? "$(echo "$out6" | grep -m1 'did not come up')"
 
+echo "CI_SERVICES_PUBLISH: loopback only, and a bad entry changes nothing"
+bash $S/down.sh >/dev/null 2>&1
+CI_SERVICES_PUBLISH="lldap:0.0.0.0:17170" bash $S/up.sh ldap >/dev/null 2>&1; rc7=$?
+[ $rc7 -eq 2 ] && [ ! -e $S/out/.lock ] && [ -z "$(docker ps -aq --filter label=com.docker.compose.project=dkwci)" ]
+check "an entry that tries to name a bind address is refused before anything starts (no lock, no container)" $?
+CI_SERVICES_PUBLISH="lldap:18917:17170" bash $S/up.sh ldap >/dev/null 2>&1; check "a valid entry starts the stack" $?
+ports="$(docker ps --filter label=com.docker.compose.project=dkwci --format '{{.Ports}}' | tr ',' '\n' | grep -- '->' | sed 's/^ *//')"
+[ "$ports" = "127.0.0.1:18917->17170/tcp" ]; check "the only published port is 127.0.0.1:18917" $? "$ports"
+curl -sf -o /dev/null http://127.0.0.1:18917/; check "...and it answers on the host" $?
+bash $S/down.sh >/dev/null 2>&1; [ ! -e $S/out/publish.yml ]; check "down.sh removes the override" $?
+
 echo "a refused run_test.sh leaves the running stack alone"
 bash $S/down.sh >/dev/null 2>&1; bash $S/up.sh ldap >/dev/null 2>&1
 CI_SERVICES=ldap bash ci/run_test.sh ci_services_wiring >/dev/null 2>&1; rc5=$?
@@ -102,7 +113,7 @@ check "...and the stack it did not start is still running" $?
 
 echo "secrets_not_in_output: no generated or dummy secret appears in what CI prints"
 bash $S/down.sh >/dev/null 2>&1
-outU="$(bash $S/up.sh ldap git kafka azure s3 sftp 2>&1)"; check "up.sh with every profile exits 0" $? "$(echo "$outU" | tail -3)"
+outU="$(bash $S/up.sh ldap git kafka azure s3 sftp idp 2>&1)"; check "up.sh with every profile exits 0" $? "$(echo "$outU" | tail -3)"
 outT="$(CI_SERVICES=git CI_SERVICES_UP=0 CI_SERVICES_KEEP=1 CI_TEST_ENV=GIT_HOST=127.0.0.1:9 bash ci/run_test.sh git_sync 2>&1)"; rcT=$?
 [ $rcT -ne 0 ] && echo "$outT" | grep -q "\[FAIL\] Gitea not reachable at 127.0.0.1:9"; check "git_sync against an unreachable Gitea fails (REQUIRE_SERVICES=1)" $? "$(echo "$outT" | tail -3)"
 tf="$(mktemp)"; echo "$outT" > "$tf"; outA="$(python3 ci/annotate.py "$tf" test_git_sync 2>&1)"; rm -f "$tf"

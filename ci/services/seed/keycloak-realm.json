@@ -1,0 +1,80 @@
+{
+  "realm": "dkw",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "groups": [
+    {"name": "LakehouseAdmins"}
+  ],
+  "users": [
+    {
+      "username": "alice", "enabled": true, "emailVerified": true,
+      "email": "alice@example.org", "firstName": "Alice", "lastName": "Test",
+      "credentials": [{"type": "password", "value": "alicepw", "temporary": false}],
+      "groups": ["/LakehouseAdmins"],
+      "requiredActions": []
+    },
+    {
+      "username": "bob", "enabled": true, "emailVerified": true,
+      "email": "bob@example.org", "firstName": "Bob", "lastName": "Test",
+      "credentials": [{"type": "password", "value": "bobpw", "temporary": false}],
+      "requiredActions": []
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "dkw-oidc",
+      "name": "Data Kiln Works (OIDC, CI test client)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "dkwci-test-oidc-secret-not-a-real-one",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://testserver/api/auth/oidc/callback",
+        "http://localhost:8117/api/auth/oidc/callback"
+      ],
+      "webOrigins": ["+"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "protocolMappers": [
+        {
+          "name": "groups", "protocol": "openid-connect", "protocolMapper": "oidc-group-membership-mapper",
+          "config": {"claim.name": "groups", "full.path": "false", "id.token.claim": "true", "access.token.claim": "true",
+                     "userinfo.token.claim": "true"}
+        }
+      ]
+    },
+    {
+      "clientId": "urn:dkw:keycloak-test",
+      "name": "Data Kiln Works (SAML, CI test client)",
+      "enabled": true,
+      "protocol": "saml",
+      "redirectUris": ["http://localhost:8117/*"],
+      "adminUrl": "http://localhost:8117/api/auth/saml/acs",
+      "frontchannelLogout": true,
+      "attributes": {
+        "saml.assertion.signature": "true",
+        "saml.server.signature": "true",
+        "saml.client.signature": "false",
+        "saml.authnstatement": "true",
+        "saml_force_name_id_format": "true",
+        "saml_name_id_format": "username",
+        "saml_assertion_consumer_url_post": "http://localhost:8117/api/auth/saml/acs"
+      },
+      "protocolMappers": [
+        {
+          "name": "username", "protocol": "saml", "protocolMapper": "saml-user-property-mapper",
+          "config": {"user.attribute": "username", "attribute.name": "username", "attribute.nameformat": "Basic"}
+        },
+        {
+          "name": "groups", "protocol": "saml", "protocolMapper": "saml-group-membership-mapper",
+          "config": {"attribute.name": "groups", "full.path": "false", "single": "false", "attribute.nameformat": "Basic"}
+        }
+      ]
+    }
+  ]
+}
